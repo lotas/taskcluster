@@ -84,5 +84,8 @@ __pycache__
 /docker/buckets
 docker-compose.override.yml
 
+# environment secrets
+.env
+
 dist/
 .DS_Store

@@ -11,7 +11,8 @@
   "workspaces": [
     "libraries/*",
     "services/*",
-    "db"
+    "db",
+    "tools/queue-forecasting"
   ],
   "dependencies": {
     "@apollo/client": "^3.13.9",

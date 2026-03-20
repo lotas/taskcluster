@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:15
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_DB: forecasting
+      POSTGRES_HOST_AUTH_METHOD: trust
+      LC_COLLATE: en_US.UTF8
+      LC_CTYPE: en_US.UTF8
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      # NOTE: init.sql only runs on first volume creation.
+      # To apply schema changes, run: docker compose down -v && docker compose up -d
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 3s
+      timeout: 4s
+      retries: 100
+      start_period: 3s
+
+  collector:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    command: ["node", "src/collector.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 20s
+    restart: unless-stopped
+    profiles:
+      - collector
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+
+  predictor:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    command: ["node", "src/predictor.js", "--date", "${PREDICT_DATE:-2026-03-18}"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - predictor
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+
+volumes:
+  pgdata:
