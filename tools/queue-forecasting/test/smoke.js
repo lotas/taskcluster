@@ -356,6 +356,31 @@ async function testExtractImageName() {
   );
 }
 
+// Test 14: queue_pending capture and COALESCE preservation
+async function testQueuePendingCapture() {
+  console.log('\nTest 14: queue_pending capture');
+  await resetTable();
+
+  await upsertTaskEvent(pool, {
+    task_id: 'task-qp', run_id: 0,
+    task_queue_id: 'gecko-t/linux',
+    queue_pending: 42,
+    scheduled: '2026-03-20T10:00:00Z',
+  });
+
+  const rows = await getRows('task-qp');
+  assert(rows[0].queue_pending === 42, 'queue_pending persisted');
+
+  // Second upsert without queue_pending should not overwrite
+  await upsertTaskEvent(pool, {
+    task_id: 'task-qp', run_id: 0,
+    started: '2026-03-20T10:01:00Z',
+  });
+
+  const rows2 = await getRows('task-qp');
+  assert(rows2[0].queue_pending === 42, 'queue_pending preserved by COALESCE');
+}
+
 // --- Run all tests ---
 
 try {
@@ -372,6 +397,7 @@ try {
   await testBackfillIncludesPlaceholders();
   await testNormalizeMetadataName();
   await testExtractImageName();
+  await testQueuePendingCapture();
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) process.exit(1);

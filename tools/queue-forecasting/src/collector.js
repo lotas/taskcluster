@@ -12,6 +12,11 @@ const BACKFILL_INTERVAL_MS = 60_000; // 1 minute
 const MAX_BACKFILL_RETRIES = 3;
 const backfillFailCounts = new Map(); // taskId -> attempt count
 
+// --- Queue Pending Counter ---
+const pendingCounts = new Map();       // taskQueueId -> number
+const pendingCountsSeeded = new Set(); // queues that have been seeded from API
+const SYNC_INTERVAL_MS = 60_000;
+
 const pool = createPool(process.env.DATABASE_URL);
 const taskCache = createTaskCache();
 const monitor = createNoOpMonitor();
@@ -40,6 +45,46 @@ const queueClient = new taskcluster.Queue({
 const queueEvents = new taskcluster.QueueEvents({
   rootUrl: process.env.TASKCLUSTER_ROOT_URL,
 });
+
+// Seed a queue's counter from the API
+async function seedQueueCount(taskQueueId) {
+  try {
+    const counts = await queueClient.taskQueueCounts(taskQueueId);
+    pendingCounts.set(taskQueueId, counts.pendingTasks);
+    pendingCountsSeeded.add(taskQueueId);
+  } catch (err) {
+    console.error(`[queue-counts] Seed failed for ${taskQueueId}: ${err.message}`);
+  }
+}
+
+// Get current pending count (seeds from API on first encounter)
+async function getQueuePending(taskQueueId) {
+  if (!taskQueueId) return null;
+  if (!pendingCountsSeeded.has(taskQueueId)) {
+    await seedQueueCount(taskQueueId);
+  }
+  return pendingCounts.get(taskQueueId) ?? null;
+}
+
+function incrementQueuePending(taskQueueId) {
+  if (!taskQueueId || !pendingCountsSeeded.has(taskQueueId)) return;
+  pendingCounts.set(taskQueueId, (pendingCounts.get(taskQueueId) || 0) + 1);
+}
+
+function decrementQueuePending(taskQueueId) {
+  if (!taskQueueId || !pendingCountsSeeded.has(taskQueueId)) return;
+  const current = pendingCounts.get(taskQueueId) || 0;
+  pendingCounts.set(taskQueueId, Math.max(0, current - 1));
+}
+
+// Periodic sync — re-fetch counts for all seeded queues to correct drift
+async function syncAllQueueCounts() {
+  const queues = [...pendingCountsSeeded];
+  for (let i = 0; i < queues.length; i += MAX_CONCURRENT_FETCHES) {
+    const batch = queues.slice(i, i + MAX_CONCURRENT_FETCHES);
+    await Promise.all(batch.map(qid => seedQueueCount(qid)));
+  }
+}
 
 function extractRunFields(status, runId) {
   const run = status.runs?.[runId];
@@ -95,13 +140,17 @@ async function handleTaskDefined(payload) {
 async function handleTaskPending(payload) {
   const { status, runId } = payload;
   const runFields = extractRunFields(status, runId);
+  const taskQueueId = status.taskQueueId || null;
+  const queuePending = await getQueuePending(taskQueueId);
   await upsertTaskEvent(pool, {
     task_id: status.taskId,
     run_id: runId,
     ...extractStatusFields(status),
     tags: extractTags(payload),
     ...runFields,
+    queue_pending: queuePending,
   });
+  incrementQueuePending(taskQueueId);
 }
 
 async function handleTaskRunning(payload) {
@@ -114,6 +163,7 @@ async function handleTaskRunning(payload) {
     tags: extractTags(payload),
     ...runFields,
   });
+  decrementQueuePending(status.taskQueueId || null);
 }
 
 async function handleResolved(payload) {
@@ -309,6 +359,7 @@ async function backfillSweep() {
 }
 
 const backfillTimer = setInterval(backfillSweep, BACKFILL_INTERVAL_MS);
+const syncTimer = setInterval(syncAllQueueCounts, SYNC_INTERVAL_MS);
 
 // --- Graceful Shutdown ---
 
@@ -318,6 +369,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   console.log(`[collector] Received ${signal}, shutting down...`);
   clearInterval(backfillTimer);
+  clearInterval(syncTimer);
 
   try {
     await pq.stop();

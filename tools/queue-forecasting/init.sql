@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS task_events (
   reason_created  TEXT,
   reason_resolved TEXT,
 
+  -- Queue depth snapshot (approximate pending count at time of pending event)
+  queue_pending   INTEGER,
+
   -- Computed (filled on resolution, only when both scheduled and started are present)
   wait_duration_s DOUBLE PRECISION,
   run_duration_s  DOUBLE PRECISION,

@@ -11,9 +11,10 @@ INSERT INTO task_events (
   metadata_name, scheduler_id, project_id, tags, worker_group,
   task_created, scheduled, started, resolved,
   reason_created, reason_resolved,
+  queue_pending,
   wait_duration_s, run_duration_s,
   normalized_name, max_run_time_s, image_name
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 ON CONFLICT (task_id, run_id) DO UPDATE SET
   task_queue_id     = COALESCE(EXCLUDED.task_queue_id,     task_events.task_queue_id),
   task_group_id     = COALESCE(EXCLUDED.task_group_id,     task_events.task_group_id),
@@ -33,6 +34,7 @@ ON CONFLICT (task_id, run_id) DO UPDATE SET
   resolved          = COALESCE(EXCLUDED.resolved,          task_events.resolved),
   reason_created    = COALESCE(EXCLUDED.reason_created,    task_events.reason_created),
   reason_resolved   = COALESCE(EXCLUDED.reason_resolved,   task_events.reason_resolved),
+  queue_pending     = COALESCE(EXCLUDED.queue_pending,     task_events.queue_pending),
   wait_duration_s   = COALESCE(EXCLUDED.wait_duration_s,   task_events.wait_duration_s),
   run_duration_s    = COALESCE(EXCLUDED.run_duration_s,    task_events.run_duration_s);
 `;
@@ -48,6 +50,7 @@ export async function upsertTaskEvent(pool, fields) {
     scheduled = null, started = null, resolved = null,
     reason_created = null, reason_resolved = null,
     wait_duration_s = null, run_duration_s = null,
+    queue_pending = null,
     normalized_name = null, max_run_time_s = null, image_name = null,
   } = fields;
 
@@ -59,6 +62,7 @@ export async function upsertTaskEvent(pool, fields) {
     worker_group,
     task_created, scheduled, started, resolved,
     reason_created, reason_resolved,
+    queue_pending,
     wait_duration_s, run_duration_s,
     normalized_name, max_run_time_s, image_name,
   ]);
