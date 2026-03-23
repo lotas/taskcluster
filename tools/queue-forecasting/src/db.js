@@ -4,6 +4,36 @@ export function createPool(databaseUrl) {
   return new pg.Pool({ connectionString: databaseUrl, max: 20 });
 }
 
+// Promote a run_id=NULL placeholder to a real run row, merging fields.
+// Only promotes if no row with the target run_id already exists.
+const PROMOTE_PLACEHOLDER_SQL = `
+UPDATE task_events SET
+  run_id            = $2,
+  task_queue_id     = COALESCE($3,  task_events.task_queue_id),
+  task_group_id     = COALESCE($4,  task_events.task_group_id),
+  priority          = COALESCE($5,  task_events.priority),
+  original_priority = COALESCE(task_events.original_priority, $6),
+  metadata_name     = COALESCE($7,  task_events.metadata_name),
+  scheduler_id      = COALESCE($8,  task_events.scheduler_id),
+  project_id        = COALESCE($9,  task_events.project_id),
+  tags              = COALESCE($10, task_events.tags),
+  worker_group      = COALESCE($11, task_events.worker_group),
+  task_created      = COALESCE($12, task_events.task_created),
+  scheduled         = COALESCE($13, task_events.scheduled),
+  started           = COALESCE($14, task_events.started),
+  resolved          = COALESCE($15, task_events.resolved),
+  reason_created    = COALESCE($16, task_events.reason_created),
+  reason_resolved   = COALESCE($17, task_events.reason_resolved),
+  queue_pending     = COALESCE($18, task_events.queue_pending),
+  wait_duration_s   = COALESCE($19, task_events.wait_duration_s),
+  run_duration_s    = COALESCE($20, task_events.run_duration_s),
+  normalized_name   = COALESCE($21, task_events.normalized_name),
+  max_run_time_s    = COALESCE($22, task_events.max_run_time_s),
+  image_name        = COALESCE($23, task_events.image_name)
+WHERE task_id = $1 AND run_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = $1 AND run_id = $2);
+`;
+
 const UPSERT_SQL = `
 INSERT INTO task_events (
   task_id, run_id,
@@ -54,7 +84,7 @@ export async function upsertTaskEvent(pool, fields) {
     normalized_name = null, max_run_time_s = null, image_name = null,
   } = fields;
 
-  await pool.query(UPSERT_SQL, [
+  const params = [
     task_id, run_id,
     task_queue_id, task_group_id, priority, original_priority,
     metadata_name, scheduler_id, project_id,
@@ -65,7 +95,16 @@ export async function upsertTaskEvent(pool, fields) {
     queue_pending,
     wait_duration_s, run_duration_s,
     normalized_name, max_run_time_s, image_name,
-  ]);
+  ];
+
+  // When a run event arrives, try to promote the run_id=NULL placeholder first.
+  // This avoids creating a duplicate row for the same task.
+  if (run_id != null) {
+    const promoteRes = await pool.query(PROMOTE_PLACEHOLDER_SQL, params);
+    if (promoteRes.rowCount > 0) return;
+  }
+
+  await pool.query(UPSERT_SQL, params);
 }
 
 const ENRICH_SQL = `

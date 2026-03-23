@@ -129,9 +129,10 @@ async function predictDuration(task, asOfDate) {
     if (r) return r;
   }
 
-  // Level 3: tags kind + test-type
-  const kind = task.tags?.kind;
-  const testType = task.tags?.['test-type'];
+  // Level 3: tags kind + test-type (handle tags as string or object)
+  const parsedTags = parseTags(task.tags);
+  const kind = parsedTags?.kind;
+  const testType = parsedTags?.['test-type'];
   if (kind && testType) {
     const r = await tryLevel('kind+test-type', DURATION_BY_KIND_AND_TEST_TYPE, [kind, testType, asOfDate]);
     if (r) return r;
@@ -180,13 +181,14 @@ GROUP BY metadata_name;
 `;
 
 const BULK_STATS_BY_KIND_TEST_TYPE = `
-SELECT tags->>'kind' || '|' || tags->>'test-type' AS key,
+SELECT (tags->>'kind') || '|' || (tags->>'test-type') AS key,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
        percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
        count(*) AS sample_size
 FROM task_events
 WHERE run_id IS NOT NULL
   AND run_duration_s IS NOT NULL
+  AND tags IS NOT NULL
   AND tags->>'kind' IS NOT NULL
   AND tags->>'test-type' IS NOT NULL
   AND reason_resolved = 'completed'
@@ -292,6 +294,12 @@ async function loadBulkStats(date) {
   };
 }
 
+function parseTags(tags) {
+  if (!tags) return null;
+  if (typeof tags === 'object') return tags;
+  try { return JSON.parse(tags); } catch { return null; }
+}
+
 function predictDurationFromStats(task, stats) {
   // Level 1: metadata_name exact match
   if (task.metadata_name) {
@@ -306,9 +314,10 @@ function predictDurationFromStats(task, stats) {
     if (s) return { level: 'normalized_name', ...s };
   }
 
-  // Level 3: tags kind + test-type
-  const kind = task.tags?.kind;
-  const testType = task.tags?.['test-type'];
+  // Level 3: tags kind + test-type (handle tags as string or object)
+  const tags = parseTags(task.tags);
+  const kind = tags?.kind;
+  const testType = tags?.['test-type'];
   if (kind && testType) {
     const s = stats.byKindTestType.get(`${kind}|${testType}`);
     if (s) return { level: 'kind+test-type', ...s };

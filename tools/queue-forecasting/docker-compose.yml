@@ -44,7 +44,8 @@ services:
     build:
       context: ../..
       dockerfile: tools/queue-forecasting/Dockerfile
-    command: ["node", "src/predictor.js", "--date", "${PREDICT_DATE:-2026-03-18}"]
+    command: ["node", "src/predict-sample.js"]
+    # command: ["node", "src/predictor.js", "--date", "${PREDICT_DATE:-2026-03-23}"]
     depends_on:
       postgres:
         condition: service_healthy
