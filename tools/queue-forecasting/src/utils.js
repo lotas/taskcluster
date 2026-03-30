@@ -3,6 +3,29 @@ export function normalizeMetadataName(name) {
   return name.replace(/@[0-9a-f]{12,}$/i, '').trim();
 }
 
+export function pendingBucket(queuePending) {
+  const n = parseInt(queuePending, 10);
+  if (isNaN(n) || n === 0) return 'empty';
+  if (n <= 5) return 'low';
+  if (n <= 20) return 'moderate';
+  if (n <= 50) return 'busy';
+  if (n <= 200) return 'heavy';
+  if (n <= 500) return 'very-heavy';
+  if (n <= 1500) return 'overloaded';
+  return 'saturated';
+}
+
+export const PENDING_BUCKET_SQL = `CASE
+  WHEN queue_pending IS NULL OR queue_pending = 0 THEN 'empty'
+  WHEN queue_pending <= 5 THEN 'low'
+  WHEN queue_pending <= 20 THEN 'moderate'
+  WHEN queue_pending <= 50 THEN 'busy'
+  WHEN queue_pending <= 200 THEN 'heavy'
+  WHEN queue_pending <= 500 THEN 'very-heavy'
+  WHEN queue_pending <= 1500 THEN 'overloaded'
+  ELSE 'saturated'
+END`;
+
 export function extractImageName(taskDef) {
   const image = taskDef?.payload?.image;
   if (!image) return null;

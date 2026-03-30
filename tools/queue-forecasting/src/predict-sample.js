@@ -1,5 +1,5 @@
 import { createPool } from './db.js';
-import { normalizeMetadataName } from './utils.js';
+import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL } from './utils.js';
 
 const pool = createPool(process.env.DATABASE_URL || 'postgresql://postgres@host.docker.internal:5433/forecasting');
 
@@ -8,7 +8,7 @@ const MIN_SAMPLE_SIZE = 5;
 async function findPendingTask() {
   const res = await pool.query(`
     SELECT task_id, run_id, metadata_name, normalized_name, task_queue_id,
-           tags, scheduler_id, image_name, scheduled, started, queue_pending
+           tags, scheduler_id, image_name, priority, scheduled, started, queue_pending
     FROM task_events
     WHERE scheduled IS NOT NULL
       AND started IS NULL
@@ -20,7 +20,7 @@ async function findPendingTask() {
     // Fallback: find a recently scheduled task (even if started)
     const fallback = await pool.query(`
       SELECT task_id, run_id, metadata_name, normalized_name, task_queue_id,
-             tags, scheduler_id, image_name, scheduled, started, queue_pending
+             tags, scheduler_id, image_name, priority, scheduled, started, queue_pending
       FROM task_events
       WHERE scheduled IS NOT NULL AND metadata_name IS NOT NULL
       ORDER BY scheduled DESC
@@ -162,6 +162,87 @@ async function predictWithFallback(task) {
   return null;
 }
 
+async function predictWaitWithFallback(task) {
+  const asOfDate = new Date().toISOString();
+  const bucket = pendingBucket(task.queue_pending);
+  const levels = [];
+
+  // Level 1: queue + pending bucket
+  if (task.task_queue_id) {
+    levels.push({
+      label: 'queue+bucket',
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+                   count(*) AS sample_size
+            FROM task_events
+            WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
+              AND task_queue_id = $1 AND ${PENDING_BUCKET_SQL} = $2
+              AND reason_resolved = 'completed'
+              AND resolved < $3 AND resolved > $3::timestamptz - INTERVAL '7 days'`,
+      params: [task.task_queue_id, bucket, asOfDate],
+    });
+  }
+
+  // Level 2: queue only
+  if (task.task_queue_id) {
+    levels.push({
+      label: 'queue',
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+                   count(*) AS sample_size
+            FROM task_events
+            WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
+              AND task_queue_id = $1
+              AND reason_resolved = 'completed'
+              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
+      params: [task.task_queue_id, asOfDate],
+    });
+  }
+
+  // Level 3: priority + pending bucket
+  if (task.priority != null) {
+    levels.push({
+      label: 'priority+bucket',
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+                   count(*) AS sample_size
+            FROM task_events
+            WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
+              AND priority = $1 AND ${PENDING_BUCKET_SQL} = $2
+              AND reason_resolved = 'completed'
+              AND resolved < $3 AND resolved > $3::timestamptz - INTERVAL '7 days'`,
+      params: [task.priority, bucket, asOfDate],
+    });
+  }
+
+  // Level 4: global
+  levels.push({
+    label: 'global',
+    sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+                 percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+                 count(*) AS sample_size
+          FROM task_events
+          WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
+            AND reason_resolved = 'completed'
+            AND resolved < $1 AND resolved > $1::timestamptz - INTERVAL '7 days'`,
+    params: [asOfDate],
+  });
+
+  for (const level of levels) {
+    const res = await pool.query(level.sql, level.params);
+    const row = res.rows[0];
+    if (row && parseInt(row.sample_size, 10) >= MIN_SAMPLE_SIZE) {
+      return {
+        level: level.label,
+        p50: parseFloat(row.p50),
+        p90: parseFloat(row.p90),
+        sample_size: parseInt(row.sample_size, 10),
+      };
+    }
+  }
+  return null;
+}
+
 function fmt(seconds) {
   if (seconds < 60) return `${seconds.toFixed(0)}s`;
   if (seconds < 3600) return `${(seconds / 60).toFixed(1)}m`;
@@ -191,17 +272,39 @@ async function run() {
     console.log(`  Queue depth: ${task.queue_pending} pending at schedule time`);
   }
 
-  console.log('\n--- Prediction ---');
+  console.log('\n--- Duration Prediction ---');
   const prediction = await predictWithFallback(task);
   if (!prediction) {
     console.log('  No prediction possible (insufficient historical data).');
-    return;
+  } else {
+    console.log(`  Match level:  ${prediction.level}`);
+    console.log(`  Sample size:  ${prediction.sample_size} completed runs (last 7 days)`);
+    console.log(`  p50 duration: ${fmt(prediction.p50)}`);
+    console.log(`  p90 duration: ${fmt(prediction.p90)}`);
   }
 
-  console.log(`  Match level:  ${prediction.level}`);
-  console.log(`  Sample size:  ${prediction.sample_size} completed runs (last 7 days)`);
-  console.log(`  p50 duration: ${fmt(prediction.p50)}`);
-  console.log(`  p90 duration: ${fmt(prediction.p90)}`);
+  console.log('\n--- Wait Time Prediction ---');
+  const bucket = pendingBucket(task.queue_pending);
+  console.log(`  Pending bucket: ${bucket} (queue_pending=${task.queue_pending ?? 'null'})`);
+  const waitPrediction = await predictWaitWithFallback(task);
+  if (!waitPrediction) {
+    console.log('  No wait prediction possible (insufficient historical data).');
+  } else {
+    console.log(`  Match level:  ${waitPrediction.level}`);
+    console.log(`  Sample size:  ${waitPrediction.sample_size} completed runs (last 7 days)`);
+    console.log(`  p50 wait:     ${fmt(waitPrediction.p50)}`);
+    console.log(`  p90 wait:     ${fmt(waitPrediction.p90)}`);
+
+    if (isPending && prediction) {
+      const scheduledTime = new Date(task.scheduled);
+      const predictedStart = new Date(scheduledTime.getTime() + waitPrediction.p50 * 1000);
+      const predictedCompletion = new Date(predictedStart.getTime() + prediction.p50 * 1000);
+      console.log('\n--- Combined Estimate (pending task) ---');
+      console.log(`  Predicted start:      ${predictedStart.toISOString()} (scheduled + wait p50)`);
+      console.log(`  Predicted completion: ${predictedCompletion.toISOString()} (start + duration p50)`);
+      console.log(`  Total time:           ${fmt(waitPrediction.p50 + prediction.p50)}`);
+    }
+  }
 }
 
 try {

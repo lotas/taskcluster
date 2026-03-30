@@ -1,9 +1,22 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import taskcluster from '@taskcluster/client';
 import { Client, consume, pulseCredentials } from '@taskcluster/lib-pulse';
 import { createNoOpMonitor } from './monitor.js';
 import { createTaskCache } from './cache.js';
 import { createPool, upsertTaskEvent, enrichTaskRows, updatePriorityByTask, updatePriorityByGroup, getUnenrichedTaskIds } from './db.js';
 import { normalizeMetadataName, extractImageName } from './utils.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ERROR_LOG_PATH = process.env.COLLECTOR_ERROR_LOG || path.join(__dirname, '..', 'collector-errors.log');
+const errorLogStream = fs.createWriteStream(ERROR_LOG_PATH, { flags: 'a' });
+
+function logError(category, message, details = {}) {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), category, message, ...details });
+  errorLogStream.write(entry + '\n');
+  console.error(`[${category}] ${message}`);
+}
 
 const MAX_CONCURRENT_FETCHES = 50;
 let inFlightFetches = 0;
@@ -53,7 +66,11 @@ async function seedQueueCount(taskQueueId) {
     pendingCounts.set(taskQueueId, counts.pendingTasks);
     pendingCountsSeeded.add(taskQueueId);
   } catch (err) {
-    console.error(`[queue-counts] Seed failed for ${taskQueueId}: ${err.message}`);
+    logError('queue-counts', `Seed failed for ${taskQueueId}: ${err.message}`, {
+      taskQueueId,
+      statusCode: err.statusCode,
+      code: err.code,
+    });
   }
 }
 
@@ -236,7 +253,11 @@ async function backgroundApiFetch(taskId, status) {
     // Cache enrichment data (not just a boolean) so new run rows can be enriched
     taskCache.set(taskId, enrichment);
   } catch (err) {
-    console.error(`[api-fetch] Failed for ${taskId}: ${err.message}`);
+    logError('api-fetch', `Failed for ${taskId}: ${err.message}`, {
+      taskId,
+      statusCode: err.statusCode,
+      code: err.code,
+    });
     // Track failures so backfill can skip persistently-failing tasks
     const count = (backfillFailCounts.get(taskId) || 0) + 1;
     backfillFailCounts.set(taskId, count);
@@ -352,7 +373,7 @@ async function backfillSweep() {
       await Promise.all(batch.map(taskId => backgroundApiFetch(taskId, {})));
     }
   } catch (err) {
-    console.error('[backfill] Sweep error:', err.message);
+    logError('backfill', `Sweep error: ${err.message}`);
   } finally {
     backfillRunning = false;
   }
@@ -360,6 +381,33 @@ async function backfillSweep() {
 
 const backfillTimer = setInterval(backfillSweep, BACKFILL_INTERVAL_MS);
 const syncTimer = setInterval(syncAllQueueCounts, SYNC_INTERVAL_MS);
+
+// --- Missing queue_pending Monitor ---
+
+const PENDING_GAP_CHECK_INTERVAL_MS = 300_000; // 5 minutes
+let lastPendingGapCount = 0;
+
+async function checkPendingGaps() {
+  try {
+    const res = await pool.query(`
+      SELECT count(*) AS n FROM task_events
+      WHERE queue_pending IS NULL
+        AND reason_resolved = 'completed'
+        AND started IS NOT NULL
+    `);
+    const count = parseInt(res.rows[0].n, 10);
+    if (count > lastPendingGapCount) {
+      const delta = count - lastPendingGapCount;
+      logError('pending-gap', `${delta} new completed tasks missing queue_pending (total: ${count})`, { total: count, delta });
+      lastPendingGapCount = count;
+    }
+  } catch (err) {
+    // non-critical, don't crash
+  }
+}
+
+const pendingGapTimer = setInterval(checkPendingGaps, PENDING_GAP_CHECK_INTERVAL_MS);
+checkPendingGaps(); // initial check on startup
 
 // --- Graceful Shutdown ---
 
@@ -370,6 +418,7 @@ async function shutdown(signal) {
   console.log(`[collector] Received ${signal}, shutting down...`);
   clearInterval(backfillTimer);
   clearInterval(syncTimer);
+  clearInterval(pendingGapTimer);
 
   try {
     await pq.stop();
@@ -398,6 +447,7 @@ async function shutdown(signal) {
     console.error('[collector] Error closing DB pool:', err.message);
   }
 
+  errorLogStream.end();
   console.log('[collector] Shutdown complete');
   process.exit(0);
 }

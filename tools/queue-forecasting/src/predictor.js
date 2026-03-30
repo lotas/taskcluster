@@ -1,5 +1,5 @@
 import { createPool } from './db.js';
-import { normalizeMetadataName } from './utils.js';
+import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL } from './utils.js';
 
 const pool = createPool(process.env.DATABASE_URL);
 
@@ -294,6 +294,121 @@ async function loadBulkStats(date) {
   };
 }
 
+// --- Wait Time Prediction (queue-aware) ---
+
+const BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET = `
+SELECT task_queue_id || '|' || ${PENDING_BUCKET_SQL} AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+       count(*) AS sample_size
+FROM task_events
+WHERE run_id IS NOT NULL
+  AND wait_duration_s IS NOT NULL
+  AND reason_resolved = 'completed'
+  AND resolved < $1::date
+  AND resolved > $1::date - INTERVAL '7 days'
+GROUP BY task_queue_id, ${PENDING_BUCKET_SQL};
+`;
+
+const BULK_WAIT_STATS_BY_QUEUE = `
+SELECT task_queue_id AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+       count(*) AS sample_size
+FROM task_events
+WHERE run_id IS NOT NULL
+  AND wait_duration_s IS NOT NULL
+  AND task_queue_id IS NOT NULL
+  AND reason_resolved = 'completed'
+  AND resolved < $1::date
+  AND resolved > $1::date - INTERVAL '7 days'
+GROUP BY task_queue_id;
+`;
+
+const BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET = `
+SELECT priority || '|' || ${PENDING_BUCKET_SQL} AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+       count(*) AS sample_size
+FROM task_events
+WHERE run_id IS NOT NULL
+  AND wait_duration_s IS NOT NULL
+  AND reason_resolved = 'completed'
+  AND resolved < $1::date
+  AND resolved > $1::date - INTERVAL '7 days'
+GROUP BY priority, ${PENDING_BUCKET_SQL};
+`;
+
+const WAIT_GLOBAL = `
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+       count(*) AS sample_size
+FROM task_events
+WHERE run_id IS NOT NULL
+  AND wait_duration_s IS NOT NULL
+  AND reason_resolved = 'completed'
+  AND resolved < $1::date
+  AND resolved > $1::date - INTERVAL '7 days';
+`;
+
+async function loadBulkWaitStats(date) {
+  const [byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all([
+    pool.query(BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET, [date]),
+    pool.query(BULK_WAIT_STATS_BY_QUEUE, [date]),
+    pool.query(BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET, [date]),
+    pool.query(WAIT_GLOBAL, [date]),
+  ]);
+
+  const toMap = (rows) => {
+    const m = new Map();
+    for (const r of rows) {
+      if (parseInt(r.sample_size, 10) >= MIN_SAMPLE_SIZE) {
+        m.set(r.key, { p50: r.p50, p90: r.p90, sample_size: parseInt(r.sample_size, 10) });
+      }
+    }
+    return m;
+  };
+
+  const globalRow = globalRes.rows[0];
+  const globalStats = (globalRow && parseInt(globalRow.sample_size, 10) >= MIN_SAMPLE_SIZE)
+    ? { p50: globalRow.p50, p90: globalRow.p90, sample_size: parseInt(globalRow.sample_size, 10) }
+    : null;
+
+  return {
+    byQueueAndBucket: toMap(byQueueBucket.rows),
+    byQueue: toMap(byQueue.rows),
+    byPriorityAndBucket: toMap(byPriorityBucket.rows),
+    global: globalStats,
+  };
+}
+
+function predictWaitFromStats(task, waitStats) {
+  const bucket = pendingBucket(task.queue_pending);
+
+  // Level 1: queue + pending bucket
+  if (task.task_queue_id) {
+    const s = waitStats.byQueueAndBucket.get(`${task.task_queue_id}|${bucket}`);
+    if (s) return { level: 'queue+bucket', ...s };
+  }
+
+  // Level 2: queue only
+  if (task.task_queue_id) {
+    const s = waitStats.byQueue.get(task.task_queue_id);
+    if (s) return { level: 'queue', ...s };
+  }
+
+  // Level 3: priority + pending bucket
+  if (task.priority != null) {
+    const s = waitStats.byPriorityAndBucket.get(`${task.priority}|${bucket}`);
+    if (s) return { level: 'priority+bucket', ...s };
+  }
+
+  // Level 4: global
+  if (waitStats.global) return { level: 'global', ...waitStats.global };
+
+  return null;
+}
+
 function parseTags(tags) {
   if (!tags) return null;
   if (typeof tags === 'object') return tags;
@@ -351,7 +466,7 @@ function predictDurationFromStats(task, stats) {
 
 const RESOLVED_TASKS_SQL = `
 SELECT task_id, run_id, metadata_name, normalized_name, task_queue_id, tags,
-       scheduler_id, image_name,
+       scheduler_id, image_name, priority, queue_pending,
        scheduled, started, resolved,
        run_duration_s, wait_duration_s,
        reason_resolved
@@ -366,9 +481,10 @@ WHERE run_id IS NOT NULL
 async function runBacktest(date) {
   console.log(`\n=== Backtest for ${date} ===\n`);
 
-  // Bulk-load all statistics in 4 parallel queries instead of per-row
-  const [stats, tasksRes] = await Promise.all([
+  // Bulk-load all statistics in parallel
+  const [stats, waitStats, tasksRes] = await Promise.all([
     loadBulkStats(date),
+    loadBulkWaitStats(date),
     pool.query(RESOLVED_TASKS_SQL, [date]),
   ]);
   const tasks = tasksRes.rows;
@@ -405,21 +521,62 @@ async function runBacktest(date) {
     levelCounts[prediction.level] = (levelCounts[prediction.level] || 0) + 1;
   }
 
-  if (predictions === 0) {
-    console.log('No predictions could be made (insufficient historical data).');
-    return;
+  if (predictions > 0) {
+    const mae = totalError / predictions;
+    const within2xPct = ((within2x / predictions) * 100).toFixed(1);
+
+    console.log('--- Duration Prediction Accuracy ---');
+    console.log(`  Tasks evaluated:       ${predictions}`);
+    console.log(`  Mean Absolute Error:   ${mae.toFixed(1)}s`);
+    console.log(`  Within 2x of actual:   ${within2xPct}%`);
+    console.log(`  Prediction levels used:`);
+    for (const [level, count] of Object.entries(levelCounts)) {
+      console.log(`    ${level}: ${count}`);
+    }
+  } else {
+    console.log('No duration predictions could be made (insufficient historical data).');
   }
 
-  const mae = totalError / predictions;
-  const within2xPct = ((within2x / predictions) * 100).toFixed(1);
+  // --- Wait Time Evaluation ---
+  let waitPredictions = 0;
+  let waitTotalError = 0;
+  let waitWithin2x = 0;
+  const waitLevelCounts = {};
 
-  console.log('--- Duration Prediction Accuracy ---');
-  console.log(`  Tasks evaluated:       ${predictions}`);
-  console.log(`  Mean Absolute Error:   ${mae.toFixed(1)}s`);
-  console.log(`  Within 2x of actual:   ${within2xPct}%`);
-  console.log(`  Prediction levels used:`);
-  for (const [level, count] of Object.entries(levelCounts)) {
-    console.log(`    ${level}: ${count}`);
+  for (const task of tasks) {
+    if (task.wait_duration_s == null) continue;
+
+    const prediction = predictWaitFromStats(task, waitStats);
+    if (!prediction) continue;
+
+    waitPredictions++;
+    const actual = parseFloat(task.wait_duration_s);
+    const predicted = parseFloat(prediction.p50);
+    const error = Math.abs(predicted - actual);
+    waitTotalError += error;
+
+    if (predicted > 0 && actual > 0) {
+      const ratio = Math.max(predicted / actual, actual / predicted);
+      if (ratio <= 2) waitWithin2x++;
+    }
+
+    waitLevelCounts[prediction.level] = (waitLevelCounts[prediction.level] || 0) + 1;
+  }
+
+  if (waitPredictions > 0) {
+    const waitMae = waitTotalError / waitPredictions;
+    const waitWithin2xPct = ((waitWithin2x / waitPredictions) * 100).toFixed(1);
+
+    console.log('\n--- Wait Time Prediction Accuracy ---');
+    console.log(`  Tasks evaluated:       ${waitPredictions}`);
+    console.log(`  Mean Absolute Error:   ${waitMae.toFixed(1)}s`);
+    console.log(`  Within 2x of actual:   ${waitWithin2xPct}%`);
+    console.log(`  Prediction levels used:`);
+    for (const [level, count] of Object.entries(waitLevelCounts)) {
+      console.log(`    ${level}: ${count}`);
+    }
+  } else {
+    console.log('\nNo wait time predictions could be made (insufficient historical data).');
   }
 }
 
