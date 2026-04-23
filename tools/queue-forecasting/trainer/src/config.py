@@ -42,6 +42,7 @@ class Config:
     model_type: str
     quantiles: list[float]
     model_params: dict[str, Any]
+    residual: dict[str, Any] | None = None
     source_path: Path = field(default_factory=Path)
 
 
@@ -67,6 +68,7 @@ def load_config(path: str | Path) -> Config:
         model_type=raw["model_type"],
         quantiles=list(raw["quantiles"]),
         model_params=dict(raw.get("model_params") or {}),
+        residual=raw.get("residual"),
         source_path=p,
     )
 

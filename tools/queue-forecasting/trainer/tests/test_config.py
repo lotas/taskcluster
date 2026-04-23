@@ -153,6 +153,54 @@ def test_midnight_as_of_date_passes(tmp_path):
     assert c.as_of_date == datetime(2026, 4, 24, tzinfo=timezone.utc)
 
 
+def test_config_has_no_residual_by_default(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.residual is None
+
+
+def test_config_parses_residual_block(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+        residual:
+          baseline_file: baseline_predictions.ndjson
+          baseline_feature: bl_wait_p50
+          transform: log_ratio
+    """)
+    c = cfg.load_config(path)
+    assert c.residual == {
+        "baseline_file": "baseline_predictions.ndjson",
+        "baseline_feature": "bl_wait_p50",
+        "transform": "log_ratio",
+    }
+
+
 def test_resolve_holdout_days_cli(tmp_path):
     path = _write(tmp_path, """
         target: wait_time

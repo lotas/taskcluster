@@ -12,8 +12,8 @@ import pandas as pd
 from src import config as cfg
 from src import data_loader
 from src.features import FeatureBuilder
-from src.model import LightGBMQuantileModel
-from src.evaluate import evaluate as do_eval
+from src.model import LightGBMQuantileModel, ResidualLightGBMQuantileModel
+from src.evaluate import evaluate as do_eval, load_prior_manifest
 
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "data" / "models"
@@ -55,6 +55,9 @@ def main(argv: list[str] | None = None) -> int:
     holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
     _require_baselines(holdout_day_keys)
 
+    if c.residual:
+        print(f"  residual mode: baseline_feature={c.residual['baseline_feature']} "
+              f"transform={c.residual.get('transform', 'log_ratio')}")
     print(f"Loading data for {c.target} (as_of={c.as_of_date.isoformat()}, "
           f"train={w.train_start.date()}..{w.train_end.date()}, "
           f"val={w.val_start.date()}, "
@@ -71,10 +74,19 @@ def main(argv: list[str] | None = None) -> int:
     hold  = builder.transform(hold_df)
 
     # Train one model per quantile.
+    def _make_model(alpha: float) -> LightGBMQuantileModel:
+        if c.residual:
+            return ResidualLightGBMQuantileModel(
+                alpha=alpha,
+                params=c.model_params,
+                baseline_feature=c.residual["baseline_feature"],
+            )
+        return LightGBMQuantileModel(alpha=alpha, params=c.model_params)
+
     models: dict[float, LightGBMQuantileModel] = {}
     for q in c.quantiles:
         print(f"  training quantile={q} …")
-        m = LightGBMQuantileModel(alpha=q, params=c.model_params)
+        m = _make_model(q)
         m.fit(train.X, train.y, val.X, val.y)
         models[q] = m
 
@@ -83,7 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     for q, m in models.items():
         tag = f"p{int(q * 100)}"
-        m.save(run_dir / f"{c.target}_{tag}.lgb")
+        suffix = "_residual" if c.residual else ""
+        m.save(run_dir / f"{c.target}{suffix}_{tag}.lgb")
 
     # Evaluate. Target key matches what the baseline JSON uses:
     # baseline stores both "duration" and "wait" blocks; we pick ours.
@@ -99,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
         baseline_dir=BASELINE_DIR,
         target=target_key,
     )
+
+    # Three-way compare only meaningful for residual runs.
+    prior_manifest = None
+    if c.residual:
+        prior_manifest = load_prior_manifest(run_dir, c.target)
 
     manifest = {
         "target": c.target,
@@ -132,6 +150,10 @@ def main(argv: list[str] | None = None) -> int:
                 "aggregate": report.primary_agg,
                 "baseline_per_day": report.baseline_per_day,
                 "baseline_aggregate": report.baseline_agg,
+                "buckets_per_day": report.primary_buckets_per_day,
+                "buckets_aggregate": report.primary_buckets_agg,
+                "baseline_buckets_per_day": report.baseline_buckets_per_day,
+                "baseline_buckets_aggregate": report.baseline_buckets_agg,
             },
             "supplemental": {
                 "slice": "reason_resolved IN ('completed','failed')",
@@ -140,17 +162,70 @@ def main(argv: list[str] | None = None) -> int:
             },
         },
     }
-    (run_dir / f"{c.target}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
 
-    # Console summary.
+    if c.residual and prior_manifest:
+        prior_primary = prior_manifest.get("evaluation", {}).get("primary", {})
+        manifest["evaluation"]["primary"]["lightgbm_only_aggregate"]         = prior_primary.get("aggregate")
+        manifest["evaluation"]["primary"]["lightgbm_only_buckets_aggregate"] = prior_primary.get("buckets_aggregate")
+        manifest["evaluation"]["primary"]["prior_manifest_trained_at"]       = prior_manifest.get("trained_at")
+
+    suffix = "_residual" if c.residual else ""
+    (run_dir / f"{c.target}{suffix}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+
+    # Summary printing ------------------------------------------------------
+
+    def _fmt_mae(agg):
+        v = agg.get("mae_s") if agg else None
+        return f"{v:.1f}s" if v is not None and v == v else "n/a"
+
+    def _fmt_w2x(agg):
+        v = agg.get("within_2x_rate") if agg else None
+        return f"{v * 100:.1f}%" if v is not None and v == v else "n/a"
+
+    three_way = bool(c.residual and prior_manifest)
+
     print("\n=== Evaluation (primary: completed-only) ===")
-    print(f"  LightGBM : MAE={report.primary_agg['mae_s']:.1f}s  within_2x={report.primary_agg['within_2x_rate']*100:.1f}%")
-    print(f"  Baseline : MAE={report.baseline_agg['mae_s']:.1f}s  within_2x={report.baseline_agg['within_2x_rate']*100:.1f}%")
-    if report.baseline_agg['mae_s'] > 0:
-        print(f"  Delta MAE: {(report.primary_agg['mae_s'] - report.baseline_agg['mae_s']) / report.baseline_agg['mae_s'] * 100:+.1f}%")
+    if three_way:
+        lgb_only = prior_manifest["evaluation"]["primary"].get("aggregate", {})
+        print(f"  {'':20s} {'Baseline':>12s} {'LGB-only':>12s} {'Residual':>12s}")
+        print(f"  {'MAE':<20s} {_fmt_mae(report.baseline_agg):>12s} {_fmt_mae(lgb_only):>12s} {_fmt_mae(report.primary_agg):>12s}")
+        print(f"  {'within-2x':<20s} {_fmt_w2x(report.baseline_agg):>12s} {_fmt_w2x(lgb_only):>12s} {_fmt_w2x(report.primary_agg):>12s}")
+    else:
+        print(f"  LightGBM : MAE={_fmt_mae(report.primary_agg)}  within_2x={_fmt_w2x(report.primary_agg)}")
+        print(f"  Baseline : MAE={_fmt_mae(report.baseline_agg)}  within_2x={_fmt_w2x(report.baseline_agg)}")
+        base_mae = report.baseline_agg.get("mae_s", 0.0) or 0.0
+        lgb_mae  = report.primary_agg.get("mae_s", 0.0) or 0.0
+        if base_mae > 0:
+            print(f"  Delta MAE: {(lgb_mae - base_mae) / base_mae * 100:+.1f}%")
+
     p90_cov_rate = report.primary_agg.get("p90_coverage_rate")
-    if p90_cov_rate is not None:
+    if p90_cov_rate is not None and p90_cov_rate == p90_cov_rate:  # NaN check
         print(f"  p90 coverage: {p90_cov_rate * 100:.1f}% (target [85%, 95%])")
+
+    # Per-bucket breakdown for wait target
+    if c.target == "wait_time" and report.primary_buckets_agg:
+        print("\n=== Wait model — per-bucket breakdown ===")
+        if three_way:
+            lgb_buckets = prior_manifest["evaluation"]["primary"].get("buckets_aggregate", {}) or {}
+            header = f"{'bucket':<7} {'n':>10} | {'Base MAE':>10} {'LGB MAE':>10} {'Res MAE':>10} | {'Base w/in2x':>12} {'LGB w/in2x':>12} {'Res w/in2x':>12}"
+            print(header)
+            for name in ["<1m", "1-5m", "5-30m", "30m+"]:
+                res   = report.primary_buckets_agg.get(name, {})
+                lgb_b = lgb_buckets.get(name, {})
+                base  = report.baseline_buckets_agg.get(name, {})
+                n     = res.get("mae", {}).get("eligible_n", 0)
+                print(f"{name:<7} {n:>10,} | "
+                      f"{_fmt_mae(base):>10} {_fmt_mae(lgb_b):>10} {_fmt_mae(res):>10} | "
+                      f"{_fmt_w2x(base):>12} {_fmt_w2x(lgb_b):>12} {_fmt_w2x(res):>12}")
+        else:
+            header = f"{'bucket':<7} {'n (LGB)':>10} {'MAE (LGB)':>12} {'MAE (base)':>12} {'w/in2x (LGB)':>14} {'w/in2x (base)':>15}"
+            print(header)
+            for name in ["<1m", "1-5m", "5-30m", "30m+"]:
+                lgb_b  = report.primary_buckets_agg.get(name, {})
+                base_b = report.baseline_buckets_agg.get(name, {})
+                n      = lgb_b.get("mae", {}).get("eligible_n", 0)
+                print(f"{name:<7} {n:>10,} {_fmt_mae(lgb_b):>12} {_fmt_mae(base_b):>12} {_fmt_w2x(lgb_b):>14} {_fmt_w2x(base_b):>15}")
+
     print(f"\nModels + manifest in {run_dir}")
     return 0
 

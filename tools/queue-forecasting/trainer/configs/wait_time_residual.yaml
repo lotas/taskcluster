@@ -1,0 +1,49 @@
+target: wait_time
+target_column: wait_duration_s
+
+lookback_days: 14
+holdout_days: 5
+validation_days: 1
+as_of_date: null
+
+filters:
+  - "r.started_at IS NOT NULL"
+  - "r.queue_pending IS NOT NULL"
+  - "r.wait_duration_s IS NOT NULL"
+  - "r.wait_duration_s >= 0"
+
+categorical_features:
+  - task_queue_id
+  - scheduler_id
+  - priority_at_pending
+  - tags.kind
+  - tags.os
+  - tags.project
+  - tags.worker-implementation
+
+numeric_features:
+  - queue_pending
+  - max_run_time_s
+  - hour_sin
+  - hour_cos
+  - day_sin
+  - day_cos
+  - bl_wait_p50
+
+derived_features:
+  cyclical_time:
+    source: pending_at
+
+model_type: lightgbm
+quantiles: [0.5, 0.9]
+model_params:
+  num_leaves: 63
+  learning_rate: 0.05
+  n_estimators: 500
+  early_stopping_rounds: 20
+  min_data_in_leaf: 100
+
+residual:
+  baseline_file: baseline_predictions.ndjson
+  baseline_feature: bl_wait_p50
+  transform: log_ratio

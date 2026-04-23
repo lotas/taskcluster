@@ -3,6 +3,22 @@ import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL } from './util
 
 const pool = createPool(process.env.DATABASE_URL);
 
+// --- Wait-time bucket helpers ---
+
+const WAIT_BUCKETS = [
+  { name: '<1m',   lo: 0,    hi: 60       },
+  { name: '1-5m',  lo: 60,   hi: 300      },
+  { name: '5-30m', lo: 300,  hi: 1800     },
+  { name: '30m+',  lo: 1800, hi: Infinity },
+];
+
+function waitBucket(actualSeconds) {
+  for (const b of WAIT_BUCKETS) {
+    if (actualSeconds >= b.lo && actualSeconds < b.hi) return b.name;
+  }
+  return null;
+}
+
 // --- Duration Prediction (hierarchical fallback) ---
 //
 // predictDuration() is the single-task prediction function intended for real-time
@@ -522,6 +538,63 @@ async function loadBulkWaitStatsForCutoff(cutoff) {
   };
 }
 
+// --- Export Baseline Predictions ---
+
+async function runExportBaselinePredictions({ fromDate, toDate, outputPath }) {
+  // Validate args
+  const from = new Date(`${fromDate}T00:00:00Z`);
+  const to   = new Date(`${toDate}T00:00:00Z`);
+  if (!(from < to)) {
+    throw new Error(`--from (${fromDate}) must be strictly before --to (${toDate})`);
+  }
+
+  const fs = await import('node:fs');
+  const out = fs.createWriteStream(outputPath, { flags: 'w' });
+  let cumulative = 0;
+
+  const ROW_SQL = `
+    SELECT r.task_id, r.run_id, t.metadata_name, t.normalized_name, t.task_queue_id, t.tags,
+           t.scheduler_id, r.priority_at_pending, r.queue_pending,
+           r.pending_at, r.started_at, r.resolved_at,
+           r.run_duration_s, r.wait_duration_s,
+           r.reason_resolved
+    FROM queue_forecast_task_runs r
+    JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+    WHERE r.pending_at >= $1::timestamptz
+      AND r.pending_at <  $1::timestamptz + INTERVAL '1 day';
+  `;
+
+  for (let d = new Date(from); d < to; d.setUTCDate(d.getUTCDate() + 1)) {
+    const cutoff = d.toISOString();           // e.g. "2026-04-15T00:00:00.000Z"
+    const dayStr = cutoff.slice(0, 10);        // "2026-04-15"
+    const [stats, waitStats, rowsRes] = await Promise.all([
+      loadBulkStatsForCutoff(cutoff),
+      loadBulkWaitStatsForCutoff(cutoff),
+      pool.query(ROW_SQL, [cutoff]),
+    ]);
+    let dayCount = 0;
+    for (const row of rowsRes.rows) {
+      const blD = predictDurationFromStats(row, stats);
+      const blW = predictWaitFromStats(row, waitStats);
+      out.write(JSON.stringify({
+        task_id: row.task_id,
+        run_id:  row.run_id,
+        pending_at: row.pending_at instanceof Date ? row.pending_at.toISOString() : row.pending_at,
+        bl_duration_p50: blD ? parseFloat(blD.p50) : null,
+        bl_duration_p90: blD ? parseFloat(blD.p90) : null,
+        bl_wait_p50:     blW ? parseFloat(blW.p50) : null,
+        bl_wait_p90:     blW ? parseFloat(blW.p90) : null,
+      }) + '\n');
+      dayCount++;
+    }
+    cumulative += dayCount;
+    process.stderr.write(`[export] ${dayStr}: ${dayCount.toLocaleString()} rows (cumulative ${cumulative.toLocaleString()})\n`);
+  }
+
+  await new Promise((resolve, reject) => out.end(err => err ? reject(err) : resolve()));
+  console.log(`Exported ${cumulative.toLocaleString()} baseline-prediction rows to ${outputPath}`);
+}
+
 // --- Backtest ---
 
 const RESOLVED_TASKS_SQL = `
@@ -657,7 +730,17 @@ async function runPendingEvalBacktest(dateStr) {
 
   const agg = {
     duration: { n: 0, mae: { eligible_n: 0, sum_abs_error: 0 }, within_2x: { eligible_n: 0, hit_n: 0 } },
-    wait:     { n: 0, mae: { eligible_n: 0, sum_abs_error: 0 }, within_2x: { eligible_n: 0, hit_n: 0 } },
+    wait: {
+      n: 0,
+      mae: { eligible_n: 0, sum_abs_error: 0 },
+      within_2x: { eligible_n: 0, hit_n: 0 },
+      buckets: Object.fromEntries(
+        WAIT_BUCKETS.map(b => [b.name, {
+          mae: { eligible_n: 0, sum_abs_error: 0 },
+          within_2x: { eligible_n: 0, hit_n: 0 },
+        }])
+      ),
+    },
   };
 
   for (const task of tasks) {
@@ -678,8 +761,13 @@ async function runPendingEvalBacktest(dateStr) {
       }
     }
 
-    // Wait
-    if (task.wait_duration_s != null) {
+    // Wait — cohort must match the Python trainer's wait_time.yaml filter:
+    //   started_at IS NOT NULL AND wait_duration_s IS NOT NULL
+    //     AND wait_duration_s >= 0 AND queue_pending IS NOT NULL
+    // so the baseline and trainer evaluate on the same rows.
+    if (task.wait_duration_s != null
+        && task.queue_pending != null
+        && parseFloat(task.wait_duration_s) >= 0) {
       const p = predictWaitFromStats(task, waitStats);
       if (p) {
         const actual = parseFloat(task.wait_duration_s);
@@ -692,6 +780,17 @@ async function runPendingEvalBacktest(dateStr) {
           const ratio = Math.max(predicted / actual, actual / predicted);
           if (ratio <= 2) agg.wait.within_2x.hit_n++;
         }
+        const bucket = waitBucket(actual);
+        if (bucket) {
+          const b = agg.wait.buckets[bucket];
+          b.mae.eligible_n++;
+          b.mae.sum_abs_error += Math.abs(predicted - actual);
+          if (predicted > 0 && actual > 0) {
+            b.within_2x.eligible_n++;
+            const ratio = Math.max(predicted / actual, actual / predicted);
+            if (ratio <= 2) b.within_2x.hit_n++;
+          }
+        }
       }
     }
   }
@@ -702,6 +801,13 @@ async function runPendingEvalBacktest(dateStr) {
   console.log(`  n=${agg.duration.n} MAE=${avg(agg.duration.mae.sum_abs_error, agg.duration.mae.eligible_n)} within_2x=${pct(agg.duration.within_2x.hit_n, agg.duration.within_2x.eligible_n)}`);
   console.log('--- Wait ---');
   console.log(`  n=${agg.wait.n} MAE=${avg(agg.wait.mae.sum_abs_error, agg.wait.mae.eligible_n)} within_2x=${pct(agg.wait.within_2x.hit_n, agg.wait.within_2x.eligible_n)}`);
+  console.log('--- Wait by bucket ---');
+  for (const b of WAIT_BUCKETS) {
+    const bd = agg.wait.buckets[b.name];
+    const mae = bd.mae.eligible_n ? (bd.mae.sum_abs_error / bd.mae.eligible_n).toFixed(1) + 's' : 'n/a';
+    const w2x = bd.within_2x.eligible_n ? (bd.within_2x.hit_n / bd.within_2x.eligible_n * 100).toFixed(1) + '%' : 'n/a';
+    console.log(`  ${b.name.padEnd(6)} n=${bd.mae.eligible_n} MAE=${mae} within_2x=${w2x}`);
+  }
 
   return { dateStr, cutoff, agg };
 }
@@ -740,6 +846,7 @@ function buildOutputJson(result) {
         eligible_n: agg.wait.within_2x.eligible_n,
         hit_n:      agg.wait.within_2x.hit_n,
       },
+      buckets: agg.wait.buckets,
     },
   };
 }
@@ -750,19 +857,27 @@ const args = process.argv.slice(2);
 let date = null;
 let pendingEvalDate = null;
 let outputJson = null;
+let exportBaselinePredictions = false;
+let fromDate = null;
+let toDate = null;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--date' && args[i + 1]) { date = args[i + 1]; i++; continue; }
   if (args[i] === '--pending-eval-date' && args[i + 1]) { pendingEvalDate = args[i + 1]; i++; continue; }
   if (args[i] === '--output-json' && args[i + 1]) { outputJson = args[i + 1]; i++; continue; }
+  if (args[i] === '--output'      && args[i + 1]) { outputJson = args[i + 1]; i++; continue; }
+  if (args[i] === '--export-baseline-predictions') { exportBaselinePredictions = true; continue; }
+  if (args[i] === '--from' && args[i + 1]) { fromDate = args[i + 1]; i++; continue; }
+  if (args[i] === '--to'   && args[i + 1]) { toDate   = args[i + 1]; i++; continue; }
 }
 
 const isValidDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s).getTime());
 
-if (!date && !pendingEvalDate) {
+if (!date && !pendingEvalDate && !exportBaselinePredictions) {
   console.error('Usage:');
   console.error('  node src/predictor.js --date YYYY-MM-DD');
   console.error('  node src/predictor.js --pending-eval-date YYYY-MM-DD [--output-json path]');
+  console.error('  node src/predictor.js --export-baseline-predictions --from YYYY-MM-DD --to YYYY-MM-DD --output path.ndjson');
   process.exit(1);
 }
 
@@ -776,7 +891,17 @@ if (pendingEvalDate && !isValidDate(pendingEvalDate)) {
 }
 
 try {
-  if (pendingEvalDate) {
+  if (exportBaselinePredictions) {
+    if (!fromDate || !toDate || !outputJson) {
+      console.error('Usage: --export-baseline-predictions --from YYYY-MM-DD --to YYYY-MM-DD --output path.ndjson');
+      process.exit(1);
+    }
+    if (!isValidDate(fromDate) || !isValidDate(toDate)) {
+      console.error(`Invalid date range: ${fromDate} .. ${toDate}`);
+      process.exit(1);
+    }
+    await runExportBaselinePredictions({ fromDate, toDate, outputPath: outputJson });
+  } else if (pendingEvalDate) {
     const result = await runPendingEvalBacktest(pendingEvalDate);
     if (outputJson) {
       const fs = await import('node:fs/promises');

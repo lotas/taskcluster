@@ -147,3 +147,62 @@ def test_evaluate_manifest_has_p90_fields(tmp_path):
     day = report.primary_per_day["2026-04-19"]
     assert "pinball_p50" in day
     assert "p90_coverage" in day
+
+
+def test_compute_bucket_metrics_assigns_correctly():
+    # 5 rows: waits = [30, 120, 600, 3600, 90]
+    # Buckets: <1m, 1-5m, 5-30m, 30m+, 1-5m
+    y_true = np.array([30.0, 120.0, 600.0, 3600.0, 90.0])
+    y_pred = np.array([25.0, 130.0, 500.0, 3000.0, 95.0])
+    from src.evaluate import compute_bucket_metrics
+    buckets = compute_bucket_metrics(y_true, y_pred)
+    assert buckets["<1m"]["mae"]["eligible_n"] == 1
+    assert buckets["1-5m"]["mae"]["eligible_n"] == 2
+    assert buckets["5-30m"]["mae"]["eligible_n"] == 1
+    assert buckets["30m+"]["mae"]["eligible_n"] == 1
+
+
+def test_aggregate_buckets_sums_raw_counts():
+    from src.evaluate import aggregate_buckets
+    d1 = {
+        "<1m":   {"mae": {"eligible_n": 10, "sum_abs_error": 50.0},
+                  "within_2x": {"eligible_n": 10, "hit_n": 8}},
+        "1-5m":  {"mae": {"eligible_n": 5, "sum_abs_error": 100.0},
+                  "within_2x": {"eligible_n": 5, "hit_n": 3}},
+        "5-30m": {"mae": {"eligible_n": 0, "sum_abs_error": 0.0},
+                  "within_2x": {"eligible_n": 0, "hit_n": 0}},
+        "30m+":  {"mae": {"eligible_n": 0, "sum_abs_error": 0.0},
+                  "within_2x": {"eligible_n": 0, "hit_n": 0}},
+    }
+    d2 = {
+        "<1m":   {"mae": {"eligible_n": 20, "sum_abs_error": 120.0},
+                  "within_2x": {"eligible_n": 20, "hit_n": 14}},
+        "1-5m":  {"mae": {"eligible_n": 0, "sum_abs_error": 0.0},
+                  "within_2x": {"eligible_n": 0, "hit_n": 0}},
+        "5-30m": {"mae": {"eligible_n": 0, "sum_abs_error": 0.0},
+                  "within_2x": {"eligible_n": 0, "hit_n": 0}},
+        "30m+":  {"mae": {"eligible_n": 0, "sum_abs_error": 0.0},
+                  "within_2x": {"eligible_n": 0, "hit_n": 0}},
+    }
+    agg = aggregate_buckets([d1, d2])
+    assert agg["<1m"]["mae"]["eligible_n"] == 30
+    assert agg["<1m"]["mae"]["sum_abs_error"] == 170.0
+    assert np.isclose(agg["<1m"]["mae_s"], 170.0 / 30)
+    assert agg["<1m"]["within_2x"]["hit_n"] == 22
+
+
+def test_load_prior_manifest(tmp_path):
+    from src.evaluate import load_prior_manifest
+    run_dir = tmp_path / "2026-04-23"
+    run_dir.mkdir()
+    (run_dir / "wait_time_manifest.json").write_text('{"target": "wait_time", "evaluation": {"primary": {"aggregate": {"mae_s": 539.1}}}}')
+    m = load_prior_manifest(run_dir, "wait_time")
+    assert m is not None
+    assert m["target"] == "wait_time"
+    assert m["evaluation"]["primary"]["aggregate"]["mae_s"] == 539.1
+
+
+def test_load_prior_manifest_missing_returns_none(tmp_path):
+    from src.evaluate import load_prior_manifest
+    m = load_prior_manifest(tmp_path, "wait_time")
+    assert m is None

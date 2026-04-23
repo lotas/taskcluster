@@ -8,7 +8,7 @@ src/predictor.js.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -120,6 +120,63 @@ def load_baseline_days(directory: Path) -> dict[str, dict]:
     return out
 
 
+WAIT_BUCKETS = [
+    ("<1m",   0.0,    60.0),
+    ("1-5m",  60.0,   300.0),
+    ("5-30m", 300.0,  1800.0),
+    ("30m+",  1800.0, float("inf")),
+]
+
+
+def compute_bucket_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, dict]:
+    """Per-bucket (MAE + within_2x) keyed by bucket name. Uses actual (y_true)
+    to assign buckets, half-open intervals matching predictor.js."""
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    out: dict[str, dict] = {}
+    for name, lo, hi in WAIT_BUCKETS:
+        mask = np.isfinite(yt) & (yt >= lo) & (yt < hi)
+        if not mask.any():
+            out[name] = {
+                "mae":       {"eligible_n": 0, "sum_abs_error": 0.0},
+                "within_2x": {"eligible_n": 0, "hit_n": 0},
+            }
+            continue
+        row = per_row_metrics(y_true=yt[mask], y_pred=yp[mask])
+        # Strip any extra keys to keep shape identical to predictor.js output.
+        out[name] = {
+            "mae":       row["mae"],
+            "within_2x": row["within_2x"],
+        }
+    return out
+
+
+def aggregate_buckets(day_buckets: list[dict[str, dict]]) -> dict[str, dict]:
+    """Given a list of per-day bucket-dicts, sum raw counts across days."""
+    agg: dict[str, dict] = {
+        name: {
+            "mae":       {"eligible_n": 0, "sum_abs_error": 0.0},
+            "within_2x": {"eligible_n": 0, "hit_n": 0},
+        }
+        for name, _, _ in WAIT_BUCKETS
+    }
+    for day in day_buckets:
+        for name, _, _ in WAIT_BUCKETS:
+            if name not in day:
+                continue
+            agg[name]["mae"]["eligible_n"]    += day[name]["mae"]["eligible_n"]
+            agg[name]["mae"]["sum_abs_error"] += day[name]["mae"]["sum_abs_error"]
+            agg[name]["within_2x"]["eligible_n"] += day[name]["within_2x"]["eligible_n"]
+            agg[name]["within_2x"]["hit_n"]      += day[name]["within_2x"]["hit_n"]
+    # Derived rates (so the manifest is self-contained)
+    for name in list(agg.keys()):
+        mae = agg[name]["mae"]
+        w2x = agg[name]["within_2x"]
+        agg[name]["mae_s"]          = (mae["sum_abs_error"] / mae["eligible_n"]) if mae["eligible_n"] else float("nan")
+        agg[name]["within_2x_rate"] = (w2x["hit_n"] / w2x["eligible_n"]) if w2x["eligible_n"] else float("nan")
+    return agg
+
+
 @dataclass
 class MetricsReport:
     primary_per_day: dict[str, dict]
@@ -128,6 +185,25 @@ class MetricsReport:
     supplemental_agg: dict
     baseline_per_day: dict[str, dict]
     baseline_agg: dict
+    # Only populated for wait-target runs
+    primary_buckets_per_day: dict[str, dict[str, dict]] = field(default_factory=dict)
+    primary_buckets_agg: dict[str, dict] = field(default_factory=dict)
+    baseline_buckets_per_day: dict[str, dict[str, dict]] = field(default_factory=dict)
+    baseline_buckets_agg: dict[str, dict] = field(default_factory=dict)
+
+
+def load_prior_manifest(run_dir: Path, target: str) -> dict | None:
+    """Load the non-residual LightGBM-only manifest from the same run directory.
+
+    Returns None if no such manifest exists (e.g. this is the first training run).
+    The filename convention is `<target>_manifest.json` for non-residual,
+    `<target>_residual_manifest.json` for residual.
+    """
+    import json as _json
+    p = run_dir / f"{target}_manifest.json"
+    if not p.exists():
+        return None
+    return _json.loads(p.read_text())
 
 
 def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
@@ -163,6 +239,25 @@ def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
     }
     baseline_agg = aggregate_days(baseline_per_day.values())
 
+    primary_buckets_per_day: dict[str, dict[str, dict]] = {}
+    primary_buckets_agg: dict[str, dict] = {}
+    baseline_buckets_per_day: dict[str, dict[str, dict]] = {}
+    baseline_buckets_agg: dict[str, dict] = {}
+
+    if target == "wait":
+        # Trainer-side: recompute per-bucket per day
+        day_keys_series = p_meta["pending_at"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d")
+        for day, idx in day_keys_series.groupby(day_keys_series).groups.items():
+            sel = idx.to_numpy()
+            primary_buckets_per_day[str(day)] = compute_bucket_metrics(p_yt[sel], p_yp[sel])
+        primary_buckets_agg = aggregate_buckets(list(primary_buckets_per_day.values()))
+
+        # Baseline-side: pull from the JSONs
+        for day, blob in baseline_raw.items():
+            if day in holdout_day_keys and "buckets" in blob.get("wait", {}):
+                baseline_buckets_per_day[day] = blob["wait"]["buckets"]
+        baseline_buckets_agg = aggregate_buckets(list(baseline_buckets_per_day.values()))
+
     return MetricsReport(
         primary_per_day=primary_per_day,
         primary_agg=primary_agg,
@@ -170,4 +265,8 @@ def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
         supplemental_agg=supplemental_agg,
         baseline_per_day=baseline_per_day,
         baseline_agg=baseline_agg,
+        primary_buckets_per_day=primary_buckets_per_day,
+        primary_buckets_agg=primary_buckets_agg,
+        baseline_buckets_per_day=baseline_buckets_per_day,
+        baseline_buckets_agg=baseline_buckets_agg,
     )
