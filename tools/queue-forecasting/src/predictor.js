@@ -8,100 +8,86 @@ const pool = createPool(process.env.DATABASE_URL);
 // predictDuration() is the single-task prediction function intended for real-time
 // use (e.g., a future API endpoint that predicts duration for a newly pending task).
 // It queries with a per-task asOfDate, which matters when tasks have different
-// scheduled times. Currently unused — the backtest path below uses bulk-loaded
+// pending times. Currently unused — the backtest path below uses bulk-loaded
 // statistics (predictDurationFromStats) for performance at scale.
 //
 // TODO: Wire this into a real-time prediction API or CLI single-task mode.
 
 const DURATION_BY_METADATA_NAME = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND metadata_name = $1
-  AND reason_resolved = 'completed'
-  AND resolved < $2
-  AND resolved > $2::timestamptz - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.metadata_name = $1
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $2
+  AND r.resolved_at > $2::timestamptz - INTERVAL '7 days';
 `;
 
 const DURATION_BY_NORMALIZED_NAME = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND normalized_name = $1
-  AND reason_resolved = 'completed'
-  AND resolved < $2
-  AND resolved > $2::timestamptz - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.normalized_name = $1
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $2
+  AND r.resolved_at > $2::timestamptz - INTERVAL '7 days';
 `;
 
 const DURATION_BY_KIND_AND_TEST_TYPE = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND tags->>'kind' = $1
-  AND tags->>'test-type' = $2
-  AND reason_resolved = 'completed'
-  AND resolved < $3
-  AND resolved > $3::timestamptz - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.tags->>'kind' = $1
+  AND t.tags->>'test-type' = $2
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $3
+  AND r.resolved_at > $3::timestamptz - INTERVAL '7 days';
 `;
 
 const DURATION_BY_TASK_QUEUE_ID = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND task_queue_id = $1
-  AND reason_resolved = 'completed'
-  AND resolved < $2
-  AND resolved > $2::timestamptz - INTERVAL '7 days';
-`;
-
-const DURATION_BY_IMAGE_NAME = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
-       count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND image_name = $1
-  AND reason_resolved = 'completed'
-  AND resolved < $2
-  AND resolved > $2::timestamptz - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.task_queue_id = $1
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $2
+  AND r.resolved_at > $2::timestamptz - INTERVAL '7 days';
 `;
 
 const DURATION_BY_SCHEDULER_ID = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND scheduler_id = $1
-  AND reason_resolved = 'completed'
-  AND resolved < $2
-  AND resolved > $2::timestamptz - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.scheduler_id = $1
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $2
+  AND r.resolved_at > $2::timestamptz - INTERVAL '7 days';
 `;
 
 const DURATION_GLOBAL = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1
-  AND resolved > $1::timestamptz - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+WHERE r.run_duration_s IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $1
+  AND r.resolved_at > $1::timestamptz - INTERVAL '7 days';
 `;
 
 const MIN_SAMPLE_SIZE = 5;
@@ -144,19 +130,13 @@ async function predictDuration(task, asOfDate) {
     if (r) return r;
   }
 
-  // Level 5: image_name
-  if (task.image_name) {
-    const r = await tryLevel('image_name', DURATION_BY_IMAGE_NAME, [task.image_name, asOfDate]);
-    if (r) return r;
-  }
-
-  // Level 6: scheduler_id
+  // Level 5: scheduler_id
   if (task.scheduler_id) {
     const r = await tryLevel('scheduler_id', DURATION_BY_SCHEDULER_ID, [task.scheduler_id, asOfDate]);
     if (r) return r;
   }
 
-  // Level 7: global median
+  // Level 6: global median
   const r = await tryLevel('global', DURATION_GLOBAL, [asOfDate]);
   if (r) return r;
 
@@ -166,104 +146,88 @@ async function predictDuration(task, asOfDate) {
 // --- Bulk Statistics Queries (for backtest) ---
 
 const BULK_STATS_BY_METADATA_NAME = `
-SELECT metadata_name AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT t.metadata_name AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND metadata_name IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY metadata_name;
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.metadata_name IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.metadata_name;
 `;
 
 const BULK_STATS_BY_KIND_TEST_TYPE = `
-SELECT (tags->>'kind') || '|' || (tags->>'test-type') AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT (t.tags->>'kind') || '|' || (t.tags->>'test-type') AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND tags IS NOT NULL
-  AND tags->>'kind' IS NOT NULL
-  AND tags->>'test-type' IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY tags->>'kind', tags->>'test-type';
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.tags IS NOT NULL
+  AND t.tags->>'kind' IS NOT NULL
+  AND t.tags->>'test-type' IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.tags->>'kind', t.tags->>'test-type';
 `;
 
 const BULK_STATS_BY_NORMALIZED_NAME = `
-SELECT normalized_name AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT t.normalized_name AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND normalized_name IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY normalized_name;
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.normalized_name IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.normalized_name;
 `;
 
 const BULK_STATS_BY_TASK_QUEUE_ID = `
-SELECT task_queue_id AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT t.task_queue_id AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND task_queue_id IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY task_queue_id;
-`;
-
-const BULK_STATS_BY_IMAGE_NAME = `
-SELECT image_name AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
-       count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND image_name IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY image_name;
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.task_queue_id IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.task_queue_id;
 `;
 
 const BULK_STATS_BY_SCHEDULER_ID = `
-SELECT scheduler_id AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+SELECT t.scheduler_id AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND run_duration_s IS NOT NULL
-  AND scheduler_id IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY scheduler_id;
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.run_duration_s IS NOT NULL
+  AND t.scheduler_id IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.scheduler_id;
 `;
 
 async function loadBulkStats(date) {
-  const [byName, byNormName, byKindType, byQueue, byImage, byScheduler, globalRes] = await Promise.all([
+  const [byName, byNormName, byKindType, byQueue, byScheduler, globalRes] = await Promise.all([
     pool.query(BULK_STATS_BY_METADATA_NAME, [date]),
     pool.query(BULK_STATS_BY_NORMALIZED_NAME, [date]),
     pool.query(BULK_STATS_BY_KIND_TEST_TYPE, [date]),
     pool.query(BULK_STATS_BY_TASK_QUEUE_ID, [date]),
-    pool.query(BULK_STATS_BY_IMAGE_NAME, [date]),
     pool.query(BULK_STATS_BY_SCHEDULER_ID, [date]),
     pool.query(DURATION_GLOBAL, [date]),
   ]);
@@ -288,7 +252,6 @@ async function loadBulkStats(date) {
     byNormalizedName: toMap(byNormName.rows),
     byKindTestType: toMap(byKindType.rows),
     byTaskQueueId: toMap(byQueue.rows),
-    byImageName: toMap(byImage.rows),
     bySchedulerId: toMap(byScheduler.rows),
     global: globalStats,
   };
@@ -297,58 +260,56 @@ async function loadBulkStats(date) {
 // --- Wait Time Prediction (queue-aware) ---
 
 const BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET = `
-SELECT task_queue_id || '|' || ${PENDING_BUCKET_SQL} AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+SELECT t.task_queue_id || '|' || ${PENDING_BUCKET_SQL} AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND wait_duration_s IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY task_queue_id, ${PENDING_BUCKET_SQL};
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.wait_duration_s IS NOT NULL
+  AND r.started_at IS NOT NULL
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.task_queue_id, ${PENDING_BUCKET_SQL};
 `;
 
 const BULK_WAIT_STATS_BY_QUEUE = `
-SELECT task_queue_id AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+SELECT t.task_queue_id AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND wait_duration_s IS NOT NULL
-  AND task_queue_id IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY task_queue_id;
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.wait_duration_s IS NOT NULL
+  AND t.task_queue_id IS NOT NULL
+  AND r.started_at IS NOT NULL
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.task_queue_id;
 `;
 
 const BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET = `
-SELECT priority || '|' || ${PENDING_BUCKET_SQL} AS key,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+SELECT r.priority_at_pending || '|' || ${PENDING_BUCKET_SQL} AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND wait_duration_s IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days'
-GROUP BY priority, ${PENDING_BUCKET_SQL};
+FROM queue_forecast_task_runs r
+WHERE r.wait_duration_s IS NOT NULL
+  AND r.started_at IS NOT NULL
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY r.priority_at_pending, ${PENDING_BUCKET_SQL};
 `;
 
 const WAIT_GLOBAL = `
-SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-       percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
        count(*) AS sample_size
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND wait_duration_s IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved < $1::date
-  AND resolved > $1::date - INTERVAL '7 days';
+FROM queue_forecast_task_runs r
+WHERE r.wait_duration_s IS NOT NULL
+  AND r.started_at IS NOT NULL
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days';
 `;
 
 async function loadBulkWaitStats(date) {
@@ -385,8 +346,8 @@ async function loadBulkWaitStats(date) {
 function predictWaitFromStats(task, waitStats) {
   const bucket = pendingBucket(task.queue_pending);
 
-  // Level 1: queue + pending bucket
-  if (task.task_queue_id) {
+  // Level 1: queue + pending bucket (skip when queue_pending unknown)
+  if (task.task_queue_id && bucket != null) {
     const s = waitStats.byQueueAndBucket.get(`${task.task_queue_id}|${bucket}`);
     if (s) return { level: 'queue+bucket', ...s };
   }
@@ -397,9 +358,9 @@ function predictWaitFromStats(task, waitStats) {
     if (s) return { level: 'queue', ...s };
   }
 
-  // Level 3: priority + pending bucket
-  if (task.priority != null) {
-    const s = waitStats.byPriorityAndBucket.get(`${task.priority}|${bucket}`);
+  // Level 3: priority + pending bucket (skip when queue_pending unknown)
+  if (task.priority_at_pending != null && bucket != null) {
+    const s = waitStats.byPriorityAndBucket.get(`${task.priority_at_pending}|${bucket}`);
     if (s) return { level: 'priority+bucket', ...s };
   }
 
@@ -444,38 +405,137 @@ function predictDurationFromStats(task, stats) {
     if (s) return { level: 'task_queue_id', ...s };
   }
 
-  // Level 5: image_name
-  if (task.image_name) {
-    const s = stats.byImageName.get(task.image_name);
-    if (s) return { level: 'image_name', ...s };
-  }
-
-  // Level 6: scheduler_id
+  // Level 5: scheduler_id
   if (task.scheduler_id) {
     const s = stats.bySchedulerId.get(task.scheduler_id);
     if (s) return { level: 'scheduler_id', ...s };
   }
 
-  // Level 7: global median
+  // Level 6: global median
   if (stats.global) return { level: 'global', ...stats.global };
 
   return null;
 }
 
+// --- Pending-eval-date mode ---
+// Evaluate the baseline on runs whose pending_at falls on day D
+// (UTC), using percentile history restricted to rows resolved strictly
+// before D 00:00Z. This is the apples-to-apples mode used for
+// model comparison. See trainer-spec.md §"Evaluation protocol".
+
+const RESOLVED_TASKS_SQL_PENDING = `
+SELECT r.task_id, r.run_id, t.metadata_name, t.normalized_name, t.task_queue_id, t.tags,
+       t.scheduler_id, r.priority_at_pending, r.queue_pending,
+       r.pending_at, r.started_at, r.resolved_at,
+       r.run_duration_s, r.wait_duration_s,
+       r.reason_resolved
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.pending_at >= $1::timestamptz
+  AND r.pending_at <  $1::timestamptz + INTERVAL '1 day'
+  AND r.reason_resolved = 'completed';
+`;
+
+// Rewrite existing bulk-stats SQL for pending-eval-date mode.
+// Swaps the two `resolved_at` bounds for a single `resolved_at < $cutoff`
+// plus `resolved_at > $cutoff - INTERVAL '7 days'`. Same 7-day lookback
+// window but anchored on the feature-available cutoff instant instead
+// of the eval-resolve date.
+function toPendingHistorySql(sql) {
+  return sql
+    .replace(/r\.resolved_at < \$1::date/g, 'r.resolved_at < $1::timestamptz')
+    .replace(/r\.resolved_at > \$1::date - INTERVAL '7 days'/g,
+             "r.resolved_at > $1::timestamptz - INTERVAL '7 days'");
+}
+
+async function loadBulkStatsForCutoff(cutoff) {
+  const q = [
+    BULK_STATS_BY_METADATA_NAME,
+    BULK_STATS_BY_NORMALIZED_NAME,
+    BULK_STATS_BY_KIND_TEST_TYPE,
+    BULK_STATS_BY_TASK_QUEUE_ID,
+    BULK_STATS_BY_SCHEDULER_ID,
+    DURATION_GLOBAL,
+  ].map(toPendingHistorySql);
+
+  const [byName, byNormName, byKindType, byQueue, byScheduler, globalRes] = await Promise.all(
+    q.map(sql => pool.query(sql, [cutoff]))
+  );
+
+  const toMap = (rows) => {
+    const m = new Map();
+    for (const r of rows) {
+      if (parseInt(r.sample_size, 10) >= MIN_SAMPLE_SIZE) {
+        m.set(r.key, { p50: r.p50, p90: r.p90, sample_size: parseInt(r.sample_size, 10) });
+      }
+    }
+    return m;
+  };
+
+  const g = globalRes.rows[0];
+  const globalStats = (g && parseInt(g.sample_size, 10) >= MIN_SAMPLE_SIZE)
+    ? { p50: g.p50, p90: g.p90, sample_size: parseInt(g.sample_size, 10) }
+    : null;
+
+  return {
+    byMetadataName: toMap(byName.rows),
+    byNormalizedName: toMap(byNormName.rows),
+    byKindTestType: toMap(byKindType.rows),
+    byTaskQueueId: toMap(byQueue.rows),
+    bySchedulerId: toMap(byScheduler.rows),
+    global: globalStats,
+  };
+}
+
+async function loadBulkWaitStatsForCutoff(cutoff) {
+  const q = [
+    BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET,
+    BULK_WAIT_STATS_BY_QUEUE,
+    BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET,
+    WAIT_GLOBAL,
+  ].map(toPendingHistorySql);
+
+  const [byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all(
+    q.map(sql => pool.query(sql, [cutoff]))
+  );
+
+  const toMap = (rows) => {
+    const m = new Map();
+    for (const r of rows) {
+      if (parseInt(r.sample_size, 10) >= MIN_SAMPLE_SIZE) {
+        m.set(r.key, { p50: r.p50, p90: r.p90, sample_size: parseInt(r.sample_size, 10) });
+      }
+    }
+    return m;
+  };
+
+  const g = globalRes.rows[0];
+  const globalStats = (g && parseInt(g.sample_size, 10) >= MIN_SAMPLE_SIZE)
+    ? { p50: g.p50, p90: g.p90, sample_size: parseInt(g.sample_size, 10) }
+    : null;
+
+  return {
+    byQueueAndBucket: toMap(byQueueBucket.rows),
+    byQueue: toMap(byQueue.rows),
+    byPriorityAndBucket: toMap(byPriorityBucket.rows),
+    global: globalStats,
+  };
+}
+
 // --- Backtest ---
 
 const RESOLVED_TASKS_SQL = `
-SELECT task_id, run_id, metadata_name, normalized_name, task_queue_id, tags,
-       scheduler_id, image_name, priority, queue_pending,
-       scheduled, started, resolved,
-       run_duration_s, wait_duration_s,
-       reason_resolved
-FROM task_events
-WHERE run_id IS NOT NULL
-  AND resolved IS NOT NULL
-  AND reason_resolved = 'completed'
-  AND resolved >= $1::date
-  AND resolved < $1::date + INTERVAL '1 day';
+SELECT r.task_id, r.run_id, t.metadata_name, t.normalized_name, t.task_queue_id, t.tags,
+       t.scheduler_id, r.priority_at_pending, r.queue_pending,
+       r.pending_at, r.started_at, r.resolved_at,
+       r.run_duration_s, r.wait_duration_s,
+       r.reason_resolved
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.resolved_at IS NOT NULL
+  AND r.reason_resolved = 'completed'
+  AND r.resolved_at >= $1::date
+  AND r.resolved_at < $1::date + INTERVAL '1 day';
 `;
 
 async function runBacktest(date) {
@@ -580,25 +640,152 @@ async function runBacktest(date) {
   }
 }
 
+async function runPendingEvalBacktest(dateStr) {
+  const cutoff = `${dateStr}T00:00:00Z`;
+
+  console.log(`\n=== Pending-eval-date backtest for ${dateStr} ===\n`);
+  console.log(`  Eval cohort: pending_at ∈ [${cutoff}, +1d), reason_resolved='completed'`);
+  console.log(`  History cutoff: resolved_at < ${cutoff} (7-day trailing window)\n`);
+
+  const [stats, waitStats, tasksRes] = await Promise.all([
+    loadBulkStatsForCutoff(cutoff),
+    loadBulkWaitStatsForCutoff(cutoff),
+    pool.query(RESOLVED_TASKS_SQL_PENDING, [cutoff]),
+  ]);
+  const tasks = tasksRes.rows;
+  console.log(`Found ${tasks.length} completed runs pending on ${dateStr}\n`);
+
+  const agg = {
+    duration: { n: 0, mae: { eligible_n: 0, sum_abs_error: 0 }, within_2x: { eligible_n: 0, hit_n: 0 } },
+    wait:     { n: 0, mae: { eligible_n: 0, sum_abs_error: 0 }, within_2x: { eligible_n: 0, hit_n: 0 } },
+  };
+
+  for (const task of tasks) {
+    // Duration
+    if (task.run_duration_s != null) {
+      const p = predictDurationFromStats(task, stats);
+      if (p) {
+        const actual = parseFloat(task.run_duration_s);
+        const predicted = parseFloat(p.p50);
+        agg.duration.n++;
+        agg.duration.mae.eligible_n++;
+        agg.duration.mae.sum_abs_error += Math.abs(predicted - actual);
+        if (predicted > 0 && actual > 0) {
+          agg.duration.within_2x.eligible_n++;
+          const ratio = Math.max(predicted / actual, actual / predicted);
+          if (ratio <= 2) agg.duration.within_2x.hit_n++;
+        }
+      }
+    }
+
+    // Wait
+    if (task.wait_duration_s != null) {
+      const p = predictWaitFromStats(task, waitStats);
+      if (p) {
+        const actual = parseFloat(task.wait_duration_s);
+        const predicted = parseFloat(p.p50);
+        agg.wait.n++;
+        agg.wait.mae.eligible_n++;
+        agg.wait.mae.sum_abs_error += Math.abs(predicted - actual);
+        if (predicted > 0 && actual > 0) {
+          agg.wait.within_2x.eligible_n++;
+          const ratio = Math.max(predicted / actual, actual / predicted);
+          if (ratio <= 2) agg.wait.within_2x.hit_n++;
+        }
+      }
+    }
+  }
+
+  const pct = (num, den) => den > 0 ? (num / den * 100).toFixed(1) + '%' : 'n/a';
+  const avg = (num, den) => den > 0 ? (num / den).toFixed(1) + 's' : 'n/a';
+  console.log('--- Duration ---');
+  console.log(`  n=${agg.duration.n} MAE=${avg(agg.duration.mae.sum_abs_error, agg.duration.mae.eligible_n)} within_2x=${pct(agg.duration.within_2x.hit_n, agg.duration.within_2x.eligible_n)}`);
+  console.log('--- Wait ---');
+  console.log(`  n=${agg.wait.n} MAE=${avg(agg.wait.mae.sum_abs_error, agg.wait.mae.eligible_n)} within_2x=${pct(agg.wait.within_2x.hit_n, agg.wait.within_2x.eligible_n)}`);
+
+  return { dateStr, cutoff, agg };
+}
+
+function buildOutputJson(result) {
+  const { dateStr, cutoff, agg } = result;
+  const nextDay = new Date(new Date(cutoff).getTime() + 24 * 3600 * 1000).toISOString();
+  return {
+    mode: 'pending-eval-date',
+    eval_date: dateStr,
+    eval_window: {
+      pending_start: cutoff,
+      pending_end:   nextDay,
+    },
+    history_cutoff: cutoff,
+    history_lookback_days: 7,
+    slice: "reason_resolved = 'completed'",
+    duration: {
+      n: agg.duration.n,
+      mae: {
+        eligible_n:    agg.duration.mae.eligible_n,
+        sum_abs_error: agg.duration.mae.sum_abs_error,
+      },
+      within_2x: {
+        eligible_n: agg.duration.within_2x.eligible_n,
+        hit_n:      agg.duration.within_2x.hit_n,
+      },
+    },
+    wait: {
+      n: agg.wait.n,
+      mae: {
+        eligible_n:    agg.wait.mae.eligible_n,
+        sum_abs_error: agg.wait.mae.sum_abs_error,
+      },
+      within_2x: {
+        eligible_n: agg.wait.within_2x.eligible_n,
+        hit_n:      agg.wait.within_2x.hit_n,
+      },
+    },
+  };
+}
+
 // --- CLI ---
 
 const args = process.argv.slice(2);
 let date = null;
+let pendingEvalDate = null;
+let outputJson = null;
 
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--date' && args[i + 1]) {
-    date = args[i + 1];
-    i++;
-  }
+  if (args[i] === '--date' && args[i + 1]) { date = args[i + 1]; i++; continue; }
+  if (args[i] === '--pending-eval-date' && args[i + 1]) { pendingEvalDate = args[i + 1]; i++; continue; }
+  if (args[i] === '--output-json' && args[i + 1]) { outputJson = args[i + 1]; i++; continue; }
 }
 
-if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(new Date(date).getTime())) {
-  console.error('Usage: node src/predictor.js --date YYYY-MM-DD');
+const isValidDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s).getTime());
+
+if (!date && !pendingEvalDate) {
+  console.error('Usage:');
+  console.error('  node src/predictor.js --date YYYY-MM-DD');
+  console.error('  node src/predictor.js --pending-eval-date YYYY-MM-DD [--output-json path]');
+  process.exit(1);
+}
+
+if (date && !isValidDate(date)) {
+  console.error(`Invalid --date: ${date}`);
+  process.exit(1);
+}
+if (pendingEvalDate && !isValidDate(pendingEvalDate)) {
+  console.error(`Invalid --pending-eval-date: ${pendingEvalDate}`);
   process.exit(1);
 }
 
 try {
-  await runBacktest(date);
+  if (pendingEvalDate) {
+    const result = await runPendingEvalBacktest(pendingEvalDate);
+    if (outputJson) {
+      const fs = await import('node:fs/promises');
+      await fs.writeFile(outputJson, JSON.stringify(buildOutputJson(result), null, 2));
+      console.log(`\nWrote baseline JSON: ${outputJson}`);
+    }
+  } else {
+    await runBacktest(date);
+  }
 } finally {
   await pool.end();
 }

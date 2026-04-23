@@ -73,6 +73,13 @@ node src/predictor.js --date 2026-03-18
 
 This runs backtests against completed tasks resolved on the given date and prints accuracy statistics.
 
+### Other Tools
+
+```bash
+node src/predict-sample.js   # Predict a single currently-pending task
+node src/diagnose.js          # Print database diagnostics and queue-pending analysis
+```
+
 ## Running Tests
 
 ### Smoke Tests (requires Postgres)
@@ -82,7 +89,7 @@ export DATABASE_URL=postgresql://postgres@localhost:5433/forecasting
 node test/smoke.js
 ```
 
-Tests upsert idempotency, out-of-order event handling, priority update scoping, enrichment, and the placeholder/run row distinction.
+Tests upsert idempotency, out-of-order event handling, FK constraints, enrichment, priority snapshot immutability, and CASCADE deletes.
 
 ## Running Everything in Docker
 
@@ -114,6 +121,19 @@ docker compose down -v        # destroy data volume (resets schema)
 
 ## Architecture
 
-- **Collector** (`src/collector.js`): Long-running process subscribing to 8 Pulse exchanges. Upserts event data synchronously, fires background API fetches for task metadata enrichment.
-- **Predictor** (`src/predictor.js`): CLI backtest tool. Predicts run durations using hierarchical cohort matching (metadata_name → kind+test-type → task_queue_id → global median).
-- **Database**: Single `task_events` table with two row types — placeholder rows (`run_id IS NULL`) for task-level data and run rows (`run_id IS NOT NULL`) for per-run lifecycle data.
+- **Collector** (`src/collector.js`): Long-running process subscribing to 6 Pulse exchanges (`task-defined`, `task-pending`, `task-running`, `task-completed`, `task-failed`, `task-exception`). Upserts task and run data synchronously, fires background API fetches for task metadata enrichment. Maintains in-memory queue-depth counters seeded and periodically synced from the Queue API.
+- **Predictor** (`src/predictor.js`): CLI backtest tool. Predicts run durations using hierarchical cohort matching (metadata_name -> normalized_name -> kind+test-type -> task_queue_id -> scheduler_id -> global median). Also predicts wait times using queue depth bucketing.
+- **Database**: Normalized two-table model:
+  - `queue_forecast_tasks` — one row per `task_id`, stores task-level identity and metadata (queue, scheduler, tags, etc.)
+  - `queue_forecast_task_runs` — one row per `(task_id, run_id)`, stores per-run execution data (timestamps, durations, queue depth snapshot)
+  - `queue_forecast_run_predictions` — one row per `(task_id, run_id)`, stores predictions for evaluation
+
+## Migration
+
+If upgrading from the old single-table `task_events` schema, run the migration script:
+
+```bash
+docker compose exec -T postgres psql -U postgres -d forecasting < migrate.sql
+```
+
+See `migrate.sql` for details and verification queries.

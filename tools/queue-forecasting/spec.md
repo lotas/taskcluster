@@ -509,6 +509,237 @@ training (e.g., a brand new `metadata_name` or `task_queue_id`):
 - After one nightly retrain cycle, the new task type enters the
   training data and gets proper coverage
 
+## ML Pipeline Architecture Options
+
+The sections above describe the ML algorithm, features, and training strategy
+independently of where training and inference run. There are three viable
+deployment architectures. All share the same data model, collection layer,
+and evaluation methodology — they differ only in who trains the model and
+where inference happens.
+
+### Shared Component: Daily Data Export (approaches A and B)
+
+Both bugbug-based approaches require a daily Taskcluster task that
+exports training data from Postgres and publishes it as a TC artifact.
+
+```
+┌─────────────┐    daily TC task    ┌──────────────────────┐
+│  Postgres    │ ──────────────────→ │ training_data.json.zst│
+│  (collector) │   SQL query +       │ (TC artifact, 7-day  │
+│              │   zstd compress     │  expiry, TC-indexed)  │
+└─────────────┘                     └──────────────────────┘
+```
+
+- Runs as a scheduled TC task (not in docker-compose)
+- Queries the training SQL from the run duration and wait time model
+  sections above, exports as newline-delimited JSON compressed with
+  zstandard (`.json.zst`)
+- Published as a public TC artifact, indexed via `project.queue-forecasting.data.latest`
+- Estimated size: 1-3 GB compressed for a 30-day window (~7.5M rows)
+- Artifact expiry: 7 days (training only needs the latest snapshot)
+
+This aligns with bugbug's existing data pipeline pattern — every data
+source in bugbug (Bugzilla, Mercurial, CI failures) follows the same
+retrieval-task → artifact → training-task flow.
+
+### Approach A: Full bugbug Integration (training + serving)
+
+**Data flow:**
+```
+Node.js collector → Postgres → daily export task → TC artifact
+  → bugbug data-retrieval task downloads artifact
+  → bugbug training task (XGBoost) → model stored as pickle
+  → bugbug HTTP service serves predictions
+  → Node.js services call bugbug HTTP API
+```
+
+**What lives where:**
+
+| Component | Location | Owner |
+|-----------|----------|-------|
+| Collector, reconciler | `tools/queue-forecasting/` (TC repo) | TC team |
+| Data export task | `tools/queue-forecasting/` (TC repo) | TC team |
+| Data retrieval script | bugbug repo | bugbug team |
+| Model class + training | bugbug repo | bugbug team |
+| HTTP prediction endpoint | bugbug HTTP service | bugbug team |
+| Prediction API (proxy) | `tools/queue-forecasting/` (TC repo) | TC team |
+
+**What needs to be added to bugbug:**
+1. **Data retrieval script** — downloads the `training_data.json.zst`
+   artifact from TC index, decompresses, yields records. Similar to
+   existing `bugbug/bugzilla.py` retrieval pattern.
+2. **Model class** — extends `bugbug.model.Model`, defines feature
+   extraction from the exported task/run records. Uses XGBoost
+   (bugbug's standard) with quantile regression for p50/p90.
+3. **Training task** — entry in `infra/data-pipeline.yml` depending on
+   the data retrieval task.
+4. **HTTP endpoint** — new route in `http_service/bugbug_http/app.py`
+   that accepts task features and returns wait time + run duration
+   predictions.
+
+**Prediction flow:**
+1. `task-pending` event arrives at collector
+2. Collector upserts run, then calls bugbug HTTP API with features
+3. bugbug API enqueues prediction job (Redis + RQ)
+4. Collector polls for result (bugbug's standard async pattern)
+5. Result written to `queue_forecast_run_predictions`
+
+**Pros:**
+- No Python or ML code in the TC repo
+- Leverages existing Mozilla ML infrastructure (CI, monitoring,
+  deployment, model management)
+- bugbug team already maintains training orchestration and HTTP serving
+- Existing patterns for model rollback and evaluation
+
+**Cons:**
+- **Network latency**: bugbug uses async polling (enqueue → poll for
+  result). At ~250k predictions/day (~3/sec sustained), each prediction
+  incurs HTTP round-trips instead of sub-ms local inference.
+  Batching can amortize this but adds complexity.
+- **XGBoost vs LightGBM**: bugbug standardizes on XGBoost. XGBoost
+  requires manual categorical encoding (label encoding or one-hot)
+  where LightGBM handles high-cardinality categoricals natively.
+  Quality is comparable for tabular data, but feature engineering
+  is more involved.
+- **External service dependency**: bugbug HTTP downtime means no new
+  predictions. Stale predictions in `queue_forecast_run_predictions`
+  remain available but won't update.
+- **Cross-team coordination**: model changes require PRs to bugbug repo
+  and alignment with bugbug release cadence.
+
+**Cost summary:**
+
+| Cost | Estimate |
+|------|----------|
+| Data export artifact storage | ~1-3 GB/day, 7-day expiry = ~7-21 GB peak |
+| Network transfer (export → bugbug) | ~1-3 GB/day (TC-internal, free) |
+| bugbug training compute | 1 TC task/day, ~10-30 min |
+| HTTP API calls | ~250k/day, async polling |
+
+### Approach B: Mixed Mode (bugbug training, ONNX local inference)
+
+**Data flow:**
+```
+Node.js collector → Postgres → daily export task → TC artifact
+  → bugbug data-retrieval task downloads artifact
+  → bugbug training task → ONNX export as TC artifact
+  → Node.js predictor downloads ONNX model + category mappings
+  → Local inference via onnxruntime-node
+```
+
+**What lives where:**
+
+| Component | Location | Owner |
+|-----------|----------|-------|
+| Collector, reconciler, predictor | `tools/queue-forecasting/` (TC repo) | TC team |
+| Data export task | `tools/queue-forecasting/` (TC repo) | TC team |
+| Data retrieval + training | bugbug repo | bugbug team |
+| ONNX model artifact | TC artifact storage | produced by bugbug |
+
+**What needs to be added to bugbug (same as A, plus):**
+- ONNX export step after training. bugbug does not support ONNX today.
+  XGBoost models can be converted via `onnxmltools` or `skl2onnx`, but
+  this is less battle-tested than LightGBM's ONNX export path.
+- Category mapping sidecar (`category_mappings.json`) exported alongside
+  the ONNX model.
+- Parity tests between Python XGBoost predictions and ONNX runtime
+  predictions (float precision can drift).
+
+**Prediction flow:**
+1. `task-pending` event arrives at collector
+2. Collector calls local `predictor.js` (same as current spec)
+3. Predictor runs ONNX model in-process, sub-ms latency
+4. Result written to `queue_forecast_run_predictions`
+
+**Model hot-reload:**
+- Predictor polls TC index for new ONNX artifact (or watches a local
+  volume synced from TC artifacts)
+- Loads new model + category mappings atomically
+
+**Pros:**
+- Sub-ms local inference preserved — no runtime dependency on bugbug
+- Leverages bugbug's training orchestration and CI
+- Model is a static artifact — predictor is self-contained after download
+
+**Cons:**
+- **ONNX export is new to bugbug** — needs to be implemented and
+  maintained. Adds a capability bugbug doesn't currently have.
+- **XGBoost ONNX maturity**: XGBoost → ONNX conversion exists but is
+  less mature than LightGBM → ONNX. Quantile regression ONNX export
+  may need validation.
+- **Category mapping sidecar**: same complexity as approach C (the
+  Node.js predictor must replicate categorical encoding).
+- **Cross-team dependency for training changes**, but not for runtime.
+
+**Cost summary:**
+
+| Cost | Estimate |
+|------|----------|
+| Data export artifact storage | ~1-3 GB/day, 7-day expiry |
+| ONNX model artifact storage | ~10-50 MB/day, 7-day expiry |
+| bugbug training compute | 1 TC task/day, ~10-30 min |
+| Network transfer at inference | None (local) |
+
+### Approach C: All-in-TC Standalone (current spec baseline)
+
+**Data flow:**
+```
+Node.js collector → Postgres
+  → Nightly Python trainer (docker-compose) queries Postgres directly
+  → LightGBM training → ONNX export to shared volume
+  → Node.js predictor loads ONNX, runs local inference
+```
+
+This is the architecture described in the preceding sections. The Python
+trainer lives in `tools/queue-forecasting/` alongside the Node.js code,
+runs as a docker-compose service on a nightly cron.
+
+**Pros:**
+- Full control over the entire pipeline — no external dependencies
+- LightGBM with native categorical support (no manual encoding needed
+  for high-cardinality features like `metadata_name`)
+- Sub-ms local inference
+- Self-contained: one `docker-compose up` runs everything
+- Simpler debugging — all code in one repo
+
+**Cons:**
+- Own the entire ML pipeline: training infrastructure, monitoring,
+  model versioning, rollback
+- Python code in the TC repo (TC is primarily Node.js and Go)
+- Must build training orchestration, evaluation automation, and
+  model management from scratch
+
+**Cost summary:**
+
+| Cost | Estimate |
+|------|----------|
+| Training compute | docker-compose container, ~10-30 min/day |
+| Storage | ONNX models on local/shared volume, ~50 MB |
+| External dependencies | None |
+
+### Comparison Matrix
+
+| Dimension | A: Full bugbug | B: Mixed mode | C: Standalone |
+|-----------|---------------|---------------|---------------|
+| Inference latency | ~100ms+ (HTTP poll) | Sub-ms (local ONNX) | Sub-ms (local ONNX) |
+| Runtime dependency | bugbug HTTP service | None (static artifact) | None |
+| Training orchestration | bugbug (existing) | bugbug (existing) | Self-built |
+| ML framework | XGBoost | XGBoost | LightGBM |
+| Categorical handling | Manual encoding | Manual encoding | Native |
+| Python in TC repo | No | No | Yes |
+| New bugbug work | Model + endpoint | Model + ONNX export | None |
+| Operational ownership | Shared (TC + bugbug) | Shared (training only) | TC team only |
+
+### Recommendation
+
+Start with **Approach C** (standalone) to validate the model quality and
+prediction pipeline end-to-end with minimal cross-team coordination. The
+evaluation metrics (within-2x rate, pinball loss, p90 calibration) will
+determine whether the ML approach works before investing in infrastructure
+integration. If the model proves valuable, migrate training to bugbug
+(Approach B) to offload pipeline maintenance, with Approach A as an
+option if local inference complexity becomes a burden.
+
 ## API
 
 ### Prediction Endpoint
@@ -843,8 +1074,37 @@ CREATE TABLE queue_forecast_task_runs_w2026_13
   data. V2 feature.
 - **Trend/regression detection** — daily cohort rollups comparing trailing
   7-day vs 28-day quantiles. Requires stable evaluation pipeline first.
-- **LightGBM shadow mode comparison** — running a new model version
+- **bugbug migration** — V1 starts standalone (Approach C) to validate
+  model quality. Once evaluation confirms the approach works, migrate
+  training to bugbug (Approach B or A) to leverage existing Mozilla ML
+  infrastructure. See "ML Pipeline Architecture Options" above for the
+  full comparison. Decision point: after Phase 1 evaluation metrics are
+  stable.
+- **Shadow mode comparison** — running a new model version
   side-by-side with production and auto-promoting only if it wins on
-  evaluation metrics.
+  evaluation metrics. Applicable regardless of pipeline architecture.
 - **TC UI integration** — wiring the prediction API into the task
   detail view.
+- **Lando landing queue as a leading indicator** — Lando's merge queue
+  shows what's about to land and therefore what will be scheduled soon.
+  This is a forward-looking signal the current models lack — today the
+  wait-time model only reacts to `queue_pending` at enqueue time. A
+  periodic snapshot of the Lando queue depth (and optionally the repos
+  being landed) could feed into the wait-time model and V2 queue load
+  prediction. Complexity: requires a new data source (Lando API), and
+  the signal is indirect — a landing doesn't map 1:1 to specific task
+  queues without understanding the push-to-taskgraph relationship.
+- **Tree status and sheriff activity** — tree closures halt new tasks,
+  and sheriff-initiated backfills cause sudden load spikes. Both are
+  regime changes that dramatically shift queue behavior. TreeHerder
+  exposes tree status (open / closed / approval-required) via API.
+  Adding tree state as a categorical feature to both models would help
+  them distinguish normal load from closure-recovery bursts. Backfill
+  detection is harder — may require identifying sheriff-triggered task
+  groups via `scheduler_id` or push metadata.
+- **Guiding principle: TC-only first, extend if needed** — V1
+  deliberately uses only Taskcluster-internal data (Pulse events, Queue
+  API). The evaluation pipeline (within-2x rate, pinball loss, p90
+  calibration) provides an objective checkpoint: if TC-only features
+  don't meet accuracy targets after Phase 1 evaluation, that is the
+  signal to integrate external sources like Lando and TreeHerder.

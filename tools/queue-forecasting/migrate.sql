@@ -1,18 +1,17 @@
--- Queue Forecasting Schema
--- Normalized two-table model: tasks (identity) + task_runs (execution)
+-- Migration: task_events -> normalized two-table model
+-- Run this against an existing database that has the task_events table.
+-- The collector should be STOPPED before running this migration.
+
+BEGIN;
 
 -- ==========================================
--- TABLE 1: Task-level identity and metadata
+-- Step 1: Create new tables
 -- ==========================================
+
 CREATE TABLE IF NOT EXISTS queue_forecast_tasks (
-    -- 8-byte types
     task_created       TIMESTAMPTZ,
     enriched_at        TIMESTAMPTZ,
-
-    -- 4-byte types
     max_run_time_s     INTEGER,
-
-    -- Variable-length
     task_id            TEXT PRIMARY KEY,
     task_queue_id      TEXT,
     task_group_id      TEXT,
@@ -24,36 +23,23 @@ CREATE TABLE IF NOT EXISTS queue_forecast_tasks (
     tags               JSONB
 );
 
--- ==========================================
--- TABLE 2: Per-run execution data
--- ==========================================
 CREATE TABLE IF NOT EXISTS queue_forecast_task_runs (
-    -- 8-byte types
     pending_at         TIMESTAMPTZ,
     started_at         TIMESTAMPTZ,
     resolved_at        TIMESTAMPTZ,
     wait_duration_s    DOUBLE PRECISION,
     run_duration_s     DOUBLE PRECISION,
-
-    -- 4-byte types
     run_id             INT NOT NULL,
     queue_pending      INTEGER,
-
-    -- Variable-length
     task_id            TEXT NOT NULL
                        REFERENCES queue_forecast_tasks(task_id) ON DELETE CASCADE,
     priority_at_pending TEXT,
     reason_created     TEXT,
     reason_resolved    TEXT,
-
     PRIMARY KEY (task_id, run_id)
 );
 
--- ==========================================
--- TABLE 3: Prediction log (one per run)
--- ==========================================
 CREATE TABLE IF NOT EXISTS queue_forecast_run_predictions (
-    -- 8-byte types
     predicted_at                 TIMESTAMPTZ DEFAULT now(),
     expected_completion_time     TIMESTAMPTZ,
     guaranteed_completion_time   TIMESTAMPTZ,
@@ -61,35 +47,81 @@ CREATE TABLE IF NOT EXISTS queue_forecast_run_predictions (
     wait_p90_s                   DOUBLE PRECISION,
     run_p50_s                    DOUBLE PRECISION,
     run_p90_s                    DOUBLE PRECISION,
-
-    -- 4-byte types
     run_id                       INT NOT NULL,
-
-    -- Variable-length
     task_id                      TEXT NOT NULL,
     model_version                TEXT NOT NULL,
     input_features               JSONB,
-
     PRIMARY KEY (task_id, run_id)
 );
 
 -- ==========================================
--- INDEXES
+-- Step 2: Migrate data
 -- ==========================================
 
--- Training sweep: last N days of clean completed runs
+-- A. Populate queue_forecast_tasks
+--    DISTINCT ON grabs the most complete metadata per task_id
+--    (latest run_id tends to have the richest enrichment)
+INSERT INTO queue_forecast_tasks (
+    task_id, task_queue_id, task_group_id, scheduler_id, project_id,
+    metadata_name, normalized_name, original_priority,
+    max_run_time_s, tags, task_created, enriched_at
+)
+SELECT DISTINCT ON (task_id)
+    task_id, task_queue_id, task_group_id, scheduler_id, project_id,
+    metadata_name, normalized_name, original_priority,
+    max_run_time_s, tags, task_created,
+    CASE WHEN metadata_name IS NOT NULL THEN now() END
+FROM task_events
+ORDER BY task_id, run_id DESC NULLS LAST
+ON CONFLICT (task_id) DO NOTHING;
+
+-- B. Populate queue_forecast_task_runs
+--    Skip NULL run_id rows (task-defined placeholders with no actual run)
+INSERT INTO queue_forecast_task_runs (
+    task_id, run_id, priority_at_pending, reason_created, reason_resolved,
+    pending_at, started_at, resolved_at, queue_pending,
+    wait_duration_s, run_duration_s
+)
+SELECT
+    task_id, run_id, priority, reason_created, reason_resolved,
+    scheduled, started, resolved, queue_pending,
+    wait_duration_s, run_duration_s
+FROM task_events
+WHERE run_id IS NOT NULL
+ON CONFLICT (task_id, run_id) DO NOTHING;
+
+-- ==========================================
+-- Step 3: Create indexes
+-- ==========================================
+
 CREATE INDEX IF NOT EXISTS idx_qf_task_runs_training
     ON queue_forecast_task_runs (resolved_at)
     WHERE started_at IS NOT NULL
       AND run_duration_s IS NOT NULL
       AND reason_resolved IN ('completed', 'failed');
 
--- Reconciler: find stuck/unresolved runs
 CREATE INDEX IF NOT EXISTS idx_qf_task_runs_unresolved
     ON queue_forecast_task_runs (pending_at)
     WHERE resolved_at IS NULL;
 
--- Enrichment backfill: find tasks missing metadata
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_unenriched
     ON queue_forecast_tasks (task_id)
     WHERE metadata_name IS NULL;
+
+COMMIT;
+
+-- ==========================================
+-- Step 4: Verify (run these manually)
+-- ==========================================
+
+SELECT 'queue_forecast_tasks' AS tbl, count(*) FROM queue_forecast_tasks
+UNION ALL
+SELECT 'queue_forecast_task_runs', count(*) FROM queue_forecast_task_runs
+UNION ALL
+SELECT 'task_events (total)', count(*) FROM task_events
+UNION ALL
+SELECT 'task_events (with run_id)', count(*)
+  FROM task_events WHERE run_id IS NOT NULL;
+
+-- queue_forecast_task_runs count should match task_events-with-run_id count
+-- queue_forecast_tasks count should match distinct task_id count

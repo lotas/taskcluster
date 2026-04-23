@@ -7,23 +7,25 @@ const MIN_SAMPLE_SIZE = 5;
 
 async function findPendingTask() {
   const res = await pool.query(`
-    SELECT task_id, run_id, metadata_name, normalized_name, task_queue_id,
-           tags, scheduler_id, image_name, priority, scheduled, started, queue_pending
-    FROM task_events
-    WHERE scheduled IS NOT NULL
-      AND started IS NULL
-      AND resolved IS NULL
-    ORDER BY scheduled DESC
+    SELECT t.task_id, r.run_id, t.metadata_name, t.normalized_name, t.task_queue_id,
+           t.tags, t.scheduler_id, r.priority_at_pending, r.pending_at, r.started_at, r.queue_pending
+    FROM queue_forecast_task_runs r
+    JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+    WHERE r.pending_at IS NOT NULL
+      AND r.started_at IS NULL
+      AND r.resolved_at IS NULL
+    ORDER BY r.pending_at DESC
     LIMIT 1
   `);
   if (res.rows.length === 0) {
     // Fallback: find a recently scheduled task (even if started)
     const fallback = await pool.query(`
-      SELECT task_id, run_id, metadata_name, normalized_name, task_queue_id,
-             tags, scheduler_id, image_name, priority, scheduled, started, queue_pending
-      FROM task_events
-      WHERE scheduled IS NOT NULL AND metadata_name IS NOT NULL
-      ORDER BY scheduled DESC
+      SELECT t.task_id, r.run_id, t.metadata_name, t.normalized_name, t.task_queue_id,
+             t.tags, t.scheduler_id, r.priority_at_pending, r.pending_at, r.started_at, r.queue_pending
+      FROM queue_forecast_task_runs r
+      JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+      WHERE r.pending_at IS NOT NULL AND t.metadata_name IS NOT NULL
+      ORDER BY r.pending_at DESC
       LIMIT 1
     `);
     return fallback.rows[0] || null;
@@ -45,13 +47,14 @@ async function predictWithFallback(task) {
   if (task.metadata_name) {
     levels.push({
       label: 'metadata_name',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-              AND metadata_name = $1 AND reason_resolved = 'completed'
-              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.run_duration_s IS NOT NULL
+              AND t.metadata_name = $1 AND r.reason_resolved = 'completed'
+              AND r.resolved_at < $2 AND r.resolved_at > $2::timestamptz - INTERVAL '7 days'`,
       params: [task.metadata_name, asOfDate],
     });
   }
@@ -61,13 +64,14 @@ async function predictWithFallback(task) {
   if (normName && normName !== task.metadata_name) {
     levels.push({
       label: 'normalized_name',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-              AND normalized_name = $1 AND reason_resolved = 'completed'
-              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.run_duration_s IS NOT NULL
+              AND t.normalized_name = $1 AND r.reason_resolved = 'completed'
+              AND r.resolved_at < $2 AND r.resolved_at > $2::timestamptz - INTERVAL '7 days'`,
       params: [normName, asOfDate],
     });
   }
@@ -77,14 +81,15 @@ async function predictWithFallback(task) {
   if (tags?.kind && tags?.['test-type']) {
     levels.push({
       label: 'kind+test-type',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-              AND tags->>'kind' = $1 AND tags->>'test-type' = $2
-              AND reason_resolved = 'completed'
-              AND resolved < $3 AND resolved > $3::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.run_duration_s IS NOT NULL
+              AND t.tags->>'kind' = $1 AND t.tags->>'test-type' = $2
+              AND r.reason_resolved = 'completed'
+              AND r.resolved_at < $3 AND r.resolved_at > $3::timestamptz - INTERVAL '7 days'`,
       params: [tags.kind, tags['test-type'], asOfDate],
     });
   }
@@ -93,57 +98,44 @@ async function predictWithFallback(task) {
   if (task.task_queue_id) {
     levels.push({
       label: 'task_queue_id',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-              AND task_queue_id = $1 AND reason_resolved = 'completed'
-              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.run_duration_s IS NOT NULL
+              AND t.task_queue_id = $1 AND r.reason_resolved = 'completed'
+              AND r.resolved_at < $2 AND r.resolved_at > $2::timestamptz - INTERVAL '7 days'`,
       params: [task.task_queue_id, asOfDate],
     });
   }
 
-  // Level 5: image_name
-  if (task.image_name) {
-    levels.push({
-      label: 'image_name',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
-                   count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-              AND image_name = $1 AND reason_resolved = 'completed'
-              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
-      params: [task.image_name, asOfDate],
-    });
-  }
-
-  // Level 6: scheduler_id
+  // Level 5: scheduler_id
   if (task.scheduler_id) {
     levels.push({
       label: 'scheduler_id',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-              AND scheduler_id = $1 AND reason_resolved = 'completed'
-              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.run_duration_s IS NOT NULL
+              AND t.scheduler_id = $1 AND r.reason_resolved = 'completed'
+              AND r.resolved_at < $2 AND r.resolved_at > $2::timestamptz - INTERVAL '7 days'`,
       params: [task.scheduler_id, asOfDate],
     });
   }
 
-  // Level 7: global
+  // Level 6: global
   levels.push({
     label: 'global',
-    sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY run_duration_s) AS p50,
-                 percentile_cont(0.9) WITHIN GROUP (ORDER BY run_duration_s) AS p90,
+    sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.run_duration_s) AS p50,
+                 percentile_cont(0.9) WITHIN GROUP (ORDER BY r.run_duration_s) AS p90,
                  count(*) AS sample_size
-          FROM task_events
-          WHERE run_id IS NOT NULL AND run_duration_s IS NOT NULL
-            AND reason_resolved = 'completed'
-            AND resolved < $1 AND resolved > $1::timestamptz - INTERVAL '7 days'`,
+          FROM queue_forecast_task_runs r
+          WHERE r.run_duration_s IS NOT NULL
+            AND r.reason_resolved = 'completed'
+            AND r.resolved_at < $1 AND r.resolved_at > $1::timestamptz - INTERVAL '7 days'`,
     params: [asOfDate],
   });
 
@@ -167,18 +159,19 @@ async function predictWaitWithFallback(task) {
   const bucket = pendingBucket(task.queue_pending);
   const levels = [];
 
-  // Level 1: queue + pending bucket
-  if (task.task_queue_id) {
+  // Level 1: queue + pending bucket (skip when queue_pending unknown)
+  if (task.task_queue_id && bucket != null) {
     levels.push({
       label: 'queue+bucket',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
-              AND task_queue_id = $1 AND ${PENDING_BUCKET_SQL} = $2
-              AND reason_resolved = 'completed'
-              AND resolved < $3 AND resolved > $3::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.wait_duration_s IS NOT NULL
+              AND t.task_queue_id = $1 AND ${PENDING_BUCKET_SQL} = $2
+              AND r.started_at IS NOT NULL
+              AND r.resolved_at < $3 AND r.resolved_at > $3::timestamptz - INTERVAL '7 days'`,
       params: [task.task_queue_id, bucket, asOfDate],
     });
   }
@@ -187,44 +180,45 @@ async function predictWaitWithFallback(task) {
   if (task.task_queue_id) {
     levels.push({
       label: 'queue',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
-              AND task_queue_id = $1
-              AND reason_resolved = 'completed'
-              AND resolved < $2 AND resolved > $2::timestamptz - INTERVAL '7 days'`,
+            FROM queue_forecast_task_runs r
+            JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+            WHERE r.wait_duration_s IS NOT NULL
+              AND t.task_queue_id = $1
+              AND r.started_at IS NOT NULL
+              AND r.resolved_at < $2 AND r.resolved_at > $2::timestamptz - INTERVAL '7 days'`,
       params: [task.task_queue_id, asOfDate],
     });
   }
 
-  // Level 3: priority + pending bucket
-  if (task.priority != null) {
+  // Level 3: priority + pending bucket (skip when queue_pending unknown)
+  if (task.priority_at_pending != null && bucket != null) {
     levels.push({
       label: 'priority+bucket',
-      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-                   percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+      sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
                    count(*) AS sample_size
-            FROM task_events
-            WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
-              AND priority = $1 AND ${PENDING_BUCKET_SQL} = $2
-              AND reason_resolved = 'completed'
-              AND resolved < $3 AND resolved > $3::timestamptz - INTERVAL '7 days'`,
-      params: [task.priority, bucket, asOfDate],
+            FROM queue_forecast_task_runs r
+            WHERE r.wait_duration_s IS NOT NULL
+              AND r.priority_at_pending = $1 AND ${PENDING_BUCKET_SQL} = $2
+              AND r.started_at IS NOT NULL
+              AND r.resolved_at < $3 AND r.resolved_at > $3::timestamptz - INTERVAL '7 days'`,
+      params: [task.priority_at_pending, bucket, asOfDate],
     });
   }
 
   // Level 4: global
   levels.push({
     label: 'global',
-    sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY wait_duration_s) AS p50,
-                 percentile_cont(0.9) WITHIN GROUP (ORDER BY wait_duration_s) AS p90,
+    sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+                 percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
                  count(*) AS sample_size
-          FROM task_events
-          WHERE run_id IS NOT NULL AND wait_duration_s IS NOT NULL
-            AND reason_resolved = 'completed'
-            AND resolved < $1 AND resolved > $1::timestamptz - INTERVAL '7 days'`,
+          FROM queue_forecast_task_runs r
+          WHERE r.wait_duration_s IS NOT NULL
+            AND r.started_at IS NOT NULL
+            AND r.resolved_at < $1 AND r.resolved_at > $1::timestamptz - INTERVAL '7 days'`,
     params: [asOfDate],
   });
 
@@ -259,15 +253,15 @@ async function run() {
   }
 
   const tags = parseTags(task.tags);
-  const isPending = !task.started;
+  const isPending = !task.started_at;
 
   console.log(`Task: ${task.task_id} (run ${task.run_id ?? 'none'})`);
   console.log(`  Name:       ${task.metadata_name || '(not enriched)'}`);
   console.log(`  Queue:      ${task.task_queue_id || '(unknown)'}`);
   console.log(`  Scheduler:  ${task.scheduler_id || '(unknown)'}`);
   console.log(`  Tags:       ${tags ? JSON.stringify(tags) : '(none)'}`);
-  console.log(`  Scheduled:  ${task.scheduled}`);
-  console.log(`  Status:     ${isPending ? 'PENDING (not started)' : `started at ${task.started}`}`);
+  console.log(`  Pending at: ${task.pending_at}`);
+  console.log(`  Status:     ${isPending ? 'PENDING (not started)' : `started at ${task.started_at}`}`);
   if (task.queue_pending != null) {
     console.log(`  Queue depth: ${task.queue_pending} pending at schedule time`);
   }
@@ -296,11 +290,11 @@ async function run() {
     console.log(`  p90 wait:     ${fmt(waitPrediction.p90)}`);
 
     if (isPending && prediction) {
-      const scheduledTime = new Date(task.scheduled);
-      const predictedStart = new Date(scheduledTime.getTime() + waitPrediction.p50 * 1000);
+      const pendingTime = new Date(task.pending_at);
+      const predictedStart = new Date(pendingTime.getTime() + waitPrediction.p50 * 1000);
       const predictedCompletion = new Date(predictedStart.getTime() + prediction.p50 * 1000);
       console.log('\n--- Combined Estimate (pending task) ---');
-      console.log(`  Predicted start:      ${predictedStart.toISOString()} (scheduled + wait p50)`);
+      console.log(`  Predicted start:      ${predictedStart.toISOString()} (pending + wait p50)`);
       console.log(`  Predicted completion: ${predictedCompletion.toISOString()} (start + duration p50)`);
       console.log(`  Total time:           ${fmt(waitPrediction.p50 + prediction.p50)}`);
     }

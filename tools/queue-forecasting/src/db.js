@@ -4,168 +4,128 @@ export function createPool(databaseUrl) {
   return new pg.Pool({ connectionString: databaseUrl, max: 20 });
 }
 
-// Promote a run_id=NULL placeholder to a real run row, merging fields.
-// Only promotes if no row with the target run_id already exists.
-const PROMOTE_PLACEHOLDER_SQL = `
-UPDATE task_events SET
-  run_id            = $2,
-  task_queue_id     = COALESCE($3,  task_events.task_queue_id),
-  task_group_id     = COALESCE($4,  task_events.task_group_id),
-  priority          = COALESCE($5,  task_events.priority),
-  original_priority = COALESCE(task_events.original_priority, $6),
-  metadata_name     = COALESCE($7,  task_events.metadata_name),
-  scheduler_id      = COALESCE($8,  task_events.scheduler_id),
-  project_id        = COALESCE($9,  task_events.project_id),
-  tags              = COALESCE($10, task_events.tags),
-  worker_group      = COALESCE($11, task_events.worker_group),
-  task_created      = COALESCE($12, task_events.task_created),
-  scheduled         = COALESCE($13, task_events.scheduled),
-  started           = COALESCE($14, task_events.started),
-  resolved          = COALESCE($15, task_events.resolved),
-  reason_created    = COALESCE($16, task_events.reason_created),
-  reason_resolved   = COALESCE($17, task_events.reason_resolved),
-  queue_pending     = COALESCE($18, task_events.queue_pending),
-  wait_duration_s   = COALESCE($19, task_events.wait_duration_s),
-  run_duration_s    = COALESCE($20, task_events.run_duration_s),
-  normalized_name   = COALESCE($21, task_events.normalized_name),
-  max_run_time_s    = COALESCE($22, task_events.max_run_time_s),
-  image_name        = COALESCE($23, task_events.image_name)
-WHERE task_id = $1 AND run_id IS NULL
-  AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = $1 AND run_id = $2);
+// --- Task upsert (queue_forecast_tasks) ---
+
+const UPSERT_TASK_SQL = `
+INSERT INTO queue_forecast_tasks (
+  task_id, task_queue_id, task_group_id, scheduler_id, project_id,
+  metadata_name, normalized_name, original_priority,
+  max_run_time_s, tags, task_created
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (task_id) DO UPDATE SET
+  task_queue_id     = COALESCE(EXCLUDED.task_queue_id,     queue_forecast_tasks.task_queue_id),
+  task_group_id     = COALESCE(EXCLUDED.task_group_id,     queue_forecast_tasks.task_group_id),
+  scheduler_id      = COALESCE(EXCLUDED.scheduler_id,      queue_forecast_tasks.scheduler_id),
+  project_id        = COALESCE(EXCLUDED.project_id,        queue_forecast_tasks.project_id),
+  metadata_name     = COALESCE(EXCLUDED.metadata_name,     queue_forecast_tasks.metadata_name),
+  normalized_name   = COALESCE(EXCLUDED.normalized_name,   queue_forecast_tasks.normalized_name),
+  original_priority = COALESCE(queue_forecast_tasks.original_priority, EXCLUDED.original_priority),
+  max_run_time_s    = COALESCE(EXCLUDED.max_run_time_s,    queue_forecast_tasks.max_run_time_s),
+  tags              = COALESCE(EXCLUDED.tags,               queue_forecast_tasks.tags),
+  task_created      = COALESCE(EXCLUDED.task_created,      queue_forecast_tasks.task_created);
 `;
 
-const UPSERT_SQL = `
-INSERT INTO task_events (
-  task_id, run_id,
-  task_queue_id, task_group_id, priority, original_priority,
-  metadata_name, scheduler_id, project_id, tags, worker_group,
-  task_created, scheduled, started, resolved,
-  reason_created, reason_resolved,
-  queue_pending,
-  wait_duration_s, run_duration_s,
-  normalized_name, max_run_time_s, image_name
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-ON CONFLICT (task_id, run_id) DO UPDATE SET
-  task_queue_id     = COALESCE(EXCLUDED.task_queue_id,     task_events.task_queue_id),
-  task_group_id     = COALESCE(EXCLUDED.task_group_id,     task_events.task_group_id),
-  priority          = COALESCE(EXCLUDED.priority,              task_events.priority),
-  original_priority = COALESCE(task_events.original_priority, EXCLUDED.original_priority),
-  metadata_name     = COALESCE(EXCLUDED.metadata_name,     task_events.metadata_name),
-  normalized_name   = COALESCE(EXCLUDED.normalized_name,   task_events.normalized_name),
-  scheduler_id      = COALESCE(EXCLUDED.scheduler_id,      task_events.scheduler_id),
-  project_id        = COALESCE(EXCLUDED.project_id,        task_events.project_id),
-  tags              = COALESCE(EXCLUDED.tags,               task_events.tags),
-  worker_group      = COALESCE(EXCLUDED.worker_group,      task_events.worker_group),
-  max_run_time_s    = COALESCE(EXCLUDED.max_run_time_s,    task_events.max_run_time_s),
-  image_name        = COALESCE(EXCLUDED.image_name,        task_events.image_name),
-  task_created      = COALESCE(EXCLUDED.task_created,      task_events.task_created),
-  scheduled         = COALESCE(EXCLUDED.scheduled,         task_events.scheduled),
-  started           = COALESCE(EXCLUDED.started,           task_events.started),
-  resolved          = COALESCE(EXCLUDED.resolved,          task_events.resolved),
-  reason_created    = COALESCE(EXCLUDED.reason_created,    task_events.reason_created),
-  reason_resolved   = COALESCE(EXCLUDED.reason_resolved,   task_events.reason_resolved),
-  queue_pending     = COALESCE(EXCLUDED.queue_pending,     task_events.queue_pending),
-  wait_duration_s   = COALESCE(EXCLUDED.wait_duration_s,   task_events.wait_duration_s),
-  run_duration_s    = COALESCE(EXCLUDED.run_duration_s,    task_events.run_duration_s);
-`;
-
-export async function upsertTaskEvent(pool, fields) {
+export async function upsertTask(pool, fields) {
   const {
-    task_id, run_id = null,
+    task_id,
     task_queue_id = null, task_group_id = null,
-    priority = null, original_priority = null,
-    metadata_name = null, scheduler_id = null,
-    project_id = null, tags = null, worker_group = null,
-    task_created = null,
-    scheduled = null, started = null, resolved = null,
-    reason_created = null, reason_resolved = null,
-    wait_duration_s = null, run_duration_s = null,
-    queue_pending = null,
-    normalized_name = null, max_run_time_s = null, image_name = null,
+    scheduler_id = null, project_id = null,
+    metadata_name = null, normalized_name = null,
+    original_priority = null,
+    max_run_time_s = null, tags = null, task_created = null,
   } = fields;
 
-  const params = [
-    task_id, run_id,
-    task_queue_id, task_group_id, priority, original_priority,
-    metadata_name, scheduler_id, project_id,
+  await pool.query(UPSERT_TASK_SQL, [
+    task_id,
+    task_queue_id, task_group_id, scheduler_id, project_id,
+    metadata_name, normalized_name, original_priority,
+    max_run_time_s,
     tags ? JSON.stringify(tags) : null,
-    worker_group,
-    task_created, scheduled, started, resolved,
-    reason_created, reason_resolved,
-    queue_pending,
-    wait_duration_s, run_duration_s,
-    normalized_name, max_run_time_s, image_name,
-  ];
-
-  // When a run event arrives, try to promote the run_id=NULL placeholder first.
-  // This avoids creating a duplicate row for the same task.
-  if (run_id != null) {
-    const promoteRes = await pool.query(PROMOTE_PLACEHOLDER_SQL, params);
-    if (promoteRes.rowCount > 0) return;
-  }
-
-  await pool.query(UPSERT_SQL, params);
+    task_created,
+  ]);
 }
 
-const ENRICH_SQL = `
-UPDATE task_events SET
-  metadata_name     = COALESCE($2, task_events.metadata_name),
-  tags              = COALESCE($3, task_events.tags),
-  task_created      = COALESCE($4, task_events.task_created),
-  original_priority = COALESCE(task_events.original_priority, $5),
-  task_queue_id     = COALESCE($6, task_events.task_queue_id),
-  task_group_id     = COALESCE($7, task_events.task_group_id),
-  scheduler_id      = COALESCE($8, task_events.scheduler_id),
-  project_id        = COALESCE($9, task_events.project_id),
-  normalized_name   = COALESCE($10, task_events.normalized_name),
-  max_run_time_s    = COALESCE($11, task_events.max_run_time_s),
-  image_name        = COALESCE($12, task_events.image_name)
+// --- Task run upsert (queue_forecast_task_runs) ---
+
+const UPSERT_TASK_RUN_SQL = `
+INSERT INTO queue_forecast_task_runs (
+  task_id, run_id, priority_at_pending, reason_created, reason_resolved,
+  pending_at, started_at, resolved_at, queue_pending,
+  wait_duration_s, run_duration_s
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (task_id, run_id) DO UPDATE SET
+  priority_at_pending = COALESCE(queue_forecast_task_runs.priority_at_pending, EXCLUDED.priority_at_pending),
+  reason_created      = COALESCE(EXCLUDED.reason_created,    queue_forecast_task_runs.reason_created),
+  reason_resolved     = COALESCE(EXCLUDED.reason_resolved,   queue_forecast_task_runs.reason_resolved),
+  pending_at          = COALESCE(EXCLUDED.pending_at,        queue_forecast_task_runs.pending_at),
+  started_at          = COALESCE(EXCLUDED.started_at,        queue_forecast_task_runs.started_at),
+  resolved_at         = COALESCE(EXCLUDED.resolved_at,       queue_forecast_task_runs.resolved_at),
+  queue_pending       = COALESCE(EXCLUDED.queue_pending,     queue_forecast_task_runs.queue_pending),
+  wait_duration_s     = COALESCE(EXCLUDED.wait_duration_s,   queue_forecast_task_runs.wait_duration_s),
+  run_duration_s      = COALESCE(EXCLUDED.run_duration_s,    queue_forecast_task_runs.run_duration_s);
+`;
+
+export async function upsertTaskRun(pool, fields) {
+  const {
+    task_id, run_id,
+    priority_at_pending = null, reason_created = null, reason_resolved = null,
+    pending_at = null, started_at = null, resolved_at = null,
+    queue_pending = null,
+    wait_duration_s = null, run_duration_s = null,
+  } = fields;
+
+  await pool.query(UPSERT_TASK_RUN_SQL, [
+    task_id, run_id,
+    priority_at_pending, reason_created, reason_resolved,
+    pending_at, started_at, resolved_at,
+    queue_pending,
+    wait_duration_s, run_duration_s,
+  ]);
+}
+
+// --- Task enrichment (queue_forecast_tasks only) ---
+
+const ENRICH_TASK_SQL = `
+UPDATE queue_forecast_tasks SET
+  metadata_name     = COALESCE($2, metadata_name),
+  normalized_name   = COALESCE($3, normalized_name),
+  tags              = COALESCE($4, tags),
+  task_created      = COALESCE($5, task_created),
+  original_priority = COALESCE(original_priority, $6),
+  task_queue_id     = COALESCE($7, task_queue_id),
+  task_group_id     = COALESCE($8, task_group_id),
+  scheduler_id      = COALESCE($9, scheduler_id),
+  project_id        = COALESCE($10, project_id),
+  max_run_time_s    = COALESCE($11, max_run_time_s),
+  enriched_at       = COALESCE(enriched_at, now())
 WHERE task_id = $1;
 `;
 
-export async function enrichTaskRows(pool, taskId, enrichment) {
+export async function enrichTask(pool, taskId, enrichment) {
   const {
-    metadata_name = null, tags = null,
-    task_created = null, original_priority = null,
+    metadata_name = null, normalized_name = null,
+    tags = null, task_created = null, original_priority = null,
     task_queue_id = null, task_group_id = null,
     scheduler_id = null, project_id = null,
-    normalized_name = null, max_run_time_s = null, image_name = null,
+    max_run_time_s = null,
   } = enrichment;
 
-  await pool.query(ENRICH_SQL, [
+  await pool.query(ENRICH_TASK_SQL, [
     taskId,
-    metadata_name,
+    metadata_name, normalized_name,
     tags ? JSON.stringify(tags) : null,
     task_created, original_priority,
     task_queue_id, task_group_id,
     scheduler_id, project_id,
-    normalized_name, max_run_time_s, image_name,
+    max_run_time_s,
   ]);
 }
 
-const UPDATE_PRIORITY_BY_TASK_SQL = `
-UPDATE task_events
-SET priority = $2
-WHERE task_id = $1;
-`;
-
-export async function updatePriorityByTask(pool, taskId, newPriority) {
-  await pool.query(UPDATE_PRIORITY_BY_TASK_SQL, [taskId, newPriority]);
-}
-
-const UPDATE_PRIORITY_BY_GROUP_SQL = `
-UPDATE task_events
-SET priority = $2
-WHERE task_group_id = $1;
-`;
-
-export async function updatePriorityByGroup(pool, taskGroupId, newPriority) {
-  await pool.query(UPDATE_PRIORITY_BY_GROUP_SQL, [taskGroupId, newPriority]);
-}
+// --- Unenriched task query ---
 
 const UNENRICHED_TASKS_SQL = `
-SELECT DISTINCT task_id
-FROM task_events
+SELECT task_id
+FROM queue_forecast_tasks
 WHERE metadata_name IS NULL
   AND ($2::text[] IS NULL OR task_id != ALL($2::text[]))
 ORDER BY task_id

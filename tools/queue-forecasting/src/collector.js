@@ -5,8 +5,8 @@ import taskcluster from '@taskcluster/client';
 import { Client, consume, pulseCredentials } from '@taskcluster/lib-pulse';
 import { createNoOpMonitor } from './monitor.js';
 import { createTaskCache } from './cache.js';
-import { createPool, upsertTaskEvent, enrichTaskRows, updatePriorityByTask, updatePriorityByGroup, getUnenrichedTaskIds } from './db.js';
-import { normalizeMetadataName, extractImageName } from './utils.js';
+import { createPool, upsertTask, upsertTaskRun, enrichTask, getUnenrichedTaskIds } from './db.js';
+import { normalizeMetadataName } from './utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ERROR_LOG_PATH = process.env.COLLECTOR_ERROR_LOG || path.join(__dirname, '..', 'collector-errors.log');
@@ -107,32 +107,30 @@ function extractRunFields(status, runId) {
   const run = status.runs?.[runId];
   if (!run) return {};
   return {
-    scheduled: run.scheduled || null,
-    started: run.started || null,
-    resolved: run.resolved || null,
+    pending_at: run.scheduled || null,
+    started_at: run.started || null,
+    resolved_at: run.resolved || null,
     reason_created: run.reasonCreated || null,
     reason_resolved: run.reasonResolved || null,
-    worker_group: run.workerGroup || null,
   };
 }
 
-function computeDurations(scheduled, started, resolved) {
+function computeDurations(pending_at, started_at, resolved_at) {
   let wait_duration_s = null;
   let run_duration_s = null;
-  if (scheduled && started) {
-    wait_duration_s = (new Date(started) - new Date(scheduled)) / 1000;
+  if (pending_at && started_at) {
+    wait_duration_s = (new Date(started_at) - new Date(pending_at)) / 1000;
   }
-  if (started && resolved) {
-    run_duration_s = (new Date(resolved) - new Date(started)) / 1000;
+  if (started_at && resolved_at) {
+    run_duration_s = (new Date(resolved_at) - new Date(started_at)) / 1000;
   }
   return { wait_duration_s, run_duration_s };
 }
 
-function extractStatusFields(status) {
+function extractTaskFields(status) {
   return {
     task_queue_id: status.taskQueueId || null,
     task_group_id: status.taskGroupId || null,
-    priority: status.priority || null,
     scheduler_id: status.schedulerId || null,
     project_id: status.projectId || null,
   };
@@ -146,10 +144,9 @@ function extractTags(payload) {
 
 async function handleTaskDefined(payload) {
   const { status } = payload;
-  await upsertTaskEvent(pool, {
+  await upsertTask(pool, {
     task_id: status.taskId,
-    run_id: null,
-    ...extractStatusFields(status),
+    ...extractTaskFields(status),
     tags: extractTags(payload),
   });
 }
@@ -158,26 +155,40 @@ async function handleTaskPending(payload) {
   const { status, runId } = payload;
   const runFields = extractRunFields(status, runId);
   const taskQueueId = status.taskQueueId || null;
+
+  // Increment BEFORE snapshotting: the seeded value from the API already
+  // includes this task's pending event (Pulse delivers after state change),
+  // but our local counter hasn't counted it yet. Incrementing first keeps
+  // the snapshot aligned with reality.
+  incrementQueuePending(taskQueueId);
   const queuePending = await getQueuePending(taskQueueId);
-  await upsertTaskEvent(pool, {
+
+  await upsertTask(pool, {
+    task_id: status.taskId,
+    ...extractTaskFields(status),
+    tags: extractTags(payload),
+  });
+  await upsertTaskRun(pool, {
     task_id: status.taskId,
     run_id: runId,
-    ...extractStatusFields(status),
-    tags: extractTags(payload),
     ...runFields,
+    priority_at_pending: status.priority || null,
     queue_pending: queuePending,
   });
-  incrementQueuePending(taskQueueId);
 }
 
 async function handleTaskRunning(payload) {
   const { status, runId } = payload;
   const runFields = extractRunFields(status, runId);
-  await upsertTaskEvent(pool, {
+
+  await upsertTask(pool, {
+    task_id: status.taskId,
+    ...extractTaskFields(status),
+    tags: extractTags(payload),
+  });
+  await upsertTaskRun(pool, {
     task_id: status.taskId,
     run_id: runId,
-    ...extractStatusFields(status),
-    tags: extractTags(payload),
     ...runFields,
   });
   decrementQueuePending(status.taskQueueId || null);
@@ -186,49 +197,58 @@ async function handleTaskRunning(payload) {
 async function handleResolved(payload) {
   const { status, runId } = payload;
   const runFields = extractRunFields(status, runId);
-  const durations = computeDurations(runFields.scheduled, runFields.started, runFields.resolved);
-  await upsertTaskEvent(pool, {
+  const durations = computeDurations(runFields.pending_at, runFields.started_at, runFields.resolved_at);
+
+  await upsertTask(pool, {
+    task_id: status.taskId,
+    ...extractTaskFields(status),
+    tags: extractTags(payload),
+  });
+  await upsertTaskRun(pool, {
     task_id: status.taskId,
     run_id: runId,
-    ...extractStatusFields(status),
-    tags: extractTags(payload),
     ...runFields,
     ...durations,
   });
+
+  // If the run never started (e.g. canceled before pickup), the pending
+  // counter was incremented at task-pending but never decremented at
+  // task-running. Correct the drift here.
+  if (!runFields.started_at) {
+    decrementQueuePending(status.taskQueueId || null);
+  }
 }
 
 async function handleTaskException(payload) {
   const { status } = payload;
   const runId = payload.runId;
 
+  await upsertTask(pool, {
+    task_id: status.taskId,
+    ...extractTaskFields(status),
+    tags: extractTags(payload),
+  });
+
   if (runId != null) {
     const runFields = extractRunFields(status, runId);
-    const durations = computeDurations(runFields.scheduled, runFields.started, runFields.resolved);
-    await upsertTaskEvent(pool, {
+    const durations = computeDurations(runFields.pending_at, runFields.started_at, runFields.resolved_at);
+    await upsertTaskRun(pool, {
       task_id: status.taskId,
       run_id: runId,
-      ...extractStatusFields(status),
-      tags: extractTags(payload),
       ...runFields,
       ...durations,
     });
-  } else {
-    // No runId — deadline exceeded before any run started
-    const lastRun = status.runs?.[status.runs.length - 1];
-    await upsertTaskEvent(pool, {
-      task_id: status.taskId,
-      run_id: null,
-      ...extractStatusFields(status),
-      tags: extractTags(payload),
-      resolved: lastRun?.resolved || null,
-      reason_resolved: lastRun?.reasonResolved || null,
-    });
+
+    // Exception without starting — pending counter was never decremented
+    if (!runFields.started_at) {
+      decrementQueuePending(status.taskQueueId || null);
+    }
   }
 }
 
 async function backgroundApiFetch(taskId, status) {
   if (taskCache.has(taskId)) return;
-  if (inFlightTaskIds.has(taskId)) return; // dedup concurrent fetches
+  if (inFlightTaskIds.has(taskId)) return;
   if (inFlightFetches >= MAX_CONCURRENT_FETCHES) return;
 
   inFlightFetches++;
@@ -247,10 +267,8 @@ async function backgroundApiFetch(taskId, status) {
       scheduler_id: taskDef.schedulerId || status.schedulerId,
       project_id: taskDef.projectId || status.projectId,
       max_run_time_s: taskDef.payload?.maxRunTime ?? null,
-      image_name: extractImageName(taskDef),
     };
-    await enrichTaskRows(pool, taskId, enrichment);
-    // Cache enrichment data (not just a boolean) so new run rows can be enriched
+    await enrichTask(pool, taskId, enrichment);
     taskCache.set(taskId, enrichment);
   } catch (err) {
     logError('api-fetch', `Failed for ${taskId}: ${err.message}`, {
@@ -258,7 +276,6 @@ async function backgroundApiFetch(taskId, status) {
       statusCode: err.statusCode,
       code: err.code,
     });
-    // Track failures so backfill can skip persistently-failing tasks
     const count = (backfillFailCounts.get(taskId) || 0) + 1;
     backfillFailCounts.set(taskId, count);
   } finally {
@@ -288,25 +305,16 @@ async function handleMessage(message) {
     case 'task-exception':
       await handleTaskException(payload);
       break;
-    case 'task-priority-changed':
-      await updatePriorityByTask(pool, payload.status.taskId, payload.newPriority);
-      break;
-    case 'task-group-priority-changed':
-      await updatePriorityByGroup(pool, payload.taskGroupId, payload.newPriority);
-      break;
+    // task-priority-changed and task-group-priority-changed are no-ops:
+    // priority_at_pending is an immutable snapshot captured at pending time
     default:
-      console.warn(`[collector] Unrecognized event type: ${eventType}`);
       break;
   }
 
-  // Fire-and-forget API fetch (does not block ack)
+  // Fire-and-forget API enrichment (does not block ack)
   if (payload.status) {
     const taskId = payload.status.taskId;
-    const cached = taskCache.get(taskId);
-    if (cached) {
-      // Enrich newly inserted run rows with cached task metadata
-      enrichTaskRows(pool, taskId, cached).catch(() => {});
-    } else {
+    if (!taskCache.has(taskId)) {
       backgroundApiFetch(taskId, payload.status).catch(() => {});
     }
   }
@@ -321,8 +329,6 @@ const bindings = [
   queueEvents.taskCompleted(),
   queueEvents.taskFailed(),
   queueEvents.taskException(),
-  queueEvents.taskPriorityChanged(),
-  queueEvents.taskGroupPriorityChanged(),
 ].map(binding => ({
   exchange: binding.exchange,
   routingKeyPattern: '#',
@@ -354,20 +360,17 @@ async function backfillSweep() {
     if (taskIds.length === 0) return;
     console.log(`[backfill] Found ${taskIds.length} unenriched tasks, fetching...`);
 
-    // Process cached tasks synchronously (cheap DB updates)
     const fetchTasks = [];
     for (const taskId of taskIds) {
       if (taskCache.has(taskId)) {
-        await enrichTaskRows(pool, taskId, taskCache.get(taskId));
+        await enrichTask(pool, taskId, taskCache.get(taskId));
       } else if ((backfillFailCounts.get(taskId) || 0) >= MAX_BACKFILL_RETRIES) {
-        // Skip tasks that have persistently failed enrichment
         continue;
       } else {
         fetchTasks.push(taskId);
       }
     }
 
-    // Process API fetches in batches of MAX_CONCURRENT_FETCHES
     for (let i = 0; i < fetchTasks.length; i += MAX_CONCURRENT_FETCHES) {
       const batch = fetchTasks.slice(i, i + MAX_CONCURRENT_FETCHES);
       await Promise.all(batch.map(taskId => backgroundApiFetch(taskId, {})));
@@ -390,10 +393,10 @@ let lastPendingGapCount = 0;
 async function checkPendingGaps() {
   try {
     const res = await pool.query(`
-      SELECT count(*) AS n FROM task_events
+      SELECT count(*) AS n FROM queue_forecast_task_runs
       WHERE queue_pending IS NULL
         AND reason_resolved = 'completed'
-        AND started IS NOT NULL
+        AND started_at IS NOT NULL
     `);
     const count = parseInt(res.rows[0].n, 10);
     if (count > lastPendingGapCount) {

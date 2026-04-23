@@ -1,4 +1,4 @@
-import { createPool, upsertTaskEvent, enrichTaskRows, updatePriorityByTask, updatePriorityByGroup, getUnenrichedTaskIds } from '../src/db.js';
+import { createPool, upsertTask, upsertTaskRun, enrichTask, getUnenrichedTaskIds } from '../src/db.js';
 import { normalizeMetadataName, extractImageName } from '../src/utils.js';
 
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
@@ -17,199 +17,192 @@ function assert(condition, message) {
   }
 }
 
-async function resetTable() {
-  await pool.query('DELETE FROM task_events');
+async function resetTables() {
+  await pool.query('DELETE FROM queue_forecast_task_runs');
+  await pool.query('DELETE FROM queue_forecast_tasks');
 }
 
-async function getRows(taskId) {
+async function getTaskRow(taskId) {
   const res = await pool.query(
-    'SELECT * FROM task_events WHERE task_id = $1 ORDER BY run_id NULLS FIRST',
+    'SELECT * FROM queue_forecast_tasks WHERE task_id = $1',
+    [taskId],
+  );
+  return res.rows[0] || null;
+}
+
+async function getRunRows(taskId) {
+  const res = await pool.query(
+    'SELECT * FROM queue_forecast_task_runs WHERE task_id = $1 ORDER BY run_id',
     [taskId],
   );
   return res.rows;
 }
 
-// Test 1: Upsert idempotency
-async function testUpsertIdempotency() {
-  console.log('\nTest 1: Upsert idempotency');
-  await resetTable();
+// Test 1: Task upsert idempotency
+async function testTaskUpsertIdempotency() {
+  console.log('\nTest 1: Task upsert idempotency');
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
-    task_id: 'task-1', run_id: 0,
-    task_queue_id: 'gecko-t/linux', priority: 'medium',
-    scheduled: '2026-03-18T10:00:00Z',
+  await upsertTask(pool, {
+    task_id: 'task-1',
+    task_queue_id: 'gecko-t/linux',
   });
-  await upsertTaskEvent(pool, {
-    task_id: 'task-1', run_id: 0,
-    task_queue_id: 'gecko-t/linux', priority: 'medium',
-    scheduled: '2026-03-18T10:00:00Z',
-  });
-
-  const rows = await getRows('task-1');
-  assert(rows.length === 1, 'Single row after duplicate upsert');
-  assert(rows[0].task_queue_id === 'gecko-t/linux', 'task_queue_id preserved');
-}
-
-// Test 2: Out-of-order events (COALESCE merge)
-async function testOutOfOrderEvents() {
-  console.log('\nTest 2: Out-of-order events');
-  await resetTable();
-
-  // task-running arrives first
-  await upsertTaskEvent(pool, {
-    task_id: 'task-2', run_id: 0,
-    started: '2026-03-18T10:05:00Z',
-    worker_group: 'us-east-1',
-  });
-  // task-pending arrives second
-  await upsertTaskEvent(pool, {
-    task_id: 'task-2', run_id: 0,
-    scheduled: '2026-03-18T10:00:00Z',
-    reason_created: 'scheduled',
+  await upsertTask(pool, {
+    task_id: 'task-1',
     task_queue_id: 'gecko-t/linux',
   });
 
-  const rows = await getRows('task-2');
-  assert(rows.length === 1, 'Single row after out-of-order events');
-  assert(rows[0].started !== null, 'started preserved from first event');
-  assert(rows[0].scheduled !== null, 'scheduled merged from second event');
-  assert(rows[0].worker_group === 'us-east-1', 'worker_group preserved');
-  assert(rows[0].task_queue_id === 'gecko-t/linux', 'task_queue_id merged');
+  const task = await getTaskRow('task-1');
+  assert(task !== null, 'Task row exists');
+  assert(task.task_queue_id === 'gecko-t/linux', 'task_queue_id preserved');
 }
 
-// Test 3: original_priority immutability
-async function testOriginalPriorityImmutability() {
-  console.log('\nTest 3: original_priority immutability');
-  await resetTable();
+// Test 2: Run upsert idempotency
+async function testRunUpsertIdempotency() {
+  console.log('\nTest 2: Run upsert idempotency');
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
+  await upsertTask(pool, { task_id: 'task-2', task_queue_id: 'gecko-t/linux' });
+  await upsertTaskRun(pool, {
+    task_id: 'task-2', run_id: 0,
+    pending_at: '2026-03-18T10:00:00Z',
+  });
+  await upsertTaskRun(pool, {
+    task_id: 'task-2', run_id: 0,
+    pending_at: '2026-03-18T10:00:00Z',
+  });
+
+  const runs = await getRunRows('task-2');
+  assert(runs.length === 1, 'Single run row after duplicate upsert');
+}
+
+// Test 3: Out-of-order events (COALESCE merge)
+async function testOutOfOrderEvents() {
+  console.log('\nTest 3: Out-of-order events');
+  await resetTables();
+
+  await upsertTask(pool, { task_id: 'task-3' });
+  // task-running arrives first
+  await upsertTaskRun(pool, {
     task_id: 'task-3', run_id: 0,
+    started_at: '2026-03-18T10:05:00Z',
+  });
+  // task-pending arrives second
+  await upsertTaskRun(pool, {
+    task_id: 'task-3', run_id: 0,
+    pending_at: '2026-03-18T10:00:00Z',
+    reason_created: 'scheduled',
+  });
+
+  const runs = await getRunRows('task-3');
+  assert(runs.length === 1, 'Single run row after out-of-order events');
+  assert(runs[0].started_at !== null, 'started_at preserved from first event');
+  assert(runs[0].pending_at !== null, 'pending_at merged from second event');
+}
+
+// Test 4: original_priority immutability (first-write-wins)
+async function testOriginalPriorityImmutability() {
+  console.log('\nTest 4: original_priority immutability');
+  await resetTables();
+
+  await upsertTask(pool, {
+    task_id: 'task-4',
     original_priority: 'medium',
   });
-  await upsertTaskEvent(pool, {
-    task_id: 'task-3', run_id: 0,
+  await upsertTask(pool, {
+    task_id: 'task-4',
     original_priority: 'high',
   });
 
-  const rows = await getRows('task-3');
-  assert(rows[0].original_priority === 'medium', 'original_priority stays medium (first write wins)');
+  const task = await getTaskRow('task-4');
+  assert(task.original_priority === 'medium', 'original_priority stays medium (first write wins)');
 }
 
-// Test 4: NULL run_id uniqueness (UNIQUE NULLS NOT DISTINCT)
-async function testNullRunIdUniqueness() {
-  console.log('\nTest 4: NULL run_id uniqueness');
-  await resetTable();
+// Test 5: priority_at_pending immutability (first-write-wins)
+async function testPriorityAtPendingImmutability() {
+  console.log('\nTest 5: priority_at_pending immutability');
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
-    task_id: 'task-4', run_id: null,
-    task_queue_id: 'gecko-t/linux',
-  });
-  await upsertTaskEvent(pool, {
-    task_id: 'task-4', run_id: null,
-    priority: 'high',
-  });
-
-  const rows = await getRows('task-4');
-  assert(rows.length === 1, 'Single row for (task_id, NULL) — NULLS NOT DISTINCT works');
-  assert(rows[0].task_queue_id === 'gecko-t/linux', 'task_queue_id preserved from first upsert');
-  assert(rows[0].priority === 'high', 'priority merged from second upsert');
-}
-
-// Test 5: Priority update scoping (only unresolved rows)
-async function testPriorityUpdateScoping() {
-  console.log('\nTest 5: Priority update scoping');
-  await resetTable();
-
-  // Unresolved placeholder row
-  await upsertTaskEvent(pool, {
-    task_id: 'task-5', run_id: null,
-    priority: 'low',
-  });
-  // Unresolved run row
-  await upsertTaskEvent(pool, {
+  await upsertTask(pool, { task_id: 'task-5' });
+  await upsertTaskRun(pool, {
     task_id: 'task-5', run_id: 0,
-    priority: 'low',
-    scheduled: '2026-03-18T10:00:00Z',
+    priority_at_pending: 'medium',
+    pending_at: '2026-03-18T10:00:00Z',
   });
-  // Resolved run row
-  await upsertTaskEvent(pool, {
-    task_id: 'task-5', run_id: 1,
-    priority: 'low',
-    resolved: '2026-03-18T10:10:00Z',
+  // Later event tries to overwrite priority
+  await upsertTaskRun(pool, {
+    task_id: 'task-5', run_id: 0,
+    priority_at_pending: 'high',
+    started_at: '2026-03-18T10:05:00Z',
   });
 
-  await updatePriorityByTask(pool, 'task-5', 'high');
-
-  const rows = await getRows('task-5');
-  const placeholder = rows.find(r => r.run_id === null);
-  const run0 = rows.find(r => r.run_id === 0);
-  const run1 = rows.find(r => r.run_id === 1);
-
-  assert(placeholder.priority === 'high', 'Placeholder updated');
-  assert(run0.priority === 'high', 'Unresolved run row updated');
-  assert(run1.priority === 'high', 'Resolved run row also updated (priority is task-level)');
+  const runs = await getRunRows('task-5');
+  assert(runs[0].priority_at_pending === 'medium', 'priority_at_pending stays medium (first write wins)');
+  assert(runs[0].started_at !== null, 'started_at still merged from second event');
 }
 
-// Test 6: Group priority update scoping
-async function testGroupPriorityUpdateScoping() {
-  console.log('\nTest 6: Group priority update scoping');
-  await resetTable();
+// Test 6: Task + run separation
+async function testTaskRunSeparation() {
+  console.log('\nTest 6: Task + run separation');
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
-    task_id: 'task-6a', run_id: 0,
-    task_group_id: 'group-6', priority: 'low',
+  await upsertTask(pool, {
+    task_id: 'task-6',
+    task_queue_id: 'gecko-t/linux',
+    scheduler_id: 'gecko-level-3',
   });
-  await upsertTaskEvent(pool, {
-    task_id: 'task-6b', run_id: 0,
-    task_group_id: 'group-6', priority: 'low',
-    resolved: '2026-03-18T10:10:00Z',
+  await upsertTaskRun(pool, {
+    task_id: 'task-6', run_id: 0,
+    pending_at: '2026-03-18T10:00:00Z',
+  });
+  await upsertTaskRun(pool, {
+    task_id: 'task-6', run_id: 1,
+    pending_at: '2026-03-18T10:10:00Z',
   });
 
-  await updatePriorityByGroup(pool, 'group-6', 'high');
-
-  const rowsA = await getRows('task-6a');
-  const rowsB = await getRows('task-6b');
-
-  assert(rowsA[0].priority === 'high', 'Unresolved group member updated');
-  assert(rowsB[0].priority === 'high', 'Resolved group member also updated (priority is task-level)');
+  const task = await getTaskRow('task-6');
+  const runs = await getRunRows('task-6');
+  assert(task !== null, 'Task row exists');
+  assert(runs.length === 2, 'Two run rows exist');
+  assert(task.task_queue_id === 'gecko-t/linux', 'Task-level field on task row');
+  assert(runs[0].pending_at !== null, 'Run-level field on run row');
 }
 
 // Test 7: Wait/run duration calculation
 async function testDurationCalculation() {
   console.log('\nTest 7: Wait/run duration calculation');
-  await resetTable();
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
+  await upsertTask(pool, { task_id: 'task-7' });
+  await upsertTaskRun(pool, {
     task_id: 'task-7', run_id: 0,
-    scheduled: '2026-03-18T10:00:00Z',
-    started: '2026-03-18T10:02:00Z',
-    resolved: '2026-03-18T10:07:00Z',
+    pending_at: '2026-03-18T10:00:00Z',
+    started_at: '2026-03-18T10:02:00Z',
+    resolved_at: '2026-03-18T10:07:00Z',
     wait_duration_s: 120,
     run_duration_s: 300,
   });
 
-  const rows = await getRows('task-7');
-  assert(parseFloat(rows[0].wait_duration_s) === 120, 'wait_duration_s = 120s');
-  assert(parseFloat(rows[0].run_duration_s) === 300, 'run_duration_s = 300s');
+  const runs = await getRunRows('task-7');
+  assert(parseFloat(runs[0].wait_duration_s) === 120, 'wait_duration_s = 120s');
+  assert(parseFloat(runs[0].run_duration_s) === 300, 'run_duration_s = 300s');
 }
 
 // Test 8: Enrichment update
 async function testEnrichmentUpdate() {
   console.log('\nTest 8: Enrichment update');
-  await resetTable();
+  await resetTables();
 
-  // Placeholder row
-  await upsertTaskEvent(pool, {
-    task_id: 'task-8', run_id: null,
+  await upsertTask(pool, {
+    task_id: 'task-8',
     task_queue_id: 'gecko-t/linux',
   });
-  // Run row
-  await upsertTaskEvent(pool, {
+  await upsertTaskRun(pool, {
     task_id: 'task-8', run_id: 0,
-    scheduled: '2026-03-18T10:00:00Z',
+    pending_at: '2026-03-18T10:00:00Z',
   });
 
-  await enrichTaskRows(pool, 'task-8', {
+  await enrichTask(pool, 'task-8', {
     metadata_name: 'test-linux/debug-mochitest-1',
     normalized_name: 'test-linux/debug-mochitest-1',
     tags: { kind: 'test', 'test-type': 'mochitest' },
@@ -220,89 +213,138 @@ async function testEnrichmentUpdate() {
     scheduler_id: 'gecko-level-3',
     project_id: 'mozilla-central',
     max_run_time_s: 3600,
-    image_name: 'ubuntu:22.04',
   });
 
-  const rows = await getRows('task-8');
-  assert(rows.length === 2, 'Both placeholder and run rows exist');
-  for (const row of rows) {
-    assert(row.metadata_name === 'test-linux/debug-mochitest-1', `metadata_name enriched (run_id=${row.run_id})`);
-    assert(row.normalized_name === 'test-linux/debug-mochitest-1', `normalized_name enriched (run_id=${row.run_id})`);
-    assert(row.scheduler_id === 'gecko-level-3', `scheduler_id enriched (run_id=${row.run_id})`);
-    assert(row.project_id === 'mozilla-central', `project_id enriched (run_id=${row.run_id})`);
-    assert(row.max_run_time_s === 3600, `max_run_time_s enriched (run_id=${row.run_id})`);
-    assert(row.image_name === 'ubuntu:22.04', `image_name enriched (run_id=${row.run_id})`);
-  }
+  const task = await getTaskRow('task-8');
+  assert(task.metadata_name === 'test-linux/debug-mochitest-1', 'metadata_name enriched');
+  assert(task.normalized_name === 'test-linux/debug-mochitest-1', 'normalized_name enriched');
+  assert(task.scheduler_id === 'gecko-level-3', 'scheduler_id enriched');
+  assert(task.project_id === 'mozilla-central', 'project_id enriched');
+  assert(task.max_run_time_s === 3600, 'max_run_time_s enriched');
+  assert(task.enriched_at !== null, 'enriched_at set');
 }
 
-// Test 9: Placeholder vs run row distinction
-async function testPlaceholderVsRunRow() {
-  console.log('\nTest 9: Placeholder vs run row distinction');
-  await resetTable();
+// Test 9: enriched_at only set once
+async function testEnrichedAtOnce() {
+  console.log('\nTest 9: enriched_at only set once');
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
-    task_id: 'task-9', run_id: null,
-    task_queue_id: 'gecko-t/linux',
-  });
-  await upsertTaskEvent(pool, {
-    task_id: 'task-9', run_id: 0,
-    task_queue_id: 'gecko-t/linux',
-    scheduled: '2026-03-18T10:00:00Z',
-  });
+  await upsertTask(pool, { task_id: 'task-9' });
 
-  const allRows = await getRows('task-9');
-  assert(allRows.length === 2, 'Both placeholder and run row exist');
+  const before = await getTaskRow('task-9');
+  assert(before.enriched_at === null, 'enriched_at is NULL before enrichment');
 
-  const runOnlyRes = await pool.query(
-    'SELECT * FROM task_events WHERE task_id = $1 AND run_id IS NOT NULL',
-    ['task-9'],
+  await enrichTask(pool, 'task-9', { metadata_name: 'test-1' });
+  const after1 = await getTaskRow('task-9');
+  const firstEnrichedAt = after1.enriched_at;
+  assert(firstEnrichedAt !== null, 'enriched_at set after first enrichment');
+
+  // Small delay to ensure timestamps would differ
+  await new Promise(r => setTimeout(r, 10));
+  await enrichTask(pool, 'task-9', { metadata_name: 'test-2' });
+  const after2 = await getTaskRow('task-9');
+  assert(
+    after2.enriched_at.getTime() === firstEnrichedAt.getTime(),
+    'enriched_at unchanged after second enrichment (COALESCE preserves first)',
   );
-  assert(runOnlyRes.rows.length === 1, 'Predictor query (run_id IS NOT NULL) excludes placeholder');
-  assert(runOnlyRes.rows[0].run_id === 0, 'Only run row returned');
 }
 
-// Test 10: Priority updates via upsert (new value wins)
-async function testPriorityUpsertNewValueWins() {
-  console.log('\nTest 10: Priority updates via upsert (new value wins)');
-  await resetTable();
+// Test 10: FK constraint — run requires task
+async function testFkConstraint() {
+  console.log('\nTest 10: FK constraint — run requires task');
+  await resetTables();
 
-  await upsertTaskEvent(pool, {
-    task_id: 'task-10', run_id: 0,
-    priority: 'medium',
-    scheduled: '2026-03-18T10:00:00Z',
-  });
-  // A later lifecycle event carries an updated priority
-  await upsertTaskEvent(pool, {
-    task_id: 'task-10', run_id: 0,
-    priority: 'high',
-    started: '2026-03-18T10:05:00Z',
-  });
-
-  const rows = await getRows('task-10');
-  assert(rows.length === 1, 'Single row after upsert');
-  assert(rows[0].priority === 'high', 'priority updated to high (new value wins)');
-  assert(rows[0].scheduled !== null, 'scheduled preserved from first event');
-  assert(rows[0].started !== null, 'started merged from second event');
+  let fkViolation = false;
+  try {
+    await upsertTaskRun(pool, {
+      task_id: 'nonexistent-task', run_id: 0,
+      pending_at: '2026-03-18T10:00:00Z',
+    });
+  } catch (err) {
+    if (err.code === '23503') fkViolation = true; // foreign_key_violation
+  }
+  assert(fkViolation, 'FK violation when inserting run for nonexistent task');
 }
 
-// Test 11: Backfill query includes placeholder rows (run_id IS NULL)
-async function testBackfillIncludesPlaceholders() {
-  console.log('\nTest 11: Backfill query includes placeholder rows');
-  await resetTable();
+// Test 11: Backfill query returns unenriched tasks
+async function testBackfillQuery() {
+  console.log('\nTest 11: Backfill query returns unenriched tasks');
+  await resetTables();
 
-  // Placeholder row without metadata
-  await upsertTaskEvent(pool, {
-    task_id: 'task-11', run_id: null,
+  await upsertTask(pool, {
+    task_id: 'task-11',
     task_queue_id: 'gecko-t/linux',
   });
 
   const taskIds = await getUnenrichedTaskIds(pool);
-  assert(taskIds.includes('task-11'), 'Placeholder row (run_id IS NULL) included in backfill query');
+  assert(taskIds.includes('task-11'), 'Unenriched task included in backfill query');
+
+  await enrichTask(pool, 'task-11', { metadata_name: 'test-enriched' });
+  const taskIds2 = await getUnenrichedTaskIds(pool);
+  assert(!taskIds2.includes('task-11'), 'Enriched task excluded from backfill query');
 }
 
-// Test 12: normalizeMetadataName
+// Test 12: queue_pending capture and COALESCE preservation
+async function testQueuePendingCapture() {
+  console.log('\nTest 12: queue_pending capture');
+  await resetTables();
+
+  await upsertTask(pool, { task_id: 'task-qp' });
+  await upsertTaskRun(pool, {
+    task_id: 'task-qp', run_id: 0,
+    queue_pending: 42,
+    pending_at: '2026-03-20T10:00:00Z',
+  });
+
+  const runs = await getRunRows('task-qp');
+  assert(runs[0].queue_pending === 42, 'queue_pending persisted');
+
+  // Second upsert without queue_pending should not overwrite
+  await upsertTaskRun(pool, {
+    task_id: 'task-qp', run_id: 0,
+    started_at: '2026-03-20T10:01:00Z',
+  });
+
+  const runs2 = await getRunRows('task-qp');
+  assert(runs2[0].queue_pending === 42, 'queue_pending preserved by COALESCE');
+}
+
+// Test 13: COALESCE merge on task fields
+async function testTaskCoalesceMerge() {
+  console.log('\nTest 13: COALESCE merge on task fields');
+  await resetTables();
+
+  await upsertTask(pool, {
+    task_id: 'task-13',
+    task_queue_id: 'gecko-t/linux',
+  });
+  await upsertTask(pool, {
+    task_id: 'task-13',
+    scheduler_id: 'gecko-level-3',
+  });
+
+  const task = await getTaskRow('task-13');
+  assert(task.task_queue_id === 'gecko-t/linux', 'task_queue_id preserved from first upsert');
+  assert(task.scheduler_id === 'gecko-level-3', 'scheduler_id merged from second upsert');
+}
+
+// Test 14: CASCADE delete
+async function testCascadeDelete() {
+  console.log('\nTest 14: CASCADE delete');
+  await resetTables();
+
+  await upsertTask(pool, { task_id: 'task-14' });
+  await upsertTaskRun(pool, { task_id: 'task-14', run_id: 0, pending_at: '2026-03-18T10:00:00Z' });
+  await upsertTaskRun(pool, { task_id: 'task-14', run_id: 1, pending_at: '2026-03-18T10:10:00Z' });
+
+  await pool.query('DELETE FROM queue_forecast_tasks WHERE task_id = $1', ['task-14']);
+  const runs = await getRunRows('task-14');
+  assert(runs.length === 0, 'Run rows deleted by CASCADE when task deleted');
+}
+
+// Test 15: normalizeMetadataName
 async function testNormalizeMetadataName() {
-  console.log('\nTest 12: normalizeMetadataName');
+  console.log('\nTest 15: normalizeMetadataName');
 
   assert(
     normalizeMetadataName('mozci classify autoland@193d2dd1a0b3') === 'mozci classify autoland',
@@ -330,9 +372,9 @@ async function testNormalizeMetadataName() {
   );
 }
 
-// Test 13: extractImageName
+// Test 16: extractImageName (utility still works, even though column dropped)
 async function testExtractImageName() {
-  console.log('\nTest 13: extractImageName');
+  console.log('\nTest 16: extractImageName');
 
   assert(
     extractImageName({ payload: { image: 'ubuntu:22.04' } }) === 'ubuntu:22.04',
@@ -356,48 +398,25 @@ async function testExtractImageName() {
   );
 }
 
-// Test 14: queue_pending capture and COALESCE preservation
-async function testQueuePendingCapture() {
-  console.log('\nTest 14: queue_pending capture');
-  await resetTable();
-
-  await upsertTaskEvent(pool, {
-    task_id: 'task-qp', run_id: 0,
-    task_queue_id: 'gecko-t/linux',
-    queue_pending: 42,
-    scheduled: '2026-03-20T10:00:00Z',
-  });
-
-  const rows = await getRows('task-qp');
-  assert(rows[0].queue_pending === 42, 'queue_pending persisted');
-
-  // Second upsert without queue_pending should not overwrite
-  await upsertTaskEvent(pool, {
-    task_id: 'task-qp', run_id: 0,
-    started: '2026-03-20T10:01:00Z',
-  });
-
-  const rows2 = await getRows('task-qp');
-  assert(rows2[0].queue_pending === 42, 'queue_pending preserved by COALESCE');
-}
-
 // --- Run all tests ---
 
 try {
-  await testUpsertIdempotency();
+  await testTaskUpsertIdempotency();
+  await testRunUpsertIdempotency();
   await testOutOfOrderEvents();
   await testOriginalPriorityImmutability();
-  await testNullRunIdUniqueness();
-  await testPriorityUpdateScoping();
-  await testGroupPriorityUpdateScoping();
+  await testPriorityAtPendingImmutability();
+  await testTaskRunSeparation();
   await testDurationCalculation();
   await testEnrichmentUpdate();
-  await testPlaceholderVsRunRow();
-  await testPriorityUpsertNewValueWins();
-  await testBackfillIncludesPlaceholders();
+  await testEnrichedAtOnce();
+  await testFkConstraint();
+  await testBackfillQuery();
+  await testQueuePendingCapture();
+  await testTaskCoalesceMerge();
+  await testCascadeDelete();
   await testNormalizeMetadataName();
   await testExtractImageName();
-  await testQueuePendingCapture();
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) process.exit(1);

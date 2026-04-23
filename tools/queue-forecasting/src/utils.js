@@ -4,8 +4,10 @@ export function normalizeMetadataName(name) {
 }
 
 export function pendingBucket(queuePending) {
+  if (queuePending == null) return null;
   const n = parseInt(queuePending, 10);
-  if (isNaN(n) || n === 0) return 'empty';
+  if (isNaN(n)) return null;
+  if (n === 0) return 'empty';
   if (n <= 5) return 'low';
   if (n <= 20) return 'moderate';
   if (n <= 50) return 'busy';
@@ -16,13 +18,14 @@ export function pendingBucket(queuePending) {
 }
 
 export const PENDING_BUCKET_SQL = `CASE
-  WHEN queue_pending IS NULL OR queue_pending = 0 THEN 'empty'
-  WHEN queue_pending <= 5 THEN 'low'
-  WHEN queue_pending <= 20 THEN 'moderate'
-  WHEN queue_pending <= 50 THEN 'busy'
-  WHEN queue_pending <= 200 THEN 'heavy'
-  WHEN queue_pending <= 500 THEN 'very-heavy'
-  WHEN queue_pending <= 1500 THEN 'overloaded'
+  WHEN r.queue_pending IS NULL THEN NULL
+  WHEN r.queue_pending = 0 THEN 'empty'
+  WHEN r.queue_pending <= 5 THEN 'low'
+  WHEN r.queue_pending <= 20 THEN 'moderate'
+  WHEN r.queue_pending <= 50 THEN 'busy'
+  WHEN r.queue_pending <= 200 THEN 'heavy'
+  WHEN r.queue_pending <= 500 THEN 'very-heavy'
+  WHEN r.queue_pending <= 1500 THEN 'overloaded'
   ELSE 'saturated'
 END`;
 

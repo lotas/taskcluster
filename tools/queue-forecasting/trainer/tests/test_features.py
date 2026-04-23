@@ -1,0 +1,125 @@
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+
+from src.config import Config
+from src.features import FeatureBuilder, Split
+
+
+def _cfg(**overrides):
+    base = dict(
+        target="wait_time", target_column="y",
+        lookback_days=14, holdout_days=5, validation_days=1,
+        as_of_date=datetime(2026, 4, 24, tzinfo=timezone.utc),
+        filters=[],
+        categorical_features=["task_queue_id", "tags.kind"],
+        numeric_features=["queue_pending", "hour_sin", "hour_cos", "day_sin", "day_cos"],
+        derived_features={"cyclical_time": {"source": "pending_at"}},
+        model_type="lightgbm", quantiles=[0.5], model_params={},
+    )
+    base.update(overrides)
+    return Config(**base)
+
+
+def _frame(rows):
+    return pd.DataFrame(rows)
+
+
+def test_fit_transform_and_transform_preserve_category_codes():
+    c = _cfg()
+    train = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 01:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 5.0,
+         "task_queue_id": "q1", "tags": {"kind": "build"}, "queue_pending": 10},
+        {"task_id": "b", "run_id": 0, "pending_at": pd.Timestamp("2026-04-11 02:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 7.0,
+         "task_queue_id": "q2", "tags": {"kind": "test"}, "queue_pending": 20},
+    ])
+    hold = _frame([
+        {"task_id": "c", "run_id": 0, "pending_at": pd.Timestamp("2026-04-20 03:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 6.0,
+         "task_queue_id": "q1", "tags": {"kind": "build"}, "queue_pending": 15},
+        {"task_id": "d", "run_id": 0, "pending_at": pd.Timestamp("2026-04-20 04:00", tz="UTC"),
+         "reason_resolved": "failed",   "y": 9.0,
+         "task_queue_id": "q_unseen", "tags": {"kind": "wpt"}, "queue_pending": 30},
+    ])
+
+    b = FeatureBuilder(c)
+    tr = b.fit_transform(train)
+    ho = b.transform(hold)
+
+    assert isinstance(tr, Split) and isinstance(ho, Split)
+    # Train codes are stable into holdout
+    tr_q_cats = list(tr.X["task_queue_id"].cat.categories)
+    ho_q_cats = list(ho.X["task_queue_id"].cat.categories)
+    assert tr_q_cats == ho_q_cats
+
+    # Unseen holdout value becomes NaN (LightGBM unknown)
+    unseen_row = ho.X.iloc[1]
+    assert pd.isna(unseen_row["task_queue_id"])
+    assert pd.isna(unseen_row["tags.kind"])
+
+    # Meta carries slice columns
+    assert list(ho.meta.columns) == ["pending_at", "reason_resolved", "task_id", "run_id"]
+    assert ho.meta["reason_resolved"].iloc[1] == "failed"
+
+
+def test_cyclical_time_features():
+    c = _cfg()
+    df = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 00:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 1.0,
+         "task_queue_id": "q", "tags": {"kind": "k"}, "queue_pending": 1},
+    ])
+    b = FeatureBuilder(c)
+    s = b.fit_transform(df)
+    # hour=0, dow=4 (Friday)
+    assert np.isclose(s.X["hour_sin"].iloc[0], 0.0)
+    assert np.isclose(s.X["hour_cos"].iloc[0], 1.0)
+
+
+def test_build_type_regex_extraction():
+    c = _cfg(
+        target="run_duration", target_column="y",
+        categorical_features=["build_type"],
+        numeric_features=[],
+        derived_features={
+            "build_type_regex": {"source": "metadata_name", "pattern": "/(debug|opt)[-/]"},
+        },
+    )
+    df = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 00:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 1.0,
+         "metadata_name": "test-linux2404-64/debug-mochitest-1"},
+        {"task_id": "b", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 00:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 1.0,
+         "metadata_name": "test-linux2404-64/opt-mochitest-2"},
+        {"task_id": "c", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 00:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 1.0,
+         "metadata_name": "build-something"},
+    ])
+    b = FeatureBuilder(c)
+    s = b.fit_transform(df)
+    vals = list(s.X["build_type"].astype(object))
+    assert vals[:2] == ["debug", "opt"]
+    assert pd.isna(vals[2])
+
+
+def test_stats_record_unseen_rate():
+    c = _cfg()
+    train = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 00:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 1.0,
+         "task_queue_id": "q1", "tags": {"kind": "k"}, "queue_pending": 1},
+    ])
+    hold = _frame([
+        {"task_id": "b", "run_id": 0, "pending_at": pd.Timestamp("2026-04-20 00:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 2.0,
+         "task_queue_id": "q_unseen", "tags": {"kind": "k"}, "queue_pending": 2},
+    ])
+    b = FeatureBuilder(c)
+    b.fit_transform(train)
+    h = b.transform(hold)
+    assert h.stats["unseen_rate"]["task_queue_id"] == 1.0
+    assert h.stats["unseen_rate"]["tags.kind"] == 0.0

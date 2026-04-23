@@ -44,9 +44,8 @@ services:
     build:
       context: ../..
       dockerfile: tools/queue-forecasting/Dockerfile
-    command: ["node", "src/diagnose.js"]
-    # command: ["node", "src/predict-sample.js"]
-    # command: ["node", "src/predictor.js", "--date", "${PREDICT_DATE:-2026-03-23}"]
+    # command: ["node", "src/diagnose.js"]
+    command: ["node", "src/predictor.js", "--date", "${PREDICT_DATE:-2026-04-20}"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,6 +58,26 @@ services:
       DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
     volumes:
       - ./src:/app/tools/queue-forecasting/src
+      - ./trainer/data/baseline:/app/tools/queue-forecasting/trainer/data/baseline
+
+  trainer:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/trainer/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - trainer
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+    volumes:
+      - ./trainer:/app/trainer
+    entrypoint: ["uv", "run", "python", "-m", "src.train"]
+    working_dir: /app/trainer
 
 volumes:
   pgdata:
