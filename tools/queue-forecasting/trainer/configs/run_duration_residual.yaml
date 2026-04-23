@@ -1,0 +1,47 @@
+target: run_duration
+target_column: run_duration_s
+
+lookback_days: 30
+holdout_days: 5
+validation_days: 1
+as_of_date: null
+
+filters:
+  - "r.started_at IS NOT NULL"
+  - "r.run_duration_s IS NOT NULL"
+  - "r.reason_resolved IN ('completed', 'failed')"
+
+categorical_features:
+  - task_queue_id
+  - scheduler_id
+  - metadata_name
+  - normalized_name
+  - tags.kind
+  - tags.test-type
+  - tags.os
+  - tags.project
+  - tags.worker-implementation
+  - build_type
+
+numeric_features:
+  - max_run_time_s
+  - bl_duration_p50
+
+derived_features:
+  build_type_regex:
+    source: metadata_name
+    pattern: "/(debug|opt)[-/]"
+
+model_type: lightgbm
+quantiles: [0.5, 0.9]
+model_params:
+  num_leaves: 63
+  learning_rate: 0.05
+  n_estimators: 500
+  early_stopping_rounds: 20
+  min_data_in_leaf: 100
+
+residual:
+  baseline_file: baseline_predictions.ndjson
+  baseline_feature: bl_duration_p50
+  transform: log_ratio
