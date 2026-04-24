@@ -80,6 +80,46 @@ node src/predict-sample.js   # Predict a single currently-pending task
 node src/diagnose.js          # Print database diagnostics and queue-pending analysis
 ```
 
+## Running the Worker Counter
+
+The worker counter polls the Taskcluster WorkerManager API every 5 minutes to collect per-queue worker metrics and stores them as a time series. It also derives "busy worker" counts by querying our own `queue_forecast_task_runs` table for in-flight runs.
+
+### What it collects
+
+| Column | Source |
+|--------|--------|
+| `running_workers` | `runningCount` from WorkerManager `/worker-pools/stats` (workers in "running" state) |
+| `existing_capacity` | `currentCapacity` from same endpoint (total capacity not yet stopped) |
+| `claimed_tasks` | Count of runs where `started_at IS NOT NULL AND resolved_at IS NULL` in our local DB |
+
+Rows land in `queue_forecast_worker_counts` (one row per queue per 5-min slot, upserted idempotently). A daily dimension refresh classifies each `task_queue_id` as `'dynamic'` (managed by WorkerManager) or `'static'` (self-hosted) in `queue_forecast_worker_pools`.
+
+The service operates **anonymously** — no Taskcluster credentials are required.
+
+### How to run
+
+```bash
+cd tools/queue-forecasting
+docker compose --profile worker-counter up -d
+```
+
+To run alongside the collector:
+
+```bash
+docker compose --profile collector --profile worker-counter up -d
+```
+
+### Expected row rate
+
+Approximately 50–100 rows per 5-minute sample (one row per active queue). At that rate, 1 month of data is ~432 000–864 000 rows.
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `TASKCLUSTER_ROOT_URL` | e.g., `https://firefox-ci-tc.services.mozilla.com` |
+| `DATABASE_URL` | e.g., `postgresql://postgres@localhost:5433/forecasting` |
+
 ## Running Tests
 
 ### Smoke Tests (requires Postgres)

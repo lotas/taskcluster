@@ -125,3 +125,29 @@ SELECT 'task_events (with run_id)', count(*)
 
 -- queue_forecast_task_runs count should match task_events-with-run_id count
 -- queue_forecast_tasks count should match distinct task_id count
+
+-- ==========================================
+-- TABLE 4: Worker-count time series
+-- ==========================================
+CREATE TABLE IF NOT EXISTS queue_forecast_worker_counts (
+    sampled_at         TIMESTAMPTZ NOT NULL,
+    task_queue_id      TEXT NOT NULL,
+    running_workers    INTEGER,
+    claimed_tasks      INTEGER,
+    existing_capacity  INTEGER,
+    source             TEXT NOT NULL,
+    PRIMARY KEY (task_queue_id, sampled_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_qf_worker_counts_sampled_at
+    ON queue_forecast_worker_counts (sampled_at);
+
+-- ==========================================
+-- TABLE 5: Worker pool classification (daily-refreshed dimension)
+-- ==========================================
+CREATE TABLE IF NOT EXISTS queue_forecast_worker_pools (
+    task_queue_id   TEXT PRIMARY KEY,
+    pool_kind       TEXT NOT NULL,     -- 'dynamic' | 'static' | 'unknown'
+    provider_type   TEXT,              -- for dynamic: 'aws' | 'azure' | 'google' | 'static' | etc.
+    refreshed_at    TIMESTAMPTZ NOT NULL
+);

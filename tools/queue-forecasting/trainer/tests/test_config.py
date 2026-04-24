@@ -1,8 +1,7 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import textwrap
 
 import pytest
@@ -199,6 +198,101 @@ def test_config_parses_residual_block(tmp_path):
         "baseline_feature": "bl_wait_p50",
         "transform": "log_ratio",
     }
+
+
+def test_config_parses_velocity_features(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+        velocity_features:
+          enabled: true
+          trailing_windows_minutes: [60, 240]
+          tolerance_minutes: 5
+    """)
+    c = cfg.load_config(path)
+    assert c.velocity_features == {
+        "enabled": True,
+        "trailing_windows_minutes": [60, 240],
+        "tolerance_minutes": 5,
+    }
+
+
+def test_config_velocity_features_default_none(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.velocity_features is None
+
+
+def test_config_parses_throughput_features(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+        throughput_features:
+          enabled: true
+          windows_minutes: [15, 60]
+    """)
+    c = cfg.load_config(path)
+    assert c.throughput_features == {
+        "enabled": True,
+        "windows_minutes": [15, 60],
+    }
+
+
+def test_config_throughput_features_default_none(tmp_path):
+    # Uses an existing test YAML without the block — should be None.
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.throughput_features is None
 
 
 def test_resolve_holdout_days_cli(tmp_path):

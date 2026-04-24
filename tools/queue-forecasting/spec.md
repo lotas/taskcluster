@@ -7,6 +7,28 @@ collects task lifecycle data, and predicts how long tasks will take to run
 and wait in queue. Lives in `tools/queue-forecasting/` within the Taskcluster
 monorepo.
 
+**V1 design (gated on feature maturity)**
+
+Phase 1 experiments showed direct LightGBM under-performs the percentile
+baseline on both targets. Phase 2 validated a residual architecture where the
+baseline percentile prediction is fed to LightGBM as an input feature and the
+model learns a log-ratio correction. This architecture clears the MAE target on
+both run_duration (−6.3%) and wait_time (−15.3%), but wait-time ratio-accuracy
+on long waits (30m+ bucket: 38.6% within-2x) is not yet user-acceptable.
+
+This spec describes the **intended** V1 design. Production deployment is
+explicitly gated on closing the long-tail ratio-accuracy gap — primarily via
+queue-velocity features (active worker count, tasks_completed_in_last_N_min)
+that would let the model distinguish a fast-draining queue from a stalled one.
+Training pipeline, schema, serving flow, and artifacts are all defined here
+because they are stable; the sequencing is: (1) feature work, (2) re-evaluate,
+(3) if 30m+ bucket reaches within-2x ≥ 50% and overall ratio-accuracy is
+user-acceptable, proceed to ONNX export + Node inference wiring.
+
+The **baseline percentile stats are a first-class serving artifact**, not just
+an experimentation aid — they will be exported nightly alongside the ONNX
+models and loaded by the predictor at startup.
+
 ## Environment
 
 - **Runtime:** Node.js (ESM) for collection and real-time inference;
@@ -19,25 +41,36 @@ monorepo.
 
 ## Goals
 
-### V1 (ship first)
+### V1 (intended design; production gated on feature maturity)
 
 1. **Per-task run duration prediction** — given a newly pending run, predict
-   execution time (p50/p90) using LightGBM trained on task identity, queue,
-   tags, and other stored attributes.
+   execution time (p50/p90) using a residual LightGBM model: a percentile
+   baseline provides a memorized p50, which is fed as an input feature to
+   LightGBM that learns a log-ratio correction on top.
 2. **Per-task wait time prediction** — predict queue wait time (p50/p90)
-   using queue depth, priority, time-of-day, and queue identity.
+   using the same residual architecture: percentile baseline (keyed on
+   queue + pending bucket, priority, etc.) provides p50, LightGBM corrects.
    Goals 1+2 compose into an ETA.
 3. **Prediction API** — expose predictions for newly pending runs with model
    version and confidence metadata. TC UI as first consumer.
+4. **Queue depth time-series collection** — the collector writes a
+   `queue_forecast_queue_depth_samples` row per queue every 5 minutes from
+   V1 onward, seeding the data needed for V2 queue load prediction.
+5. **Worker-count time-series collection** — a dedicated `worker-counter`
+   service polls the Taskcluster `worker-manager.listWorkerPoolsStats` API
+   every 5 minutes and writes per-pool worker counts to
+   `queue_forecast_worker_counts`. Collection begins in V1 so that enough
+   history is available when queue-velocity features are introduced in
+   Phase 3a training. See Collection §"Worker Count Sampling".
 
-### V2 (data collection starts now, features ship later)
+### V2 (features ship later, data collected from V1)
 
-4. **Queue-level forecasting** — "if I submit to this queue now, how long
+6. **Queue-level forecasting** — "if I submit to this queue now, how long
    will it wait?" and "what is the expected drain time for the current
    backlog?" Reuses the wait-time model with hypothetical inputs.
-5. **Queue load prediction** — predict pending count for a given queue at a
-   given hour and day-of-week. Requires time-series queue depth data
-   collected from V1 onward.
+7. **Queue load prediction** — predict pending count for a given queue at a
+   given hour and day-of-week. Uses time-series queue depth data collected
+   continuously from V1 onward (see goal 4).
 
 ### Non-goals
 
@@ -157,10 +190,15 @@ CREATE TABLE queue_forecast_run_predictions (
     -- Variable-length
     task_id                      TEXT NOT NULL,
     model_version                TEXT NOT NULL,
+    predictor_kind               TEXT NOT NULL,
     input_features               JSONB,
 
-    PRIMARY KEY (task_id, run_id)
+    PRIMARY KEY (task_id, run_id, model_version, predictor_kind)
 );
+CREATE INDEX idx_qf_run_predictions_run
+    ON queue_forecast_run_predictions (task_id, run_id);
+CREATE INDEX idx_qf_run_predictions_predicted_at
+    ON queue_forecast_run_predictions (predicted_at);
 ```
 
 Notes:
@@ -168,8 +206,104 @@ Notes:
 - `guaranteed_completion_time = pending_at + wait_p90_s + run_p90_s`
 - `input_features` captures the exact feature vector fed to the model,
   enabling post-hoc debugging ("why did the model predict 45 minutes?").
-- One prediction per run. If models are updated, the old prediction is
-  overwritten.
+- `predictor_kind` is a TEXT discriminator identifying which predictor
+  produced the row. Known values: `'baseline'`, `'residual_lightgbm'`,
+  `'lightgbm_direct'`. Future variants (e.g. XGBoost) add new values.
+- The primary key is `(task_id, run_id, model_version, predictor_kind)`.
+  Old predictions are **not** overwritten when models are updated; each
+  model version and predictor kind appends its own row. This enables
+  side-by-side shadow-mode comparison across model versions without
+  requiring a separate table.
+- Retention: the 45-day rolling window applies, enforced via partition
+  on `predicted_at` (same pattern as `queue_forecast_task_runs`).
+- Lookup by run: use the `(task_id, run_id)` index; the API should
+  select the row with the current `predictor_kind` and latest
+  `model_version` for serving.
+
+### `queue_forecast_queue_depth_samples`
+
+Periodic snapshots of queue depth per `task_queue_id`, collected from V1
+onward. Required for V2 queue load prediction (goal 6). Collection starts
+immediately in V1 so that enough history exists when V2 features are built.
+
+```sql
+CREATE TABLE queue_forecast_queue_depth_samples (
+    sampled_at     TIMESTAMPTZ NOT NULL,
+    task_queue_id  TEXT NOT NULL,
+    queue_pending  INTEGER NOT NULL,
+    PRIMARY KEY (task_queue_id, sampled_at)
+);
+CREATE INDEX idx_qf_depth_samples_sampled_at
+    ON queue_forecast_queue_depth_samples (sampled_at);
+```
+
+Notes:
+- The collector writes one row per active `task_queue_id` every 5 minutes
+  during its existing periodic sync cycle (the same cycle that refreshes
+  in-memory pending counts from the Queue API). The 5-minute interval is
+  cheap — ~100 queues × 12 samples/hour × 24 hours = ~28k rows/day.
+- `queue_pending` is the same in-memory approximate counter used for the
+  `queue_forecast_task_runs.queue_pending` snapshot — no additional API call.
+- Retention: 45-day rolling window, same as the other tables.
+
+### `queue_forecast_worker_counts`
+
+Per-pool worker-count snapshots collected by the `worker-counter` service every
+5 minutes. These time-series rows power the queue-velocity features added to the
+wait-time model in Phase 3a.
+
+```sql
+CREATE TABLE queue_forecast_worker_counts (
+    sampled_at         TIMESTAMPTZ NOT NULL,
+    task_queue_id      TEXT NOT NULL,
+    running_workers    INTEGER,         -- NULL for static pools (V1 accepted gap)
+    claimed_tasks      INTEGER,         -- derived from queue_forecast_task_runs
+    existing_capacity  INTEGER,         -- NULL for static pools
+    source             TEXT NOT NULL,   -- 'tc_api' | 'prometheus_historical'
+    PRIMARY KEY (task_queue_id, sampled_at)
+);
+CREATE INDEX idx_qf_worker_counts_sampled_at
+    ON queue_forecast_worker_counts (sampled_at);
+```
+
+Notes:
+- `running_workers` and `existing_capacity` come from `worker-manager.listWorkerPoolsStats`
+  (`runningCount` and `currentCapacity` fields). Dynamic pools only — static
+  pools carry `NULL` for both columns in V1.
+- `claimed_tasks` is derived from our own `queue_forecast_task_runs` table:
+  rows with `started_at IS NOT NULL AND resolved_at IS NULL` per `task_queue_id`.
+  No external API call is required — this is a key simplification that makes the
+  "busy-worker" signal free from data already collected.
+- `source = 'tc_api'` for live samples from the `worker-counter` service.
+  Historical coverage before the service started can be backfilled from
+  Prometheus with `source = 'prometheus_historical'` (see Collection §"Worker
+  Count Sampling" and Deferred §"Prometheus backfill").
+- Row volume: ~100 pools × 12 samples/hour × 24 h ≈ 28 k rows/day — identical
+  in order of magnitude to `queue_forecast_queue_depth_samples`.
+- Retention: 45-day rolling window, same as other time-series tables.
+
+### `queue_forecast_worker_pools`
+
+Dimension table describing each known worker pool, refreshed daily by the
+`worker-counter` service from `worker-manager.listWorkerPools`.
+
+```sql
+CREATE TABLE queue_forecast_worker_pools (
+    task_queue_id   TEXT PRIMARY KEY,
+    pool_kind       TEXT NOT NULL,   -- 'dynamic' | 'static' | 'unknown'
+    provider_type   TEXT,            -- e.g. 'aws' | 'azure' | 'google' | 'static' | NULL
+    refreshed_at    TIMESTAMPTZ NOT NULL
+);
+```
+
+Notes:
+- `pool_kind` distinguishes dynamic (autoscaled) from static (fixed-size) pools.
+  Static pools drive the `NULL` treatment for `running_workers` / `existing_capacity`
+  in `queue_forecast_worker_counts`.
+- `provider_type` is surfaced as a categorical feature (`provider_type`) in the
+  wait-time model's velocity feature block (see ML Pipeline §"Wait Time Model"
+  feature table).
+- The table is upserted daily; stale rows are overwritten on the next refresh.
 
 ### Indexes
 
@@ -216,6 +350,66 @@ The collector maintains in-memory pending counts per `task_queue_id`:
   `task-pending` time
 
 These are approximate values — documented as such. Good enough for modeling.
+
+### Queue Depth Sampling
+
+During each periodic sync cycle the collector also writes a row to
+`queue_forecast_queue_depth_samples` for every `task_queue_id` that
+has been seen. This happens every 5 minutes, piggybacking on the
+existing 60-second counter-refresh cycle (every ~5 refreshes):
+- No additional Queue API calls — uses the same in-memory counters
+- Provides the time-series queue depth data required for V2 queue load
+  prediction (see Goals §V2)
+- See `queue_forecast_queue_depth_samples` in the Data Model section for
+  the schema and row-volume estimates
+
+### Worker Count Sampling
+
+A dedicated **`worker-counter`** service (Node.js, sibling to `collector` and
+`predictor`) collects per-pool worker counts independently of the Pulse
+collector. Failure in either service does not cascade to the other.
+
+**Signals collected (every 5 minutes):**
+
+| Signal | Source | Notes |
+|--------|--------|-------|
+| `running_workers` | `worker-manager.listWorkerPoolsStats` → `runningCount` | Dynamic pools only |
+| `existing_capacity` | `worker-manager.listWorkerPoolsStats` → `currentCapacity` | Dynamic pools only |
+| `claimed_tasks` | SQL on `queue_forecast_task_runs` | All pools; see derivation below |
+
+`claimed_tasks` derivation (no external API call):
+```sql
+SELECT task_queue_id, count(*) AS claimed_tasks
+FROM queue_forecast_task_runs
+WHERE started_at IS NOT NULL AND resolved_at IS NULL
+GROUP BY task_queue_id;
+```
+Because these rows already exist in our own database, the busy-worker count
+comes free from data the collector already maintains.
+
+**Cadence and access:**
+- Polls `worker-manager.listWorkerPoolsStats` every **5 minutes** for all known
+  dynamic pools.
+- **Anonymous API access** — the `listWorkerPoolsStats` endpoint is publicly
+  readable; no credentials are required.
+- Refreshes `queue_forecast_worker_pools` dimension table **daily** from
+  `worker-manager.listWorkerPools` to track pool additions, removals, and
+  type changes.
+
+**Static pools:** `running_workers` and `existing_capacity` are written as
+`NULL` for V1. Static pools have a fixed, known size and are not the primary
+driver of the queue-velocity problem that these features are meant to address.
+
+**Failure isolation:** `worker-counter` runs as a separate process. A crash
+or API timeout in `worker-counter` does not affect Pulse event processing in
+`collector`. Missed samples leave gaps in `queue_forecast_worker_counts` that
+the trainer handles via the `[T-10m, T]` lookback window (NULL when no sample
+exists).
+
+**`source` column values:**
+- `'tc_api'` — live samples from the `worker-counter` service.
+- `'prometheus_historical'` — backfill rows written by a future standalone
+  script querying PromQL. See Deferred §"Prometheus backfill" for details.
 
 ### Event Routing
 
@@ -353,6 +547,7 @@ runtime.
 
 | Feature | Type | Source | Notes |
 |---------|------|--------|-------|
+| `bl_duration_p50` | numeric | baseline_stats | Baseline percentile p50 — the residual input feature |
 | `metadata_name` | categorical | tasks | Most specific identifier (~5k unique/day) |
 | `normalized_name` | categorical | tasks | Groups retriggered variants |
 | `task_queue_id` | categorical | tasks | Worker pool identity (~50-100 unique) |
@@ -367,6 +562,9 @@ runtime.
 **Build type extraction:** The Python trainer extracts `debug` vs `opt` from
 `metadata_name` via regex (e.g. `test-linux2404-64/debug-...` → `debug`).
 This is one of the strongest run duration predictors in Firefox CI.
+
+**Training target (residual):** `log((run_duration_s + 1) / (bl_duration_p50 + 1))`.
+At inference, inverse-transformed as `exp(model_raw) * (bl_duration_p50 + 1) - 1`.
 
 #### Wait Time Model (`wait_time_model.onnx`)
 
@@ -397,6 +595,7 @@ observed regardless of whether it later completed or failed.
 
 | Feature | Type | Source | Notes |
 |---------|------|--------|-------|
+| `bl_wait_p50` | numeric | baseline_stats | Baseline percentile p50 — the residual input feature |
 | `task_queue_id` | categorical | tasks | Most important baseline |
 | `priority_at_pending` | categorical | task_runs | Critical for scheduling order |
 | `queue_pending` | numeric | task_runs | Backlog depth at enqueue time |
@@ -407,6 +606,42 @@ observed regardless of whether it later completed or failed.
 | `tags->>'project'` | categorical | tasks.tags | try vs autoland behave differently |
 | `hour_sin`, `hour_cos` | numeric | derived | Cyclical encoding of hour-of-day (UTC) |
 | `day_sin`, `day_cos` | numeric | derived | Cyclical encoding of day-of-week |
+
+**Training target (residual):** `log((wait_duration_s + 1) / (bl_wait_p50 + 1))`.
+At inference, inverse-transformed as `exp(model_raw) * (bl_wait_p50 + 1) - 1`.
+
+**Queue-velocity features (V1 collection; Phase 3a inclusion):**
+
+The following features are derived from `queue_forecast_worker_counts` joined
+with `queue_forecast_worker_pools` at training-data export time. Collection
+begins in V1 (via the `worker-counter` service) so that enough history exists
+when Phase 3a training starts. The features are **not included in the initial
+model** — they are added in Phase 3a after sufficient data has accumulated.
+
+For a row pending at time `T` in queue `Q`, the trainer NDJSON export joins the
+most recent worker-count sample in `[T-10m, T]`:
+
+| Feature | Type | Derivation |
+|---------|------|------------|
+| `running_workers_now` | numeric | Latest `running_workers` for Q in `[T-10m, T]` |
+| `claimed_tasks_now` | numeric | Latest `claimed_tasks` for Q in `[T-10m, T]` |
+| `idle_workers_now` | numeric | `max(running_workers_now − claimed_tasks_now, 0)` |
+| `utilization_now` | numeric | `claimed_tasks_now / max(running_workers_now, 1)` |
+| `provision_lag_now` | numeric | `existing_capacity − running_workers` (dynamic only; NULL for static) |
+| `running_workers_1h_avg` | numeric | Mean of `running_workers` over `[T-1h, T)` |
+| `running_workers_1h_delta` | numeric | `running_workers_now − running_workers_1h_avg` |
+| `tasks_per_worker` | numeric | `queue_pending / max(running_workers_now, 1)` |
+| `pool_kind` | categorical | From `queue_forecast_worker_pools` |
+| `provider_type` | categorical | From `queue_forecast_worker_pools` |
+
+All ten features are NULL-safe: LightGBM routes NULL values through its default
+branches, so static pools (where `running_workers` is NULL) and gaps between
+samples degrade gracefully rather than dropping rows.
+
+**Velocity features are wait-time-only.** Worker availability matters a great
+deal for how long a task waits in queue; it matters very little for how long a
+task runs once a worker has claimed it. The run duration model does not include
+these features.
 
 **Cyclical time encoding:**
 ```
@@ -423,13 +658,20 @@ and Friday and Monday are close.
 
 **Sliding window retrain**, not incremental learning. Every night:
 
-1. Python trainer queries Postgres for the relevant lookback window
-2. Trains a fresh LightGBM model from scratch (discards yesterday's model)
-3. Uses `objective=quantile` with `alpha=0.5` for p50, `alpha=0.9` for p90
+1. Export baseline percentile stats from the training window into
+   `baseline_stats.json`. The baseline is computed before training so
+   its p50 values are available as input features.
+2. Python trainer queries Postgres for the relevant lookback window
+3. Joins each row with its baseline p50 and computes the residual
+   training target: `log((y + 1) / (bl_p50 + 1))`
+4. Trains a fresh LightGBM model from scratch (discards yesterday's model)
+   using `objective=quantile` with `alpha=0.5` for p50, `alpha=0.9` for p90
    (two training passes per model, or a single multi-quantile model)
-4. Exports to ONNX format
-5. Writes `run_duration_model.onnx` and `wait_time_model.onnx` to a
-   shared volume
+5. Exports to ONNX format alongside `category_mappings.json` and the
+   already-generated `baseline_stats.json`
+6. Writes all three artifacts to the shared volume as a version-tagged
+   bundle: `run_duration_model.onnx`, `wait_time_model.onnx`,
+   `baseline_stats.json`, `category_mappings.json`
 
 **Why not incremental:** Decision tree incremental learning leads to tree
 bloat (slowing inference) and struggles to adapt when new queue names or
@@ -453,61 +695,138 @@ All feature engineering happens in the Python training script:
 
 ### ONNX Runtime in Node.js
 
-The `predictor.js` service loads both `.onnx` model files into memory
-using `onnxruntime-node`. When a `task-pending` event arrives:
+The `predictor.js` service loads both `.onnx` model files **and the baseline
+stats** into memory at startup. The V1 serving architecture is two-stage:
+
+**Stage 1 — baseline percentile lookup (sub-ms, in-memory):**
+
+The predictor first computes the baseline p50 prediction for the task, using
+the same hierarchical lookup as `src/predictor.js:predictWaitFromStats` and
+`predictDurationFromStats`:
+- Wait time: keyed on `(task_queue_id, pending_bucket, priority_at_pending)`
+  with fallback to coarser keys
+- Run duration: keyed on `(metadata_name)` with fallback to `(normalized_name,
+  task_queue_id)` and broader cohorts
+
+The baseline stats (`baseline_stats.json`) are exported nightly by the
+training pipeline alongside the ONNX models, and hot-reloaded atomically
+together with the models (they are version-coupled).
+
+**Stage 2 — residual LightGBM correction (sub-ms, in-process ONNX):**
+
+When a `task-pending` event arrives:
 
 1. Collector upserts the run into `queue_forecast_task_runs`
 2. Collector calls the predictor with the task/run features
-3. Predictor applies the same feature engineering as training:
-   - Categorical encoding (string -> integer mapping, loaded alongside
-     the ONNX model as a JSON sidecar file)
+3. Predictor performs Stage 1: compute baseline p50 (`bl`) from
+   `baseline_stats.json` for the relevant target
+4. Predictor applies feature engineering:
+   - Categorical encoding (string → int32 via `category_mappings.json`,
+     loaded alongside the ONNX model; see §"Category Mapping Sidecar")
    - Cyclical time encoding from `pending_at`
    - Build type regex extraction from `metadata_name`
-4. Runs both models (run duration + wait time) in-memory
-5. Composes the ETA:
+   - Baseline p50 (`bl_wait_p50` / `bl_duration_p50`) appended as a
+     numeric feature
+5. Runs both ONNX models (run duration + wait time) in-process
+6. Inverse-transforms model output:
+   `y_hat = exp(model_raw) * (bl + 1) - 1`
+7. Composes the ETA:
    - `expected_completion_time = pending_at + wait_p50 + run_p50`
    - `guaranteed_completion_time = pending_at + wait_p90 + run_p90`
-6. Writes prediction to `queue_forecast_run_predictions`
+8. Writes prediction to `queue_forecast_run_predictions` with
+   `predictor_kind = 'residual_lightgbm'`
+
+**Fallback:** if the ONNX model is unavailable, times out, or the category
+mapping rejects the row (cold-start miss on a required feature), the predictor
+falls back to the Stage 1 baseline prediction and writes it with
+`predictor_kind = 'baseline'`. The baseline is always computed first, so
+fallback adds no extra latency to the happy path.
 
 Inference latency target: low single-digit milliseconds per prediction.
-No network calls to Python. No database reads for historical stats.
+No network calls to Python. Baseline stats are loaded in-memory (sub-ms
+lookup via pre-built Map).
 
 ### Category Mapping Sidecar
 
-LightGBM categorical features are integer-coded during training. The
-Python trainer must export a `category_mappings.json` alongside each
-ONNX model containing the string-to-integer mapping for every categorical
-feature. The Node.js predictor loads this at startup and on model reload.
+LightGBM categorical features are int32-coded during training. The Python
+trainer exports a `category_mappings.json` alongside each ONNX model
+containing the string-to-int32 mapping for every categorical feature.
+
+Format:
+
+```json
+{
+  "task_queue_id": { "gecko-1/opt": 0, "gecko-1/debug": 1, "_unknown_": -1 },
+  "priority_at_pending": { "high": 0, "normal": 1, "_unknown_": -1 },
+  "...": { "...": 0 }
+}
+```
+
+**Cold-start code:** The reserved code `-1` always means "value not seen at
+training time." Python and Node use the same rule. LightGBM treats negative
+int32 category codes as missing values and routes them through its
+default "unknown" branches (the same path as NaN for numeric features).
+
+**Node.js inference rule:** look up the feature value in the mapping; if
+absent, substitute `-1`. Do NOT use `null`, `undefined`, or the string
+value — use the integer `-1` explicitly. This is a strict contract
+between the Python exporter and the Node.js inference path.
 
 **Parity requirement:** Float/double precision can drift between Python
 and ONNX inference. Automated parity tests between Python predictions
 and Node.js ONNX predictions are a strict requirement before any model
-is deployed.
+is deployed. Parity tests must include at least one cold-start row per
+categorical feature (i.e. a row where the categorical value was not seen
+at training time, mapped to `-1`).
 
 ### Model Hot-Reload
 
 The predictor watches the shared model volume for new `.onnx` files.
 When the nightly trainer writes a new model:
 - Predictor detects the new file (filesystem watch or polling)
-- Loads new model + category mappings into memory
-- Swaps atomically (old model serves requests until new one is ready)
+- Loads new model, `category_mappings.json`, and `baseline_stats.json`
+  into memory — all three are version-coupled and must be swapped
+  together atomically
+- Swaps atomically (old model + old baseline serve requests until new
+  set is fully loaded and parity-checked)
 - Logs the model version transition
+
+The `baseline_stats.json` is coupled to the ONNX model because the
+baseline lookup is a first-class input feature: a model trained on one
+set of baseline statistics must not be run with a different baseline at
+serving time. The nightly training pipeline exports all three artifacts
+(`run_duration_model.onnx`, `wait_time_model.onnx`, `baseline_stats.json`)
+as a single version-tagged bundle.
 
 ### Cold Start Handling
 
 When LightGBM encounters a categorical value it has never seen during
 training (e.g., a brand new `metadata_name` or `task_queue_id`):
 
-- LightGBM treats unseen categoricals as a separate "unknown" bucket
-  and routes them through decision tree branches based on other features
-- This means a brand new task type still gets a prediction — it just
-  relies more heavily on `task_queue_id`, `tags`, `scheduler_id`,
-  and other features the model has seen
+- The Python trainer exports `category_mappings.json` (see §"Category
+  Mapping Sidecar") with the string-to-int32 mapping for every categorical
+  feature. The reserved code `-1` means "value not seen at training time."
+- The Node.js predictor looks up each categorical feature value in its
+  mapping. If absent, it substitutes the integer `-1` — not null, not
+  the string value, not any other sentinel. LightGBM treats negative
+  int32 category codes as missing and routes them through the model's
+  default "unknown" branches.
+- A cold-start row still gets a LightGBM prediction — it relies more
+  heavily on features the model has seen (e.g. `task_queue_id`, `tags`,
+  `scheduler_id`) and less on the unseen feature. The residual
+  architecture helps here: the baseline p50 is always available via
+  percentile lookup, so even a fully cold-start row gets a reasonable
+  ETA from Stage 1, and Stage 2 applies whatever correction it can.
+- If the category mapping rejects a row on a required feature (e.g. the
+  queue itself is brand new and the baseline has no stats for it),
+  the predictor falls back to the baseline-only prediction
+  (`predictor_kind = 'baseline'`) rather than producing a poorly-supported
+  residual correction.
 - The `input_features` JSONB in `queue_forecast_run_predictions` should
-  flag which features were unknown, enabling evaluation of cold-start
-  accuracy
-- After one nightly retrain cycle, the new task type enters the
-  training data and gets proper coverage
+  flag which features were cold-start (mapped to `-1`), enabling
+  evaluation of cold-start accuracy.
+- After one nightly retrain cycle, the new task type enters the training
+  data and gets proper coverage.
 
 ## ML Pipeline Architecture Options
 
@@ -774,8 +1093,12 @@ GET /v1/predict/:taskId/:runId
 
 This endpoint reads from `queue_forecast_run_predictions`. If the
 prediction already exists (generated at `task-pending` time), it returns
-it. If the run exists but has no prediction yet (race condition or missed
-event), it generates one on the fly.
+the row where `predictor_kind = 'residual_lightgbm'` and `model_version`
+matches the currently loaded model. If no LightGBM prediction is present
+(e.g. only a baseline fallback row exists), it returns the baseline row.
+If the run exists but has no prediction at all (race condition or missed
+event), it generates one on the fly and includes `predictorKind` in the
+response so callers know which predictor was used.
 
 ### Queue Status Endpoint (V2)
 
@@ -798,6 +1121,27 @@ against actuals.
 - **Strict time-split only.** Never random split. Train on days 1-N,
   evaluate on day N+1. Random splitting leaks future information.
 - Evaluation runs automatically after each nightly training cycle.
+
+### Evaluation population vs serving population
+
+Evaluation during offline model development uses a held-out time window
+where only `reason_resolved = 'completed'` runs are evaluated (the
+"primary" slice from the trainer spec). This is an apples-to-apples
+comparison against the baseline, which also uses only completed runs.
+
+However, the model serves predictions to **all pending runs**, including
+those that will eventually fail, be retried, or be exceptional. Before
+a new model is promoted from shadow-mode to production, evaluation must
+be run on the **serving population**: all pending runs with observable
+ground truth (wait time: `started_at IS NOT NULL`; run duration:
+`run_duration_s IS NOT NULL`). This is the "supplemental" slice
+(`reason_resolved IN ('completed', 'failed')`) from the trainer spec.
+
+**Promotion rule:** the primary slice (completed-only) drives the
+go/no-go decision for Phase 1. The supplemental slice is the gate for
+promoting a shadow-mode candidate to production — it is the population
+the model actually serves and is therefore the definitive accuracy signal
+for deployment.
 
 ### Metrics
 
@@ -832,10 +1176,12 @@ SELECT
     rp.expected_completion_time,
     rp.guaranteed_completion_time,
     rp.model_version,
+    rp.predictor_kind,
     r.wait_duration_s   AS actual_wait,
     r.run_duration_s    AS actual_run,
     r.pending_at,
     r.resolved_at,
+    r.reason_resolved,
     t.task_queue_id,
     t.tags
 FROM queue_forecast_run_predictions rp
@@ -847,9 +1193,24 @@ WHERE r.resolved_at IS NOT NULL
   AND r.started_at IS NOT NULL
   AND r.resolved_at >= $1::date
   AND r.resolved_at < $1::date + INTERVAL '1 day'
+  AND rp.predictor_kind = 'residual_lightgbm'   -- filter to production predictor
+  AND rp.model_version  = $2                     -- pin to a specific version
 ```
 
+The `predictor_kind` filter selects predictions from the production
+predictor; omit it (or use `IN ('residual_lightgbm', 'baseline')`) to
+include shadow-mode predictions for comparison. The `reason_resolved`
+column is included so the caller can slice into the primary
+(completed-only) and supplemental (completed + failed) populations.
+
 ### Rollout
+
+**Feature-maturity gate (prerequisite to all phases below):** No phase below
+begins until the long-tail ratio-accuracy gap is closed. Specifically, the
+30m+ wait bucket must reach within-2x ≥ 50% (current: 38.6%). The primary
+path is queue-velocity feature experiments (active worker count,
+tasks_completed_in_last_N_min). See `trainer-phase2-decision.md §5` for
+the full sequencing.
 
 | Phase | What ships | Predictions visible? |
 |-------|-----------|---------------------|
@@ -858,7 +1219,7 @@ WHERE r.resolved_at IS NOT NULL
 | **Phase 3** | TC UI integration | Default-on for supported queues. |
 
 No model is exposed to users without passing automated evaluation on
-the metrics above.
+the metrics above, including the per-bucket within-2x thresholds.
 
 ## Data Retention
 
@@ -888,9 +1249,10 @@ partitioned on `predicted_at`.
 
 ### Model Artifacts
 
-Keep the last 7 days of `.onnx` model files and `category_mappings.json`
-on the shared volume. Allows quick rollback if a nightly model degrades.
-Older artifacts are deleted.
+Keep the last 7 days of `.onnx` model files, `category_mappings.json`,
+and `baseline_stats.json` on the shared volume. These three artifacts
+are version-coupled and must be retained together. Allows quick rollback
+if a nightly model degrades. Older artifacts are deleted.
 
 ## Migration from `task_events`
 
@@ -959,10 +1321,15 @@ CREATE TABLE queue_forecast_run_predictions (
     -- Variable-length
     task_id                      TEXT NOT NULL,
     model_version                TEXT NOT NULL,
+    predictor_kind               TEXT NOT NULL,
     input_features               JSONB,
 
-    PRIMARY KEY (task_id, run_id)
+    PRIMARY KEY (task_id, run_id, model_version, predictor_kind)
 );
+CREATE INDEX idx_qf_run_predictions_run
+    ON queue_forecast_run_predictions (task_id, run_id);
+CREATE INDEX idx_qf_run_predictions_predicted_at
+    ON queue_forecast_run_predictions (predicted_at);
 ```
 
 ### Step 2: Migrate the data
@@ -1067,11 +1434,12 @@ CREATE TABLE queue_forecast_task_runs_w2026_13
 
 ## Deferred / Future Work
 
-- **Queue depth time-series** (`queue_forecast_queue_depth_samples` table) —
-  needed for goal 5 (queue load prediction by time/day). Start collecting
-  once V1 prediction pipeline is stable.
-- **Queue drain forecasting** — builds on wait-time model + queue depth
-  data. V2 feature.
+- **Queue drain forecasting** — builds on the wait-time model + queue
+  depth time-series (collected from V1 onward via
+  `queue_forecast_queue_depth_samples`). V2 feature.
+- **Queue load prediction model** — predicts pending count for a given
+  queue at a given hour and day-of-week. Uses the time-series data being
+  collected continuously from V1 onward. V2 feature.
 - **Trend/regression detection** — daily cohort rollups comparing trailing
   7-day vs 28-day quantiles. Requires stable evaluation pipeline first.
 - **bugbug migration** — V1 starts standalone (Approach C) to validate
@@ -1080,9 +1448,33 @@ CREATE TABLE queue_forecast_task_runs_w2026_13
   infrastructure. See "ML Pipeline Architecture Options" above for the
   full comparison. Decision point: after Phase 1 evaluation metrics are
   stable.
-- **Shadow mode comparison** — running a new model version
-  side-by-side with production and auto-promoting only if it wins on
-  evaluation metrics. Applicable regardless of pipeline architecture.
+- **Shadow mode comparison** — running a new model version or predictor
+  kind side-by-side with production by writing additional rows to
+  `queue_forecast_run_predictions` (different `predictor_kind` and/or
+  `model_version` values). Auto-promotion if the candidate wins on
+  evaluation metrics. The multi-row PK added in V1 makes this possible
+  without schema changes.
+- **Prerequisites to production** (from Phase 2 known gaps; these block
+  Phase 3a and must be resolved before any model ships to users):
+  - **Queue-velocity features (primary prerequisite)** — the 10 features
+    described in ML Pipeline §"Wait Time Model" (velocity feature block),
+    derived from `queue_forecast_worker_counts` and `queue_forecast_worker_pools`
+    (see Data Model for schemas). These are the targeted fix for the 30m+
+    ratio-accuracy gap (current: 38.6% within-2x; required: ≥ 50%).
+    Status:
+    - Collection: in progress — `worker-counter` service running as of 2026-04-24
+      (see Collection §"Worker Count Sampling").
+    - Feature extraction: pending — the trainer NDJSON export path needs to join
+      `queue_forecast_worker_counts` + `queue_forecast_worker_pools` at
+      feature-extraction time.
+    - Re-train + re-evaluate: pending.
+    - Exit criterion: 30m+ within-2x ≥ 50%, aggregate within-2x ≥ 60%.
+  - within-2x calibration improvements via loss-function tuning or
+    bucket-conditional quantile choice (secondary; pursue if velocity
+    features alone do not close the gap)
+  - p90 coverage tightening toward 90% (transform choice or alpha tuning)
+  - XGBoost `QuantileModel` subclass (pluggable interface already exists;
+    experiment once the production path is unblocked)
 - **TC UI integration** — wiring the prediction API into the task
   detail view.
 - **Lando landing queue as a leading indicator** — Lando's merge queue
@@ -1102,9 +1494,19 @@ CREATE TABLE queue_forecast_task_runs_w2026_13
   them distinguish normal load from closure-recovery bursts. Backfill
   detection is harder — may require identifying sheriff-triggered task
   groups via `scheduler_id` or push metadata.
+- **Prometheus historical backfill** — the `worker-counter` service
+  begins collecting from 2026-04-24 onward. Historical coverage from
+  before that date can be backfilled via a standalone script that queries
+  PromQL metrics (`fxci_queue_running_workers`,
+  `fxci_queue_claimed_tasks`, `fxci_worker_manager_existing_capacity`)
+  and writes rows to `queue_forecast_worker_counts` with
+  `source = 'prometheus_historical'`. The `source` column makes the
+  multi-origin picture first-class in the schema — live and backfilled
+  rows coexist without special-casing in the trainer. The backfill script
+  is future work and does not block live collection or Phase 3a training.
 - **Guiding principle: TC-only first, extend if needed** — V1
   deliberately uses only Taskcluster-internal data (Pulse events, Queue
   API). The evaluation pipeline (within-2x rate, pinball loss, p90
   calibration) provides an objective checkpoint: if TC-only features
-  don't meet accuracy targets after Phase 1 evaluation, that is the
-  signal to integrate external sources like Lando and TreeHerder.
+  don't meet accuracy targets, that is the signal to integrate external
+  sources like Lando and TreeHerder.

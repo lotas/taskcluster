@@ -80,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
                 alpha=alpha,
                 params=c.model_params,
                 baseline_feature=c.residual["baseline_feature"],
+                transform=c.residual.get("transform", "log_ratio"),
             )
         return LightGBMQuantileModel(alpha=alpha, params=c.model_params)
 
@@ -93,10 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     # Save models + manifest.
     run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Output filenames key off the config stem so each variant (e.g. log_ratio,
+    # additive, log_diff) keeps its own manifest instead of overwriting.
+    run_stem = c.source_path.stem
     for q, m in models.items():
         tag = f"p{int(q * 100)}"
-        suffix = "_residual" if c.residual else ""
-        m.save(run_dir / f"{c.target}{suffix}_{tag}.lgb")
+        m.save(run_dir / f"{run_stem}_{tag}.lgb")
 
     # Evaluate. Target key matches what the baseline JSON uses:
     # baseline stores both "duration" and "wait" blocks; we pick ours.
@@ -169,8 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest["evaluation"]["primary"]["lightgbm_only_buckets_aggregate"] = prior_primary.get("buckets_aggregate")
         manifest["evaluation"]["primary"]["prior_manifest_trained_at"]       = prior_manifest.get("trained_at")
 
-    suffix = "_residual" if c.residual else ""
-    (run_dir / f"{c.target}{suffix}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    (run_dir / f"{run_stem}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
 
     # Summary printing ------------------------------------------------------
 

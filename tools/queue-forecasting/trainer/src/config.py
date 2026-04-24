@@ -43,6 +43,8 @@ class Config:
     quantiles: list[float]
     model_params: dict[str, Any]
     residual: dict[str, Any] | None = None
+    velocity_features: dict[str, Any] | None = None
+    throughput_features: dict[str, Any] | None = None
     source_path: Path = field(default_factory=Path)
 
 
@@ -69,6 +71,8 @@ def load_config(path: str | Path) -> Config:
         quantiles=list(raw["quantiles"]),
         model_params=dict(raw.get("model_params") or {}),
         residual=raw.get("residual"),
+        velocity_features=raw.get("velocity_features"),
+        throughput_features=raw.get("throughput_features"),
         source_path=p,
     )
 

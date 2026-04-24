@@ -79,5 +79,25 @@ services:
     entrypoint: ["uv", "run", "python", "-m", "src.train"]
     working_dir: /app/trainer
 
+  worker-counter:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    command: ["node", "src/worker-counter.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 10s
+    restart: unless-stopped
+    profiles:
+      - worker-counter
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+
 volumes:
   pgdata:

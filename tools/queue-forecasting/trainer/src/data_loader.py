@@ -9,8 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import timezone
 
 import pandas as pd
 import psycopg
@@ -126,6 +126,134 @@ def load_baseline_predictions(path: Path) -> pd.DataFrame:
     return df[keep]
 
 
+def load_worker_counts(
+    c: Config,
+    train_start: datetime,
+    as_of_date: datetime,
+) -> pd.DataFrame:
+    """Load worker-count time-series from Postgres, cached to Parquet.
+
+    The lookback covers train_start - 1.5 hours so that trailing-window
+    averages at the very start of the training period have enough history.
+    Worker counts don't depend on model config, so the cache key is purely
+    the time range.
+    """
+    from datetime import timedelta
+
+    fetch_from = train_start - timedelta(hours=1, minutes=30)
+    fetch_to = as_of_date
+
+    from_str = fetch_from.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    to_str = fetch_to.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    cache_file = CACHE_DIR / f"worker_counts_{from_str}_{to_str}.parquet"
+
+    if cache_file.exists():
+        return pd.read_parquet(cache_file)
+
+    dsn = os.environ["DATABASE_URL"]
+    query = """
+SELECT task_queue_id, sampled_at, running_workers, claimed_tasks, existing_capacity
+FROM queue_forecast_worker_counts
+WHERE sampled_at >= %(fetch_from)s
+  AND sampled_at < %(fetch_to)s
+ORDER BY task_queue_id, sampled_at;
+"""
+    params = {"fetch_from": fetch_from, "fetch_to": fetch_to}
+    with psycopg.connect(dsn) as conn:
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        except Exception:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                columns = [d.name for d in cur.description]
+                df = pd.DataFrame(rows, columns=columns)
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_file, index=False)
+    return df
+
+
+def load_worker_pools() -> pd.DataFrame:
+    """Load the worker-pool dimension table from Postgres.
+
+    Small table (~650 rows), no caching needed.
+    """
+    dsn = os.environ["DATABASE_URL"]
+    query = """
+SELECT task_queue_id, pool_kind, provider_type
+FROM queue_forecast_worker_pools;
+"""
+    with psycopg.connect(dsn) as conn:
+        try:
+            df = pd.read_sql_query(query, conn)
+        except Exception:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+                columns = [d.name for d in cur.description]
+                df = pd.DataFrame(rows, columns=columns)
+    return df
+
+
+def load_task_runs_for_throughput(
+    c: Config,
+    window_start: datetime,
+    window_end: datetime,
+) -> pd.DataFrame:
+    """Load task-run history needed by add_throughput_features, cached to Parquet.
+
+    Returns columns: task_queue_id, started_at, resolved_at,
+    wait_duration_s, run_duration_s.
+
+    The range [window_start, window_end] should be wide enough to cover the
+    widest trailing window for every training row: callers typically pass
+    train_start - max_window_minutes - 30m  as window_start and as_of_date
+    as window_end.
+
+    Rows are filtered to resolved_at IS NOT NULL (in-progress runs carry no
+    useful throughput signal).  Caching is independent of the main query
+    cache so that different model configs that share the same time range
+    reuse the same Parquet file.
+    """
+    from_str = window_start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    to_str   = window_end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    cache_file = CACHE_DIR / f"throughput_runs_{from_str}_{to_str}.parquet"
+
+    if cache_file.exists():
+        return pd.read_parquet(cache_file)
+
+    dsn = os.environ["DATABASE_URL"]
+    # task_queue_id lives on queue_forecast_tasks, not on queue_forecast_task_runs.
+    query = """
+SELECT t.task_queue_id,
+       r.started_at,
+       r.resolved_at,
+       r.wait_duration_s,
+       r.run_duration_s
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.resolved_at IS NOT NULL
+  AND r.resolved_at >= %(window_start)s
+  AND r.resolved_at <= %(window_end)s
+  AND t.task_queue_id IS NOT NULL;
+"""
+    params = {"window_start": window_start, "window_end": window_end}
+    with psycopg.connect(dsn) as conn:
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        except Exception:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                columns = [d.name for d in cur.description]
+                df = pd.DataFrame(rows, columns=columns)
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_file, index=False)
+    return df
+
+
 def load(c: Config, *, refresh_cache: bool = False) -> pd.DataFrame:
     path = cache_path(c)
     if path.exists() and not refresh_cache:
@@ -162,4 +290,32 @@ def load(c: Config, *, refresh_cache: bool = False) -> pd.DataFrame:
             raise RuntimeError(
                 f"Baseline join changed row count: {before} -> {len(df)} (duplicate keys?)"
             )
+
+    if c.velocity_features and c.velocity_features.get("enabled"):
+        from src.velocity_features import add_velocity_features
+
+        w = compute_windows(c)
+        worker_counts = load_worker_counts(c, w.train_start, w.as_of_date)
+        worker_pools = load_worker_pools()
+        trailing = tuple(c.velocity_features.get("trailing_windows_minutes", [60]))
+        tol = int(c.velocity_features.get("tolerance_minutes", 10))
+        df = add_velocity_features(
+            df, worker_counts, worker_pools,
+            tolerance_minutes=tol,
+            trailing_windows_minutes=trailing,
+        )
+
+    if c.throughput_features and c.throughput_features.get("enabled"):
+        from src.queue_throughput import add_throughput_features
+
+        w = compute_windows(c)
+        windows = tuple(c.throughput_features.get("windows_minutes", [15, 60]))
+        max_window = max(windows) if windows else 60
+        runs_df = load_task_runs_for_throughput(
+            c,
+            w.train_start - pd.Timedelta(minutes=max_window + 30),
+            w.as_of_date,
+        )
+        df = add_throughput_features(df, runs_df, windows_minutes=windows)
+
     return df
