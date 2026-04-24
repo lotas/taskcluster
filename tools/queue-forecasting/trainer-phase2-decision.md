@@ -128,3 +128,119 @@ Phase 3a.
 ## Recommendation
 
 Architecture is the right shape. Numbers are not user-acceptable yet. The residual + log_ratio + baseline-as-serving-artifact design is confirmed — no architecture rework needed. The next work is feature experiments (queue velocity first); production path is deferred until the long-tail ratio-accuracy meets user bar (30m+ within-2x ≥ 50%).
+
+---
+
+## 6. Experiment log
+
+Append-only, reverse-chronological. Each entry records the exact config, cohort windows, aggregate and per-bucket metrics (wait-model only), the comparison reference, and the concrete next action it triggered.
+
+**Conventions:**
+- "Cohort" = `train [start, end), val day, holdout [start, end)` over `pending_at` in UTC.
+- "Primary slice" = `reason_resolved = 'completed'` unless noted.
+- Numbers are manifest `evaluation.primary.aggregate` values.
+- `w/in2x` = within-2x ratio; `p90cov` = fraction of actuals ≤ predicted p90 (target band [0.85, 0.95]).
+- **Same-cohort comparisons only.** Across cohorts the baseline itself shifts materially (see E10 vs E4) — comparing across runs from different dates is not valid.
+
+### 2026-04-24 — Phase 3a feature work
+
+#### E11 (pending): `wait_time_residual.yaml` + `wait_time.yaml` on today's cohort
+Purpose: re-establish both no-features baseline (LGB-only) and residual-only (no throughput) on Apr 19-23 cohort so the next E12 run fires a real 3-way compare against apples-to-apples predecessors. Must complete before any further throughput conclusions.
+
+#### E10: `wait_time_residual_throughput.yaml`  (Apr 19-23 cohort)
+First run with DB-derived throughput/drain features: `queue_tasks_started_{15,60}m`, `queue_tasks_completed_{15,60}m`, `queue_avg_wait_{15,60}m`, `queue_avg_run_time_{15,60}m` (leakage-gated to `resolved_at < pending_at`). Per-row loops vectorized via `np.searchsorted` over per-queue cumulative arrays (earlier impl took ~20 min, vectorized ~0.5s at 100k rows).
+
+- Cohort: train [2026-04-04, 2026-04-18), val 2026-04-18, holdout [2026-04-19, 2026-04-24)
+- Rows: train=2,535,783 val=63,605 hold=892,080
+- Aggregate: **MAE=706.8s w/in2x=49.4% p90cov=73.3%**
+- Δ vs today's baseline: MAE −12.9%, w/in2x +0.9pp, **p90cov out of band**
+- Per-bucket (LGB vs same-cohort baseline):
+  | bucket | n       | base MAE | lgb MAE  | base w/in2x | lgb w/in2x |
+  |---     |---      |---       |---       |---          |---         |
+  | <1m    | 389,488 | 56.1s    | **22.8s** (−59%) | 41.8%  | **43.2%**  |
+  | 1-5m   | 201,803 | 175.9s   | **100.2s** (−43%)| 64.7%  | **65.7%**  |
+  | 5-30m  | 141,964 | **517.5s** | 537.6s (+4%)   | **60.0%** | 54.7%   |
+  | 30m+   |  75,978 | 6925s    | **6141s** (−11%) | 17.8%  | **26.0%**  |
+- Interpretation:
+  - Throughput features deliver big wins on short-wait MAE (<1m: −59%, 1-5m: −43%) — the "queue is draining fast" signal directly helps.
+  - 5-30m bucket regresses slightly on within-2x (−5.3pp); still the weakest bucket.
+  - 30m+ within-2x improved (+8.2pp) but still far from ≥50% target.
+  - **p90 coverage tanked to 73.3%** — residual p90 is over-confident. Possibly throughput features let p90 lean on recent fast-drain windows and miss long-tail cases.
+- Cannot declare win/loss until same-cohort comparison (E11).
+- Next: E11 (wait_time_residual.yaml + wait_time.yaml on today's 2026-04-24 run_dir) to enable 3-way.
+
+#### E9: `backfill_claimed_tasks.py`  (infra, not a model run)
+Computed historical `claimed_tasks` from `queue_forecast_task_runs` and wrote to `queue_forecast_worker_counts` with `source='db_derived'` for the full data range. Used `generate_series` over 5-min steps joined to runs where `started_at ≤ T AND (resolved_at > T OR resolved_at IS NULL)`. Replaces Prometheus backfill path (no API access).
+
+#### E8: `worker-counter` service launched
+Live 5-min polling of `worker-manager.listWorkerPoolsStats` started. Initial sample: 558 rows, 531 dynamic pools + 122 static pools classified in `queue_forecast_worker_pools`. Source column value `tc_api`. Live collection ongoing.
+
+### 2026-04-23 — Phase 2 residual experiments
+
+#### E7: `run_duration_residual.yaml`
+- Cohort: train [2026-03-24, 2026-04-17), val 2026-04-17, holdout [2026-04-18, 2026-04-23)
+- Rows: train=5,023,092 val=156,506 hold=757,919
+- Aggregate: **MAE=130.1s w/in2x=89.7% p90cov=87.9%**
+- Δ vs baseline: MAE **−6.3%**, w/in2x +1.0pp
+- Δ vs LGB-only: MAE −11.3%, w/in2x +0.6pp
+- Spec go/no-go: MAE ≥5% ✅, p90 in band ✅
+- Interpretation: **clean win**. Phase 1 "clean miss" reverses — the baseline's `metadata_name` exact-match percentile becomes a feature instead of a competitor, and LightGBM adds small but consistent corrections.
+
+#### E6: `wait_time_residual_logdiff.yaml`  (`log_diff` transform)
+- Cohort: Apr 18-22 (same as E4/E5)
+- Aggregate: **MAE=519.9s w/in2x=54.6% p90cov=85.8%**
+- Matches E4 (`log_ratio`) to the last decimal.
+- Interpretation: confirmed algebraic identity `log1p(y) - log1p(bl) ≡ log((y+1)/(bl+1))`. Useful as a sanity check but no new information.
+
+#### E5: `wait_time_residual_additive.yaml`  (additive transform)
+- Cohort: Apr 18-22
+- Aggregate: **MAE=549.9s w/in2x=53.4% p90cov=90.9%**
+- Δ vs E4 (log_ratio): MAE **+5.8% (worse)**, w/in2x **−1.2pp (worse)**, p90cov **+5.1pp (better)**
+- Per-bucket (vs same-cohort baseline):
+  | bucket | base MAE | add MAE  | base w/in2x | add w/in2x |
+  |---     |---       |---       |---          |---         |
+  | <1m    | 32.0s    | 39.9s    | 43.3%       | 43.1%      |
+  | 1-5m   | 117.6s   | 136.8s   | 67.5%       | 68.3%      |
+  | 5-30m  | 423.2s   | 528.0s   | 62.3%       | 63.1%      |
+  | 30m+   | 8175s    | 6652s    | 22.8%       | **45.3%**  |
+- Interpretation: additive loses on MAE and w/in2x across most buckets, but wins on **30m+ within-2x (+22.5pp)** and **p90 calibration**. Logged as an option if p90 coverage becomes the binding constraint or if the 30m+ long-tail win becomes more important than short-bucket gains. Not the default winner.
+
+#### E4: `wait_time_residual.yaml`  (log_ratio transform) — the Phase 2 incumbent winner
+- Cohort: train [2026-04-04, 2026-04-18), val 2026-04-18, holdout [2026-04-19, 2026-04-24) (i.e. Apr 18-22 cohort measured before today's data rolled)
+- Rows: train=2,615,709 val=160,628 hold=775,042
+- Aggregate: **MAE=519.9s w/in2x=54.6% p90cov=85.8%**
+- Δ vs same-cohort baseline: MAE **−15.3%** ✅, w/in2x +2.9pp (target +5pp — fail), p90cov in band ✅
+- Δ vs E2 (LGB-only): MAE −3.6%, w/in2x +11.9pp
+- Per-bucket:
+  | bucket | n    | base MAE | res MAE | base w/in2x | res w/in2x |
+  |---     |---   |---       |---      |---          |---         |
+  | <1m    | 357k | 32.0s    | **29.4s** | 43.3%     | **44.8%**  |
+  | 1-5m   | 182k | 117.6s   | **105.3s** | 67.5%    | **69.8%**  |
+  | 5-30m  | 127k | **423.2s** | 478.3s  | 62.3%     | **65.1%**  |
+  | 30m+   |  43k | 8175s    | **6525s** | 22.8%     | **38.6%**  |
+- Interpretation: **MAE spec cleared**; within-2x improvement below original +5pp target. Architecture validated. Production deployment gated: user bar is ratio-accuracy at 30m+ (current 38.6% far from acceptable). Drove Phase 3a feature work.
+
+#### E3: `run_duration.yaml`  (LGB-only, Phase 1)
+- Cohort: Apr 18-22
+- Aggregate: MAE=146.6s w/in2x=89.1% p90cov=88.0%
+- Δ vs baseline: MAE **+5.6% (worse)**, w/in2x +0.4pp
+- Verdict: clean miss; baseline `metadata_name` exact-match percentile is hard to beat without using it as a feature. Drove E7 residual experiment.
+
+#### E2: `wait_time.yaml`  (LGB-only, Phase 1)
+- Cohort: Apr 18-22
+- Aggregate: MAE=539.1s w/in2x=42.7% p90cov=94.2%
+- Δ vs baseline: MAE −12.2% (below 15% spec), w/in2x **−9.0pp (regression)**
+- Per-bucket catastrophe in <1m: within-2x 23.5% (baseline 43.3%). Drove E4 residual experiment (baseline-as-feature specifically to rescue <1m).
+
+#### E1: Baseline percentile predictor — `predictor.js --pending-eval-date`
+Reference point, not a model run. Per-day JSONs under `trainer/data/baseline/*.json`. Aggregate over Apr 18-22, completed-only:
+- Wait: MAE=613.7s w/in2x=51.7%
+- Duration: MAE=138.8s w/in2x=88.7%
+- Cohort filter matched to trainer (`started_at NOT NULL AND queue_pending NOT NULL AND wait_duration_s ≥ 0` for wait; standard filter for duration). Without matching cohort the baseline appeared 10% worse (MAE 677s for wait) — a noisy-no-queue-context artifact.
+
+### Shared observations (valid across experiments)
+
+- **Cohort shifts day-to-day are large.** Apr 18-22 vs Apr 19-23 shows baseline wait MAE moving 613.7s → 811.9s and <1m MAE 32.0s → 56.1s. Cross-cohort comparisons are not valid — always compare within a single run_dir.
+- **The 30m+ bucket is the production gate.** Current best (E4): within-2x 38.6%. Target: ≥50%. Gap attributable to feature-saturation on existing inputs (queue_pending, priority, time-of-day) — direct velocity signal is expected to close most of it.
+- **p90 calibration is sensitive.** Varies 73.3% (E10) → 85.8% (E4) → 90.9% (E5) → 94.2% (E2) across otherwise-related configs. Worth tracking; a future experiment dedicated to calibration (e.g. training with alpha=0.92 for p90) may be warranted.
+- **Per-row loops over 5M rows at ~200µs/row = ~17 min.** Vectorize via `np.searchsorted` over per-queue cumulative arrays — cuts to seconds (confirmed in E10 vectorization pass).
