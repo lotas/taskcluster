@@ -457,14 +457,26 @@ WHERE r.pending_at >= $1::timestamptz
 // plus `resolved_at > $cutoff - INTERVAL '7 days'`. Same 7-day lookback
 // window but anchored on the feature-available cutoff instant instead
 // of the eval-resolve date.
-function toPendingHistorySql(sql) {
-  return sql
+//
+// When `excludeDates` is non-empty, also injects an extra clause excluding
+// any history rows whose `resolved_at::date` is in the given set. Empty
+// or undefined `excludeDates` MUST yield the exact original SQL string
+// (idempotence with pre-flag callers).
+function toPendingHistorySql(sql, excludeDates) {
+  let out = sql
     .replace(/r\.resolved_at < \$1::date/g, 'r.resolved_at < $1::timestamptz')
     .replace(/r\.resolved_at > \$1::date - INTERVAL '7 days'/g,
              "r.resolved_at > $1::timestamptz - INTERVAL '7 days'");
+  if (excludeDates && excludeDates.length > 0) {
+    out = out.replace(
+      /r\.resolved_at > \$1::timestamptz - INTERVAL '7 days'/g,
+      "r.resolved_at > $1::timestamptz - INTERVAL '7 days'\n  AND r.resolved_at::date <> ALL($2::date[])"
+    );
+  }
+  return out;
 }
 
-async function loadBulkStatsForCutoff(cutoff) {
+async function loadBulkStatsForCutoff(cutoff, excludeDates = []) {
   const q = [
     BULK_STATS_BY_METADATA_NAME,
     BULK_STATS_BY_NORMALIZED_NAME,
@@ -472,10 +484,11 @@ async function loadBulkStatsForCutoff(cutoff) {
     BULK_STATS_BY_TASK_QUEUE_ID,
     BULK_STATS_BY_SCHEDULER_ID,
     DURATION_GLOBAL,
-  ].map(toPendingHistorySql);
+  ].map(sql => toPendingHistorySql(sql, excludeDates));
 
+  const params = excludeDates.length > 0 ? [cutoff, excludeDates] : [cutoff];
   const [byName, byNormName, byKindType, byQueue, byScheduler, globalRes] = await Promise.all(
-    q.map(sql => pool.query(sql, [cutoff]))
+    q.map(sql => pool.query(sql, params))
   );
 
   const toMap = (rows) => {
@@ -503,16 +516,17 @@ async function loadBulkStatsForCutoff(cutoff) {
   };
 }
 
-async function loadBulkWaitStatsForCutoff(cutoff) {
+async function loadBulkWaitStatsForCutoff(cutoff, excludeDates = []) {
   const q = [
     BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET,
     BULK_WAIT_STATS_BY_QUEUE,
     BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET,
     WAIT_GLOBAL,
-  ].map(toPendingHistorySql);
+  ].map(sql => toPendingHistorySql(sql, excludeDates));
 
+  const params = excludeDates.length > 0 ? [cutoff, excludeDates] : [cutoff];
   const [byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all(
-    q.map(sql => pool.query(sql, [cutoff]))
+    q.map(sql => pool.query(sql, params))
   );
 
   const toMap = (rows) => {
@@ -540,7 +554,7 @@ async function loadBulkWaitStatsForCutoff(cutoff) {
 
 // --- Export Baseline Predictions ---
 
-async function runExportBaselinePredictions({ fromDate, toDate, outputPath }) {
+async function runExportBaselinePredictions({ fromDate, toDate, outputPath, excludeDates = [] }) {
   // Validate args
   const from = new Date(`${fromDate}T00:00:00Z`);
   const to   = new Date(`${toDate}T00:00:00Z`);
@@ -568,8 +582,8 @@ async function runExportBaselinePredictions({ fromDate, toDate, outputPath }) {
     const cutoff = d.toISOString();           // e.g. "2026-04-15T00:00:00.000Z"
     const dayStr = cutoff.slice(0, 10);        // "2026-04-15"
     const [stats, waitStats, rowsRes] = await Promise.all([
-      loadBulkStatsForCutoff(cutoff),
-      loadBulkWaitStatsForCutoff(cutoff),
+      loadBulkStatsForCutoff(cutoff, excludeDates),
+      loadBulkWaitStatsForCutoff(cutoff, excludeDates),
       pool.query(ROW_SQL, [cutoff]),
     ]);
     let dayCount = 0;
@@ -713,7 +727,7 @@ async function runBacktest(date) {
   }
 }
 
-async function runPendingEvalBacktest(dateStr) {
+async function runPendingEvalBacktest(dateStr, excludeDates = []) {
   const cutoff = `${dateStr}T00:00:00Z`;
 
   console.log(`\n=== Pending-eval-date backtest for ${dateStr} ===\n`);
@@ -721,8 +735,8 @@ async function runPendingEvalBacktest(dateStr) {
   console.log(`  History cutoff: resolved_at < ${cutoff} (7-day trailing window)\n`);
 
   const [stats, waitStats, tasksRes] = await Promise.all([
-    loadBulkStatsForCutoff(cutoff),
-    loadBulkWaitStatsForCutoff(cutoff),
+    loadBulkStatsForCutoff(cutoff, excludeDates),
+    loadBulkWaitStatsForCutoff(cutoff, excludeDates),
     pool.query(RESOLVED_TASKS_SQL_PENDING, [cutoff]),
   ]);
   const tasks = tasksRes.rows;
@@ -860,6 +874,7 @@ let outputJson = null;
 let exportBaselinePredictions = false;
 let fromDate = null;
 let toDate = null;
+let excludeDates = [];
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--date' && args[i + 1]) { date = args[i + 1]; i++; continue; }
@@ -869,6 +884,21 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === '--export-baseline-predictions') { exportBaselinePredictions = true; continue; }
   if (args[i] === '--from' && args[i + 1]) { fromDate = args[i + 1]; i++; continue; }
   if (args[i] === '--to'   && args[i + 1]) { toDate   = args[i + 1]; i++; continue; }
+  if (args[i] === '--exclude-dates' && args[i + 1]) {
+    excludeDates = args[i + 1].split(',').map(s => s.trim()).filter(Boolean);
+    for (const d of excludeDates) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+        console.error(`Invalid --exclude-dates entry: ${d}`);
+        process.exit(1);
+      }
+    }
+    i++;
+    continue;
+  }
+}
+
+if (excludeDates.length > 0) {
+  process.stderr.write(`[predictor] excluding ${excludeDates.length} anomalous date(s) from history: ${excludeDates.join(',')}\n`);
 }
 
 const isValidDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s).getTime());
@@ -900,9 +930,9 @@ try {
       console.error(`Invalid date range: ${fromDate} .. ${toDate}`);
       process.exit(1);
     }
-    await runExportBaselinePredictions({ fromDate, toDate, outputPath: outputJson });
+    await runExportBaselinePredictions({ fromDate, toDate, outputPath: outputJson, excludeDates });
   } else if (pendingEvalDate) {
-    const result = await runPendingEvalBacktest(pendingEvalDate);
+    const result = await runPendingEvalBacktest(pendingEvalDate, excludeDates);
     if (outputJson) {
       const fs = await import('node:fs/promises');
       await fs.writeFile(outputJson, JSON.stringify(buildOutputJson(result), null, 2));

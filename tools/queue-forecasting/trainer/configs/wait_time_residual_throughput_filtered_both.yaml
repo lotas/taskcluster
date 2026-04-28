@@ -1,0 +1,70 @@
+target: wait_time
+target_column: wait_duration_s
+
+lookback_days: 14
+holdout_days: 5
+validation_days: 1
+as_of_date: null
+
+filters:
+  - "r.started_at IS NOT NULL"
+  - "r.queue_pending IS NOT NULL"
+  - "r.wait_duration_s IS NOT NULL"
+  - "r.wait_duration_s >= 0"
+
+categorical_features:
+  - task_queue_id
+  - scheduler_id
+  - priority_at_pending
+  - tags.kind
+  - tags.os
+  - tags.project
+  - tags.worker-implementation
+
+# New numeric features — LightGBM will ignore any that are all-NaN,
+# so safe to list all windows even if some are sparse.
+numeric_features:
+  - queue_pending
+  - max_run_time_s
+  - hour_sin
+  - hour_cos
+  - day_sin
+  - day_cos
+  - bl_wait_p50
+  - queue_tasks_started_15m
+  - queue_tasks_completed_15m
+  - queue_avg_wait_15m
+  - queue_avg_run_time_15m
+  - queue_tasks_started_60m
+  - queue_tasks_completed_60m
+  - queue_avg_wait_60m
+  - queue_avg_run_time_60m
+
+derived_features:
+  cyclical_time:
+    source: pending_at
+
+model_type: lightgbm
+quantiles: [0.5, 0.9]
+model_params:
+  num_leaves: 63
+  learning_rate: 0.05
+  n_estimators: 500
+  early_stopping_rounds: 20
+  min_data_in_leaf: 100
+
+residual:
+  baseline_file: baseline_predictions.ndjson
+  baseline_feature: bl_wait_p50
+  transform: log_ratio
+
+throughput_features:
+  enabled: true
+  windows_minutes: [15, 60]
+
+baseline_dir: data/baseline_filtered
+
+anomaly_filter:
+  enabled: true
+  mode: both                # Policy C: exclude anomalous days from train+val AND baseline percentile history
+  # flag_subset: omitted    # use any of the flags

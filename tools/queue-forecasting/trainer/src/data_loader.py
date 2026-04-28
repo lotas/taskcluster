@@ -254,6 +254,43 @@ WHERE r.resolved_at IS NOT NULL
     return df
 
 
+_ALLOWED_FLAGS = frozenset({
+    "flag_exception_spike",
+    "flag_stuck_pending_spike",
+    "flag_wait_p99_spike",
+    "flag_volume_anomaly",
+    "flag_low_completion",
+})
+
+
+def load_anomalous_dates(c: Config) -> set[datetime.date]:
+    """Return the set of dates flagged anomalous in queue_forecast_daily_health.
+
+    Honors ``c.anomaly_filter["flag_subset"]``: when set, only the listed flags
+    contribute to the anomaly determination. Default: any of the per-flag
+    booleans true -> anomalous.
+    """
+    if c.anomaly_filter is None or not c.anomaly_filter.get("enabled"):
+        return set()
+    dsn = os.environ["DATABASE_URL"]
+    flag_subset = c.anomaly_filter.get("flag_subset")  # list[str] | None
+    if flag_subset:
+        invalid = [f for f in flag_subset if f not in _ALLOWED_FLAGS]
+        if invalid:
+            raise ValueError(
+                f"Unknown flag(s) in anomaly_filter.flag_subset: {invalid}. "
+                f"Allowed: {sorted(_ALLOWED_FLAGS)}"
+            )
+        condition = " OR ".join(f"{f} = TRUE" for f in flag_subset)
+    else:
+        condition = "is_anomalous = TRUE"
+    query = f"SELECT sample_date FROM queue_forecast_daily_health WHERE {condition}"
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            return {r[0] for r in cur.fetchall()}
+
+
 def load(c: Config, *, refresh_cache: bool = False) -> pd.DataFrame:
     path = cache_path(c)
     if path.exists() and not refresh_cache:
@@ -282,7 +319,12 @@ def load(c: Config, *, refresh_cache: bool = False) -> pd.DataFrame:
         df.to_parquet(path, index=False)
 
     if c.residual:
-        bl_path = CACHE_DIR.parent / "baseline" / c.residual["baseline_file"]
+        bl_dir = c.baseline_dir or "baseline"
+        # Strip leading "data/" so configs can spell either "baseline_filtered" or
+        # "data/baseline_filtered" interchangeably; both resolve under data/.
+        if bl_dir.startswith("data/"):
+            bl_dir = bl_dir[len("data/"):]
+        bl_path = CACHE_DIR.parent / bl_dir / c.residual["baseline_file"]
         bl = load_baseline_predictions(bl_path)
         before = len(df)
         df = df.merge(bl, on=["task_id", "run_id"], how="left")

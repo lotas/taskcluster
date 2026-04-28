@@ -151,3 +151,57 @@ CREATE TABLE IF NOT EXISTS queue_forecast_worker_pools (
     provider_type   TEXT,              -- for dynamic: 'aws' | 'azure' | 'google' | 'static' | etc.
     refreshed_at    TIMESTAMPTZ NOT NULL
 );
+
+-- =====================================================
+-- TABLE 6: Daily data-quality / health metrics
+-- =====================================================
+-- Stores per-day computed metrics derived from queue_forecast_task_runs +
+-- queue_forecast_tasks. Used by the trainer to optionally filter anomalous
+-- days from training/validation. Holdout is never filtered, only labeled.
+--
+-- The detector is data-driven: thresholds are absolute or relative to a
+-- trailing-window median, NOT a hardcoded list of incident dates.
+CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
+    sample_date              DATE PRIMARY KEY,
+
+    -- Raw counts (for transparency / re-derivation)
+    n_total                  INTEGER NOT NULL,
+    n_completed              INTEGER NOT NULL,
+    n_failed                 INTEGER NOT NULL,
+    n_exception              INTEGER NOT NULL,
+    n_worker_shutdown        INTEGER NOT NULL,
+    n_claim_expired          INTEGER NOT NULL,
+    n_deadline_exceeded      INTEGER NOT NULL,
+    n_canceled               INTEGER NOT NULL,
+    n_started                INTEGER NOT NULL,            -- runs with started_at NOT NULL
+    n_pending_no_start       INTEGER NOT NULL,            -- deadline-exceeded with started_at NULL
+                                                          -- (proxy for "task defined but worker never picked up")
+
+    -- Derived rates (NULL if n_total = 0)
+    exception_rate           DOUBLE PRECISION,            -- (exception + worker_shutdown + claim_expired) / n_total
+    stuck_pending_rate       DOUBLE PRECISION,            -- n_pending_no_start / n_total
+    completion_rate          DOUBLE PRECISION,            -- n_completed / n_total
+    wait_p99_s               DOUBLE PRECISION,            -- p99 of wait_duration_s among runs that started
+    run_p99_s                DOUBLE PRECISION,            -- p99 of run_duration_s among completed runs
+
+    -- Per-flag booleans. Each is independently triggerable so policies can
+    -- subset (e.g. "only exclude on exception spikes, ignore wait p99").
+    flag_exception_spike     BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_stuck_pending_spike BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_wait_p99_spike      BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_volume_anomaly      BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_low_completion      BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- Aggregate convenience (recompute via UPDATE rather than GENERATED ALWAYS
+    -- to keep this Postgres-version-agnostic and easy to evolve)
+    is_anomalous             BOOLEAN NOT NULL DEFAULT FALSE,
+    anomaly_reasons          TEXT[] NOT NULL DEFAULT '{}',
+
+    -- Threshold values used at compute time (for auditability)
+    threshold_snapshot       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    computed_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_qf_daily_health_anomalous
+    ON queue_forecast_daily_health (sample_date)
+    WHERE is_anomalous;

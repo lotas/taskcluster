@@ -295,6 +295,130 @@ def test_config_throughput_features_default_none(tmp_path):
     assert c.throughput_features is None
 
 
+def test_load_config_as_of_date_override(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path, as_of_date_override="2026-04-20")
+    assert c.as_of_date == datetime(2026, 4, 20, tzinfo=timezone.utc)
+
+
+def test_load_config_override_with_datetime_object(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path, as_of_date_override=datetime(2026, 4, 19, tzinfo=timezone.utc))
+    assert c.as_of_date == datetime(2026, 4, 19, tzinfo=timezone.utc)
+
+
+def test_config_parses_anomaly_filter(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+        anomaly_filter:
+          enabled: true
+          mode: training
+    """)
+    c = cfg.load_config(path)
+    assert c.anomaly_filter == {"enabled": True, "mode": "training"}
+
+
+def test_config_anomaly_filter_default_none(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.anomaly_filter is None
+
+
+def test_config_parses_baseline_dir(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+        baseline_dir: data/baseline_filtered
+    """)
+    c = cfg.load_config(path)
+    assert c.baseline_dir == "data/baseline_filtered"
+
+
+def test_config_baseline_dir_default_none(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.baseline_dir is None
+
+
 def test_resolve_holdout_days_cli(tmp_path):
     path = _write(tmp_path, """
         target: wait_time

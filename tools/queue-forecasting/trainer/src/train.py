@@ -17,7 +17,27 @@ from src.evaluate import evaluate as do_eval, load_prior_manifest
 
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "data" / "models"
-BASELINE_DIR = Path(__file__).resolve().parent.parent / "data" / "baseline"
+TRAINER_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _strip_data_prefix(rel: str) -> str:
+    """Strip a leading "data/" prefix; preserves relative-to-trainer-root semantics
+    while letting configs spell out "data/baseline_filtered" naturally."""
+    if rel.startswith("data/"):
+        return rel[len("data/"):]
+    return rel
+
+
+def _baseline_dir(c: cfg.Config) -> Path:
+    """Resolve the baseline-cache directory for a config.
+
+    Defaults to <trainer_root>/data/baseline. A config-supplied baseline_dir
+    is interpreted relative to the trainer root; a leading "data/" prefix is
+    stripped so the on-disk layout mirrors the existing default.
+    """
+    if c.baseline_dir:
+        return TRAINER_ROOT / "data" / _strip_data_prefix(c.baseline_dir)
+    return TRAINER_ROOT / "data" / "baseline"
 
 
 def _split_by_pending_at(df: pd.DataFrame, c: cfg.Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -29,18 +49,18 @@ def _split_by_pending_at(df: pd.DataFrame, c: cfg.Config) -> tuple[pd.DataFrame,
     return train, val, hold
 
 
-def _require_baselines(holdout_day_keys: list[str]) -> None:
-    missing = [d for d in holdout_day_keys if not (BASELINE_DIR / f"{d}.json").exists()]
+def _require_baselines(holdout_day_keys: list[str], baseline_dir: Path) -> None:
+    missing = [d for d in holdout_day_keys if not (baseline_dir / f"{d}.json").exists()]
     if missing:
         lines = "\n".join(f"    {d}" for d in missing)
         raise SystemExit(
-            f"ERROR: baseline JSONs missing for {len(missing)} holdout days:\n{lines}\n\n"
+            f"ERROR: baseline JSONs missing in {baseline_dir} for {len(missing)} holdout days:\n{lines}\n\n"
             f"Generate them first:\n"
             f"    ./scripts/run_training.sh <config>\n"
             f"or manually per day:\n"
             f"    docker compose run --rm predictor node src/predictor.js \\\n"
             f"      --pending-eval-date YYYY-MM-DD \\\n"
-            f"      --output-json /app/tools/queue-forecasting/trainer/data/baseline/YYYY-MM-DD.json"
+            f"      --output-json /app/tools/queue-forecasting/{baseline_dir.relative_to(TRAINER_ROOT.parent)}/YYYY-MM-DD.json"
         )
 
 
@@ -48,12 +68,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--as-of-date", default=None,
+                        help="Override as_of_date from config (UTC midnight of given day)")
     args = parser.parse_args(argv)
 
-    c = cfg.load_config(args.config)
+    c = cfg.load_config(args.config, as_of_date_override=args.as_of_date)
     w = cfg.compute_windows(c)
+    baseline_dir = _baseline_dir(c)
     holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
-    _require_baselines(holdout_day_keys)
+    _require_baselines(holdout_day_keys, baseline_dir)
 
     if c.residual:
         print(f"  residual mode: baseline_feature={c.residual['baseline_feature']} "
@@ -67,6 +90,19 @@ def main(argv: list[str] | None = None) -> int:
 
     train_df, val_df, hold_df = _split_by_pending_at(df, c)
     print(f"  train={len(train_df):,}  val={len(val_df):,}  hold={len(hold_df):,}")
+
+    if c.anomaly_filter and c.anomaly_filter.get("enabled"):
+        mode = c.anomaly_filter.get("mode", "training")
+        if mode in ("training", "both"):
+            anomalous_dates = data_loader.load_anomalous_dates(c)
+            if anomalous_dates:
+                n_train_before = len(train_df)
+                n_val_before   = len(val_df)
+                train_df = train_df[~train_df["pending_at"].dt.tz_convert("UTC").dt.date.isin(anomalous_dates)].reset_index(drop=True)
+                val_df   = val_df  [~val_df  ["pending_at"].dt.tz_convert("UTC").dt.date.isin(anomalous_dates)].reset_index(drop=True)
+                print(f"  anomaly filter ({mode}): train {n_train_before:,}→{len(train_df):,}, "
+                      f"val {n_val_before:,}→{len(val_df):,} ({len(anomalous_dates)} anomalous days)")
+            # Holdout is never filtered. Will be sliced for reporting in Stage 2.
 
     builder = FeatureBuilder(c)
     train = builder.fit_transform(train_df)
@@ -112,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         hold_meta=hold.meta,
         y_true=hold.y.to_numpy(),
         holdout_day_keys=holdout_day_keys,
-        baseline_dir=BASELINE_DIR,
+        baseline_dir=baseline_dir,
         target=target_key,
     )
 

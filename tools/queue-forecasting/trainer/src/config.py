@@ -45,15 +45,23 @@ class Config:
     residual: dict[str, Any] | None = None
     velocity_features: dict[str, Any] | None = None
     throughput_features: dict[str, Any] | None = None
+    anomaly_filter: dict[str, Any] | None = None
+    baseline_dir: str | None = None
     source_path: Path = field(default_factory=Path)
 
 
-def load_config(path: str | Path) -> Config:
+def load_config(
+    path: str | Path,
+    *,
+    as_of_date_override: str | datetime | None = None,
+) -> Config:
     p = Path(path)
     with p.open() as fh:
         raw = yaml.safe_load(fh)
 
     raw_as_of = raw.get("as_of_date")
+    if as_of_date_override is not None:
+        raw_as_of = as_of_date_override
     as_of_date = _resolve_as_of_date(raw_as_of)
 
     return Config(
@@ -73,6 +81,8 @@ def load_config(path: str | Path) -> Config:
         residual=raw.get("residual"),
         velocity_features=raw.get("velocity_features"),
         throughput_features=raw.get("throughput_features"),
+        anomaly_filter=raw.get("anomaly_filter"),
+        baseline_dir=raw.get("baseline_dir"),
         source_path=p,
     )
 
