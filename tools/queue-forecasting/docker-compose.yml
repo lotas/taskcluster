@@ -58,7 +58,11 @@ services:
       DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
     volumes:
       - ./src:/app/tools/queue-forecasting/src
-      - ./trainer/data/baseline:/app/tools/queue-forecasting/trainer/data/baseline
+      # Mount the whole trainer/data tree so any baseline_dir variant (default
+      # `data/baseline`, Policy B/C `data/baseline_filtered`, etc.) is visible
+      # to the predictor when it generates per-day JSONs or the aggregate
+      # residual NDJSON.
+      - ./trainer/data:/app/tools/queue-forecasting/trainer/data
 
   trainer:
     build:
