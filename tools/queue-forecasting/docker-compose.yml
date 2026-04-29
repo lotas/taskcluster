@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:15
+    shm_size: "2gb"
     ports:
       - "127.0.0.1:5433:5432"
     environment:

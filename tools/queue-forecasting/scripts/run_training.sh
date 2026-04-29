@@ -81,11 +81,14 @@ echo "Holdout days: $HOLDOUT_DAYS"
 # Step 1.5: resolve excluded dates (Policy B/C only). Empty for A or unset.
 # Also resolve the configured baseline directory so that each policy can
 # keep its own per-day baseline cache.
+#
+# `|| true` is required: under `set -euo pipefail`, grep matching nothing
+# (the by-design Policy A case) would propagate rc=1 and kill the script.
 EXCLUDED_DATES=$(docker compose run --rm \
   --entrypoint uv \
   trainer \
   run python -m scripts.resolve_excluded_dates --config "$CONFIG" "${AS_OF_FLAG[@]}" \
-  | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | tr '\n' ',' | sed 's/,$//')
+  | { grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || true; } | tr '\n' ',' | sed 's/,$//')
 
 EXCLUDE_FLAG=()
 if [[ -n "$EXCLUDED_DATES" ]]; then
@@ -97,7 +100,7 @@ BASELINE_REL=$(docker compose run --rm \
   --entrypoint uv \
   trainer \
   run python -m scripts.resolve_baseline_dir --config "$CONFIG" \
-  | grep -E '^[A-Za-z0-9_./-]+$' | tail -n 1)
+  | { grep -E '^[A-Za-z0-9_./-]+$' || true; } | tail -n 1)
 if [[ -z "$BASELINE_REL" ]]; then
   BASELINE_REL="data/baseline"
 fi
