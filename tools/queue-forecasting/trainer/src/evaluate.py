@@ -110,11 +110,16 @@ def aggregate_days(days: Iterable[dict]) -> dict:
 
 
 def load_baseline_days(directory: Path) -> dict[str, dict]:
-    """Load all baseline JSONs, keyed by eval_date."""
+    """Load per-day baseline eval JSONs (named `YYYY-MM-DD.json`), keyed by eval_date.
+
+    Restricted to the date-shaped filename so unrelated `.json` files in the
+    same directory (notably `baseline_predictions.ndjson.meta.json`) are
+    ignored.
+    """
     out: dict[str, dict] = {}
     if not directory.exists():
         return out
-    for p in sorted(directory.glob("*.json")):
+    for p in sorted(directory.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].json")):
         data = json.loads(p.read_text())
         out[data["eval_date"]] = data
     return out
