@@ -129,6 +129,31 @@ CREATE TABLE IF NOT EXISTS queue_forecast_worker_pools (
 --
 -- The detector is data-driven: thresholds are absolute or relative to a
 -- trailing-window median, NOT a hardcoded list of incident dates.
+--
+-- Anomaly classification matrix
+-- -----------------------------
+-- Flags are orthogonal; combinations distinguish operational regimes from
+-- training-data quality problems. Selected meaningful combinations:
+--
+--   volume_anomaly (high) + capacity_spike
+--       -> legitimate task spike. Workers scaled up to meet real demand.
+--          Not a quality problem; useful regime for training.
+--
+--   wait_p99_spike + capacity_drop
+--       -> real capacity shortage. Tasks queued because workers disappeared.
+--          Bad day for training (workers not representative).
+--
+--   wait_p99_spike + capacity_spike + low_utilization
+--       -> scheduling failure. Workers exist but aren't claiming tasks
+--          (provisioner/queue mismatch, broken claim path). Hard exclude.
+--
+--   capacity_spike + low_utilization (alone)
+--       -> wasteful over-provisioning. Operational concern, NOT a data
+--          quality problem; informational only (does not flip is_anomalous).
+--
+--   volume_anomaly (low n_total) + sampler_offline
+--       -> data loss. Worker-counter or task collector dropped samples;
+--          excludes day from training.
 CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
     sample_date              DATE PRIMARY KEY,
 
@@ -152,6 +177,15 @@ CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
     wait_p99_s               DOUBLE PRECISION,            -- p99 of wait_duration_s among runs that started
     run_p99_s                DOUBLE PRECISION,            -- p99 of run_duration_s among completed runs
 
+    -- Worker-count daily aggregates (NULL when n_worker_samples = 0).
+    -- All "total_*" values aggregate across queues at each timestamp first,
+    -- then take a percentile/min over time.
+    total_capacity_p50       INTEGER,                     -- p50 over time of sum(existing_capacity) across queues
+    total_capacity_min       INTEGER,                     -- min over time
+    total_running_p50        INTEGER,                     -- p50 over time of sum(running_workers)
+    utilization_p50          DOUBLE PRECISION,            -- p50 over time of sum(running)/sum(capacity)
+    n_worker_samples         INTEGER NOT NULL DEFAULT 0,  -- count of distinct sampled_at values
+
     -- Per-flag booleans. Each is independently triggerable so policies can
     -- subset (e.g. "only exclude on exception spikes, ignore wait p99").
     flag_exception_spike     BOOLEAN NOT NULL DEFAULT FALSE,
@@ -159,6 +193,16 @@ CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
     flag_wait_p99_spike      BOOLEAN NOT NULL DEFAULT FALSE,
     flag_volume_anomaly      BOOLEAN NOT NULL DEFAULT FALSE,
     flag_low_completion      BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- Worker-side flags. capacity_drop and sampler_offline indicate genuine
+    -- training-data-quality problems and contribute to is_anomalous by
+    -- default. capacity_spike and low_utilization are informational
+    -- (operational classifications, not data quality) and only contribute
+    -- when callers opt in via the trainer's anomaly_filter.flag_subset.
+    flag_capacity_drop       BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_capacity_spike      BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_low_utilization     BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_sampler_offline     BOOLEAN NOT NULL DEFAULT FALSE,
 
     -- Aggregate convenience (recompute via UPDATE rather than GENERATED ALWAYS
     -- to keep this Postgres-version-agnostic and easy to evolve)

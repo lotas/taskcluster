@@ -184,6 +184,13 @@ CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
     wait_p99_s               DOUBLE PRECISION,            -- p99 of wait_duration_s among runs that started
     run_p99_s                DOUBLE PRECISION,            -- p99 of run_duration_s among completed runs
 
+    -- Worker-count daily aggregates (NULL when n_worker_samples = 0)
+    total_capacity_p50       INTEGER,
+    total_capacity_min       INTEGER,
+    total_running_p50        INTEGER,
+    utilization_p50          DOUBLE PRECISION,
+    n_worker_samples         INTEGER NOT NULL DEFAULT 0,
+
     -- Per-flag booleans. Each is independently triggerable so policies can
     -- subset (e.g. "only exclude on exception spikes, ignore wait p99").
     flag_exception_spike     BOOLEAN NOT NULL DEFAULT FALSE,
@@ -191,6 +198,12 @@ CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
     flag_wait_p99_spike      BOOLEAN NOT NULL DEFAULT FALSE,
     flag_volume_anomaly      BOOLEAN NOT NULL DEFAULT FALSE,
     flag_low_completion      BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- Worker-side flags
+    flag_capacity_drop       BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_capacity_spike      BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_low_utilization     BOOLEAN NOT NULL DEFAULT FALSE,
+    flag_sampler_offline     BOOLEAN NOT NULL DEFAULT FALSE,
 
     -- Aggregate convenience (recompute via UPDATE rather than GENERATED ALWAYS
     -- to keep this Postgres-version-agnostic and easy to evolve)
@@ -205,3 +218,18 @@ CREATE TABLE IF NOT EXISTS queue_forecast_daily_health (
 CREATE INDEX IF NOT EXISTS idx_qf_daily_health_anomalous
     ON queue_forecast_daily_health (sample_date)
     WHERE is_anomalous;
+
+-- ==========================================
+-- Stage 1.5: worker-side anomaly columns
+-- Additive migration for existing daily-health tables. Safe to re-run.
+-- ==========================================
+ALTER TABLE queue_forecast_daily_health
+    ADD COLUMN IF NOT EXISTS total_capacity_p50  INTEGER,
+    ADD COLUMN IF NOT EXISTS total_capacity_min  INTEGER,
+    ADD COLUMN IF NOT EXISTS total_running_p50   INTEGER,
+    ADD COLUMN IF NOT EXISTS utilization_p50     DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS n_worker_samples    INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS flag_capacity_drop   BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS flag_capacity_spike  BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS flag_low_utilization BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS flag_sampler_offline BOOLEAN NOT NULL DEFAULT FALSE;

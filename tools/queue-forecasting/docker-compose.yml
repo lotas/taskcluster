@@ -99,5 +99,28 @@ services:
     volumes:
       - ./src:/app/tools/queue-forecasting/src
 
+  health-monitor:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/trainer/Dockerfile
+    entrypoint: ["uv", "run", "python", "-m", "scripts.compute_daily_health_loop"]
+    working_dir: /app/trainer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 10s
+    restart: unless-stopped
+    profiles:
+      - health-monitor
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      HEALTH_INTERVAL_SECONDS: "3600"
+      HEALTH_LOOKBACK_DAYS: "7"
+    volumes:
+      - ./trainer:/app/trainer
+
 volumes:
   pgdata:

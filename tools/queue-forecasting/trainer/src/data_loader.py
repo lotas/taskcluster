@@ -260,6 +260,11 @@ _ALLOWED_FLAGS = frozenset({
     "flag_wait_p99_spike",
     "flag_volume_anomaly",
     "flag_low_completion",
+    # New worker-side flags. Trainer can opt into these via flag_subset.
+    "flag_capacity_drop",
+    "flag_capacity_spike",
+    "flag_low_utilization",
+    "flag_sampler_offline",
 })
 
 

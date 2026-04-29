@@ -15,6 +15,11 @@ def _today(**kwargs):
         n_canceled=130, n_started=9700, n_pending_no_start=50,
         exception_rate=0.017, stuck_pending_rate=0.005, completion_rate=0.90,
         wait_p99_s=1800.0, run_p99_s=3600.0,
+        # Worker-count fields default to "no signal" so existing tests
+        # (which only care about task-side flags) keep passing.
+        total_capacity_p50=None, total_capacity_min=None,
+        total_running_p50=None, utilization_p50=None,
+        n_worker_samples=0,
     )
     base.update(kwargs)
     return DailyMetrics(**base)
@@ -103,3 +108,147 @@ def test_no_history_skips_relative_flags():
     today2 = _today(exception_rate=0.20)
     flags2, _, _ = evaluate_flags(today2, [])
     assert flags2["flag_exception_spike"]
+
+
+# ---------------------------------------------------------------------------
+# Worker-side flags
+# ---------------------------------------------------------------------------
+
+def test_capacity_drop_flag():
+    """today's capacity_p50 = 50; trailing 7d median = 200 -> capacity_drop."""
+    from scripts.compute_daily_health import evaluate_flags
+    today = _today(total_capacity_p50=50, n_worker_samples=288)
+    history = _hist(7, total_capacity_p50=200, n_worker_samples=288)
+    flags, reasons, _ = evaluate_flags(today, history)
+    assert flags["flag_capacity_drop"]
+    assert "capacity_drop" in reasons
+    assert not flags["flag_capacity_spike"]
+
+
+def test_capacity_spike_flag():
+    """today's capacity_p50 = 600; trailing median = 200 -> capacity_spike."""
+    from scripts.compute_daily_health import evaluate_flags
+    today = _today(total_capacity_p50=600, n_worker_samples=288)
+    history = _hist(7, total_capacity_p50=200, n_worker_samples=288)
+    flags, reasons, _ = evaluate_flags(today, history)
+    assert flags["flag_capacity_spike"]
+    assert "capacity_spike" in reasons
+    assert not flags["flag_capacity_drop"]
+
+
+def test_low_utilization_flag():
+    """utilization_p50 < 0.4 should fire low_utilization regardless of history."""
+    from scripts.compute_daily_health import evaluate_flags
+    today = _today(utilization_p50=0.25, n_worker_samples=288)
+    history = _hist(7, utilization_p50=0.7, n_worker_samples=288)
+    flags, reasons, _ = evaluate_flags(today, history)
+    assert flags["flag_low_utilization"]
+    assert "low_utilization" in reasons
+
+
+def test_sampler_offline_flag():
+    """n_worker_samples=100 < 144 (0.5 * 288) should fire sampler_offline."""
+    from scripts.compute_daily_health import evaluate_flags
+    today = _today(n_worker_samples=100, total_capacity_p50=200, utilization_p50=0.6)
+    history = _hist(7, n_worker_samples=288, total_capacity_p50=200, utilization_p50=0.6)
+    flags, reasons, _ = evaluate_flags(today, history)
+    assert flags["flag_sampler_offline"]
+    assert "sampler_offline" in reasons
+
+
+def test_no_worker_data_skips_flags():
+    """n_worker_samples=0 means no signal: none of the 4 worker flags should fire.
+
+    Handles the "we backfilled task data further back than worker-counter
+    has been collecting" case cleanly.
+    """
+    from scripts.compute_daily_health import evaluate_flags
+    today = _today(
+        n_worker_samples=0,
+        total_capacity_p50=None,
+        total_capacity_min=None,
+        total_running_p50=None,
+        utilization_p50=None,
+    )
+    # Even with strong history, today should look quiet on the worker side.
+    history = _hist(7, n_worker_samples=288, total_capacity_p50=500, utilization_p50=0.7)
+    flags, reasons, _ = evaluate_flags(today, history)
+    assert not flags["flag_capacity_drop"]
+    assert not flags["flag_capacity_spike"]
+    assert not flags["flag_low_utilization"]
+    assert not flags["flag_sampler_offline"]
+    assert "capacity_drop" not in reasons
+    assert "capacity_spike" not in reasons
+    assert "low_utilization" not in reasons
+    assert "sampler_offline" not in reasons
+
+
+def test_scheduling_failure_classification():
+    """wait_p99_spike + capacity_spike + low_utilization all fire together.
+
+    Pins that flags are orthogonal: each independently asserts itself based on
+    its own threshold; we don't pick one as "dominant".
+    """
+    from scripts.compute_daily_health import evaluate_flags
+    today = _today(
+        wait_p99_s=12000.0,           # 6x history -> wait_p99_spike
+        total_capacity_p50=600,       # 3x history -> capacity_spike
+        utilization_p50=0.15,         # < 0.4 -> low_utilization
+        n_worker_samples=288,
+    )
+    history = _hist(
+        7,
+        wait_p99_s=2000.0,
+        total_capacity_p50=200,
+        utilization_p50=0.7,
+        n_worker_samples=288,
+    )
+    flags, reasons, _ = evaluate_flags(today, history)
+    assert flags["flag_wait_p99_spike"]
+    assert flags["flag_capacity_spike"]
+    assert flags["flag_low_utilization"]
+    assert "wait_p99_spike" in reasons
+    assert "capacity_spike" in reasons
+    assert "low_utilization" in reasons
+
+
+def test_capacity_spike_alone_not_in_default_is_anomalous():
+    """capacity_spike is informational; it must not flip is_anomalous on its own."""
+    from scripts.compute_daily_health import evaluate_flags, is_anomalous_default
+    today = _today(total_capacity_p50=600, n_worker_samples=288)
+    history = _hist(7, total_capacity_p50=200, n_worker_samples=288)
+    flags, _, _ = evaluate_flags(today, history)
+    assert flags["flag_capacity_spike"]
+    assert not is_anomalous_default(flags), (
+        "capacity_spike alone must not contribute to is_anomalous (informational only)"
+    )
+
+
+def test_capacity_drop_in_default_is_anomalous():
+    """capacity_drop is a real data-quality issue and DOES contribute to is_anomalous."""
+    from scripts.compute_daily_health import evaluate_flags, is_anomalous_default
+    today = _today(total_capacity_p50=50, n_worker_samples=288)
+    history = _hist(7, total_capacity_p50=200, n_worker_samples=288)
+    flags, _, _ = evaluate_flags(today, history)
+    assert flags["flag_capacity_drop"]
+    assert is_anomalous_default(flags)
+
+
+def test_low_utilization_alone_not_in_default_is_anomalous():
+    """low_utilization is informational; not a default anomaly."""
+    from scripts.compute_daily_health import evaluate_flags, is_anomalous_default
+    today = _today(utilization_p50=0.25, n_worker_samples=288)
+    history = _hist(7, utilization_p50=0.7, n_worker_samples=288)
+    flags, _, _ = evaluate_flags(today, history)
+    assert flags["flag_low_utilization"]
+    assert not is_anomalous_default(flags)
+
+
+def test_sampler_offline_in_default_is_anomalous():
+    """sampler_offline indicates real data loss -> contributes to is_anomalous."""
+    from scripts.compute_daily_health import evaluate_flags, is_anomalous_default
+    today = _today(n_worker_samples=100, total_capacity_p50=200, utilization_p50=0.6)
+    history = _hist(7, n_worker_samples=288, total_capacity_p50=200, utilization_p50=0.6)
+    flags, _, _ = evaluate_flags(today, history)
+    assert flags["flag_sampler_offline"]
+    assert is_anomalous_default(flags)

@@ -18,6 +18,12 @@ from datetime import datetime, timezone, timedelta
 import psycopg
 
 
+# 5-minute sample cadence x 24h. Used to detect sampler outages: if we see
+# fewer than half the expected samples on a day with any data at all, the
+# sampler was at least partially down.
+EXPECTED_WORKER_SAMPLES_PER_DAY = 288
+
+
 DAY_METRICS_SQL = """
 WITH day_runs AS (
     SELECT r.task_id, r.run_id, r.started_at, r.resolved_at, r.reason_resolved,
@@ -45,6 +51,25 @@ FROM day_runs;
 """
 
 
+WORKER_METRICS_SQL = """
+WITH per_timestamp AS (
+    SELECT sampled_at,
+           SUM(COALESCE(existing_capacity, 0)) AS total_capacity,
+           SUM(COALESCE(running_workers, 0))   AS total_running
+    FROM queue_forecast_worker_counts
+    WHERE sampled_at >= %(day_start)s
+      AND sampled_at <  %(day_end)s
+    GROUP BY sampled_at
+)
+SELECT COUNT(*)                                                                    AS n_samples,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY total_capacity)                 AS total_capacity_p50,
+       MIN(total_capacity)                                                         AS total_capacity_min,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY total_running)                  AS total_running_p50,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY total_running::float / NULLIF(total_capacity, 0)) AS utilization_p50
+FROM per_timestamp;
+"""
+
+
 @dataclass
 class DailyMetrics:
     sample_date: datetime
@@ -63,6 +88,47 @@ class DailyMetrics:
     completion_rate: float | None
     wait_p99_s: float | None
     run_p99_s: float | None
+    # Worker-count daily aggregates. Default to None / 0 so existing test
+    # helpers (and any caller that doesn't yet construct worker fields)
+    # continue to work without modification.
+    total_capacity_p50: int | None = None
+    total_capacity_min: int | None = None
+    total_running_p50: int | None = None
+    utilization_p50: float | None = None
+    n_worker_samples: int = 0
+
+
+@dataclass
+class WorkerMetrics:
+    total_capacity_p50: int | None
+    total_capacity_min: int | None
+    total_running_p50: int | None
+    utilization_p50: float | None
+    n_samples: int
+
+
+# Flags that contribute to the default `is_anomalous` aggregate. Other
+# (informational) flags are still persisted but only kick in when callers
+# opt them in via the trainer's anomaly_filter.flag_subset config.
+_DEFAULT_IS_ANOMALOUS_FLAGS = (
+    "flag_exception_spike",
+    "flag_stuck_pending_spike",
+    "flag_wait_p99_spike",
+    "flag_volume_anomaly",
+    "flag_low_completion",
+    "flag_capacity_drop",
+    "flag_sampler_offline",
+)
+
+
+def is_anomalous_default(flags: dict[str, bool]) -> bool:
+    """Aggregate flags into the default is_anomalous bit.
+
+    Informational flags (capacity_spike, low_utilization) are excluded:
+    they classify operational regimes but don't make a day's training
+    data unusable.
+    """
+    return any(flags[k] for k in _DEFAULT_IS_ANOMALOUS_FLAGS if k in flags)
 
 
 def fetch_day(conn, day_start: datetime) -> DailyMetrics:
@@ -77,6 +143,7 @@ def fetch_day(conn, day_start: datetime) -> DailyMetrics:
     d = dict(zip(cols, row))
     n = d["n_total"] or 0
     excp = (d["n_exception"] or 0) + (d["n_worker_shutdown"] or 0) + (d["n_claim_expired"] or 0)
+    wm = fetch_worker_metrics(conn, day_start)
     return DailyMetrics(
         sample_date         = day_start,
         n_total             = n,
@@ -94,6 +161,35 @@ def fetch_day(conn, day_start: datetime) -> DailyMetrics:
         completion_rate     = ((d["n_completed"] or 0) / n)    if n else None,
         wait_p99_s          = d["wait_p99_s"],
         run_p99_s           = d["run_p99_s"],
+        total_capacity_p50  = wm.total_capacity_p50,
+        total_capacity_min  = wm.total_capacity_min,
+        total_running_p50   = wm.total_running_p50,
+        utilization_p50     = wm.utilization_p50,
+        n_worker_samples    = wm.n_samples,
+    )
+
+
+def fetch_worker_metrics(conn, day_start: datetime) -> WorkerMetrics:
+    """Aggregate worker-count samples for a day.
+
+    Returns all-None when there are no samples for the day so callers can
+    treat absent worker-count history as "no signal" (not anomaly).
+    """
+    day_end = day_start + timedelta(days=1)
+    with conn.cursor() as cur:
+        cur.execute(WORKER_METRICS_SQL, {"day_start": day_start, "day_end": day_end})
+        row = cur.fetchone()
+    n_samples = int(row[0] or 0)
+    if n_samples == 0:
+        return WorkerMetrics(None, None, None, None, 0)
+    cap_p50, cap_min, run_p50, util_p50 = row[1], row[2], row[3], row[4]
+    # Postgres percentile_cont returns numeric for an integer input -> cast.
+    return WorkerMetrics(
+        total_capacity_p50 = int(cap_p50) if cap_p50 is not None else None,
+        total_capacity_min = int(cap_min) if cap_min is not None else None,
+        total_running_p50  = int(run_p50) if run_p50 is not None else None,
+        utilization_p50    = float(util_p50) if util_p50 is not None else None,
+        n_samples          = n_samples,
     )
 
 
@@ -114,6 +210,10 @@ def evaluate_flags(today: DailyMetrics, history: list[DailyMetrics]) -> tuple[di
         "flag_wait_p99_spike":      False,
         "flag_volume_anomaly":      False,
         "flag_low_completion":      False,
+        "flag_capacity_drop":       False,
+        "flag_capacity_spike":      False,
+        "flag_low_utilization":     False,
+        "flag_sampler_offline":     False,
     }
     reasons: list[str] = []
 
@@ -121,6 +221,9 @@ def evaluate_flags(today: DailyMetrics, history: list[DailyMetrics]) -> tuple[di
     med_stuck    = trailing_median([h.stuck_pending_rate for h in history])
     med_wait_p99 = trailing_median([h.wait_p99_s         for h in history])
     med_volume   = trailing_median([float(h.n_total)     for h in history])
+    med_total_capacity = trailing_median(
+        [float(h.total_capacity_p50) for h in history if h.total_capacity_p50 is not None]
+    )
 
     snapshot = {
         "abs_exception_rate":     0.10,
@@ -136,6 +239,12 @@ def evaluate_flags(today: DailyMetrics, history: list[DailyMetrics]) -> tuple[di
         "trailing_median_stuck_pending_rate": med_stuck,
         "trailing_median_wait_p99_s":         med_wait_p99,
         "trailing_median_n_total":            med_volume,
+        "trailing_median_total_capacity_p50": med_total_capacity,
+        "abs_low_utilization_threshold":      0.4,
+        "expected_worker_samples_per_day":    EXPECTED_WORKER_SAMPLES_PER_DAY,
+        "rel_capacity_drop_x":                0.5,
+        "rel_capacity_spike_x":               2.0,
+        "rel_sampler_offline_x":              0.5,
     }
 
     # Exception spike — abs OR (rel and have history)
@@ -173,6 +282,34 @@ def evaluate_flags(today: DailyMetrics, history: list[DailyMetrics]) -> tuple[di
         flags["flag_low_completion"] = True
         reasons.append("low_completion")
 
+    # ---- Worker-side flags ----
+    # Skip everything when n_worker_samples == 0: that's "no data, no signal"
+    # (e.g. backfilled task data from before the worker-counter started).
+    if today.n_worker_samples > 0:
+        # Sampler offline: partial-day outages. Full silence (n=0) is handled
+        # by the guard above and treated as no-signal, not anomaly.
+        if today.n_worker_samples < 0.5 * EXPECTED_WORKER_SAMPLES_PER_DAY:
+            flags["flag_sampler_offline"] = True
+            reasons.append("sampler_offline")
+
+        # Capacity drop / spike — both relative to trailing 7d median.
+        if (
+            today.total_capacity_p50 is not None
+            and med_total_capacity is not None
+            and med_total_capacity > 0
+        ):
+            if today.total_capacity_p50 < 0.5 * med_total_capacity:
+                flags["flag_capacity_drop"] = True
+                reasons.append("capacity_drop")
+            elif today.total_capacity_p50 > 2.0 * med_total_capacity:
+                flags["flag_capacity_spike"] = True
+                reasons.append("capacity_spike")
+
+        # Low utilization — absolute (utilization is a ratio, comparable across days).
+        if today.utilization_p50 is not None and today.utilization_p50 < 0.4:
+            flags["flag_low_utilization"] = True
+            reasons.append("low_utilization")
+
     return flags, reasons, snapshot
 
 
@@ -182,16 +319,20 @@ UPSERT_SQL = """
         n_total, n_completed, n_failed, n_exception, n_worker_shutdown, n_claim_expired,
         n_deadline_exceeded, n_canceled, n_started, n_pending_no_start,
         exception_rate, stuck_pending_rate, completion_rate, wait_p99_s, run_p99_s,
+        total_capacity_p50, total_capacity_min, total_running_p50, utilization_p50, n_worker_samples,
         flag_exception_spike, flag_stuck_pending_spike, flag_wait_p99_spike,
         flag_volume_anomaly, flag_low_completion,
+        flag_capacity_drop, flag_capacity_spike, flag_low_utilization, flag_sampler_offline,
         is_anomalous, anomaly_reasons, threshold_snapshot, computed_at
     ) VALUES (
         %(sample_date)s,
         %(n_total)s, %(n_completed)s, %(n_failed)s, %(n_exception)s, %(n_worker_shutdown)s, %(n_claim_expired)s,
         %(n_deadline_exceeded)s, %(n_canceled)s, %(n_started)s, %(n_pending_no_start)s,
         %(exception_rate)s, %(stuck_pending_rate)s, %(completion_rate)s, %(wait_p99_s)s, %(run_p99_s)s,
+        %(total_capacity_p50)s, %(total_capacity_min)s, %(total_running_p50)s, %(utilization_p50)s, %(n_worker_samples)s,
         %(flag_exception_spike)s, %(flag_stuck_pending_spike)s, %(flag_wait_p99_spike)s,
         %(flag_volume_anomaly)s, %(flag_low_completion)s,
+        %(flag_capacity_drop)s, %(flag_capacity_spike)s, %(flag_low_utilization)s, %(flag_sampler_offline)s,
         %(is_anomalous)s, %(anomaly_reasons)s, %(threshold_snapshot)s, NOW()
     )
     ON CONFLICT (sample_date) DO UPDATE SET
@@ -210,11 +351,20 @@ UPSERT_SQL = """
         completion_rate = EXCLUDED.completion_rate,
         wait_p99_s = EXCLUDED.wait_p99_s,
         run_p99_s = EXCLUDED.run_p99_s,
+        total_capacity_p50 = EXCLUDED.total_capacity_p50,
+        total_capacity_min = EXCLUDED.total_capacity_min,
+        total_running_p50  = EXCLUDED.total_running_p50,
+        utilization_p50    = EXCLUDED.utilization_p50,
+        n_worker_samples   = EXCLUDED.n_worker_samples,
         flag_exception_spike     = EXCLUDED.flag_exception_spike,
         flag_stuck_pending_spike = EXCLUDED.flag_stuck_pending_spike,
         flag_wait_p99_spike      = EXCLUDED.flag_wait_p99_spike,
         flag_volume_anomaly      = EXCLUDED.flag_volume_anomaly,
         flag_low_completion      = EXCLUDED.flag_low_completion,
+        flag_capacity_drop       = EXCLUDED.flag_capacity_drop,
+        flag_capacity_spike      = EXCLUDED.flag_capacity_spike,
+        flag_low_utilization     = EXCLUDED.flag_low_utilization,
+        flag_sampler_offline     = EXCLUDED.flag_sampler_offline,
         is_anomalous             = EXCLUDED.is_anomalous,
         anomaly_reasons          = EXCLUDED.anomaly_reasons,
         threshold_snapshot       = EXCLUDED.threshold_snapshot,
@@ -246,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
             m = fetch_day(conn, d)
             history = days_metrics[-args.rolling_window_days:]   # use prior days only
             flags, reasons, snapshot = evaluate_flags(m, history)
-            is_anom = any(flags.values())
+            is_anom = is_anomalous_default(flags)
 
             print(f"[{m.sample_date.date()}] n={m.n_total:>7,} excp={m.exception_rate or 0:.3f} stuck={m.stuck_pending_rate or 0:.3f} wait_p99={m.wait_p99_s or 0:>7.0f}s anom={is_anom}{' (' + ','.join(reasons) + ')' if reasons else ''}", file=sys.stderr)
 
@@ -259,6 +409,11 @@ def main(argv: list[str] | None = None) -> int:
                     "n_canceled": m.n_canceled, "n_started": m.n_started, "n_pending_no_start": m.n_pending_no_start,
                     "exception_rate": m.exception_rate, "stuck_pending_rate": m.stuck_pending_rate,
                     "completion_rate": m.completion_rate, "wait_p99_s": m.wait_p99_s, "run_p99_s": m.run_p99_s,
+                    "total_capacity_p50": m.total_capacity_p50,
+                    "total_capacity_min": m.total_capacity_min,
+                    "total_running_p50":  m.total_running_p50,
+                    "utilization_p50":    m.utilization_p50,
+                    "n_worker_samples":   m.n_worker_samples,
                     **flags,
                     "is_anomalous": is_anom,
                     "anomaly_reasons": reasons,
