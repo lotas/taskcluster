@@ -155,8 +155,14 @@ BEGIN
             INTO row_count;
 
         SELECT string_agg(
-                   format('(%L, max(%I)::timestamptz)', column_name, column_name),
-                   ', ' ORDER BY ordinal_position
+                   format(
+                       'SELECT %L AS col_name, max(%I)::timestamptz AS ts_value FROM %I.%I',
+                       column_name,
+                       column_name,
+                       tbl.table_schema,
+                       tbl.table_name
+                   ),
+                   ' UNION ALL ' ORDER BY ordinal_position
                )
         INTO values_sql
         FROM information_schema.columns
@@ -169,7 +175,7 @@ BEGIN
         IF values_sql IS NOT NULL THEN
             EXECUTE format(
                 'SELECT col_name, ts_value
-                   FROM (VALUES %s) AS v(col_name, ts_value)
+                   FROM (%s) AS v
                   WHERE ts_value IS NOT NULL
                   ORDER BY ts_value DESC
                   LIMIT 1',
