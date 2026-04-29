@@ -125,7 +125,7 @@ async function queryDailyHealth(pool) {
       flag_sampler_offline,
       is_anomalous, anomaly_reasons
     FROM queue_forecast_daily_health
-    WHERE sample_date >= current_date - 14
+    WHERE sample_date >= current_date - 30
     ORDER BY sample_date DESC;
   `);
   return rows;
@@ -232,6 +232,15 @@ function renderTableHealth(rows) {
 }
 
 function renderFreshness(f) {
+  // Per-stream staleness thresholds (ms)
+  const thresholds = {
+    pending_at: 30 * 60 * 1000,
+    started_at: 30 * 60 * 1000,
+    resolved_at: 30 * 60 * 1000,
+    enriched_at: 30 * 60 * 1000,
+    worker_sample: 30 * 60 * 1000,
+    daily_health: 2 * 60 * 60 * 1000,  // runs hourly
+  };
   const items = [
     ['pending_at', f.latest_pending],
     ['started_at', f.latest_started],
@@ -243,7 +252,7 @@ function renderFreshness(f) {
   let html = '<table><thead><tr><th>Stream</th><th>Latest</th><th>Age</th><th></th></tr></thead><tbody>';
   for (const [name, ts] of items) {
     const ageMs = ts ? Date.now() - new Date(ts).getTime() : null;
-    const stale = ageMs != null && ageMs > 30 * 60 * 1000;
+    const stale = ageMs != null && ageMs > (thresholds[name] || 30 * 60 * 1000);
     html += `<tr>
       <td>${esc(name)}</td>
       <td class="ts">${ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—'}</td>
@@ -410,7 +419,7 @@ function renderDailyHealth(rows) {
       <td>${flagDot(r.flag_low_utilization)}</td>
       <td>${flagDot(r.flag_sampler_offline)}</td>
       <td>${r.is_anomalous
-        ? `<span class="badge badge-warn" title="${esc(r.anomaly_reasons?.join(', '))}">${esc(r.anomaly_reasons?.length || 0)} flags</span>`
+        ? `<span class="badge badge-warn" title="${esc(r.anomaly_reasons?.join(', '))}">${r.anomaly_reasons?.length || 0} flag${(r.anomaly_reasons?.length || 0) === 1 ? '' : 's'}</span>`
         : '<span class="badge badge-ok">OK</span>'}</td>
     </tr>`;
   }
@@ -516,7 +525,7 @@ function buildPage(data) {
 <div class="meta">${data.manifestsDir}</div>
 ${data.manifests}
 
-<h2>Daily Health (last 14d)</h2>
+<h2>Daily Health (last 30d)</h2>
 ${data.dailyHealth}
 
 <footer>queue-forecasting dashboard · generated ${now}</footer>
