@@ -44,3 +44,6 @@ tools/worker-runner/start-worker-*-*
 tools/taskcluster-proxy/taskcluster-proxy
 tools/taskcluster-proxy/target
 tools/livelog/livelog
+
+# queue-forecasting generated training/cache/model data; mounted at runtime
+tools/queue-forecasting/trainer/data

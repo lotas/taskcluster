@@ -163,13 +163,14 @@ Live in `trainer/configs/`. Each YAML defines target column, time windows, featu
 ./scripts/run_training.sh configs/wait_time_residual_throughput.yaml --as-of-date 2026-04-21
 ```
 
-What this script does:
+What this script does (all auto-resolved — you don't run any prerequisite commands):
 
 1. **Resolve holdout days** from the config (no DB access, pure config math).
 2. **Resolve excluded dates** for Policy B/C — queries `queue_forecast_daily_health` for anomalous days, builds a `--exclude-dates ...` flag list for the predictor.
 3. **Resolve baseline directory** from the config (default `data/baseline`, Policy B/C use `data/baseline_filtered`).
-4. **Generate per-day baseline JSONs** for each holdout day via the Node predictor, into the configured baseline dir, applying `--exclude-dates`.
-5. **Train + evaluate** — Python trainer reads from cache or queries Postgres, builds features, trains p50 + p90 quantile models, evaluates on holdout, writes `<as_of>/<config>_manifest.json` + `.lgb` model files.
+4. **Ensure aggregate residual NDJSON exists** — for any config with a `residual:` block, generates `<baseline_dir>/baseline_predictions.ndjson` covering the cohort's full training window if missing. Idempotent: skips when the file already exists. Delete the file to force regeneration.
+5. **Generate per-day baseline JSONs** for each holdout day via the Node predictor, into the configured baseline dir, applying `--exclude-dates`.
+6. **Train + evaluate** — Python trainer reads the NDJSON, builds features, trains p50 + p90 quantile models, evaluates on holdout, writes `<as_of>/<config>_manifest.json` + `.lgb` model files.
 
 ### 2. Walk-forward sweep
 
@@ -180,6 +181,8 @@ What this script does:
 ```
 
 Resume-safe: any `(date, config)` cell whose manifest already exists is skipped. To force re-run, delete the manifest first.
+
+Before the cohort loop, walk-forward does a one-time pre-pass: for each unique `(baseline_dir, exclude_dates)` group across the configs, it generates the aggregate residual NDJSON covering the entire sweep window — so individual cohorts don't each regenerate it.
 
 Then aggregate results into a CSV:
 
@@ -195,27 +198,7 @@ The CSV includes a `cohort_is_anomalous` column joined from `queue_forecast_dail
 
 ### 3. Comparing anomaly-filter policies
 
-If you want to compare unfiltered vs Policy A/B/C:
-
-**Prerequisite for Policy B/C only**: regenerate the residual training NDJSON with `--exclude-dates` into `data/baseline_filtered/`:
-
-```bash
-mkdir -p trainer/data/baseline_filtered
-
-EXCL=$(docker compose run --rm --entrypoint uv trainer \
-  run python -m scripts.resolve_excluded_dates \
-  --config configs/wait_time_residual_throughput_filtered_baseline.yaml \
-  | { grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || true; } | tr '\n' ',' | sed 's/,$//')
-
-docker compose run --rm predictor \
-  node src/predictor.js \
-  --export-baseline-predictions \
-  --from 2026-03-23 --to $(date -u +%F) \
-  --exclude-dates "$EXCL" \
-  --output /app/tools/queue-forecasting/trainer/data/baseline_filtered/baseline_predictions.ndjson
-```
-
-Then walk-forward across all four:
+Pass all four policy configs in a single sweep:
 
 ```bash
 ./scripts/walk_forward.sh \
@@ -223,7 +206,7 @@ Then walk-forward across all four:
   --configs configs/wait_time_residual_throughput.yaml,configs/wait_time_residual_throughput_filtered.yaml,configs/wait_time_residual_throughput_filtered_baseline.yaml,configs/wait_time_residual_throughput_filtered_both.yaml
 ```
 
-The unfiltered config shares the existing `data/baseline/baseline_predictions.ndjson` — no rebuild needed.
+Walk-forward auto-detects that there are two distinct `(baseline_dir, exclude_dates)` groups — `data/baseline/` (no exclusions, used by unfiltered + Policy A) and `data/baseline_filtered/` (with the daily-health excluded-dates list, used by Policy B + C) — and pre-generates the aggregate NDJSON for each group exactly once.
 
 ## Anomaly detection
 
@@ -356,3 +339,5 @@ docker compose rm -f health-monitor
 **Apr 25–26 (or any day) shows `n=0`, `anom=False`** — earlier bug in the detector skipped the volume check when `n_total = 0`. Fixed; n=0 days now flag `volume_anomaly`. Re-run `compute_daily_health.py` to refresh.
 
 **Postgres on host port 5432 vs 5433** — this tool deliberately uses 5433 to avoid collision with the monorepo's standard Postgres on 5432.
+
+**`FileNotFoundError: .../trainer/data/baseline/baseline_predictions.ndjson`** — only happens if you bypass `run_training.sh` / `walk_forward.sh` (both auto-generate the file). To force regeneration, delete the file and re-run the master script.

@@ -104,6 +104,43 @@ services:
     volumes:
       - ./src:/app/tools/queue-forecasting/src
 
+  dashboard-gen:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    command: ["node", "src/dashboard-gen.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 10s
+    restart: unless-stopped
+    profiles:
+      - dashboard
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DASHBOARD_OUTPUT_DIR: /dashboard
+      DASHBOARD_INTERVAL_MS: "900000"
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+      - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
+      - dashboard-html:/dashboard
+
+  dashboard:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - dashboard-html:/usr/share/nginx/html:ro
+    restart: unless-stopped
+    profiles:
+      - dashboard
+      - full
+    depends_on:
+      - dashboard-gen
+
   health-monitor:
     build:
       context: ../..
@@ -129,3 +166,4 @@ services:
 
 volumes:
   pgdata:
+  dashboard-html:

@@ -108,13 +108,27 @@ echo "Baseline cache dir: trainer/${BASELINE_REL}"
 
 mkdir -p "trainer/${BASELINE_REL}"
 
-# Step 2: generate per-day baselines (skip ones already present).
+# Step 1.6: if config uses residual architecture, ensure the aggregate
+# baseline-predictions NDJSON exists in the configured baseline dir. The
+# trainer joins it on (task_id, run_id) for the residual feature, so it
+# must cover every pending_at the cohort will train/eval over.
 #
-# NOTE: the residual training NDJSON (baseline_predictions.ndjson) is generated
-# separately by the user. For Policy B/C make sure that file lives in
-# trainer/${BASELINE_REL}/ and was regenerated with the same --exclude-dates
-# flag list; otherwise the residual training input still carries baselines
-# computed from contaminated history.
+# Window: [as_of - lookback_days - validation_days - holdout_days, as_of)
+# matches the trainer's compute_windows() math; +2 days padding for safety.
+if grep -q '^residual:' "trainer/${CONFIG}"; then
+  AS_OF_FOR_NDJSON="${AS_OF_DATE:-$(date -u +%F)}"
+  NDJSON_FROM=$(python3 -c "
+import sys, yaml
+from datetime import datetime, timedelta
+cfg = yaml.safe_load(open(sys.argv[1]))
+window = cfg['lookback_days'] + cfg['validation_days'] + cfg['holdout_days'] + 2
+print((datetime.fromisoformat(sys.argv[2]) - timedelta(days=window)).strftime('%Y-%m-%d'))
+" "trainer/${CONFIG}" "$AS_OF_FOR_NDJSON")
+  ./scripts/ensure_baseline_ndjson.sh \
+    "$BASELINE_REL" "$EXCLUDED_DATES" "$NDJSON_FROM" "$AS_OF_FOR_NDJSON"
+fi
+
+# Step 2: generate per-day baselines (skip ones already present).
 for d in $HOLDOUT_DAYS; do
   OUT="trainer/${BASELINE_REL}/${d}.json"
   if [[ -f "$OUT" ]]; then

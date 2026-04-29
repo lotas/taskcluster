@@ -11,3 +11,4 @@ db/
 services/
 tools/*/
 !tools/queue-forecasting/
+tools/queue-forecasting/trainer/data
