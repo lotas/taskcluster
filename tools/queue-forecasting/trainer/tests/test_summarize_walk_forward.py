@@ -84,6 +84,45 @@ def test_extract_row_and_summary(tmp_path, monkeypatch, capsys):
     assert "run_duration" not in joined
 
 
+def test_skipped_manifests_excluded_from_csv(tmp_path, monkeypatch):
+    """Skip-manifests written by train.py when anomaly filter empties train/val
+    must not appear as all-NaN rows in the summary CSV."""
+    import scripts.summarize_walk_forward as swf
+
+    fake_root = tmp_path / "models"
+    fake_root.mkdir()
+    day_dir = fake_root / "2026-04-15"
+    day_dir.mkdir()
+
+    # Two manifests: one normal, one skipped.
+    (day_dir / "wait_time_residual_throughput_manifest.json").write_text(_fake_manifest({
+        "target": "wait_time",
+        "evaluation": {"primary": {
+            "aggregate": {"mae_s": 700.0, "within_2x_rate": 0.50, "p90_coverage_rate": 0.88},
+            "baseline_aggregate": {"mae_s": 800.0, "within_2x_rate": 0.47},
+            "buckets_aggregate": {},
+        }},
+        "windows": {"holdout": {"rows": 800000}},
+    }))
+    (day_dir / "wait_time_residual_throughput_filtered_manifest.json").write_text(_fake_manifest({
+        "skipped": True,
+        "skip_reason": "anomaly filter emptied val for 2026-04-15",
+        "target": "wait_time",
+        "as_of_date": "2026-04-15T00:00:00+00:00",
+    }))
+
+    monkeypatch.setattr(swf, "MODELS_DIR", fake_root)
+    out = tmp_path / "out.csv"
+    rc = swf.main(["--from", "2026-04-15", "--to", "2026-04-15",
+                   "--configs", "*", "--output", str(out)])
+    assert rc == 0
+    content = out.read_text()
+    lines = content.strip().splitlines()
+    # 1 header + 1 data row (the skipped manifest is dropped).
+    assert len(lines) == 1 + 1, f"unexpected line count: {len(lines)}\n{content}"
+    assert "wait_time_residual_throughput_filtered" not in content
+
+
 def test_configs_filter_wildcard_includes_all(tmp_path, monkeypatch):
     """--configs='*' disables filtering, all configs/targets included in CSV."""
     import scripts.summarize_walk_forward as swf

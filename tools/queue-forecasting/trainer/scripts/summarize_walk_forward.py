@@ -105,6 +105,11 @@ def _load_anomalous_dates_from_db() -> set[str]:
 
 def extract_row(manifest_path: Path, anomalous_dates: set[str] | None = None) -> dict | None:
     data = json.loads(manifest_path.read_text())
+    # Cohort × config combinations the trainer skipped (e.g. anomaly filter
+    # emptied train or val) leave a stub manifest with `skipped: true`.
+    # Don't include them in the summary CSV — they'd just be all-NaN rows.
+    if data.get("skipped"):
+        return None
     cohort = manifest_path.parent.name   # YYYY-MM-DD
     config = manifest_path.stem.replace("_manifest", "")
     target = data.get("target", "unknown")   # 'wait_time' | 'run_duration' | ...

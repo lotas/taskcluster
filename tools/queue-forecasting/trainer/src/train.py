@@ -104,6 +104,32 @@ def main(argv: list[str] | None = None) -> int:
                       f"val {n_val_before:,}→{len(val_df):,} ({len(anomalous_dates)} anomalous days)")
             # Holdout is never filtered. Will be sliced for reporting in Stage 2.
 
+    # Detect "filter emptied train or val" — write a skip-manifest and return
+    # cleanly so walk-forward continues. Common with validation_days=1 when
+    # the single val day happens to be flagged anomalous.
+    if len(train_df) == 0 or len(val_df) == 0:
+        empty_parts = [name for name, dfp in [("train", train_df), ("val", val_df)] if len(dfp) == 0]
+        skip_reason = (
+            f"anomaly filter emptied {', '.join(empty_parts)} for {c.as_of_date.date()}; "
+            f"too few non-anomalous days in {','.join(empty_parts)} window — "
+            f"increase validation_days or move the cohort"
+        )
+        run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = run_dir / f"{c.source_path.stem}_manifest.json"
+        with manifest_path.open("w") as fh:
+            json.dump({
+                "skipped": True,
+                "skip_reason": skip_reason,
+                "target": c.target,
+                "config_path": str(c.source_path),
+                "as_of_date": c.as_of_date.isoformat(),
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+            }, fh, indent=2)
+        print(f"  SKIP: {skip_reason}")
+        print(f"  skip-manifest written: {manifest_path}")
+        return 0
+
     builder = FeatureBuilder(c)
     train = builder.fit_transform(train_df)
     val   = builder.transform(val_df)
