@@ -12,6 +12,13 @@ const PROJECT_ROOT = path.join(__dirname, '..');
 const OUTPUT_DIR = process.env.DASHBOARD_OUTPUT_DIR || path.join(PROJECT_ROOT, 'dashboard-out');
 const MODELS_DIR = path.join(PROJECT_ROOT, 'trainer', 'data', 'models');
 const INTERVAL_MS = parseInt(process.env.DASHBOARD_INTERVAL_MS || '900000', 10); // 15 min
+
+function formatInterval(ms) {
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds % 3600 === 0) return `${totalSeconds / 3600}h`;
+  if (totalSeconds % 60 === 0) return `${totalSeconds / 60}m`;
+  return `${totalSeconds}s`;
+}
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
 
 // ─── DB Queries ──────────────────────────────────────────────────────────────
@@ -741,7 +748,7 @@ function buildPage(data) {
 </head>
 <body>
 <h1>Queue Forecasting Dashboard</h1>
-<div class="header-meta">Generated ${now} · refreshes every 15m · <a href="status.html">Project Status</a></div>
+<div class="header-meta">Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="status.html">Project Status</a></div>
 
 <h2>Today (UTC)</h2>
 ${data.todayHourly}
