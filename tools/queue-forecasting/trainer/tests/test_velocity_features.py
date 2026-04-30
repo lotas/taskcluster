@@ -95,3 +95,63 @@ def test_pool_dim_join():
     assert out.iloc[0]["provider_type"] == "azure"
     assert pd.isna(out.iloc[1]["pool_kind"])
     assert pd.isna(out.iloc[1]["provider_type"])
+
+
+def test_object_dtype_input_with_unmatched_rows_yields_float64_nan():
+    """Regression: psycopg returns INTEGER/DECIMAL columns as Python objects,
+    and merge_asof rows that fall outside the tolerance window get None.
+    The combination used to produce object-dtype output columns, which
+    LightGBM rejects ("pandas dtypes must be int, float or bool"). All five
+    derived velocity fields must come out as float64 with NaN (not None) for
+    missing rows.
+    """
+    df = pd.DataFrame([
+        # Row 0: outside tolerance -> no match, should be NaN.
+        {"task_id": "a", "run_id": 0,
+         "pending_at": pd.Timestamp("2026-04-20 10:30", tz="UTC"),
+         "task_queue_id": "q1", "queue_pending": 50},
+        # Row 1: matches the 10:05 sample.
+        {"task_id": "b", "run_id": 0,
+         "pending_at": pd.Timestamp("2026-04-20 10:07", tz="UTC"),
+         "task_queue_id": "q1", "queue_pending": 50},
+    ])
+    wc = _wc([
+        {"task_queue_id": "q1", "sampled_at": pd.Timestamp("2026-04-20 10:00", tz="UTC"),
+         "running_workers": 10, "claimed_tasks": 4, "existing_capacity": 12},
+        {"task_queue_id": "q1", "sampled_at": pd.Timestamp("2026-04-20 10:05", tz="UTC"),
+         "running_workers": 14, "claimed_tasks": 5, "existing_capacity": 16},
+    ])
+    # Force object dtype to mimic psycopg's INTEGER/DECIMAL handling.
+    for col in ("running_workers", "claimed_tasks", "existing_capacity"):
+        wc[col] = wc[col].astype(object)
+
+    out = add_velocity_features(
+        df, wc,
+        pd.DataFrame(columns=["task_queue_id", "pool_kind", "provider_type"]),
+        tolerance_minutes=10,
+    )
+
+    affected = [
+        "running_workers_now",
+        "idle_workers_now",
+        "utilization_now",
+        "provision_lag_now",
+        "tasks_per_worker",
+    ]
+    for col in affected:
+        assert out[col].dtype == np.float64, (
+            f"{col} expected float64, got {out[col].dtype}"
+        )
+        # Row 0 must be NaN (numpy float NaN), not Python None.
+        val = out[col].iloc[0]
+        assert pd.isna(val)
+        assert isinstance(val, float), (
+            f"{col} row 0 expected np.float64 NaN, got {type(val).__name__}"
+        )
+
+    # Row 1 (matched) must produce the right numeric values, still float64.
+    assert out["running_workers_now"].iloc[1] == 14.0
+    assert out["idle_workers_now"].iloc[1] == 9.0
+    assert np.isclose(out["utilization_now"].iloc[1], 5 / 14)
+    assert out["provision_lag_now"].iloc[1] == 2.0
+    assert np.isclose(out["tasks_per_worker"].iloc[1], 50 / 14)

@@ -59,19 +59,33 @@ def add_velocity_features(
     # Restore original row order
     merged = merged.set_index("index").sort_index()
 
-    df["running_workers_now"] = merged["running_workers"].values
-    df["claimed_tasks_now"] = merged["claimed_tasks"].values
-    df["existing_capacity_now"] = merged["existing_capacity"].values
+    # Force float64: psycopg can hand back INTEGER/DECIMAL columns as Python
+    # objects, and unmatched merge_asof rows insert None. Either path leaves
+    # the column with object dtype, which LightGBM refuses. Coerce here so
+    # every downstream derivation (idle/utilization/provision_lag/tasks_per_worker)
+    # inherits float64 with NaN for missing rather than object with None.
+    df["running_workers_now"] = pd.to_numeric(
+        merged["running_workers"].values, errors="coerce"
+    ).astype("float64")
+    df["claimed_tasks_now"] = pd.to_numeric(
+        merged["claimed_tasks"].values, errors="coerce"
+    ).astype("float64")
+    df["existing_capacity_now"] = pd.to_numeric(
+        merged["existing_capacity"].values, errors="coerce"
+    ).astype("float64")
 
     rw = df["running_workers_now"]
     ct = df["claimed_tasks_now"]
-    df["idle_workers_now"] = (rw - ct).clip(lower=0)
-    df["utilization_now"] = ct / rw.where(rw > 0).replace(0, np.nan)
-    df["provision_lag_now"] = df["existing_capacity_now"] - rw
+    df["idle_workers_now"] = (rw - ct).clip(lower=0).astype("float64")
+    df["utilization_now"] = (ct / rw.where(rw > 0).replace(0, np.nan)).astype("float64")
+    df["provision_lag_now"] = (df["existing_capacity_now"] - rw).astype("float64")
 
     # tasks_per_worker needs queue_pending (already in the main frame for wait model)
     if "queue_pending" in df.columns:
-        df["tasks_per_worker"] = df["queue_pending"] / rw.where(rw > 0).replace(0, np.nan)
+        qp = pd.to_numeric(df["queue_pending"], errors="coerce").astype("float64")
+        df["tasks_per_worker"] = (
+            qp / rw.where(rw > 0).replace(0, np.nan)
+        ).astype("float64")
 
     # --- Trailing-window averages (vectorised) ---
     for w_min in trailing_windows_minutes:
