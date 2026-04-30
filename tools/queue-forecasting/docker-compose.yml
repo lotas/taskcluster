@@ -122,7 +122,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
       DASHBOARD_OUTPUT_DIR: /dashboard
-      DASHBOARD_INTERVAL_MS: "900000"
+      DASHBOARD_INTERVAL_MS: "300000"
     volumes:
       - ./src:/app/tools/queue-forecasting/src
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
