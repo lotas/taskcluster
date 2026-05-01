@@ -127,6 +127,7 @@ services:
       - ./src:/app/tools/queue-forecasting/src
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
       - ./trainer-phase2-decision.md:/app/tools/queue-forecasting/trainer-phase2-decision.md:ro
+      - ./walk_forward_summary.csv:/app/tools/queue-forecasting/walk_forward_summary.csv:ro
       - dashboard-html:/dashboard
 
   dashboard:
