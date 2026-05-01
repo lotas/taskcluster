@@ -613,6 +613,75 @@ function renderManifestsTabs(manifests) {
   return html;
 }
 
+function loadWalkForwardSummary() {
+  const csvPath = path.join(PROJECT_ROOT, 'walk_forward_summary.csv');
+  if (!fs.existsSync(csvPath)) return [];
+  const lines = fs.readFileSync(csvPath, 'utf8').trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',');
+  return lines.slice(1).map(line => {
+    const vals = line.split(',');
+    const row = {};
+    headers.forEach((h, i) => { row[h] = vals[i]; });
+    return row;
+  });
+}
+
+function renderWalkForwardSummary(rows) {
+  if (!rows.length) return '<p class="muted">No walk_forward_summary.csv found.</p>';
+
+  // Group by config, preserving insertion order
+  const byConfig = {};
+  for (const r of rows) {
+    if (!byConfig[r.config]) byConfig[r.config] = [];
+    byConfig[r.config].push(r);
+  }
+  const configs = Object.keys(byConfig);
+
+  let html = '<div class="tabs">';
+  configs.forEach((cfg, i) => {
+    const active = i === 0 ? ' active' : '';
+    html += `<button class="tab-btn${active}" onclick="switchTab('wf', ${i}, this)">${esc(cfg)}</button>`;
+  });
+  html += '</div>';
+
+  configs.forEach((cfg, i) => {
+    const cfgRows = byConfig[cfg];
+    const display = i === 0 ? 'block' : 'none';
+    html += `<div class="tab-panel" id="wf-${i}" style="display:${display}">`;
+    html += `<table><thead><tr>
+      <th>Cohort</th>
+      <th class="r">Baseline MAE</th>
+      <th class="r">Model MAE</th>
+      <th class="r">Δ MAE %</th>
+      <th class="r">Model within-2x</th>
+      <th class="r">Δ within-2x pp</th>
+      <th class="r">p90 cov</th>
+      <th class="r">Hold rows</th>
+    </tr></thead><tbody>`;
+    for (const r of cfgRows) {
+      const deltaMae = parseFloat(r.delta_mae_pct);
+      const deltaW2x = parseFloat(r.delta_within_2x_pp);
+      const deltaMaeStyle = !isNaN(deltaMae)
+        ? (deltaMae < 0 ? ' style="color:var(--green)"' : ' style="color:var(--red)"') : '';
+      const deltaW2xStyle = !isNaN(deltaW2x)
+        ? (deltaW2x > 0 ? ' style="color:var(--green)"' : ' style="color:var(--red)"') : '';
+      html += `<tr>
+        <td>${esc(r.cohort_as_of)}</td>
+        <td class="r">${fmtDuration(r.baseline_mae)}</td>
+        <td class="r">${fmtDuration(r.model_mae)}</td>
+        <td class="r"${deltaMaeStyle}>${!isNaN(deltaMae) ? deltaMae.toFixed(1) + '%' : '—'}</td>
+        <td class="r">${fmtPct(r.model_within_2x)}</td>
+        <td class="r"${deltaW2xStyle}>${!isNaN(deltaW2x) ? (deltaW2x > 0 ? '+' : '') + deltaW2x.toFixed(1) + 'pp' : '—'}</td>
+        <td class="r">${fmtPct(r.p90_coverage)}</td>
+        <td class="r">${fmtNum(r.hold_rows)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  });
+  return html;
+}
+
 function renderDailyHealth(rows) {
   if (!rows.length) return '<p class="muted">No daily health data.</p>';
   let html = `<table class="health-table"><thead><tr>
@@ -783,6 +852,9 @@ ${data.todayHourly}
 <div class="meta">${data.manifestsDir}</div>
 ${data.manifests}
 
+<h2>Walk-Forward Evaluation</h2>
+${data.walkForward}
+
 <h2>Daily Health (last 30d)</h2>
 ${data.dailyHealth}
 
@@ -857,6 +929,7 @@ async function generate() {
 
     const manifests = loadLatestManifests();
     const latestDir = manifests.length ? manifests[0]._date_dir : 'none';
+    const wfRows = loadWalkForwardSummary();
 
     const html = buildPage({
       tableHealth: renderTableHealth(tableHealth),
@@ -868,6 +941,7 @@ async function generate() {
       manifestsDir: `Latest: trainer/data/models/${latestDir}/`,
       dailyHealth: renderDailyHealth(dailyHealth),
       todayHourly: renderTodayHourly(todayHourly),
+      walkForward: renderWalkForwardSummary(wfRows),
     });
 
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
