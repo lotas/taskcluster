@@ -648,7 +648,7 @@ function renderWalkForwardSummary(rows) {
   configs.forEach((cfg, i) => {
     const cfgRows = byConfig[cfg];
     const display = i === 0 ? 'block' : 'none';
-    html += `<div class="tab-panel" id="wf-${i}" style="display:${display}">`;
+    html += `<div class="tab-panel wf-panel" id="wf-${i}" style="display:${display}">`;
     html += `<table><thead><tr>
       <th>Cohort</th>
       <th class="r">Baseline MAE</th>
