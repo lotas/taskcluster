@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,23 +86,34 @@ def main(argv: list[str] | None = None) -> int:
           f"train={w.train_start.date()}..{w.train_end.date()}, "
           f"val={w.val_start.date()}, "
           f"holdout={w.hold_start.date()}..{w.hold_end.date()})")
-    df = data_loader.load(c, refresh_cache=args.refresh_cache)
+    # Pre-load worker_pools before data_loader.load() so the same snapshot is
+    # used for both feature computation and lineage hashing (avoids a second
+    # DB read that could reflect a changed table mid-run).
+    _worker_pools_snapshot: "pd.DataFrame | None" = None
+    if c.velocity_features and c.velocity_features.get("enabled"):
+        _worker_pools_snapshot = data_loader.load_worker_pools()
+
+    df = data_loader.load(c, refresh_cache=args.refresh_cache, worker_pools=_worker_pools_snapshot)
     print(f"  rows loaded: {len(df):,}")
 
     train_df, val_df, hold_df = _split_by_pending_at(df, c)
     print(f"  train={len(train_df):,}  val={len(val_df):,}  hold={len(hold_df):,}")
 
+    # Dates actually excluded from train/val; captured here so lineage records
+    # the exact set used, not a re-query that could differ if the health table
+    # is updated mid-run.
+    _anomalous_dates_used: set = set()
     if c.anomaly_filter and c.anomaly_filter.get("enabled"):
         mode = c.anomaly_filter.get("mode", "training")
         if mode in ("training", "both"):
-            anomalous_dates = data_loader.load_anomalous_dates(c)
-            if anomalous_dates:
+            _anomalous_dates_used = data_loader.load_anomalous_dates(c)
+            if _anomalous_dates_used:
                 n_train_before = len(train_df)
                 n_val_before   = len(val_df)
-                train_df = train_df[~train_df["pending_at"].dt.tz_convert("UTC").dt.date.isin(anomalous_dates)].reset_index(drop=True)
-                val_df   = val_df  [~val_df  ["pending_at"].dt.tz_convert("UTC").dt.date.isin(anomalous_dates)].reset_index(drop=True)
+                train_df = train_df[~train_df["pending_at"].dt.tz_convert("UTC").dt.date.isin(_anomalous_dates_used)].reset_index(drop=True)
+                val_df   = val_df  [~val_df  ["pending_at"].dt.tz_convert("UTC").dt.date.isin(_anomalous_dates_used)].reset_index(drop=True)
                 print(f"  anomaly filter ({mode}): train {n_train_before:,}→{len(train_df):,}, "
-                      f"val {n_val_before:,}→{len(val_df):,} ({len(anomalous_dates)} anomalous days)")
+                      f"val {n_val_before:,}→{len(val_df):,} ({len(_anomalous_dates_used)} anomalous days)")
             # Holdout is never filtered. Will be sliced for reporting in Stage 2.
 
     # Detect "filter emptied train or val" — write a skip-manifest and return
@@ -153,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         m.fit(train.X, train.y, val.X, val.y)
         models[q] = m
 
-    # Save models + manifest.
+    # Save models + sidecars + manifest.
     run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
     run_dir.mkdir(parents=True, exist_ok=True)
     # Output filenames key off the config stem so each variant (e.g. log_ratio,
@@ -162,6 +174,126 @@ def main(argv: list[str] | None = None) -> int:
     for q, m in models.items():
         tag = f"p{int(q * 100)}"
         m.save(run_dir / f"{run_stem}_{tag}.lgb")
+        m.save_onnx(run_dir / f"{run_stem}_{tag}.onnx")
+
+    # Category-vocabulary sidecar (one per config, not per quantile).
+    category_mappings_path = run_dir / f"{run_stem}_category_mappings.json"
+    builder.dump_categories(category_mappings_path)
+
+    # Feature-schema sidecar — the JS serving contract.
+    s_hash = data_loader.serving_hash(c)
+    model_version = f"v_{c.as_of_date.strftime('%Y-%m-%d')}_{s_hash}"
+    feature_schema = {
+        "model_version":   model_version,
+        "target":          c.target,
+        "feature_order":   list(next(iter(models.values())).feature_names_),
+        "categorical_features": c.categorical_features,
+        "numeric_features":     c.numeric_features,
+        "derived_features":     c.derived_features,
+        "residual":             c.residual,
+        "anomaly_filter":       c.anomaly_filter,
+        "throughput_features":  c.throughput_features,
+        "velocity_features":    getattr(c, "velocity_features", None),
+        "quantile_models": {
+            str(q): f"{run_stem}_p{int(q * 100)}.onnx" for q in sorted(models)
+        },
+        "category_mappings_file": category_mappings_path.name,
+        "cold_start_code": -1,
+    }
+    feature_schema_path = run_dir / f"{run_stem}_feature_schema.json"
+    feature_schema_path.write_text(json.dumps(feature_schema, indent=2, default=str))
+
+    # artifact_hash: SHA256 over the four serving files concatenated in order.
+    serving_files = [
+        run_dir / f"{run_stem}_p50.onnx",
+        run_dir / f"{run_stem}_p90.onnx",
+        category_mappings_path,
+        feature_schema_path,
+    ]
+    h = hashlib.sha256()
+    for sf in serving_files:
+        with open(sf, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    artifact_hash = h.hexdigest()[:16]
+
+    # training_lineage: content hashes of every input that produced this model.
+    main_cache = data_loader.cache_path(c)
+    training_lineage: dict = {
+        "training_cache_file":            main_cache.name,
+        "training_cache_content_sha256":  data_loader.file_sha256(main_cache) if main_cache.exists() else None,
+    }
+    if c.anomaly_filter and c.anomaly_filter.get("enabled"):
+        mode = c.anomaly_filter.get("mode", "training")
+        if mode in ("training", "both"):
+            # Reuse the set captured at filter time — not a fresh DB query.
+            excluded = sorted(d.isoformat() for d in _anomalous_dates_used)
+            flag_subset = c.anomaly_filter.get("flag_subset")
+            condition = (
+                " OR ".join(f"{f} = TRUE" for f in flag_subset)
+                if flag_subset else "is_anomalous = TRUE"
+            )
+            training_lineage["training_excluded_dates"] = excluded
+            training_lineage["anomaly_filter_basis"] = {
+                "mode": mode,
+                "flag_subset": flag_subset,
+                "query": f"SELECT sample_date FROM queue_forecast_daily_health WHERE {condition}",
+            }
+        else:
+            training_lineage["training_excluded_dates"] = []
+            training_lineage["anomaly_filter_basis"] = None
+    else:
+        training_lineage["training_excluded_dates"] = []
+        training_lineage["anomaly_filter_basis"] = None
+
+    engineered: dict = {}
+    throughput_path = data_loader.throughput_cache_path(c)
+    if throughput_path is not None:
+        engineered["throughput_runs"] = {
+            "file":           throughput_path.name,
+            "content_sha256": data_loader.file_sha256(throughput_path) if throughput_path.exists() else None,
+        }
+    wc_path = data_loader.worker_counts_cache_path(c)
+    if wc_path is not None:
+        engineered["worker_counts"] = {
+            "file":           wc_path.name,
+            "content_sha256": data_loader.file_sha256(wc_path) if wc_path.exists() else None,
+        }
+        # worker_pools has no parquet cache; hash the snapshot captured before
+        # data_loader.load() — same object used for training, no second DB read.
+        if _worker_pools_snapshot is not None:
+            try:
+                import io as _io
+                pools_sorted = _worker_pools_snapshot.sort_values("task_queue_id").reset_index(drop=True)
+                buf = _io.BytesIO()
+                pools_sorted.to_parquet(buf, index=False)
+                pools_sha = hashlib.sha256(buf.getvalue()).hexdigest()
+                engineered["worker_pools"] = {
+                    "source":         "queue_forecast_worker_pools",
+                    "row_count":      len(_worker_pools_snapshot),
+                    "content_sha256": pools_sha,
+                }
+            except Exception as exc:
+                engineered["worker_pools"] = {"error": str(exc)}
+    if engineered:
+        training_lineage["engineered_feature_inputs"] = engineered
+
+    if c.residual:
+        bl_path = _baseline_dir(c) / c.residual["baseline_file"]
+        bl_meta_path = bl_path.with_suffix(".ndjson.meta.json") if bl_path.suffix == ".ndjson" else bl_path.with_name(bl_path.name + ".meta.json")
+        bl_meta = None
+        if bl_meta_path.exists():
+            try:
+                bl_meta = json.loads(bl_meta_path.read_text())
+            except Exception:
+                bl_meta = None
+        training_lineage["baseline_ndjson_meta"] = {
+            **(bl_meta or {}),
+            "file":           str(bl_path.relative_to(TRAINER_ROOT)),
+            "content_sha256": data_loader.file_sha256(bl_path) if bl_path.exists() else None,
+        }
+    else:
+        training_lineage["baseline_ndjson_meta"] = None
 
     # Evaluate. Target key matches what the baseline JSON uses:
     # baseline stores both "duration" and "wait" blocks; we pick ours.
@@ -186,7 +318,17 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {
         "target": c.target,
         "config_path": str(c.source_path),
-        "config_hash": data_loader.cache_key(c),
+        "config_hash": data_loader.cache_key(c),   # query-shaping only; kept for dashboard compat
+        "serving_hash": s_hash,
+        "model_version": model_version,
+        "artifact_hash": artifact_hash,
+        "serving_artifacts": [sf.name for sf in serving_files],
+        "training_artifacts": [
+            f"{run_stem}_p{int(q * 100)}.lgb"      for q in sorted(models)
+        ] + [
+            f"{run_stem}_p{int(q * 100)}.lgb.meta" for q in sorted(models)
+        ],
+        "training_lineage": training_lineage,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "model_type": c.model_type,
         "lightgbm_version": lgb.__version__,

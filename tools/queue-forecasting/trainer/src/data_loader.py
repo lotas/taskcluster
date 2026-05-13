@@ -38,6 +38,80 @@ def cache_key(c: Config) -> str:
     return hashlib.sha256(blob).hexdigest()[:8]
 
 
+def serving_hash(c: Config) -> str:
+    """8-hex-char SHA256 over every config field that affects the served model.
+
+    Includes everything cache_key covers, plus model_params, quantiles,
+    residual block, baseline_dir, anomaly_filter, throughput_features,
+    velocity_features.
+
+    Feature lists are preserved in YAML order (NOT sorted) because the
+    position of each feature in the ONNX input tensor is part of the
+    serving contract. cache_key sorts them (fine for cache identity, where
+    row content is invariant under column order); serving_hash must not.
+    """
+    payload = {
+        "shaping": {
+            "target":               c.target,
+            "target_column":        c.target_column,
+            "filters":              sorted(c.filters),
+            "categorical_features": list(c.categorical_features),  # ORDERED
+            "numeric_features":     list(c.numeric_features),      # ORDERED
+            "derived_features":     c.derived_features,
+            "lookback_days":        c.lookback_days,
+            "validation_days":      c.validation_days,
+            "holdout_days":         c.holdout_days,
+        },
+        "model_type":          c.model_type,
+        "model_params":        c.model_params,
+        "quantiles":           list(c.quantiles),
+        "residual":            c.residual,
+        "baseline_dir":        c.baseline_dir,
+        "anomaly_filter":      c.anomaly_filter,
+        "throughput_features": c.throughput_features,
+        "velocity_features":   getattr(c, "velocity_features", None),
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha256(blob).hexdigest()[:8]
+
+
+def file_sha256(path: Path) -> str:
+    """Hex SHA256 of file contents (full 64-char string)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def throughput_cache_path(c: Config) -> Path | None:
+    """Return the parquet cache path for throughput features, or None if not enabled."""
+    if not (c.throughput_features and c.throughput_features.get("enabled")):
+        return None
+    import pandas as pd
+    w = compute_windows(c)
+    windows = tuple(c.throughput_features.get("windows_minutes", [15, 60]))
+    max_window = max(windows) if windows else 60
+    window_start = w.train_start - pd.Timedelta(minutes=max_window + 30)
+    window_end = w.as_of_date
+    from_str = window_start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    to_str = window_end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return CACHE_DIR / f"throughput_runs_{from_str}_{to_str}.parquet"
+
+
+def worker_counts_cache_path(c: Config) -> Path | None:
+    """Return the parquet cache path for worker-count velocity features, or None if not enabled."""
+    if not (c.velocity_features and c.velocity_features.get("enabled")):
+        return None
+    from datetime import timedelta
+    w = compute_windows(c)
+    fetch_from = w.train_start - timedelta(hours=1, minutes=30)
+    fetch_to = w.as_of_date
+    from_str = fetch_from.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    to_str = fetch_to.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return CACHE_DIR / f"worker_counts_{from_str}_{to_str}.parquet"
+
+
 def cache_filename(c: Config) -> str:
     as_of = c.as_of_date.astimezone(timezone.utc).strftime("%Y-%m-%d")
     return f"{c.target}_lb{c.lookback_days}_asof{as_of}_{cache_key(c)}.parquet"
@@ -296,7 +370,7 @@ def load_anomalous_dates(c: Config) -> set[datetime.date]:
             return {r[0] for r in cur.fetchall()}
 
 
-def load(c: Config, *, refresh_cache: bool = False) -> pd.DataFrame:
+def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame | None = None) -> pd.DataFrame:
     path = cache_path(c)
     if path.exists() and not refresh_cache:
         df = pd.read_parquet(path)
@@ -343,7 +417,8 @@ def load(c: Config, *, refresh_cache: bool = False) -> pd.DataFrame:
 
         w = compute_windows(c)
         worker_counts = load_worker_counts(c, w.train_start, w.as_of_date)
-        worker_pools = load_worker_pools()
+        if worker_pools is None:
+            worker_pools = load_worker_pools()
         trailing = tuple(c.velocity_features.get("trailing_windows_minutes", [60]))
         tol = int(c.velocity_features.get("tolerance_minutes", 10))
         df = add_velocity_features(

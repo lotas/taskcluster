@@ -12,6 +12,7 @@
     "@taskcluster/client": "link:../../clients/client",
     "@taskcluster/lib-monitor": "workspace:*",
     "@taskcluster/lib-pulse": "workspace:*",
+    "onnxruntime-node": "^1.17.0",
     "pg": "^8.13.0",
     "quick-lru": "^5.0.0"
   }

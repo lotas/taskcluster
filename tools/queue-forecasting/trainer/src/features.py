@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -55,6 +57,21 @@ class FeatureBuilder:
             X[col] = pd.Categorical(series.where(series.isin(cats)), categories=cats)
         stats = self._stats(X, unseen=unseen)
         return Split(X=X, y=y, meta=meta, stats=stats)
+
+    def dump_categories(self, path: Path) -> None:
+        """Write category vocabularies to a JSON file.
+
+        Format: {"col_name": ["val0", "val1", ...], ...}
+        Index position in each list is the integer code seen by the model.
+        Unseen or null values at inference time should be encoded as -1
+        (the cold_start_code).  Must be called after fit_transform().
+        """
+        if not self._fitted:
+            raise RuntimeError("dump_categories called before fit_transform")
+        out: dict[str, list] = {}
+        for col, cats in self._categories.items():
+            out[col] = [v if v is not None else None for v in cats.tolist()]
+        Path(path).write_text(json.dumps(out, indent=2, default=str))
 
     # -- internals -----------------------------------------------------
 

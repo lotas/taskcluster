@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import numpy as np
@@ -104,6 +105,51 @@ def test_build_type_regex_extraction():
     vals = list(s.X["build_type"].astype(object))
     assert vals[:2] == ["debug", "opt"]
     assert pd.isna(vals[2])
+
+
+def test_dump_categories_round_trip(tmp_path):
+    c = _cfg()
+    train = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 01:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 5.0,
+         "task_queue_id": "q1", "tags": {"kind": "build"}, "queue_pending": 10},
+        {"task_id": "b", "run_id": 0, "pending_at": pd.Timestamp("2026-04-11 02:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 7.0,
+         "task_queue_id": "q2", "tags": {"kind": "test"}, "queue_pending": 20},
+        {"task_id": "c", "run_id": 0, "pending_at": pd.Timestamp("2026-04-12 03:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 3.0,
+         "task_queue_id": "q1", "tags": {"kind": "build"}, "queue_pending": 5},
+    ])
+    b = FeatureBuilder(c)
+    b.fit_transform(train)
+
+    out_path = tmp_path / "cats.json"
+    b.dump_categories(out_path)
+    assert out_path.exists()
+
+    loaded = json.loads(out_path.read_text())
+    assert set(loaded.keys()) == {"task_queue_id", "tags.kind"}
+
+    # Values must match the _categories index (sorted during fit_transform).
+    assert loaded["task_queue_id"] == sorted(["q1", "q2"])
+    assert loaded["tags.kind"] == sorted(["build", "test"])
+
+    # Index positions must match pandas Categorical codes: category at index i
+    # should have code i in the fitted FeatureBuilder.
+    for col in ["task_queue_id", "tags.kind"]:
+        cats_in_json = loaded[col]
+        cats_in_builder = list(b._categories[col])
+        assert cats_in_json == cats_in_builder, (
+            f"{col}: JSON order {cats_in_json} != builder order {cats_in_builder}"
+        )
+
+
+def test_dump_categories_raises_before_fit(tmp_path):
+    c = _cfg()
+    b = FeatureBuilder(c)
+    import pytest
+    with pytest.raises(RuntimeError, match="fit_transform"):
+        b.dump_categories(tmp_path / "cats.json")
 
 
 def test_stats_record_unseen_rate():

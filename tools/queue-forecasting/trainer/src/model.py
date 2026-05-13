@@ -7,6 +7,9 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import onnx  # noqa: F401 — imported here so ImportError surfaces early
+import onnxmltools
+from onnxconverter_common.data_types import FloatTensorType
 
 
 class QuantileModel(ABC):
@@ -30,6 +33,7 @@ class LightGBMQuantileModel(QuantileModel):
         self.alpha = alpha
         self.params = dict(params)
         self.booster: lgb.Booster | None = None
+        self.feature_names_: list[str] = []
 
     def fit(self, X_train, y_train, X_val, y_val) -> None:
         n_estimators = int(self.params.get("n_estimators", 500))
@@ -56,6 +60,10 @@ class LightGBMQuantileModel(QuantileModel):
             valid_names=["val"],
             callbacks=[lgb.early_stopping(early_stop, verbose=False)],
         )
+        # Lock in the exact training-frame column order for ONNX export.
+        # Using X_train.columns rather than booster.feature_name() preserves
+        # original casing/spacing and matches the JS input tensor exactly.
+        self.feature_names_ = list(X_train.columns)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         if self.booster is None:
@@ -70,6 +78,33 @@ class LightGBMQuantileModel(QuantileModel):
         self.booster.save_model(str(path))
         meta = path.with_suffix(path.suffix + ".meta")
         meta.write_text(f"alpha={self.alpha}\n")
+
+    def save_onnx(self, path: Path) -> None:
+        """Export the booster as an ONNX model with a single float32 input tensor.
+
+        Categorical features are expected as their integer codes (float32-cast),
+        with -1 for unseen/null values — matching the pandas Categorical convention
+        used during training and the cold_start_code in the feature schema.
+
+        For ResidualLightGBMQuantileModel this exports the raw transformed-space
+        booster; the inverse transform is applied by the JS serving layer using
+        the residual block in the feature schema.
+        """
+        if self.booster is None:
+            raise RuntimeError("model not fit")
+        if not self.feature_names_:
+            raise RuntimeError("feature_names_ not set — call fit() before save_onnx()")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        n_features = len(self.feature_names_)
+        initial_types = [("input", FloatTensorType([None, n_features]))]
+        onnx_model = onnxmltools.convert_lightgbm(
+            self.booster,
+            initial_types=initial_types,
+            target_opset=12,
+        )
+        with open(path, "wb") as fh:
+            fh.write(onnx_model.SerializeToString())
 
     @classmethod
     def load(cls, path: Path) -> "LightGBMQuantileModel":

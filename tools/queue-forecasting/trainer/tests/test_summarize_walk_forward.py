@@ -65,23 +65,28 @@ def test_extract_row_and_summary(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(swf, "MODELS_DIR", fake_root)
 
-    # Default config filter: 3 wait configs only (additive + duration excluded).
+    # Default config filter: wait_time, wait_time_residual_throughput,
+    # wait_time_residual_throughput_filtered_baseline, run_duration_residual.
+    # (wait_time_residual and wait_time_residual_additive are not in the default.)
     output_path = tmp_path / "out.csv"
     rc = swf.main(["--from", "2026-04-20", "--to", "2026-04-21", "--output", str(output_path)])
     assert rc == 0
     assert output_path.exists()
     content = output_path.read_text()
     lines = content.strip().splitlines()
-    # Expect 6 data rows (2 cohorts × 3 default-whitelisted wait configs), plus header.
+    # Expect 6 data rows: 2 cohorts × (wait_time + wait_time_residual_throughput +
+    # run_duration_residual) — filtered_baseline not in fixtures so not counted.
     assert len(lines) == 1 + 6, f"unexpected line count: {len(lines)}\n{content}"
     # Header has target column.
     assert "cohort_as_of,config,target,baseline_mae" in lines[0]
     # Only whitelisted configs appear in rows.
     joined = "\n".join(lines[1:])
     assert "wait_time_residual_throughput" in joined
-    assert "wait_time_residual" in joined
+    assert "run_duration_residual" in joined
     assert "wait_time_residual_additive" not in joined
-    assert "run_duration" not in joined
+    # vanilla wait_time_residual is no longer in the default
+    rows_no_header = [row for row in lines[1:] if ",wait_time_residual," in row]
+    assert rows_no_header == [], f"wait_time_residual should not appear: {rows_no_header}"
 
 
 def test_skipped_manifests_excluded_from_csv(tmp_path, monkeypatch):

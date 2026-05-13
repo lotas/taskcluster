@@ -270,7 +270,7 @@ def print_summary(rows: list[dict]) -> None:
         _print_target_block(target, by_target[target])
 
 
-DEFAULT_CONFIGS = "wait_time,wait_time_residual,wait_time_residual_throughput"
+DEFAULT_CONFIGS = "wait_time,wait_time_residual_throughput,wait_time_residual_throughput_filtered_baseline,run_duration_residual"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -280,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--output", default="walk_forward_summary.csv")
     p.add_argument("--configs", default=DEFAULT_CONFIGS,
                    help="Comma-separated config stems to include (matches manifest filenames without _manifest.json). "
-                        "Pass '*' or empty to disable filtering. Default: " + DEFAULT_CONFIGS)
+                        "Comma-separated config stems to include. Pass '*' or empty to disable filtering.")
     args = p.parse_args(argv)
 
     from_dt = _parse_date(args.from_date)
