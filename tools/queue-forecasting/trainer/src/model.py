@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,11 @@ import pandas as pd
 import onnx  # noqa: F401 — imported here so ImportError surfaces early
 import onnxmltools
 from onnxconverter_common.data_types import FloatTensorType
+
+# onnxmltools._parse_node recurses once per tree node. LightGBM leaf-wise growth
+# with 63 max leaves can produce very unbalanced trees whose depth exceeds
+# Python's default 1000-frame limit on 500-estimator models.
+_ONNX_RECURSION_LIMIT = 50_000
 
 
 class QuantileModel(ABC):
@@ -98,11 +104,16 @@ class LightGBMQuantileModel(QuantileModel):
         path.parent.mkdir(parents=True, exist_ok=True)
         n_features = len(self.feature_names_)
         initial_types = [("input", FloatTensorType([None, n_features]))]
-        onnx_model = onnxmltools.convert_lightgbm(
-            self.booster,
-            initial_types=initial_types,
-            target_opset=12,
-        )
+        old_limit = sys.getrecursionlimit()
+        try:
+            sys.setrecursionlimit(max(old_limit, _ONNX_RECURSION_LIMIT))
+            onnx_model = onnxmltools.convert_lightgbm(
+                self.booster,
+                initial_types=initial_types,
+                target_opset=12,
+            )
+        finally:
+            sys.setrecursionlimit(old_limit)
         with open(path, "wb") as fh:
             fh.write(onnx_model.SerializeToString())
 
