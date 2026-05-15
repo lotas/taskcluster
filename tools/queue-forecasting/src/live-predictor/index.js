@@ -1,18 +1,21 @@
 /**
  * Live Predictor service.
  *
- * Lifecycle (order matters):
- *   1. Connect to Postgres (pool for queries, dedicated client for LISTEN).
+ * Lifecycle:
+ *   1. Connect to Postgres pool.
  *   2. Load model bundles from trainer/data/models/<latest>/ (wait + duration).
  *   3. Refresh the baseline stats once, then schedule hourly refresh.
- *   4. LISTEN queue_forecast_task_pending — MUST happen BEFORE catch-up so
- *      notifications committed during catch-up are not lost.
- *   5. Run startup catch-up over currently-unresolved rows that don't yet
- *      have a prediction (keyset-paginated until exhausted).
- *   6. On each NOTIFY: dispatch predictAndStore with a concurrency cap.
+ *   4. Poll loop: every POLL_INTERVAL_MS, run a keyset-paginated sweep over
+ *      currently-unresolved unpredicted rows and predict each one. Each batch
+ *      is awaited before re-querying so the NOT EXISTS check sees just-
+ *      predicted rows on the next iteration; the cursor advances past every
+ *      attempted row so a permanently-failing row can't stall the loop.
  *
- * On unhandled errors in the LISTEN connection, exit non-zero so the
- * container's restart policy revives us.
+ * Polling replaces an earlier LISTEN/NOTIFY design that proved unreliable in
+ * practice (notifications stopped flowing after catch-up despite the listener
+ * connection appearing healthy). Polling is the simpler model: at the cost of
+ * a few seconds of latency per prediction, we get a single code path with no
+ * notification-loss failure mode.
  */
 
 import pg from 'pg';
@@ -28,20 +31,18 @@ const MODELS_ROOT = path.join(PROJECT_ROOT, 'trainer', 'data', 'models');
 
 const WAIT_STEM      = 'wait_time_residual_throughput_filtered_baseline';
 const DURATION_STEM  = 'run_duration_residual';
-const CHANNEL        = 'queue_forecast_task_pending';
-const MAX_INFLIGHT   = 4;   // cap concurrent predictions to keep DB load bounded
+const MAX_INFLIGHT   = 4;
+const POLL_INTERVAL_MS = Number(process.env.LIVE_PREDICTOR_POLL_MS || 5000);
 
-// Catch-up covers currently-unresolved rows that have no prediction yet.
+// Each poll cycle keyset-paginates through unpredicted unresolved rows.
 // Uses the existing partial index idx_qf_task_runs_unresolved
 // (`(pending_at) WHERE resolved_at IS NULL`) for an index-only scan.
 //
-// Keyset pagination over (pending_at, task_id, run_id) ensures each row is
-// visited at most once per startup, so a permanently failing row (e.g. a
-// corrupt task row that always throws inside predictAndStore) doesn't block
-// the loop — we advance past it and move on. The cursor starts before all
-// real rows; each batch shifts it forward to the last row seen.
-const CATCH_UP_BATCH = 500;
-const CATCH_UP_SQL = `
+// Cursor advances past every row seen, so a row that keeps failing inside
+// predictAndStore is attempted once per cycle (cursor reset between cycles)
+// rather than blocking forward progress within a cycle.
+const BATCH_SIZE = 500;
+const POLL_SQL = `
 SELECT r.task_id, r.run_id, r.pending_at
 FROM queue_forecast_task_runs r
 WHERE r.resolved_at IS NULL
@@ -51,7 +52,7 @@ WHERE r.resolved_at IS NULL
   )
   AND (r.pending_at, r.task_id, r.run_id) > ($1::timestamptz, $2::text, $3::int)
 ORDER BY r.pending_at, r.task_id, r.run_id
-LIMIT ${CATCH_UP_BATCH}
+LIMIT ${BATCH_SIZE}
 ;`;
 
 function log(...args) {
@@ -62,10 +63,6 @@ function logErr(...args) {
   console.error(new Date().toISOString(), '[live-predictor]', ...args);
 }
 
-/**
- * Simple semaphore-style concurrency cap. Returns a promise that resolves
- * when there's a free slot, and a release() to call when done.
- */
 function makeLimiter(max) {
   let inFlight = 0;
   const waiters = [];
@@ -88,6 +85,8 @@ function makeLimiter(max) {
     };
   };
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   const databaseUrl = process.env.DATABASE_URL;
@@ -126,86 +125,59 @@ async function main() {
   const bundles = { wait: waitBundle, duration: durationBundle };
   const acquire = makeLimiter(MAX_INFLIGHT);
 
-  async function processOne(taskId, runId, source) {
+  async function processOne(taskId, runId) {
     const release = await acquire();
     try {
       const r = await predictAndStore({ pool, bundles, baselineStats: stats, taskId, runId });
       if (r.inserted) {
-        log(`predicted ${taskId}/${runId} via ${source}${r.enriched ? '' : ' (cold-start)'}`);
+        log(`predicted ${taskId}/${runId}${r.enriched ? '' : ' (cold-start)'}`);
       } else if (r.reason !== 'duplicate') {
-        log(`skipped ${taskId}/${runId} via ${source}: ${r.reason}`);
+        log(`skipped ${taskId}/${runId}: ${r.reason}`);
       }
     } catch (err) {
-      logErr(`predict failed for ${taskId}/${runId} (${source}):`, err.message);
+      logErr(`predict failed for ${taskId}/${runId}:`, err.message);
     } finally {
       release();
     }
   }
 
-  // ────────────────────────────────────────────────────────────────────
-  // STEP A: Set up LISTEN BEFORE catch-up.
-  //
-  // NOTIFY events committed between catch-up start and LISTEN registration
-  // would be lost otherwise — postgres only delivers notifications to
-  // sessions that are LISTENing at commit time. We set up LISTEN first,
-  // then run catch-up; any events that arrive during catch-up are queued
-  // on the listener and processed after, and duplicates between catch-up
-  // and NOTIFY are handled by INSERT ... ON CONFLICT DO NOTHING.
-  // ────────────────────────────────────────────────────────────────────
-  const listener = new pg.Client({ connectionString: databaseUrl });
-  listener.on('error', (err) => {
-    logErr('listener error, exiting for restart:', err.message);
-    process.exit(1);
-  });
-  listener.on('notification', (msg) => {
-    if (msg.channel !== CHANNEL) return;
-    let payload;
-    try {
-      payload = JSON.parse(msg.payload);
-    } catch {
-      logErr('bad NOTIFY payload, ignoring:', msg.payload);
-      return;
-    }
-    if (!payload.task_id || payload.run_id === undefined) return;
-    processOne(payload.task_id, payload.run_id, 'notify');
-  });
-  await listener.connect();
-  await listener.query(`LISTEN ${CHANNEL}`);
-  log(`LISTENing on ${CHANNEL}`);
-
-  // ────────────────────────────────────────────────────────────────────
-  // STEP B: Catch-up for currently-unresolved unpredicted rows.
-  // Keyset cursor starts before all real rows; each batch advances it to
-  // the last row seen, so every row is attempted at most once and a
-  // permanently failing row never stalls the loop.
-  // ────────────────────────────────────────────────────────────────────
-  log('running catch-up');
-  let totalCatchUp = 0;
-  let cursorPendingAt = new Date(0);
-  let cursorTaskId    = '';
-  let cursorRunId     = -1;
-
-  while (true) {
-    const batch = await pool.query(CATCH_UP_SQL, [cursorPendingAt, cursorTaskId, cursorRunId]);
-    if (batch.rowCount === 0) break;
-    log(`catch-up batch: ${batch.rowCount} unresolved unpredicted rows`);
-    await Promise.all(batch.rows.map(r => processOne(r.task_id, r.run_id, 'catch-up')));
-    const last = batch.rows[batch.rows.length - 1];
-    cursorPendingAt = last.pending_at;
-    cursorTaskId    = last.task_id;
-    cursorRunId     = last.run_id;
-    totalCatchUp += batch.rowCount;
-  }
-  log(`catch-up complete: ${totalCatchUp} rows processed`);
-
-  // Keep the process alive — Node won't exit while LISTEN is open.
+  // ──────────────────────────────────────────────────────────────────────
+  // Polling loop.
+  // ──────────────────────────────────────────────────────────────────────
+  let shuttingDown = false;
   process.on('SIGTERM', async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     log('SIGTERM received, shutting down');
     stats.stopPeriodicRefresh();
-    await listener.end();
-    await pool.end();
+    await pool.end().catch(() => {});
     process.exit(0);
   });
+
+  log(`polling every ${POLL_INTERVAL_MS}ms`);
+  while (!shuttingDown) {
+    try {
+      let cursorPendingAt = new Date(0);
+      let cursorTaskId    = '';
+      let cursorRunId     = -1;
+      let cycleCount      = 0;
+
+      while (!shuttingDown) {
+        const batch = await pool.query(POLL_SQL, [cursorPendingAt, cursorTaskId, cursorRunId]);
+        if (batch.rowCount === 0) break;
+        await Promise.all(batch.rows.map(r => processOne(r.task_id, r.run_id)));
+        const last = batch.rows[batch.rows.length - 1];
+        cursorPendingAt = last.pending_at;
+        cursorTaskId    = last.task_id;
+        cursorRunId     = last.run_id;
+        cycleCount += batch.rowCount;
+      }
+      if (cycleCount > 0) log(`cycle complete: ${cycleCount} rows processed`);
+    } catch (err) {
+      logErr('poll cycle failed:', err.message);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
 }
 
 main().catch((err) => {
