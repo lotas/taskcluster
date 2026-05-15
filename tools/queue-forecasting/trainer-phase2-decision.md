@@ -1,7 +1,7 @@
 # Queue Forecasting — Phase 2 Decision
 
 **Created:** 2026-04-23
-**Last updated:** 2026-04-29 (E18 Policy B reverses E16 verdict; Phase 3a closed; Phase 3b serving contract drafted)
+**Last updated:** 2026-05-15 (Phase 3b core path shipped; live predictor in production; deviations from §5.3b spec recorded)
 **Companion to:** `trainer-spec.md`, `trainer-plan.md`
 **Authors:** residual-model experiment, wait-time transform variants, run-duration residual experiment
 
@@ -11,13 +11,14 @@
 
 **Run_duration: ship `run_duration_residual.yaml`.** 15 cohorts in E18 (was 11 in E16): mean MAE Δ% −4.50%, p90 in-band 13/15, beats LGB-only on 8/10 MAE wins and 9/10 within-2x wins. No regime fragility on duration (already noted in E16).
 
-**Production deployment now gated only on Phase 3b** (ONNX export, Node serving wiring, hot-reload, versioned writes). The "model architecture" question is settled.
+**Production deployment is live as of 2026-05-15.** The Phase 3b core path (ONNX bundle loading, hierarchical baseline-stats refresh, throughput features, NOTIFY + catch-up, versioned audit writes) is deployed and producing predictions into `queue_forecast_run_predictions`. Several items from §5.3b are explicitly deferred or accepted as V1 limitations — see §5 "Phase 3b — core path closed 2026-05-15" for the gap list.
 
 ### Decision history
 
 - **2026-04-23 (Phase 2 close):** residual log_ratio + throughput chosen as wait candidate. Tail accuracy (30m+ within-2x = 38.6%) flagged as production blocker; Phase 3a launched for queue-velocity and throughput features.
 - **2026-04-27 (E16):** 14-cohort walk-forward exposed monotonic p90 collapse since Apr 23 in residual variants; LGB-only stayed calibrated. Recommendation reversed to "ship LGB-only or hybrid" because residual architecture appeared fundamentally broken under regime shift.
 - **2026-04-29 (E18):** Stage 2 anomaly-filter sweep showed the regime fragility was baseline contamination, not architectural. Policy B (filter anomalous days from baseline history only) recovers and improves on every metric, never regresses any cohort. Recommendation reverts to single-model residual, now with Policy B baseline filtering. The hybrid + regime-detector path (E16's "option B") is no longer needed.
+- **2026-05-15 (Phase 3b core path live):** `src/live-predictor/` service deployed. First-hour data: ~5000 predictions, 100% enriched before scoring, baseline coverage distributed across `queue+bucket` / `queue` / `priority+bucket` with no global fallthrough. Policy B is correctly wired end-to-end (trainer exports `anomaly_filter` into `_feature_schema.json`; serving reads it via `filterFromSchema()` and applies the exclude-dates clause to wait baseline SQL). Known gaps recorded below.
 
 For per-cohort metrics and the regime-shift narrative supporting each step in the decision history, see §6 / E13, E16, E18.
 
@@ -207,11 +208,44 @@ These let any prediction be reproduced offline byte-for-byte: given the bundle, 
 
 Each task should produce its own design + test pass before the next starts; many have parity-validation requirements that don't compose well if rolled together.
 
+### Phase 3b — core path closed 2026-05-15
+
+Live predictor service is deployed and producing predictions. Implementation lives under `src/live-predictor/` (separate from `src/predictor.js`, which remains the backtest/baseline-export tool). Source: `model-loader.js`, `feature-builder.js`, `baseline-stats.js`, `throughput.js`, `predict.js`, `index.js`; 21 unit tests; integration via `migrate.sql` Stage 2 + collector `NOTIFY` hook + docker-compose `live-predictor` profile.
+
+**What was built (§5.3b.4 task numbering):**
+- ✅ #1 ONNX export — already done by trainer.
+- ⚠ #2 Parity tests — not done as a dedicated suite. Production telemetry (baseline-coverage distribution, no global fallthrough, p50/p90 in plausible ranges) is the current parity signal. Add a dedicated trainer-vs-onnxruntime parity test next time a model update introduces an unfamiliar feature.
+- ✅ #3 Bundle manifest — trainer emits `<stem>_manifest.json` and `_feature_schema.json` (including `anomaly_filter`) per config; live-predictor verifies `artifact_hash` on load.
+- ⚠ #4 Live baseline cache — built (`BaselineStats` class, 1h TTL, hierarchical lookup matching `predictor.js` semantics, per-target anomaly-filter flag driven by bundle schema), **but anchored on `now()` not last-completed-UTC-day midnight.** See deviation 1 below.
+- ✅ #5 Schema migration — `migrate.sql` Stage 2 adds `wait_model_version`, `wait_artifact_hash`, `duration_model_version`, `duration_artifact_hash` + 4 indexes. Audit columns are a subset of §5.3b.3 (see deviation 2).
+- ✅ #6 Inference wiring — `predict.js` orchestrator: waits for enrichment (5s poll), fetches row, computes baselines + throughput (anchored on row's `pending_at` to prevent leakage, current row excluded), runs both ONNX models, applies `log_ratio` inverse, writes prediction with audit JSONB.
+- ❌ #7 Hot-reload — not implemented. Service reads `findLatestModelDir()` at startup only; operators restart the container after a training run. Acceptable for daily/weekly retraining cadence.
+- ✅ #8 Nightly training cron — pre-existing; no changes.
+- ❌ #9 Shadow mode — explicitly out of scope for V1.
+
+**Deviations from §5.3b spec (V1 acceptances or follow-ups):**
+
+1. **Baseline cutoff anchored on `now()`, not last-completed-UTC-day midnight.** §5.3b.1 specifies UTC-midnight to close the same-day contamination loophole and match trainer's `--pending-eval-date` cutoff semantics exactly. Current `BaselineStats.refresh()` uses `new Date()` as `cutoff` and runs the 7-day window relative to that. Risk: a same-day incident can contaminate the baseline before `health-monitor` flags it (24h flag lag). For NOTIFY-triggered predictions in steady state this matters little — `now() ≈ pending_at` and most predictions consume the freshly-refreshed cache. For catch-up rows, the cutoff drifts further. Reintroduce the UTC-midnight cutoff if a regime-drift incident reproduces the E16 failure mode.
+
+2. **Audit columns are a subset of §5.3b.3.** Implemented as typed columns: `wait_model_version`, `wait_artifact_hash`, `duration_model_version`, `duration_artifact_hash`. The `input_features` JSONB captures the full audit payload — both feature vectors, both baselines (level/p50/p90/sample_size), the throughput object, enrichment state, and row state at scoring time — so any prediction can be reproduced offline given the bundle. **Not implemented as typed columns:** `predictor_kind` (always `residual_lightgbm_policy_b` for wait, `residual_lightgbm` for duration today), `baseline_cutoff_date`, `baseline_excluded_dates`, `health_max_computed_at`. Add as typed columns once offline replay tooling needs them for grouping/filtering.
+
+3. **Bundle directory layout differs from §5.3b.2.** Spec proposed `models_bundles/v_<date>_<sha>/` with consolidated `bundle.json` + shared `category_mappings.json`. Trainer actually writes `trainer/data/models/<YYYY-MM-DD>/` with per-config sidecars (`<stem>_p50.onnx`, `<stem>_p90.onnx`, `<stem>_category_mappings.json`, `<stem>_feature_schema.json`, `<stem>_manifest.json`). The loader handles per-config bundles cleanly. No functional gap — flag here only so the §5.3b.2 layout block reads as "spec'd but evolved during ONNX export work".
+
+4. **Catch-up scope: currently-unresolved rows only.** §5.3b.1 / README first-cut implied broader coverage. Final contract is keyset-paginated over `WHERE resolved_at IS NULL` (uses the existing `idx_qf_task_runs_unresolved` partial index). Short tasks that pended and resolved during a predictor outage are NOT backfilled. Acceptable since the predictor is forward-only and the prediction log is for tasks under active forecasting, not historical replay.
+
+5. **No fail-closed on health-table emptiness or daily_health unreachability.** §5.3b.1 specifies the predictor must refuse to serve in these states. Current implementation falls through to unfiltered baseline behavior (since `ANOMALOUS_DATES_SQL` returning 0 rows is indistinguishable from "no anomalous days today"). Add a startup check + alert if the health-monitor service ever drops out for extended periods.
+
+**Open work items derived from the gaps above:**
+- (a) Re-anchor baseline cutoff to last-UTC-midnight to close same-day contamination loophole (deviation 1). Low-priority while no regime-drift incident is reproducing.
+- (b) Add bundle hot-reload via symlink watching (§5.3b.4 #7) once retraining cadence tightens past weekly.
+- (c) Promote the JSONB audit subset to typed columns when offline-replay tooling is built (deviation 2).
+- (d) Parity test harness — Python trainer prediction vs onnxruntime-node prediction on a fixed input vector — to add as regression coverage before any feature additions (gap #2).
+
 ## Recommendation
 
-**Ship Policy B for wait, residual for duration.** Both targets exit Phase 2/3a at user-acceptable numbers across 14 cohorts of walk-forward evidence. The residual + log_ratio + baseline-as-serving-artifact design is confirmed end-to-end; the only mandatory addition since the original design is **filtered baseline history (Policy B)** as a load-bearing serving requirement, not an option.
+**Shipped (2026-05-15).** Policy B for wait, residual for duration, both served via `src/live-predictor/`. The model architecture decision and the core serving path are both closed. Followup work is the Phase 3b deviation list (§5 "core path closed"), tracked but not blocking.
 
-The remaining work (Phase 3b) is a serving system that mirrors training/eval semantics exactly — the contract in §5.1 makes this concrete. The risk to watch is offline/online drift on the baseline computation: same-day rows, refresh policy, flag_subset mismatch are all ways to silently re-introduce E16's regime-fragility failure mode after E18 closed it.
+The original risk framing — offline/online drift on baseline computation — is mostly mitigated: Policy B is correctly wired through the bundle (`anomaly_filter` in `_feature_schema.json` → `filterFromSchema()` in serving → `<> ALL($2::date[])` clause in baseline SQL). The one residual risk is deviation 1 (cutoff anchored on `now()` not UTC-midnight), which leaves a 24h window for same-day incidents to slip into the baseline before health-monitor flags them. Worth fixing if any regime drift reproduces; not worth blocking shipping for.
 
 ---
 
