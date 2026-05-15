@@ -12,7 +12,7 @@ export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/snap/bin:/opt/homebre
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-DEFAULT_CONFIGS="configs/wait_time.yaml,configs/wait_time_residual_throughput.yaml,configs/wait_time_residual_throughput_filtered.yaml,configs/wait_time_residual_throughput_filtered_baseline.yaml,configs/wait_time_residual_throughput_filtered_both.yaml,configs/run_duration_residual.yaml"
+DEFAULT_CONFIGS="configs/wait_time_residual_throughput_filtered_baseline.yaml,configs/run_duration_residual.yaml"
 
 LOCK_FILE="${LOCK_FILE:-/tmp/queue-forecasting-walk-forward.lock}"
 AS_OF_DATE="${AS_OF_DATE:-}"
@@ -89,7 +89,7 @@ config_stems() {
   local stems=()
 
   IFS=','
-  read -ra config_list <<< "$configs"
+  read -ra config_list <<<"$configs"
   IFS="$old_ifs"
 
   for cfg in "${config_list[@]}"; do
@@ -122,59 +122,59 @@ run_cmd() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --as-of)
-      AS_OF_DATE="$2"
-      shift 2
-      ;;
-    --from)
-      FROM_DATE="$2"
-      shift 2
-      ;;
-    --to)
-      TO_DATE="$2"
-      shift 2
-      ;;
-    --step-days)
-      STEP_DAYS="$2"
-      shift 2
-      ;;
-    --configs)
-      WALK_FORWARD_CONFIGS="$2"
-      shift 2
-      ;;
-    --summary-from)
-      SUMMARY_FROM="$2"
-      shift 2
-      ;;
-    --summary-to)
-      SUMMARY_TO="$2"
-      shift 2
-      ;;
-    --summary-configs)
-      SUMMARY_CONFIGS="$2"
-      shift 2
-      ;;
-    --summary-output)
-      SUMMARY_OUTPUT="$2"
-      shift 2
-      ;;
-    --skip-summary)
-      SKIP_SUMMARY=1
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "unknown arg: $1" >&2
-      usage
-      exit 1
-      ;;
+  --as-of)
+    AS_OF_DATE="$2"
+    shift 2
+    ;;
+  --from)
+    FROM_DATE="$2"
+    shift 2
+    ;;
+  --to)
+    TO_DATE="$2"
+    shift 2
+    ;;
+  --step-days)
+    STEP_DAYS="$2"
+    shift 2
+    ;;
+  --configs)
+    WALK_FORWARD_CONFIGS="$2"
+    shift 2
+    ;;
+  --summary-from)
+    SUMMARY_FROM="$2"
+    shift 2
+    ;;
+  --summary-to)
+    SUMMARY_TO="$2"
+    shift 2
+    ;;
+  --summary-configs)
+    SUMMARY_CONFIGS="$2"
+    shift 2
+    ;;
+  --summary-output)
+    SUMMARY_OUTPUT="$2"
+    shift 2
+    ;;
+  --skip-summary)
+    SKIP_SUMMARY=1
+    shift
+    ;;
+  --dry-run)
+    DRY_RUN=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "unknown arg: $1" >&2
+    usage
+    exit 1
+    ;;
   esac
 done
 
