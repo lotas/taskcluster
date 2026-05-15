@@ -488,6 +488,14 @@ function flagDot(val) {
   return val ? '<span class="dot dot-red" title="flagged"></span>' : '<span class="dot dot-dim"></span>';
 }
 
+// Render a task_id + run_id as a Taskcluster inspector link.
+function taskLink(taskId, runId) {
+  if (!taskId) return '—';
+  const url = `https://firefox-ci-tc.services.mozilla.com/tasks/${encodeURIComponent(taskId)}`;
+  const runLabel = runId != null ? ` · run ${esc(String(runId))}` : '';
+  return `<a class="task-link" href="${url}" target="_blank" rel="noopener">${esc(taskId)}${runLabel}</a>`;
+}
+
 // Pick a color class for a predicted-vs-actual cell. Returns '' (neutral) when
 // the comparison can't be made (any input null / non-finite).
 function colorForActual(actual, p50, p90) {
@@ -697,7 +705,6 @@ function renderResolvedSample(rows) {
   if (!rows.length) return banner + '<p class="muted">No resolved predictions yet.</p>';
 
   const tsCol = (ts) => ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
-  const truncId = (id) => id ? esc(String(id).slice(0, 12)) : '—';
   let html = banner + `<table><thead><tr>
     <th>Resolved</th><th>Task</th><th>Queue</th>
     <th class="r">Wait p50</th><th class="r">Wait p90</th><th class="r">Actual wait</th>
@@ -708,7 +715,7 @@ function renderResolvedSample(rows) {
     const runClass  = colorForActual(r.actual_run_s,  r.run_p50_s,  r.run_p90_s);
     html += `<tr>
       <td class="ts">${tsCol(r.resolved_at)}</td>
-      <td class="mono">${truncId(r.task_id)}</td>
+      <td class="mono">${taskLink(r.task_id, r.run_id)}</td>
       <td>${esc(r.task_queue_id)}</td>
       <td class="r">${fmtDuration(r.wait_p50_s)}</td>
       <td class="r">${fmtDuration(r.wait_p90_s)}</td>
@@ -725,7 +732,6 @@ function renderResolvedSample(rows) {
 function renderUnresolvedSample(rows) {
   if (!rows.length) return '<p class="muted">No unresolved predictions.</p>';
   const tsCol = (ts) => ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
-  const truncId = (id) => id ? esc(String(id).slice(0, 12)) : '—';
   let html = `<table><thead><tr>
     <th>Predicted</th><th>Task</th><th>Queue</th>
     <th class="r">Wait p50</th><th class="r">Wait p90</th>
@@ -735,7 +741,7 @@ function renderUnresolvedSample(rows) {
   for (const r of rows) {
     html += `<tr>
       <td class="ts">${tsCol(r.predicted_at)}</td>
-      <td class="mono">${truncId(r.task_id)}</td>
+      <td class="mono">${taskLink(r.task_id, r.run_id)}</td>
       <td>${esc(r.task_queue_id)}</td>
       <td class="r">${fmtDuration(r.wait_p50_s)}</td>
       <td class="r">${fmtDuration(r.wait_p90_s)}</td>
@@ -1059,6 +1065,8 @@ const CSS = `
   .pred-counter { color: var(--fg2); font-size: 13px; }
   .pred-counter strong { color: var(--fg); font-size: 16px; }
   .mono { font-family: inherit; font-size: 12px; color: var(--fg2); }
+  .task-link { color: var(--blue); text-decoration: none; }
+  .task-link:hover { text-decoration: underline; }
 `;
 
 const TAB_JS = `
