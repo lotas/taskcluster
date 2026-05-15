@@ -496,7 +496,7 @@ function colorForActual(actual, p50, p90) {
   const lo = Number(p50);
   const hi = Number(p90);
   if (!Number.isFinite(a) || !Number.isFinite(lo) || !Number.isFinite(hi)) return '';
-  if (a <= lo) return '';
+  if (a <= lo) return 'cell-good';
   if (a <= hi) return 'cell-warn';
   return 'cell-bad';
 }
@@ -1046,6 +1046,7 @@ const CSS = `
   .today-stat strong { color: var(--fg); font-size: 16px; }
   .bar { height: 12px; background: var(--blue); border-radius: 2px; opacity: 0.6; min-width: 1px; }
   /* Predictions page */
+  .cell-good { background: rgba(63,185,80,0.10);  color: var(--green); }
   .cell-warn { background: rgba(210,153,34,0.10); color: var(--yellow); }
   .cell-bad  { background: rgba(248,81,73,0.10);  color: var(--red); }
   .caveat-banner {
