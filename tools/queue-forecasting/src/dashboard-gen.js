@@ -180,6 +180,125 @@ async function queryTodayHourly(pool) {
   return rows;
 }
 
+async function queryPredictorHealth(pool) {
+  const { rows } = await pool.query(`
+    WITH recent AS (
+      SELECT
+        predicted_at,
+        wait_model_version,
+        duration_model_version,
+        (input_features->>'enriched_at_predict')::boolean    AS enriched,
+        input_features->'baselines'->'wait'->>'level'        AS wait_level,
+        input_features->'baselines'->'duration'->>'level'    AS dur_level,
+        (input_features->'baselines'->'wait'->>'p50')        AS wait_bl_p50,
+        (input_features->'baselines'->'duration'->>'p50')    AS dur_bl_p50
+      FROM queue_forecast_run_predictions
+      WHERE predicted_at >= now() - interval '1 hour'
+    ),
+    counts AS (
+      SELECT
+        (SELECT count(*) FROM queue_forecast_run_predictions
+           WHERE predicted_at >= now() - interval '5 minutes')  AS preds_5m,
+        (SELECT count(*) FROM recent)                            AS preds_1h,
+        (SELECT count(*) FROM queue_forecast_run_predictions
+           WHERE predicted_at >= now() - interval '24 hours')   AS preds_24h,
+        (SELECT max(predicted_at) FROM queue_forecast_run_predictions) AS last_predicted_at,
+        (SELECT count(*) FROM queue_forecast_task_runs r
+           WHERE r.resolved_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM queue_forecast_run_predictions p
+                WHERE p.task_id = r.task_id AND p.run_id = r.run_id))  AS catchup_backlog
+    ),
+    wait_versions AS (
+      SELECT json_agg(json_build_object('version', wait_model_version, 'n', n)
+                      ORDER BY n DESC) AS versions
+      FROM (SELECT wait_model_version, count(*) AS n FROM recent
+            GROUP BY wait_model_version) v
+    ),
+    dur_versions AS (
+      SELECT json_agg(json_build_object('version', duration_model_version, 'n', n)
+                      ORDER BY n DESC) AS versions
+      FROM (SELECT duration_model_version, count(*) AS n FROM recent
+            GROUP BY duration_model_version) v
+    ),
+    wait_coverage AS (
+      SELECT json_agg(json_build_object('level', coalesce(wait_level, '(null)'), 'n', n)
+                      ORDER BY n DESC) AS coverage
+      FROM (SELECT wait_level, count(*) AS n FROM recent
+            GROUP BY wait_level) c
+    ),
+    dur_coverage AS (
+      SELECT json_agg(json_build_object('level', coalesce(dur_level, '(null)'), 'n', n)
+                      ORDER BY n DESC) AS coverage
+      FROM (SELECT dur_level, count(*) AS n FROM recent
+            GROUP BY dur_level) c
+    ),
+    rates AS (
+      SELECT
+        avg(CASE WHEN enriched IS TRUE THEN 1.0 ELSE 0.0 END)                AS enriched_rate,
+        avg(CASE WHEN wait_bl_p50 IS NULL THEN 1.0 ELSE 0.0 END)             AS wait_nan_rate,
+        avg(CASE WHEN dur_bl_p50  IS NULL THEN 1.0 ELSE 0.0 END)             AS dur_nan_rate
+      FROM recent
+    )
+    SELECT
+      counts.preds_5m, counts.preds_1h, counts.preds_24h,
+      counts.last_predicted_at, counts.catchup_backlog,
+      wait_versions.versions  AS wait_versions,
+      dur_versions.versions   AS duration_versions,
+      wait_coverage.coverage  AS wait_coverage,
+      dur_coverage.coverage   AS duration_coverage,
+      rates.enriched_rate, rates.wait_nan_rate, rates.dur_nan_rate
+    FROM counts, wait_versions, dur_versions, wait_coverage, dur_coverage, rates;
+  `);
+  return rows[0];
+}
+
+async function queryRecentResolved(pool) {
+  const { rows } = await pool.query(`
+    SELECT
+      p.predicted_at,
+      r.resolved_at,
+      p.task_id,
+      p.run_id,
+      t.task_queue_id,
+      p.wait_p50_s, p.wait_p90_s,
+      r.wait_duration_s AS actual_wait_s,
+      p.run_p50_s,  p.run_p90_s,
+      r.run_duration_s  AS actual_run_s,
+      r.reason_resolved
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    JOIN queue_forecast_tasks      t USING (task_id)
+    WHERE r.started_at IS NOT NULL
+      AND r.resolved_at IS NOT NULL
+    ORDER BY r.resolved_at DESC
+    LIMIT 50;
+  `);
+  return rows;
+}
+
+async function queryRecentUnresolved(pool) {
+  const { rows } = await pool.query(`
+    SELECT
+      p.predicted_at,
+      p.task_id,
+      p.run_id,
+      t.task_queue_id,
+      p.wait_p50_s, p.wait_p90_s,
+      p.run_p50_s,  p.run_p90_s,
+      CASE WHEN r.started_at IS NULL THEN 'pending' ELSE 'running' END AS state,
+      r.pending_at,
+      EXTRACT(EPOCH FROM (now() - r.pending_at)) AS age_pending_s
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    JOIN queue_forecast_tasks      t USING (task_id)
+    WHERE r.resolved_at IS NULL
+    ORDER BY p.predicted_at DESC
+    LIMIT 50;
+  `);
+  return rows;
+}
+
 // ─── Manifest Loading ────────────────────────────────────────────────────────
 
 function loadLatestManifests() {
@@ -369,6 +488,19 @@ function flagDot(val) {
   return val ? '<span class="dot dot-red" title="flagged"></span>' : '<span class="dot dot-dim"></span>';
 }
 
+// Pick a color class for a predicted-vs-actual cell. Returns '' (neutral) when
+// the comparison can't be made (any input null / non-finite).
+function colorForActual(actual, p50, p90) {
+  if (actual == null || p50 == null || p90 == null) return '';
+  const a = Number(actual);
+  const lo = Number(p50);
+  const hi = Number(p90);
+  if (!Number.isFinite(a) || !Number.isFinite(lo) || !Number.isFinite(hi)) return '';
+  if (a <= lo) return '';
+  if (a <= hi) return 'cell-warn';
+  return 'cell-bad';
+}
+
 // ─── Section Renderers ───────────────────────────────────────────────────────
 
 function renderTableHealth(rows) {
@@ -489,6 +621,128 @@ function renderTodayHourly(rows) {
       <td class="r">${fmtNum(r.completed)}</td>
       <td class="r">${fmtNum(r.failed)}</td>
       <td><div class="bar" style="width:${pct}%"></div></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderPredictorHealth(h) {
+  if (!h) return '<p class="muted">No predictor data yet.</p>';
+
+  const lastAge = h.last_predicted_at ? Date.now() - new Date(h.last_predicted_at).getTime() : null;
+  const lastOk = lastAge != null && lastAge < 5 * 60 * 1000;
+
+  const countersHtml = `<div class="pred-counters">
+    <span class="pred-counter"><strong>${fmtNum(h.preds_5m)}</strong> predictions (5m)</span>
+    <span class="pred-counter"><strong>${fmtNum(h.preds_1h)}</strong> predictions (1h)</span>
+    <span class="pred-counter"><strong>${fmtNum(h.preds_24h)}</strong> predictions (24h)</span>
+    <span class="pred-counter"><strong>${fmtAge(h.last_predicted_at)}</strong> since last
+      ${h.last_predicted_at ? healthBadge(lastOk) : healthBadge(false, 'NO DATA')}</span>
+    <span class="pred-counter"><strong>${fmtNum(h.catchup_backlog)}</strong> catch-up backlog</span>
+  </div>`;
+
+  function renderVersionList(versions, kind) {
+    if (!versions || !versions.length) return `<p class="muted">No ${kind} predictions in last hour.</p>`;
+    const rows = versions.map(v =>
+      `<tr><td class="mono">${esc(v.version || '(null)')}</td><td class="r">${fmtNum(v.n)}</td></tr>`
+    ).join('');
+    return `<table><thead><tr><th>${kind} model version</th><th class="r">Count (1h)</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function renderCoverageList(coverage, kind) {
+    if (!coverage || !coverage.length) return `<p class="muted">No ${kind} coverage data.</p>`;
+    const rows = coverage.map(c =>
+      `<tr><td>${esc(c.level)}</td><td class="r">${fmtNum(c.n)}</td></tr>`
+    ).join('');
+    return `<table><thead><tr><th>${kind} baseline level</th><th class="r">Count (1h)</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  const ratesHtml = `<table><thead><tr><th>Rate (1h)</th><th class="r">Value</th></tr></thead><tbody>
+    <tr><td>enriched-at-predict</td><td class="r">${fmtPct(h.enriched_rate)}</td></tr>
+    <tr><td>NaN wait baseline</td><td class="r">${fmtPct(h.wait_nan_rate)}</td></tr>
+    <tr><td>NaN duration baseline</td><td class="r">${fmtPct(h.dur_nan_rate)}</td></tr>
+  </tbody></table>`;
+
+  return `
+    ${countersHtml}
+    <div class="grid">
+      <div class="section">
+        <h3>Active model versions</h3>
+        ${renderVersionList(h.wait_versions, 'wait')}
+        ${renderVersionList(h.duration_versions, 'duration')}
+      </div>
+      <div class="section">
+        <h3>Baseline coverage</h3>
+        ${renderCoverageList(h.wait_coverage, 'wait')}
+        ${renderCoverageList(h.duration_coverage, 'duration')}
+      </div>
+    </div>
+    <div class="section">
+      <h3>Quality rates</h3>
+      ${ratesHtml}
+    </div>
+  `;
+}
+
+function renderResolvedSample(rows) {
+  const banner = `<div class="caveat-banner">
+    <strong>Survival-biased sample.</strong> Only tasks that have already finished since
+    the predictor went live on 2026-05-15 appear below, so longer-running predictions are
+    under-represented. Use this to spot-check that predictions look directionally sensible,
+    not to judge accuracy. Aggregate calibration metrics will be added once enough resolved
+    data has accumulated.
+  </div>`;
+
+  if (!rows.length) return banner + '<p class="muted">No resolved predictions yet.</p>';
+
+  const tsCol = (ts) => ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+  const truncId = (id) => id ? esc(String(id).slice(0, 12)) : '—';
+  let html = banner + `<table><thead><tr>
+    <th>Resolved</th><th>Task</th><th>Queue</th>
+    <th class="r">Wait p50</th><th class="r">Wait p90</th><th class="r">Actual wait</th>
+    <th class="r">Run p50</th><th class="r">Run p90</th><th class="r">Actual run</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const waitClass = colorForActual(r.actual_wait_s, r.wait_p50_s, r.wait_p90_s);
+    const runClass  = colorForActual(r.actual_run_s,  r.run_p50_s,  r.run_p90_s);
+    html += `<tr>
+      <td class="ts">${tsCol(r.resolved_at)}</td>
+      <td class="mono">${truncId(r.task_id)}</td>
+      <td>${esc(r.task_queue_id)}</td>
+      <td class="r">${fmtDuration(r.wait_p50_s)}</td>
+      <td class="r">${fmtDuration(r.wait_p90_s)}</td>
+      <td class="r ${waitClass}">${fmtDuration(r.actual_wait_s)}</td>
+      <td class="r">${fmtDuration(r.run_p50_s)}</td>
+      <td class="r">${fmtDuration(r.run_p90_s)}</td>
+      <td class="r ${runClass}">${fmtDuration(r.actual_run_s)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderUnresolvedSample(rows) {
+  if (!rows.length) return '<p class="muted">No unresolved predictions.</p>';
+  const tsCol = (ts) => ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+  const truncId = (id) => id ? esc(String(id).slice(0, 12)) : '—';
+  let html = `<table><thead><tr>
+    <th>Predicted</th><th>Task</th><th>Queue</th>
+    <th class="r">Wait p50</th><th class="r">Wait p90</th>
+    <th class="r">Run p50</th><th class="r">Run p90</th>
+    <th>State</th><th class="r">Age</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    html += `<tr>
+      <td class="ts">${tsCol(r.predicted_at)}</td>
+      <td class="mono">${truncId(r.task_id)}</td>
+      <td>${esc(r.task_queue_id)}</td>
+      <td class="r">${fmtDuration(r.wait_p50_s)}</td>
+      <td class="r">${fmtDuration(r.wait_p90_s)}</td>
+      <td class="r">${fmtDuration(r.run_p50_s)}</td>
+      <td class="r">${fmtDuration(r.run_p90_s)}</td>
+      <td>${esc(r.state)}</td>
+      <td class="r">${fmtDuration(r.age_pending_s)}</td>
     </tr>`;
   }
   html += '</tbody></table>';
@@ -791,6 +1045,19 @@ const CSS = `
   .today-stat { color: var(--fg2); font-size: 13px; }
   .today-stat strong { color: var(--fg); font-size: 16px; }
   .bar { height: 12px; background: var(--blue); border-radius: 2px; opacity: 0.6; min-width: 1px; }
+  /* Predictions page */
+  .cell-warn { background: rgba(210,153,34,0.10); color: var(--yellow); }
+  .cell-bad  { background: rgba(248,81,73,0.10);  color: var(--red); }
+  .caveat-banner {
+    background: rgba(210,153,34,0.08); border-left: 3px solid var(--yellow);
+    padding: 10px 14px; margin: 8px 0 16px; color: var(--fg2); font-size: 12px;
+    line-height: 1.5;
+  }
+  .caveat-banner strong { color: var(--yellow); }
+  .pred-counters { display: flex; gap: 24px; margin-bottom: 12px; flex-wrap: wrap; }
+  .pred-counter { color: var(--fg2); font-size: 13px; }
+  .pred-counter strong { color: var(--fg); font-size: 16px; }
+  .mono { font-family: inherit; font-size: 12px; color: var(--fg2); }
 `;
 
 const TAB_JS = `
@@ -804,7 +1071,7 @@ function switchTab(group, idx, btn) {
 
 // ─── Page Builders ───────────────────────────────────────────────────────────
 
-function buildPage(data) {
+function renderPage({ title, h1Html, headerMetaHtml, bodyHtml, extraStyle = '', extraScript = '' }) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -812,13 +1079,23 @@ function buildPage(data) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="900">
-<title>Queue Forecasting Dashboard</title>
-<style>${CSS}</style>
+<title>${title}</title>
+<style>${CSS}${extraStyle}</style>
 </head>
 <body>
-<h1>Queue Forecasting Dashboard</h1>
-<div class="header-meta">Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="status.html">Project Status</a></div>
+<h1>${h1Html}</h1>
+<div class="header-meta">${headerMetaHtml}</div>
+${bodyHtml}
+<footer>queue-forecasting · generated ${now}</footer>
+${extraScript ? `<script>${extraScript}</script>` : ''}
+</body>
+</html>`;
+}
 
+function buildPage(data) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const headerMetaHtml = `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="status.html">Project Status</a> · <a href="predictions.html">Predictions</a>`;
+  const bodyHtml = `
 <h2>Today (UTC)</h2>
 ${data.todayHourly}
 
@@ -857,25 +1134,19 @@ ${data.walkForward}
 
 <h2>Daily Health (last 30d)</h2>
 ${data.dailyHealth}
-
-<footer>queue-forecasting dashboard · generated ${now}</footer>
-<script>${TAB_JS}</script>
-</body>
-</html>`;
+`;
+  return renderPage({
+    title: 'Queue Forecasting Dashboard',
+    h1Html: 'Queue Forecasting Dashboard',
+    headerMetaHtml,
+    bodyHtml,
+    extraScript: TAB_JS,
+  });
 }
 
 function buildStatusPage(mdContent) {
-  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const body = markdownToHtml(mdContent);
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="900">
-<title>Project Status — Queue Forecasting</title>
-<style>
-${CSS}
+  const extraStyle = `
   /* Markdown overrides */
   .md-body h1 { font-size: 22px; margin: 24px 0 8px; color: var(--fg); }
   .md-body h2 { font-size: 16px; margin: 24px 0 8px; text-transform: none; letter-spacing: normal; }
@@ -897,18 +1168,35 @@ ${CSS}
     color: var(--fg2); font-style: italic;
   }
   .md-body hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
-  .md-body strong { color: var(--fg); }
-</style>
-</head>
-<body>
-<h1><a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Project Status</h1>
-<div class="header-meta">Rendered from trainer-phase2-decision.md · generated ${now} · <a href="/">Back to Dashboard</a></div>
-<div class="md-body">
-${body}
-</div>
-<footer>queue-forecasting · generated ${now}</footer>
-</body>
-</html>`;
+  .md-body strong { color: var(--fg); }`;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  return renderPage({
+    title: 'Project Status — Queue Forecasting',
+    h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Project Status',
+    headerMetaHtml: `Rendered from trainer-phase2-decision.md · generated ${now} · <a href="/">Back to Dashboard</a>`,
+    bodyHtml: `<div class="md-body">\n${body}\n</div>`,
+    extraStyle,
+  });
+}
+
+function buildPredictionsPage(data) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const bodyHtml = `
+<h2>Predictor Health</h2>
+${data.predictorHealth}
+
+<h2>Last 50 Resolved (predicted vs actual)</h2>
+${data.resolvedSample}
+
+<h2>Last 50 Unresolved (in flight)</h2>
+${data.unresolvedSample}
+`;
+  return renderPage({
+    title: 'Predictions — Queue Forecasting',
+    h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Predictions',
+    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a>`,
+    bodyHtml,
+  });
 }
 
 // ─── Main Loop ───────────────────────────────────────────────────────────────
@@ -916,16 +1204,21 @@ ${body}
 async function generate() {
   const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 3 });
   try {
-    const [tableHealth, freshness, ingestion, openIssues, dailyHealth, resolutions, todayHourly] =
-      await Promise.all([
-        queryTableHealth(pool),
-        queryFreshness(pool),
-        queryIngestion(pool),
-        queryOpenIssues(pool),
-        queryDailyHealth(pool),
-        queryRecentResolutions(pool),
-        queryTodayHourly(pool),
-      ]);
+    const [
+      tableHealth, freshness, ingestion, openIssues, dailyHealth, resolutions, todayHourly,
+      predictorHealth, recentResolved, recentUnresolved,
+    ] = await Promise.all([
+      queryTableHealth(pool),
+      queryFreshness(pool),
+      queryIngestion(pool),
+      queryOpenIssues(pool),
+      queryDailyHealth(pool),
+      queryRecentResolutions(pool),
+      queryTodayHourly(pool),
+      queryPredictorHealth(pool),
+      queryRecentResolved(pool),
+      queryRecentUnresolved(pool),
+    ]);
 
     const manifests = loadLatestManifests();
     const latestDir = manifests.length ? manifests[0]._date_dir : 'none';
@@ -946,6 +1239,13 @@ async function generate() {
 
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'index.html'), html);
+
+    const predictionsHtml = buildPredictionsPage({
+      predictorHealth:  renderPredictorHealth(predictorHealth),
+      resolvedSample:   renderResolvedSample(recentResolved),
+      unresolvedSample: renderUnresolvedSample(recentUnresolved),
+    });
+    fs.writeFileSync(path.join(OUTPUT_DIR, 'predictions.html'), predictionsHtml);
 
     // Status page from markdown
     const mdPath = path.join(PROJECT_ROOT, 'trainer-phase2-decision.md');
