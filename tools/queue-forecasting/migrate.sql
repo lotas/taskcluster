@@ -233,3 +233,33 @@ ALTER TABLE queue_forecast_daily_health
     ADD COLUMN IF NOT EXISTS flag_capacity_spike  BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS flag_low_utilization BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS flag_sampler_offline BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ==========================================
+-- Stage 2: live-predictor columns + indexes
+-- Additive migration. Safe to re-run.
+-- ==========================================
+
+-- Allow null model_version (legacy column kept for backwards compat with any
+-- code that still reads it; new writes use wait_model_version / duration_model_version).
+ALTER TABLE queue_forecast_run_predictions
+    ALTER COLUMN model_version DROP NOT NULL;
+
+ALTER TABLE queue_forecast_run_predictions
+    ADD COLUMN IF NOT EXISTS wait_model_version     TEXT,
+    ADD COLUMN IF NOT EXISTS wait_artifact_hash     TEXT,
+    ADD COLUMN IF NOT EXISTS duration_model_version TEXT,
+    ADD COLUMN IF NOT EXISTS duration_artifact_hash TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_qf_run_predictions_predicted_at
+    ON queue_forecast_run_predictions (predicted_at);
+
+CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_queue_id
+    ON queue_forecast_tasks (task_queue_id);
+
+CREATE INDEX IF NOT EXISTS idx_qf_task_runs_resolved_at
+    ON queue_forecast_task_runs (resolved_at)
+    WHERE resolved_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_qf_task_runs_started_at
+    ON queue_forecast_task_runs (started_at)
+    WHERE started_at IS NOT NULL;

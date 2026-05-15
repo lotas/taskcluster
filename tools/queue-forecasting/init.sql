@@ -67,7 +67,11 @@ CREATE TABLE IF NOT EXISTS queue_forecast_run_predictions (
 
     -- Variable-length
     task_id                      TEXT NOT NULL,
-    model_version                TEXT NOT NULL,
+    model_version                TEXT,                     -- legacy, kept nullable
+    wait_model_version           TEXT,
+    wait_artifact_hash           TEXT,
+    duration_model_version       TEXT,
+    duration_artifact_hash       TEXT,
     input_features               JSONB,
 
     PRIMARY KEY (task_id, run_id)
@@ -93,6 +97,22 @@ CREATE INDEX IF NOT EXISTS idx_qf_task_runs_unresolved
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_unenriched
     ON queue_forecast_tasks (task_id)
     WHERE metadata_name IS NULL;
+
+-- Live predictor: throughput query support
+CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_queue_id
+    ON queue_forecast_tasks (task_queue_id);
+
+CREATE INDEX IF NOT EXISTS idx_qf_task_runs_resolved_at
+    ON queue_forecast_task_runs (resolved_at)
+    WHERE resolved_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_qf_task_runs_started_at
+    ON queue_forecast_task_runs (started_at)
+    WHERE started_at IS NOT NULL;
+
+-- Live predictor: predicted_at lookup for the dashboard
+CREATE INDEX IF NOT EXISTS idx_qf_run_predictions_predicted_at
+    ON queue_forecast_run_predictions (predicted_at);
 
 -- ==========================================
 -- TABLE 4: Worker-count time series

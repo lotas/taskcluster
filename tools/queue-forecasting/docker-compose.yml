@@ -65,6 +65,27 @@ services:
       # residual NDJSON.
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data
 
+  live-predictor:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    command: ["node", "src/live-predictor/index.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 10s
+    restart: unless-stopped
+    profiles:
+      - live-predictor
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+      - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
+
   trainer:
     build:
       context: ../..

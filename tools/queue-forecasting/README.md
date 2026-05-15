@@ -41,6 +41,7 @@ Standalone tool for predicting Taskcluster task wait times and run durations. Bu
 | **health-monitor** | Python | Hourly job re-computes per-day metrics (volume, exception rate, wait p99, capacity drop/spike, utilization) over a trailing 7-day window. Flags days as anomalous; trainer + predictor consume those flags to filter contaminated history. |
 | **predictor** | Node.js | Hierarchical percentile baseline (metadata_name → normalized_name → tags → queue → scheduler → global). Two output modes: per-day eval JSONs and an aggregate residual-feature NDJSON. Supports `--exclude-dates` to drop anomalous days from the 7-day history window. |
 | **trainer** | Python / LightGBM | Quantile regression (p50, p90) over engineered features (queue depth, throughput, time-of-day, worker-pool kind). Residual mode trains on the log-ratio residual against the percentile baseline. |
+| **live-predictor** | Node.js | Consumes the trainer's ONNX bundles and writes a prediction row to `queue_forecast_run_predictions` for every new task-pending event. Triggered via Postgres `NOTIFY queue_forecast_task_pending` from the collector; runs a keyset-paginated startup catch-up over currently-unresolved unpredicted rows. |
 
 ## First-time setup (new host / VM)
 
@@ -85,6 +86,7 @@ Or pick services individually:
 docker compose --profile collector       up -d   # task data
 docker compose --profile worker-counter  up -d   # worker counts (every 5 min)
 docker compose --profile health-monitor  up -d   # daily anomaly detector (hourly)
+docker compose --profile live-predictor  up -d   # real-time ONNX predictions
 ```
 
 Check health:
@@ -291,6 +293,19 @@ Other helpers:
 docker compose run --rm predictor node src/predict-sample.js   # single pending task
 docker compose run --rm predictor node src/diagnose.js          # DB diagnostics
 ```
+
+### Live Predictor
+
+The `live-predictor` service consumes the trainer's ONNX bundles and writes a
+prediction row to `queue_forecast_run_predictions` for every new task-pending
+event. It's triggered via Postgres `NOTIFY queue_forecast_task_pending` from
+the collector (with a startup catch-up query over currently-unresolved
+unpredicted rows).
+
+Start it: `docker compose --profile live-predictor up -d live-predictor`.
+Required artifacts: the latest `trainer/data/models/<date>/` must contain the
+two production bundles (`wait_time_residual_throughput_filtered_baseline_*`
+and `run_duration_residual_*`).
 
 ## Database tables
 

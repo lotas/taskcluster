@@ -175,6 +175,15 @@ async function handleTaskPending(payload) {
     priority_at_pending: status.priority || null,
     queue_pending: queuePending,
   });
+
+  // Live-predictor hint: notify listeners so they can predict immediately.
+  // Postgres NOTIFY is transaction-deferred, so even if the listener picks
+  // it up before our connection's auto-commit settles, the row is already
+  // visible by the time they re-query.  Listeners must treat the payload as
+  // a HINT (race with their own catch-up query is fine).
+  await pool.query("SELECT pg_notify('queue_forecast_task_pending', $1)", [
+    JSON.stringify({ task_id: status.taskId, run_id: runId }),
+  ]);
 }
 
 async function handleTaskRunning(payload) {
