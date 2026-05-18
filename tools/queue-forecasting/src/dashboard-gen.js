@@ -12,6 +12,7 @@ const PROJECT_ROOT = path.join(__dirname, '..');
 const OUTPUT_DIR = process.env.DASHBOARD_OUTPUT_DIR || path.join(PROJECT_ROOT, 'dashboard-out');
 const MODELS_DIR = path.join(PROJECT_ROOT, 'trainer', 'data', 'models');
 const INTERVAL_MS = parseInt(process.env.DASHBOARD_INTERVAL_MS || '900000', 10); // 15 min
+const AGGREGATIONS_WINDOW_DAYS = parseInt(process.env.AGGREGATIONS_WINDOW_DAYS || '30', 10);
 
 function formatInterval(ms) {
   const totalSeconds = Math.round(ms / 1000);
@@ -299,6 +300,68 @@ async function queryRecentUnresolved(pool) {
   return rows;
 }
 
+// Returns a SQL fragment with four COUNT(*) FILTER (...) expressions that
+// classify each resolved row's actual vs p50/p90 into good/warn/bad bands.
+// `act`, `p50`, `p90` are column expressions; aliases are prefixed by `prefix`.
+function bandCountsSql(act, p50, p90, prefix) {
+  const eligible = `${act} IS NOT NULL AND ${p50} IS NOT NULL AND ${p90} IS NOT NULL`;
+  return `
+    count(*) FILTER (WHERE ${eligible})                                              AS ${prefix}_n,
+    count(*) FILTER (WHERE ${eligible} AND ${act} <= ${p50})                          AS ${prefix}_good,
+    count(*) FILTER (WHERE ${eligible} AND ${act} >  ${p50} AND ${act} <= ${p90})     AS ${prefix}_warn,
+    count(*) FILTER (WHERE ${eligible} AND ${act} >  ${p90})                          AS ${prefix}_bad
+  `;
+}
+
+async function queryAggregationsOverall(pool, windowDays) {
+  const { rows } = await pool.query(`
+    SELECT
+      ${bandCountsSql('r.wait_duration_s', 'p.wait_p50_s', 'p.wait_p90_s', 'wait')},
+      ${bandCountsSql('r.run_duration_s',  'p.run_p50_s',  'p.run_p90_s',  'run')},
+      min(r.resolved_at) AS window_first_resolved,
+      max(r.resolved_at) AS window_last_resolved
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    WHERE r.resolved_at IS NOT NULL
+      AND r.resolved_at >= now() - ($1 || ' days')::interval;
+  `, [windowDays]);
+  return rows[0];
+}
+
+async function queryAggregationsByDay(pool, windowDays) {
+  const { rows } = await pool.query(`
+    SELECT
+      date_trunc('day', r.resolved_at AT TIME ZONE 'UTC')::date AS day,
+      ${bandCountsSql('r.wait_duration_s', 'p.wait_p50_s', 'p.wait_p90_s', 'wait')},
+      ${bandCountsSql('r.run_duration_s',  'p.run_p50_s',  'p.run_p90_s',  'run')}
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    WHERE r.resolved_at IS NOT NULL
+      AND r.resolved_at >= now() - ($1 || ' days')::interval
+    GROUP BY day
+    ORDER BY day DESC;
+  `, [windowDays]);
+  return rows;
+}
+
+async function queryAggregationsByQueue(pool, windowDays) {
+  const { rows } = await pool.query(`
+    SELECT
+      t.task_queue_id,
+      ${bandCountsSql('r.wait_duration_s', 'p.wait_p50_s', 'p.wait_p90_s', 'wait')},
+      ${bandCountsSql('r.run_duration_s',  'p.run_p50_s',  'p.run_p90_s',  'run')}
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    JOIN queue_forecast_tasks      t USING (task_id)
+    WHERE r.resolved_at IS NOT NULL
+      AND r.resolved_at >= now() - ($1 || ' days')::interval
+    GROUP BY t.task_queue_id
+    ORDER BY (count(*) FILTER (WHERE r.wait_duration_s IS NOT NULL AND p.wait_p50_s IS NOT NULL)) DESC,
+             t.task_queue_id ASC;
+  `, [windowDays]);
+  return rows;
+}
+
 // ─── Manifest Loading ────────────────────────────────────────────────────────
 
 function loadLatestManifests() {
@@ -507,6 +570,19 @@ function colorForActual(actual, p50, p90) {
   if (a <= lo) return 'cell-good';
   if (a <= hi) return 'cell-warn';
   return 'cell-bad';
+}
+
+// Renders four <td> cells (n, good%, warn%, bad%) for one band-stats row.
+function bandCells(n, good, warn, bad) {
+  const nn = Number(n) || 0;
+  if (nn === 0) {
+    return `<td class="r">0</td><td class="r">—</td><td class="r">—</td><td class="r">—</td>`;
+  }
+  const pct = (x) => `${(100 * Number(x) / nn).toFixed(1)}%`;
+  return `<td class="r">${fmtNum(nn)}</td>` +
+         `<td class="r cell-good">${pct(good)}</td>` +
+         `<td class="r cell-warn">${pct(warn)}</td>` +
+         `<td class="r cell-bad">${pct(bad)}</td>`;
 }
 
 // ─── Section Renderers ───────────────────────────────────────────────────────
@@ -979,6 +1055,51 @@ function renderDailyHealth(rows) {
   return html;
 }
 
+function renderAggregationsOverall(row) {
+  if (!row) return '<p class="muted">No data.</p>';
+  return `<table><thead><tr>
+    <th>Side</th><th class="r">n</th><th class="r">good (&le;p50)</th><th class="r">warn (p50–p90)</th><th class="r">bad (&gt;p90)</th>
+  </tr></thead><tbody>
+    <tr><td>wait</td>${bandCells(row.wait_n, row.wait_good, row.wait_warn, row.wait_bad)}</tr>
+    <tr><td>run</td>${bandCells(row.run_n,  row.run_good,  row.run_warn,  row.run_bad)}</tr>
+  </tbody></table>`;
+}
+
+function renderAggregationsByDay(rows) {
+  if (!rows.length) return '<p class="muted">No resolved predictions in window.</p>';
+  let html = `<table><thead><tr>
+    <th>Day (UTC)</th>
+    <th class="r">wait n</th><th class="r">wait good</th><th class="r">wait warn</th><th class="r">wait bad</th>
+    <th class="r">run n</th><th class="r">run good</th><th class="r">run warn</th><th class="r">run bad</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const day = r.day?.toISOString?.() ? r.day.toISOString().slice(0, 10) : String(r.day);
+    html += `<tr><td>${esc(day)}</td>` +
+            bandCells(r.wait_n, r.wait_good, r.wait_warn, r.wait_bad) +
+            bandCells(r.run_n,  r.run_good,  r.run_warn,  r.run_bad) +
+            `</tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderAggregationsByQueue(rows) {
+  if (!rows.length) return '<p class="muted">No resolved predictions in window.</p>';
+  let html = `<table><thead><tr>
+    <th>task_queue_id</th>
+    <th class="r">wait n</th><th class="r">wait good</th><th class="r">wait warn</th><th class="r">wait bad</th>
+    <th class="r">run n</th><th class="r">run good</th><th class="r">run warn</th><th class="r">run bad</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    html += `<tr><td>${esc(r.task_queue_id)}</td>` +
+            bandCells(r.wait_n, r.wait_good, r.wait_warn, r.wait_bad) +
+            bandCells(r.run_n,  r.run_good,  r.run_warn,  r.run_bad) +
+            `</tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 
 const CSS = `
@@ -1103,7 +1224,7 @@ ${extraScript ? `<script>${extraScript}</script>` : ''}
 
 function buildPage(data) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-  const headerMetaHtml = `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="status.html">Project Status</a> · <a href="predictions.html">Predictions</a>`;
+  const headerMetaHtml = `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="status.html">Project Status</a> · <a href="predictions.html">Predictions</a> · <a href="aggregations.html">Aggregations</a>`;
   const bodyHtml = `
 <h2>Today (UTC)</h2>
 ${data.todayHourly}
@@ -1203,7 +1324,29 @@ ${data.unresolvedSample}
   return renderPage({
     title: 'Predictions — Queue Forecasting',
     h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Predictions',
-    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a>`,
+    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a> · <a href="aggregations.html">Aggregations</a>`,
+    bodyHtml,
+  });
+}
+
+function buildAggregationsPage(data) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const bodyHtml = `
+<div class="meta">Window: last ${AGGREGATIONS_WINDOW_DAYS} days · ${data.overallMeta}</div>
+
+<h2>Overall</h2>
+${data.overall}
+
+<h2>By Day (UTC)</h2>
+${data.byDay}
+
+<h2>By Worker Pool (task_queue_id)</h2>
+${data.byQueue}
+`;
+  return renderPage({
+    title: 'Aggregations — Queue Forecasting',
+    h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Prediction Aggregations',
+    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a> · <a href="predictions.html">Predictions</a>`,
     bodyHtml,
   });
 }
@@ -1216,6 +1359,7 @@ async function generate() {
     const [
       tableHealth, freshness, ingestion, openIssues, dailyHealth, resolutions, todayHourly,
       predictorHealth, recentResolved, recentUnresolved,
+      aggOverall, aggByDay, aggByQueue,
     ] = await Promise.all([
       queryTableHealth(pool),
       queryFreshness(pool),
@@ -1227,6 +1371,9 @@ async function generate() {
       queryPredictorHealth(pool),
       queryRecentResolved(pool),
       queryRecentUnresolved(pool),
+      queryAggregationsOverall(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByDay(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByQueue(pool, AGGREGATIONS_WINDOW_DAYS),
     ]);
 
     const manifests = loadLatestManifests();
@@ -1255,6 +1402,16 @@ async function generate() {
       unresolvedSample: renderUnresolvedSample(recentUnresolved),
     });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'predictions.html'), predictionsHtml);
+
+    const aggregationsHtml = buildAggregationsPage({
+      overall:     renderAggregationsOverall(aggOverall),
+      overallMeta: aggOverall && aggOverall.window_first_resolved
+        ? `data range ${new Date(aggOverall.window_first_resolved).toISOString().slice(0, 10)} → ${new Date(aggOverall.window_last_resolved).toISOString().slice(0, 10)}`
+        : 'no resolved predictions in window',
+      byDay:   renderAggregationsByDay(aggByDay),
+      byQueue: renderAggregationsByQueue(aggByQueue),
+    });
+    fs.writeFileSync(path.join(OUTPUT_DIR, 'aggregations.html'), aggregationsHtml);
 
     // Status page from markdown
     const mdPath = path.join(PROJECT_ROOT, 'trainer-phase2-decision.md');
