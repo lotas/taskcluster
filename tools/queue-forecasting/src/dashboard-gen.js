@@ -300,16 +300,23 @@ async function queryRecentUnresolved(pool) {
   return rows;
 }
 
-// Returns a SQL fragment with four COUNT(*) FILTER (...) expressions that
+// Returns a SQL fragment with eight COUNT(*) FILTER (...) expressions that
 // classify each resolved row's actual vs p50/p90 into good/warn/bad bands.
+// Emits two flavors: "_all_" covers every resolved row, "_done_" restricts
+// to reason_resolved = 'completed' (the trainer's headline slice).
 // `act`, `p50`, `p90` are column expressions; aliases are prefixed by `prefix`.
 function bandCountsSql(act, p50, p90, prefix) {
   const eligible = `${act} IS NOT NULL AND ${p50} IS NOT NULL AND ${p90} IS NOT NULL`;
+  const done = `r.reason_resolved = 'completed'`;
   return `
-    count(*) FILTER (WHERE ${eligible})                                              AS ${prefix}_n,
-    count(*) FILTER (WHERE ${eligible} AND ${act} <= ${p50})                          AS ${prefix}_good,
-    count(*) FILTER (WHERE ${eligible} AND ${act} >  ${p50} AND ${act} <= ${p90})     AS ${prefix}_warn,
-    count(*) FILTER (WHERE ${eligible} AND ${act} >  ${p90})                          AS ${prefix}_bad
+    count(*) FILTER (WHERE ${eligible})                                                    AS ${prefix}_all_n,
+    count(*) FILTER (WHERE ${eligible} AND ${act} <= ${p50})                                AS ${prefix}_all_good,
+    count(*) FILTER (WHERE ${eligible} AND ${act} >  ${p50} AND ${act} <= ${p90})           AS ${prefix}_all_warn,
+    count(*) FILTER (WHERE ${eligible} AND ${act} >  ${p90})                                AS ${prefix}_all_bad,
+    count(*) FILTER (WHERE ${eligible} AND ${done})                                         AS ${prefix}_done_n,
+    count(*) FILTER (WHERE ${eligible} AND ${done} AND ${act} <= ${p50})                    AS ${prefix}_done_good,
+    count(*) FILTER (WHERE ${eligible} AND ${done} AND ${act} >  ${p50} AND ${act} <= ${p90}) AS ${prefix}_done_warn,
+    count(*) FILTER (WHERE ${eligible} AND ${done} AND ${act} >  ${p90})                    AS ${prefix}_done_bad
   `;
 }
 
@@ -356,9 +363,204 @@ async function queryAggregationsByQueue(pool, windowDays) {
     WHERE r.resolved_at IS NOT NULL
       AND r.resolved_at >= now() - ($1 || ' days')::interval
     GROUP BY t.task_queue_id
-    ORDER BY (count(*) FILTER (WHERE r.wait_duration_s IS NOT NULL AND p.wait_p50_s IS NOT NULL)) DESC,
+    ORDER BY (count(*) FILTER (WHERE r.wait_duration_s IS NOT NULL AND p.wait_p50_s IS NOT NULL AND p.wait_p90_s IS NOT NULL)) DESC,
              t.task_queue_id ASC;
   `, [windowDays]);
+  return rows;
+}
+
+// Generic "by single dimension" aggregation. `dimSql` is the SELECT expression
+// (column or CASE) producing the dimension value; `joinSql` is any extra JOIN
+// the dimSql needs (e.g. `JOIN queue_forecast_tasks t USING (task_id)`).
+async function queryAggByDim(pool, windowDays, dimSql, joinSql = '') {
+  const { rows } = await pool.query(`
+    SELECT
+      ${dimSql} AS dim,
+      ${bandCountsSql('r.wait_duration_s', 'p.wait_p50_s', 'p.wait_p90_s', 'wait')},
+      ${bandCountsSql('r.run_duration_s',  'p.run_p50_s',  'p.run_p90_s',  'run')}
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    ${joinSql}
+    WHERE r.resolved_at IS NOT NULL
+      AND r.resolved_at >= now() - ($1 || ' days')::interval
+    GROUP BY dim
+    ORDER BY (count(*) FILTER (WHERE r.wait_duration_s IS NOT NULL AND p.wait_p50_s IS NOT NULL AND p.wait_p90_s IS NOT NULL)) DESC,
+             dim ASC NULLS LAST;
+  `, [windowDays]);
+  return rows;
+}
+
+function queryAggregationsByReason(pool, windowDays) {
+  return queryAggByDim(pool, windowDays, `COALESCE(r.reason_resolved, '(null)')`);
+}
+
+function queryAggregationsByScheduler(pool, windowDays) {
+  return queryAggByDim(
+    pool, windowDays,
+    `COALESCE(t.scheduler_id, '(null)')`,
+    `JOIN queue_forecast_tasks t USING (task_id)`,
+  );
+}
+
+function queryAggregationsByPriority(pool, windowDays) {
+  return queryAggByDim(pool, windowDays, `COALESCE(r.priority_at_pending, '(null)')`);
+}
+
+function queryAggregationsByProject(pool, windowDays) {
+  return queryAggByDim(
+    pool, windowDays,
+    `COALESCE(t.project_id, '(null)')`,
+    `JOIN queue_forecast_tasks t USING (task_id)`,
+  );
+}
+
+function queryAggregationsByWaitBaselineLevel(pool, windowDays) {
+  return queryAggByDim(
+    pool, windowDays,
+    `COALESCE(p.input_features->'baselines'->'wait'->>'level', '(none)')`,
+  );
+}
+
+function queryAggregationsByRunBaselineLevel(pool, windowDays) {
+  return queryAggByDim(
+    pool, windowDays,
+    `COALESCE(p.input_features->'baselines'->'duration'->>'level', '(none)')`,
+  );
+}
+
+// Sample-size buckets: log-scaled bands. '(none)' means no baseline was used.
+const SAMPLE_BUCKET_SQL = `
+  CASE
+    WHEN $S IS NULL                  THEN '(none)'
+    WHEN $S < 10                     THEN '<10'
+    WHEN $S < 100                    THEN '10-99'
+    WHEN $S < 1000                   THEN '100-999'
+    WHEN $S < 10000                  THEN '1k-10k'
+    ELSE                                  '10k+'
+  END
+`;
+
+function queryAggregationsByWaitBaselineSampleSize(pool, windowDays) {
+  const expr = SAMPLE_BUCKET_SQL.replaceAll(
+    '$S',
+    `NULLIF(p.input_features->'baselines'->'wait'->>'sample_size','')::bigint`,
+  );
+  return queryAggByDim(pool, windowDays, expr);
+}
+
+function queryAggregationsByRunBaselineSampleSize(pool, windowDays) {
+  const expr = SAMPLE_BUCKET_SQL.replaceAll(
+    '$S',
+    `NULLIF(p.input_features->'baselines'->'duration'->>'sample_size','')::bigint`,
+  );
+  return queryAggByDim(pool, windowDays, expr);
+}
+
+const WAIT_DURATION_BUCKET_SQL = `
+  CASE
+    WHEN r.wait_duration_s IS NULL THEN '(no wait)'
+    WHEN r.wait_duration_s < 60    THEN '<1m'
+    WHEN r.wait_duration_s < 300   THEN '1-5m'
+    WHEN r.wait_duration_s < 1800  THEN '5-30m'
+    ELSE                                '30m+'
+  END
+`;
+
+const RUN_DURATION_BUCKET_SQL = `
+  CASE
+    WHEN r.run_duration_s IS NULL THEN '(no run)'
+    WHEN r.run_duration_s < 60    THEN '<1m'
+    WHEN r.run_duration_s < 300   THEN '1-5m'
+    WHEN r.run_duration_s < 1800  THEN '5-30m'
+    WHEN r.run_duration_s < 3600  THEN '30-60m'
+    ELSE                               '60m+'
+  END
+`;
+
+// Wait buckets ordered chronologically rather than by sample size, so the
+// row order communicates the duration progression. Completed-only fields
+// are still present in the same query — render code shows both flavors.
+// Wrapped in a subquery so the ORDER BY's CASE can reference `dim` — output
+// column aliases aren't resolvable inside arbitrary ORDER BY expressions
+// (only as standalone sort keys), so the inner subquery materializes `dim`.
+async function queryAggregationsByWaitBucket(pool, windowDays) {
+  const { rows } = await pool.query(`
+    SELECT * FROM (
+      SELECT
+        ${WAIT_DURATION_BUCKET_SQL} AS dim,
+        ${bandCountsSql('r.wait_duration_s', 'p.wait_p50_s', 'p.wait_p90_s', 'wait')},
+        ${bandCountsSql('r.run_duration_s',  'p.run_p50_s',  'p.run_p90_s',  'run')}
+      FROM queue_forecast_run_predictions p
+      JOIN queue_forecast_task_runs r USING (task_id, run_id)
+      WHERE r.resolved_at IS NOT NULL
+        AND r.resolved_at >= now() - ($1 || ' days')::interval
+      GROUP BY 1
+    ) s
+    ORDER BY CASE s.dim
+      WHEN '<1m'       THEN 1
+      WHEN '1-5m'      THEN 2
+      WHEN '5-30m'     THEN 3
+      WHEN '30m+'      THEN 4
+      WHEN '(no wait)' THEN 9
+      ELSE 8 END;
+  `, [windowDays]);
+  return rows;
+}
+
+async function queryAggregationsByRunBucket(pool, windowDays) {
+  const { rows } = await pool.query(`
+    SELECT * FROM (
+      SELECT
+        ${RUN_DURATION_BUCKET_SQL} AS dim,
+        ${bandCountsSql('r.wait_duration_s', 'p.wait_p50_s', 'p.wait_p90_s', 'wait')},
+        ${bandCountsSql('r.run_duration_s',  'p.run_p50_s',  'p.run_p90_s',  'run')}
+      FROM queue_forecast_run_predictions p
+      JOIN queue_forecast_task_runs r USING (task_id, run_id)
+      WHERE r.resolved_at IS NOT NULL
+        AND r.resolved_at >= now() - ($1 || ' days')::interval
+      GROUP BY 1
+    ) s
+    ORDER BY CASE s.dim
+      WHEN '<1m'      THEN 1
+      WHEN '1-5m'     THEN 2
+      WHEN '5-30m'    THEN 3
+      WHEN '30-60m'   THEN 4
+      WHEN '60m+'     THEN 5
+      WHEN '(no run)' THEN 9
+      ELSE 8 END;
+  `, [windowDays]);
+  return rows;
+}
+
+// Top names with actual > p90, restricted to completed-only since that's the
+// slice we calibrate against. Returned ordered by miss count descending.
+async function queryTopMissesByName(pool, windowDays, side, limit = 25) {
+  const cols = side === 'wait'
+    ? { act: 'r.wait_duration_s', p50: 'p.wait_p50_s', p90: 'p.wait_p90_s' }
+    : { act: 'r.run_duration_s',  p50: 'p.run_p50_s',  p90: 'p.run_p90_s'  };
+  const eligible = `${cols.act} IS NOT NULL AND ${cols.p50} IS NOT NULL AND ${cols.p90} IS NOT NULL AND r.reason_resolved = 'completed'`;
+  const { rows } = await pool.query(`
+    SELECT
+      COALESCE(t.metadata_name,   '(null)') AS metadata_name,
+      COALESCE(t.normalized_name, '(null)') AS normalized_name,
+      count(*) FILTER (WHERE ${eligible})                                  AS n_eligible,
+      count(*) FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90})     AS misses,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY ${cols.act})
+        FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90})            AS miss_actual_p50,
+      percentile_cont(0.9) WITHIN GROUP (ORDER BY ${cols.act})
+        FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90})            AS miss_actual_p90,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY ${cols.p90})
+        FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90})            AS miss_pred_p90
+    FROM queue_forecast_run_predictions p
+    JOIN queue_forecast_task_runs r USING (task_id, run_id)
+    JOIN queue_forecast_tasks      t USING (task_id)
+    WHERE r.resolved_at IS NOT NULL
+      AND r.resolved_at >= now() - ($1 || ' days')::interval
+    GROUP BY t.metadata_name, t.normalized_name
+    HAVING count(*) FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90}) > 0
+    ORDER BY misses DESC, n_eligible DESC
+    LIMIT $2;
+  `, [windowDays, limit]);
   return rows;
 }
 
@@ -1055,46 +1257,151 @@ function renderDailyHealth(rows) {
   return html;
 }
 
-function renderAggregationsOverall(row) {
-  if (!row) return '<p class="muted">No data.</p>';
+// Pull the {n,good,warn,bad} group for one flavor (`all` or `done`) out of a
+// row, given a wait/run prefix. Lets the band renderer stay flavor-agnostic.
+function pickBand(row, prefix, flavor) {
+  return {
+    n:    row[`${prefix}_${flavor}_n`],
+    good: row[`${prefix}_${flavor}_good`],
+    warn: row[`${prefix}_${flavor}_warn`],
+    bad:  row[`${prefix}_${flavor}_bad`],
+  };
+}
+
+function bandCellsFor(row, prefix, flavor) {
+  const b = pickBand(row, prefix, flavor);
+  return bandCells(b.n, b.good, b.warn, b.bad);
+}
+
+// Renders a single overall-style two-row table for one flavor ('all' / 'done').
+function renderOverallTable(row, flavor) {
   return `<table><thead><tr>
     <th>Side</th><th class="r">n</th><th class="r">good (&le;p50)</th><th class="r">warn (p50–p90)</th><th class="r">bad (&gt;p90)</th>
   </tr></thead><tbody>
-    <tr><td>wait</td>${bandCells(row.wait_n, row.wait_good, row.wait_warn, row.wait_bad)}</tr>
-    <tr><td>run</td>${bandCells(row.run_n,  row.run_good,  row.run_warn,  row.run_bad)}</tr>
+    <tr><td>wait</td>${bandCellsFor(row, 'wait', flavor)}</tr>
+    <tr><td>run</td>${bandCellsFor(row,  'run',  flavor)}</tr>
   </tbody></table>`;
 }
 
-function renderAggregationsByDay(rows) {
+function renderAggregationsOverall(row) {
+  if (!row) return '<p class="muted">No data.</p>';
+  return `
+    <h3>All resolved</h3>
+    ${renderOverallTable(row, 'all')}
+    <h3>Completed only (reason_resolved = 'completed')</h3>
+    ${renderOverallTable(row, 'done')}
+  `;
+}
+
+// Generic "by-dimension" renderer: one row per dim value, 8 numeric cells
+// (4 for wait + 4 for run) for the given flavor. Used for by-day, by-queue,
+// and every new breakdown table.
+function renderByDimTable(rows, dimLabel, flavor, dimValueFn) {
   if (!rows.length) return '<p class="muted">No resolved predictions in window.</p>';
   let html = `<table><thead><tr>
-    <th>Day (UTC)</th>
+    <th>${dimLabel}</th>
     <th class="r">wait n</th><th class="r">wait good</th><th class="r">wait warn</th><th class="r">wait bad</th>
     <th class="r">run n</th><th class="r">run good</th><th class="r">run warn</th><th class="r">run bad</th>
   </tr></thead><tbody>`;
   for (const r of rows) {
-    const day = r.day?.toISOString?.() ? r.day.toISOString().slice(0, 10) : String(r.day);
-    html += `<tr><td>${esc(day)}</td>` +
-            bandCells(r.wait_n, r.wait_good, r.wait_warn, r.wait_bad) +
-            bandCells(r.run_n,  r.run_good,  r.run_warn,  r.run_bad) +
+    html += `<tr><td>${esc(dimValueFn(r))}</td>` +
+            bandCellsFor(r, 'wait', flavor) +
+            bandCellsFor(r, 'run',  flavor) +
             `</tr>`;
   }
   html += '</tbody></table>';
   return html;
 }
 
+function renderBothFlavors(rows, dimLabel, dimValueFn) {
+  return `
+    <h3>All resolved</h3>
+    ${renderByDimTable(rows, dimLabel, 'all', dimValueFn)}
+    <h3>Completed only</h3>
+    ${renderByDimTable(rows, dimLabel, 'done', dimValueFn)}
+  `;
+}
+
+const dayValue = (r) =>
+  r.day?.toISOString?.() ? r.day.toISOString().slice(0, 10) : String(r.day);
+const dimValue = (r) => r.dim;
+
+function renderAggregationsByDay(rows) {
+  return renderBothFlavors(rows, 'Day (UTC)', dayValue);
+}
+
 function renderAggregationsByQueue(rows) {
+  return renderBothFlavors(rows, 'task_queue_id', (r) => r.task_queue_id);
+}
+
+// reason_resolved is the dimension that splits all-resolved vs completed, so
+// a "completed-only" flavor would be tautological — render the all-resolved
+// flavor only.
+function renderAggregationsByReason(rows) {
   if (!rows.length) return '<p class="muted">No resolved predictions in window.</p>';
+  return renderByDimTable(rows, 'reason_resolved', 'all', dimValue);
+}
+
+function renderAggregationsByScheduler(rows) {
+  return renderBothFlavors(rows, 'scheduler_id', dimValue);
+}
+
+function renderAggregationsByPriority(rows) {
+  return renderBothFlavors(rows, 'priority_at_pending', dimValue);
+}
+
+function renderAggregationsByProject(rows) {
+  return renderBothFlavors(rows, 'project_id', dimValue);
+}
+
+function renderAggregationsByBaselineLevel(rows, side) {
+  return renderBothFlavors(rows, `${side} baseline level`, dimValue);
+}
+
+function renderAggregationsByBaselineSampleSize(rows, side) {
+  return renderBothFlavors(rows, `${side} baseline sample size`, dimValue);
+}
+
+function renderAggregationsByWaitBucket(rows) {
+  return renderBothFlavors(rows, 'actual wait bucket', dimValue);
+}
+
+function renderAggregationsByRunBucket(rows) {
+  return renderBothFlavors(rows, 'actual run bucket', dimValue);
+}
+
+function fmtDur(s) {
+  if (s == null) return '—';
+  const x = Number(s);
+  if (!Number.isFinite(x)) return '—';
+  if (x < 60)   return `${x.toFixed(0)}s`;
+  if (x < 3600) return `${(x / 60).toFixed(1)}m`;
+  return `${(x / 3600).toFixed(1)}h`;
+}
+
+function renderTopMisses(rows, side) {
+  if (!rows.length) {
+    return '<p class="muted">No misses (actual &gt; p90) in window.</p>';
+  }
   let html = `<table><thead><tr>
-    <th>task_queue_id</th>
-    <th class="r">wait n</th><th class="r">wait good</th><th class="r">wait warn</th><th class="r">wait bad</th>
-    <th class="r">run n</th><th class="r">run good</th><th class="r">run warn</th><th class="r">run bad</th>
+    <th>metadata_name</th><th>normalized_name</th>
+    <th class="r">misses</th><th class="r">n eligible</th><th class="r">miss rate</th>
+    <th class="r">miss ${side} actual p50</th><th class="r">miss ${side} actual p90</th><th class="r">miss predicted p90 (median)</th>
   </tr></thead><tbody>`;
   for (const r of rows) {
-    html += `<tr><td>${esc(r.task_queue_id)}</td>` +
-            bandCells(r.wait_n, r.wait_good, r.wait_warn, r.wait_bad) +
-            bandCells(r.run_n,  r.run_good,  r.run_warn,  r.run_bad) +
-            `</tr>`;
+    const n = Number(r.n_eligible) || 0;
+    const misses = Number(r.misses) || 0;
+    const rate = n === 0 ? '—' : `${(100 * misses / n).toFixed(1)}%`;
+    html += `<tr>
+      <td>${esc(r.metadata_name)}</td>
+      <td>${esc(r.normalized_name)}</td>
+      <td class="r">${fmtNum(misses)}</td>
+      <td class="r">${fmtNum(n)}</td>
+      <td class="r">${rate}</td>
+      <td class="r">${fmtDur(r.miss_actual_p50)}</td>
+      <td class="r">${fmtDur(r.miss_actual_p90)}</td>
+      <td class="r">${fmtDur(r.miss_pred_p90)}</td>
+    </tr>`;
   }
   html += '</tbody></table>';
   return html;
@@ -1333,6 +1640,7 @@ function buildAggregationsPage(data) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const bodyHtml = `
 <div class="meta">Window: last ${AGGREGATIONS_WINDOW_DAYS} days · ${data.overallMeta}</div>
+<div class="meta">Bands: good (actual &le; p50) · warn (p50 &lt; actual &le; p90) · bad (actual &gt; p90). Each section shows two flavors: <b>all resolved</b> matches the existing aggregation page; <b>completed only</b> restricts to <code>reason_resolved = 'completed'</code>, matching the trainer's headline slice.</div>
 
 <h2>Overall</h2>
 ${data.overall}
@@ -1342,6 +1650,47 @@ ${data.byDay}
 
 <h2>By Worker Pool (task_queue_id)</h2>
 ${data.byQueue}
+
+<h2>By reason_resolved</h2>
+<div class="meta">Single flavor: this dimension is what separates "all" from "completed".</div>
+${data.byReason}
+
+<h2>By scheduler_id</h2>
+${data.byScheduler}
+
+<h2>By priority_at_pending</h2>
+${data.byPriority}
+
+<h2>By project_id</h2>
+${data.byProject}
+
+<h2>By Wait Baseline Level</h2>
+<div class="meta">Hierarchical fallback level used by the wait baseline (queue+bucket → queue → priority+bucket → global). <code>(none)</code> means no baseline applied.</div>
+${data.byWaitBaselineLevel}
+
+<h2>By Wait Baseline Sample-Size Bucket</h2>
+${data.byWaitBaselineSample}
+
+<h2>By Run Baseline Level</h2>
+<div class="meta">Hierarchical fallback level used by the duration baseline (metadata_name → normalized_name → kind+test-type → task_queue_id → scheduler_id → global).</div>
+${data.byRunBaselineLevel}
+
+<h2>By Run Baseline Sample-Size Bucket</h2>
+${data.byRunBaselineSample}
+
+<h2>By Actual Wait Bucket</h2>
+${data.byWaitBucket}
+
+<h2>By Actual Run Bucket</h2>
+${data.byRunBucket}
+
+<h2>Top Wait Misses (actual &gt; p90, completed only)</h2>
+<div class="meta">Highest-volume task names contributing to wait p90 misses.</div>
+${data.topWaitMisses}
+
+<h2>Top Run Misses (actual &gt; p90, completed only)</h2>
+<div class="meta">Highest-volume task names contributing to run p90 misses.</div>
+${data.topRunMisses}
 `;
   return renderPage({
     title: 'Aggregations — Queue Forecasting',
@@ -1360,6 +1709,11 @@ async function generate() {
       tableHealth, freshness, ingestion, openIssues, dailyHealth, resolutions, todayHourly,
       predictorHealth, recentResolved, recentUnresolved,
       aggOverall, aggByDay, aggByQueue,
+      aggByReason, aggByScheduler, aggByPriority, aggByProject,
+      aggByWaitBaselineLevel, aggByWaitBaselineSample,
+      aggByRunBaselineLevel,  aggByRunBaselineSample,
+      aggByWaitBucket, aggByRunBucket,
+      topWaitMisses, topRunMisses,
     ] = await Promise.all([
       queryTableHealth(pool),
       queryFreshness(pool),
@@ -1374,6 +1728,18 @@ async function generate() {
       queryAggregationsOverall(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByDay(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByQueue(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByReason(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByScheduler(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByPriority(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByProject(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByWaitBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByWaitBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByRunBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByRunBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByWaitBucket(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryAggregationsByRunBucket(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'wait'),
+      queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'run'),
     ]);
 
     const manifests = loadLatestManifests();
@@ -1408,8 +1774,20 @@ async function generate() {
       overallMeta: aggOverall && aggOverall.window_first_resolved
         ? `data range ${new Date(aggOverall.window_first_resolved).toISOString().slice(0, 10)} → ${new Date(aggOverall.window_last_resolved).toISOString().slice(0, 10)}`
         : 'no resolved predictions in window',
-      byDay:   renderAggregationsByDay(aggByDay),
-      byQueue: renderAggregationsByQueue(aggByQueue),
+      byDay:                  renderAggregationsByDay(aggByDay),
+      byQueue:                renderAggregationsByQueue(aggByQueue),
+      byReason:               renderAggregationsByReason(aggByReason),
+      byScheduler:            renderAggregationsByScheduler(aggByScheduler),
+      byPriority:             renderAggregationsByPriority(aggByPriority),
+      byProject:              renderAggregationsByProject(aggByProject),
+      byWaitBaselineLevel:    renderAggregationsByBaselineLevel(aggByWaitBaselineLevel, 'wait'),
+      byWaitBaselineSample:   renderAggregationsByBaselineSampleSize(aggByWaitBaselineSample, 'wait'),
+      byRunBaselineLevel:     renderAggregationsByBaselineLevel(aggByRunBaselineLevel, 'run'),
+      byRunBaselineSample:    renderAggregationsByBaselineSampleSize(aggByRunBaselineSample, 'run'),
+      byWaitBucket:           renderAggregationsByWaitBucket(aggByWaitBucket),
+      byRunBucket:            renderAggregationsByRunBucket(aggByRunBucket),
+      topWaitMisses:          renderTopMisses(topWaitMisses, 'wait'),
+      topRunMisses:           renderTopMisses(topRunMisses, 'run'),
     });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'aggregations.html'), aggregationsHtml);
 
