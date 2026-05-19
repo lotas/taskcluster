@@ -533,7 +533,9 @@ async function queryAggregationsByRunBucket(pool, windowDays) {
 }
 
 // Top names with actual > p90, restricted to completed-only since that's the
-// slice we calibrate against. Returned ordered by miss count descending.
+// slice we calibrate against. Grouped on normalized_name so chunked variants
+// (`*-chunk-1`, `*-chunk-2`, ...) collapse into one row — same grouping the
+// trainer uses for the per-task baselines.
 async function queryTopMissesByName(pool, windowDays, side, limit = 25) {
   const cols = side === 'wait'
     ? { act: 'r.wait_duration_s', p50: 'p.wait_p50_s', p90: 'p.wait_p90_s' }
@@ -541,8 +543,7 @@ async function queryTopMissesByName(pool, windowDays, side, limit = 25) {
   const eligible = `${cols.act} IS NOT NULL AND ${cols.p50} IS NOT NULL AND ${cols.p90} IS NOT NULL AND r.reason_resolved = 'completed'`;
   const { rows } = await pool.query(`
     SELECT
-      COALESCE(t.metadata_name,   '(null)') AS metadata_name,
-      COALESCE(t.normalized_name, '(null)') AS normalized_name,
+      COALESCE(t.normalized_name, '(null)') AS task_name,
       count(*) FILTER (WHERE ${eligible})                                  AS n_eligible,
       count(*) FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90})     AS misses,
       percentile_cont(0.5) WITHIN GROUP (ORDER BY ${cols.act})
@@ -556,7 +557,7 @@ async function queryTopMissesByName(pool, windowDays, side, limit = 25) {
     JOIN queue_forecast_tasks      t USING (task_id)
     WHERE r.resolved_at IS NOT NULL
       AND r.resolved_at >= now() - ($1 || ' days')::interval
-    GROUP BY t.metadata_name, t.normalized_name
+    GROUP BY 1
     HAVING count(*) FILTER (WHERE ${eligible} AND ${cols.act} > ${cols.p90}) > 0
     ORDER BY misses DESC, n_eligible DESC
     LIMIT $2;
@@ -1384,7 +1385,7 @@ function renderTopMisses(rows, side) {
     return '<p class="muted">No misses (actual &gt; p90) in window.</p>';
   }
   let html = `<table><thead><tr>
-    <th>metadata_name</th><th>normalized_name</th>
+    <th>task name (normalized)</th>
     <th class="r">misses</th><th class="r">n eligible</th><th class="r">miss rate</th>
     <th class="r">miss ${side} actual p50</th><th class="r">miss ${side} actual p90</th><th class="r">miss predicted p90 (median)</th>
   </tr></thead><tbody>`;
@@ -1393,8 +1394,7 @@ function renderTopMisses(rows, side) {
     const misses = Number(r.misses) || 0;
     const rate = n === 0 ? '—' : `${(100 * misses / n).toFixed(1)}%`;
     html += `<tr>
-      <td>${esc(r.metadata_name)}</td>
-      <td>${esc(r.normalized_name)}</td>
+      <td>${esc(r.task_name)}</td>
       <td class="r">${fmtNum(misses)}</td>
       <td class="r">${fmtNum(n)}</td>
       <td class="r">${rate}</td>
