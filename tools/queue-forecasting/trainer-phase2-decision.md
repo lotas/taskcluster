@@ -1,17 +1,19 @@
 # Queue Forecasting — Phase 2 Decision
 
 **Created:** 2026-04-23
-**Last updated:** 2026-05-15 (Phase 3b core path shipped; live predictor in production; deviations from §5.3b spec recorded)
+**Last updated:** 2026-05-20 (live calibration review; p90 baseline-regression findings; run-duration p90 guardrail added)
 **Companion to:** `trainer-spec.md`, `trainer-plan.md`
 **Authors:** residual-model experiment, wait-time transform variants, run-duration residual experiment
 
-## 1. Decision (current — 2026-04-29)
+## 1. Decision (architecture current — 2026-04-29; live status updated 2026-05-20)
 
 **Wait_time: ship `wait_time_residual_throughput_filtered_baseline.yaml` (Policy B).** Across 15 cohorts (Apr 15-29, E18) it never regressed baseline on MAE (worst Δ% −2.59%) or within-2x (worst +4.58pp), hits the 30m+ user-perceptibility goal on 14/15 cohorts, and improves p90 in-band ratio from 9/15 (unfiltered residual) to 11/15. The "regime fragility" diagnosed in E16 turned out to be **baseline contamination**: the unfiltered percentile baseline's 7-day history averaged over a shifted regime, dragging the residual reference wrong-on-current-data. Policy B excludes anomalous days (per `queue_forecast_daily_health.is_anomalous`) from that history; the residual model then corrects from a clean reference.
 
 **Run_duration: ship `run_duration_residual.yaml`.** 15 cohorts in E18 (was 11 in E16): mean MAE Δ% −4.50%, p90 in-band 13/15, beats LGB-only on 8/10 MAE wins and 9/10 within-2x wins. No regime fragility on duration (already noted in E16).
 
 **Production deployment is live as of 2026-05-15.** The Phase 3b core path (ONNX bundle loading, hierarchical baseline-stats refresh, throughput features, NOTIFY + catch-up, versioned audit writes) is deployed and producing predictions into `queue_forecast_run_predictions`. Several items from §5.3b are explicitly deferred or accepted as V1 limitations — see §5 "Phase 3b — core path closed 2026-05-15" for the gap list.
+
+**Live calibration status as of 2026-05-20: core serving is working, but p90/tail hardening is active.** The updated aggregation dashboard shows completed-only calibration close to target overall (`52.1% <= wait p50`, `12.0% > wait p90`; `49.1% <= run p50`, `11.2% > run p90`), but the misses are not evenly distributed. Long waits, weak baseline fallbacks, capacity-sensitive queues, and specific duration cohorts still produce user-visible underestimates. Recent baseline research also found that the residual p90 model can undercut a stronger historical p90 baseline, so the current status is "live and useful for investigation", not "ready for broad UI/ETA promotion".
 
 ### Decision history
 
@@ -20,6 +22,9 @@
 - **2026-04-29 (E18):** Stage 2 anomaly-filter sweep showed the regime fragility was baseline contamination, not architectural. Policy B (filter anomalous days from baseline history only) recovers and improves on every metric, never regresses any cohort. Recommendation reverts to single-model residual, now with Policy B baseline filtering. The hybrid + regime-detector path (E16's "option B") is no longer needed.
 - **2026-05-15 (Phase 3b core path live):** `src/live-predictor/` service deployed. First-hour data: ~5000 predictions, 100% enriched before scoring, baseline coverage distributed across `queue+bucket` / `queue` / `priority+bucket` with no global fallthrough. Policy B is correctly wired end-to-end (trainer exports `anomaly_filter` into `_feature_schema.json`; serving reads it via `filterFromSchema()` and applies the exclude-dates clause to wait baseline SQL). Known gaps recorded below.
 - **2026-05-15 (pivot from LISTEN/NOTIFY to polling):** Initial design dispatched predictions via Postgres `LISTEN queue_forecast_task_pending` from the collector. After a deploy where the collector container kept running the old image (no `pg_notify` call), notifications appeared to silently stop after the startup catch-up drained. Diagnosis pointed to a stale collector, but we pivoted to a 5s polling loop anyway — one code path, no notification-loss failure mode, latency within product tolerance. NOTIFY remains a valid optimization if sub-second latency becomes a goal.
+- **2026-05-19 (live aggregation review):** Added completed-only vs all-resolved cuts, baseline-level/sample-size cuts, priority/project cuts, actual-duration buckets, and top-miss tables. Main findings: completed-only run p90 misses are lower than all-resolved because failed/claim-expired rows are noisy; wait misses are mostly long-tail (`30m+` waits are `48.8%` bad); fallback baselines are risky (`queue` wait fallback `82.8%` bad, `priority+bucket` `53.1%` bad); `project_id` is currently all `none`.
+- **2026-05-20 (baseline p90 regression finding):** SQL in `baseline-research.md` shows the model sometimes makes p90 worse than the historical baseline. Example run-duration cohorts: `source-test-python-mozbuild-3.9-windows11-64/opt` raw model p90 miss `46.3%` vs baseline p90 miss `8.9%`; `build-linux64-asan/opt` `29.0%` vs `9.0%`; `Code review publication (production)` `25.7%` vs `11.2%`. Wait p90 shows the same pattern on some strong `queue+bucket` baselines, for example `releng-hardware/win11-64-24h2-hw` medium priority: model `57.1%` vs baseline `28.8%`.
+- **2026-05-20 (run-duration p90 guardrail):** Added `bl_duration_p90` as a run-duration feature, added live serving guardrail/audit for strong exact-name duration baselines, and added guarded p90 trainer metrics. Guardrail applies only when duration baseline level is `metadata_name`, sample size is sufficient, and baseline p90 is finite. This protects against the model compressing a multimodal/tail-heavy cohort below its own stronger historical p90.
 
 For per-cohort metrics and the regime-shift narrative supporting each step in the decision history, see §6 / E13, E16, E18.
 
@@ -101,6 +106,16 @@ The four gaps logged at Phase 2 close (2026-04-23) are largely resolved by Phase
 
 5. **Two missing Apr 28 wait manifests** — `wait_time_manifest.json` and `wait_time_residual_manifest.json` are absent from `trainer/data/models/2026-04-28/`. Configs lack `anomaly_filter` blocks so the explicit skip-manifest path doesn't trigger; appears to be a silent crash. Doesn't affect the production candidate (Policy B completed 14/14) but should be diagnosed for pipeline robustness. Low priority.
 
+**Live gaps discovered after production deployment:**
+
+6. **Run-duration p90 can regress below a stronger baseline p90.** `Code review publication (production)` exposed the pattern first: actual runtimes are multimodal, with many very short runs and a large 10-12 minute population, while the model served p90 near 6 minutes. The exact-name historical baseline p90 covered the tail much better. `baseline-research.md` shows this is broader than one task name. **Mitigation added 2026-05-20:** `bl_duration_p90` is now a training feature, live serving applies an exact-name p90 floor with audit fields, and trainer manifests report guarded p90 metrics. Next check: verify guarded rows in live data after deployment.
+
+7. **Wait p90 has the same model-vs-baseline regression pattern.** Several high-volume `queue+bucket` cohorts have a lower miss rate with the baseline p90 than the model p90. This is separate from the older 30m+ ratio-accuracy work: the live issue is that a strong queue/priority historical p90 sometimes already knows the tail and the model pulls it down. Next action: add/evaluate `bl_wait_p90`, compare raw model p90 vs baseline p90 vs guarded p90, and consider a serving guardrail only for strong wait baselines with enough samples.
+
+8. **Weak fallback baselines remain a cold-start/identity risk.** Strong rows are close to calibrated (`metadata_name` + `queue+bucket`: `10.2%` run p90 miss, `10.9%` wait p90 miss), but fallback rows are much worse (`task_queue_id` duration fallback `28.7%` run p90 miss; `queue` wait fallback `78.6%` wait p90 miss). This suggests some misses are not model architecture problems; they are missing stable identity, sparse history, or insufficient queue state.
+
+9. **Payload-hidden duration modes are still possible, but not the first fix.** The Code Review payload comparison found no useful pre-run distinction between an under-8s run and an over-800s run; differences appear only in logs, which are not available at prediction time. Payload-derived fingerprints may still help test/chunk jobs where same-named tasks execute different selected tests, but the immediate fix is to stop the p90 model from undercutting a better p90 baseline.
+
 ## 5. Next phase
 
 ### Phase 3a — closed 2026-04-29
@@ -119,7 +134,7 @@ Exit criteria met:
 
 ### Phase 3b — production path (active)
 
-The "model" question is settled. The remaining work is a serving system that respects the training/eval contract end-to-end.
+Historical Phase 3b premise: the offline architecture decision was settled, and the remaining work was a serving system that respected the training/eval contract end-to-end. Live data later reopened p90 hardening work; see Phase 3c below.
 
 #### 3b.1 Serving contract (new — derived from E18 Policy B requirement)
 
@@ -242,11 +257,24 @@ Live predictor service is deployed and producing predictions. Implementation liv
 - (c) Promote the JSONB audit subset to typed columns when offline-replay tooling is built (deviation 2).
 - (d) Parity test harness — Python trainer prediction vs onnxruntime-node prediction on a fixed input vector — to add as regression coverage before any feature additions (gap #2).
 
+### Phase 3c — live calibration hardening (active as of 2026-05-20)
+
+The core predictor is live; the current work is making tail behavior explainable and preventing the model from worsening a stronger baseline.
+
+1. **Verify run-duration p90 guardrail in production.** Use the `duration_p90_guardrail` audit object to compare raw model p90 miss rate vs served p90 miss rate after new rows arrive.
+2. **Make model-vs-baseline p90 regression a recurring diagnostic.** Add dashboard or manifest tables ranking cohorts where raw model p90 is worse than baseline p90, separately for run and wait.
+3. **Evaluate wait p90 baseline feature and guardrail.** Add `bl_wait_p90` if missing from the wait feature set, then compare raw model p90, baseline p90, and guarded p90 for strong `queue+bucket` baselines with sample-size thresholds.
+4. **Add priority/capacity wait features.** Keep throughput features, but add live worker capacity, claimed/running counts, utilization, and higher-priority queued pressure by shared pool. This targets long-wait/capacity-sensitive queues.
+5. **Investigate stable identity gaps.** For duration fallback rows and selected-test jobs, evaluate pre-run payload fingerprints only if they are stable and do not encode one-off IDs.
+6. **Keep task-level UI and task-group ETA deferred.** The current predictor is useful for diagnostics, but a user-facing ETA needs stable p90/tail behavior. Task-group ETA likely also needs dependency edges and blocked/unscheduled lifecycle data that are not currently collected.
+
 ## Recommendation
 
-**Shipped (2026-05-15).** Policy B for wait, residual for duration, both served via `src/live-predictor/`. The model architecture decision and the core serving path are both closed. Followup work is the Phase 3b deviation list (§5 "core path closed"), tracked but not blocking.
+**Shipped (2026-05-15), with live calibration hardening active (2026-05-20).** Policy B for wait and residual duration are both served via `src/live-predictor/`. The core serving path is closed, but the live p90 evidence changes the project status: do not promote this into broad Treeherder/UI ETA surfaces yet. First finish the p90 baseline-regression guardrails and wait tail diagnostics in Phase 3c.
 
 The original risk framing — offline/online drift on baseline computation — is mostly mitigated: Policy B is correctly wired through the bundle (`anomaly_filter` in `_feature_schema.json` → `filterFromSchema()` in serving → `<> ALL($2::date[])` clause in baseline SQL). The one residual risk is deviation 1 (cutoff anchored on `now()` not UTC-midnight), which leaves a 24h window for same-day incidents to slip into the baseline before health-monitor flags them. Worth fixing if any regime drift reproduces; not worth blocking shipping for.
+
+The newer risk framing is p90 tail underestimation: a residual model can improve central tendency while still lowering a p90 that the historical baseline estimated better. Run-duration now has an exact-name p90 guardrail; wait-time needs the same evaluation before user-facing ETA work resumes.
 
 ---
 
