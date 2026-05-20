@@ -31,6 +31,7 @@ numeric_features:
   - day_sin
   - day_cos
   - bl_wait_p50
+  - bl_wait_p90
   - queue_tasks_started_15m
   - queue_tasks_completed_15m
   - queue_avg_wait_15m

@@ -300,12 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     target_key = "duration" if c.target == "run_duration" else "wait"
     preds_p50 = models[0.5].predict(hold.X) if 0.5 in models else np.full(len(hold.y), np.nan)
     preds_p90 = models[0.9].predict(hold.X) if 0.9 in models else np.full(len(hold.y), np.nan)
-    # Run-duration runs floor the served p90 with the historical exact-name
-    # baseline p90 (see live-predictor guardrail). Mirror that here so the
-    # manifest can compare raw vs. guarded p90 coverage globally.
+    p90_col = f"bl_{target_key}_p90"
     baseline_p90 = (
-        hold.X["bl_duration_p90"].to_numpy()
-        if c.target == "run_duration" and "bl_duration_p90" in hold.X.columns
+        hold.X[p90_col].to_numpy()
+        if p90_col in hold.X.columns
         else None
     )
     report = do_eval(
