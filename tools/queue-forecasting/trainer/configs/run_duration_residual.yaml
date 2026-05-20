@@ -18,8 +18,12 @@ categorical_features:
   - normalized_name
   - tags.kind
   - tags.test-type
+  - tags.test-suite
+  - tags.test-platform
+  - tags.test-variant
   - tags.os
   - tags.project
+  - tags.retrigger
   - tags.worker-implementation
   - build_type
 

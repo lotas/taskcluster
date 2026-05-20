@@ -1,7 +1,7 @@
 # Queue Forecasting — Phase 2 Decision
 
 **Created:** 2026-04-23
-**Last updated:** 2026-05-20 (live calibration review; p90 baseline-regression findings; run-duration p90 guardrail added)
+**Last updated:** 2026-05-20 (live calibration review; p90 baseline-regression findings; run-duration p90 guardrail; Tier 1 tag features added)
 **Companion to:** `trainer-spec.md`, `trainer-plan.md`
 **Authors:** residual-model experiment, wait-time transform variants, run-duration residual experiment
 
@@ -13,7 +13,7 @@
 
 **Production deployment is live as of 2026-05-15.** The Phase 3b core path (ONNX bundle loading, hierarchical baseline-stats refresh, throughput features, NOTIFY + catch-up, versioned audit writes) is deployed and producing predictions into `queue_forecast_run_predictions`. Several items from §5.3b are explicitly deferred or accepted as V1 limitations — see §5 "Phase 3b — core path closed 2026-05-15" for the gap list.
 
-**Live calibration status as of 2026-05-20: core serving is working, but p90/tail hardening is active.** The updated aggregation dashboard shows completed-only calibration close to target overall (`52.1% <= wait p50`, `12.0% > wait p90`; `49.1% <= run p50`, `11.2% > run p90`), but the misses are not evenly distributed. Long waits, weak baseline fallbacks, capacity-sensitive queues, and specific duration cohorts still produce user-visible underestimates. Recent baseline research also found that the residual p90 model can undercut a stronger historical p90 baseline, so the current status is "live and useful for investigation", not "ready for broad UI/ETA promotion".
+**Live calibration status as of 2026-05-20: core serving is working, but p90/tail hardening is active.** The updated aggregation dashboard shows completed-only calibration close to target overall (`52.1% <= wait p50`, `12.0% > wait p90`; `49.1% <= run p50`, `11.2% > run p90`), but the misses are not evenly distributed. Long waits, weak baseline fallbacks, capacity-sensitive queues, and specific duration cohorts still produce user-visible underestimates. Recent baseline research also found that the residual p90 model can undercut a stronger historical p90 baseline. Payload research then split duration misses into no-signal cohorts, where the p90 guardrail is the right fix, and test-task cohorts, where richer `tags.*` identity fields already exist in the DB. Current status is "live and useful for investigation", not "ready for broad UI/ETA promotion".
 
 ### Decision history
 
@@ -25,6 +25,7 @@
 - **2026-05-19 (live aggregation review):** Added completed-only vs all-resolved cuts, baseline-level/sample-size cuts, priority/project cuts, actual-duration buckets, and top-miss tables. Main findings: completed-only run p90 misses are lower than all-resolved because failed/claim-expired rows are noisy; wait misses are mostly long-tail (`30m+` waits are `48.8%` bad); fallback baselines are risky (`queue` wait fallback `82.8%` bad, `priority+bucket` `53.1%` bad); `project_id` is currently all `none`.
 - **2026-05-20 (baseline p90 regression finding):** SQL in `baseline-research.md` shows the model sometimes makes p90 worse than the historical baseline. Example run-duration cohorts: `source-test-python-mozbuild-3.9-windows11-64/opt` raw model p90 miss `46.3%` vs baseline p90 miss `8.9%`; `build-linux64-asan/opt` `29.0%` vs `9.0%`; `Code review publication (production)` `25.7%` vs `11.2%`. Wait p90 shows the same pattern on some strong `queue+bucket` baselines, for example `releng-hardware/win11-64-24h2-hw` medium priority: model `57.1%` vs baseline `28.8%`.
 - **2026-05-20 (run-duration p90 guardrail):** Added `bl_duration_p90` as a run-duration feature, added live serving guardrail/audit for strong exact-name duration baselines, and added guarded p90 trainer metrics. Guardrail applies only when duration baseline level is `metadata_name`, sample size is sufficient, and baseline p90 is finite. This protects against the model compressing a multimodal/tail-heavy cohort below its own stronger historical p90.
+- **2026-05-20 (payload feature exploration):** `payload-feature-exploration.md` found two categories. Code Review, mozlint, and build tasks have no useful pre-run task-definition signal for their duration tail; they depend on external runtime state such as push size, changed files, cache warmth, sccache hits, or service behavior. Test tasks, however, already carry stronger identity fields in `tags` that were not in the configs: `test-suite`, `test-platform`, `test-variant`, and `retrigger`. Added these four categorical features to both active training configs; next step is a walk-forward comparison before collecting new payload fields.
 
 For per-cohort metrics and the regime-shift narrative supporting each step in the decision history, see §6 / E13, E16, E18.
 
@@ -90,6 +91,8 @@ Production configs:
 - `configs/wait_time_residual_throughput_filtered_baseline.yaml` — wait, residual + throughput features + Policy B baseline filter
 - `configs/run_duration_residual.yaml` — duration, residual, no filter (no fragility observed)
 
+As of 2026-05-20, both active configs include Tier 1 tag identity fields already present in `queue_forecast_tasks.tags`: `tags.test-suite`, `tags.test-platform`, `tags.test-variant`, and `tags.retrigger`. These are config-only features; the Python and JS feature builders already support arbitrary `tags.*` keys.
+
 ## 4. Known gaps
 
 The four gaps logged at Phase 2 close (2026-04-23) are largely resolved by Phase 3a's queue-velocity + throughput features (E10-E13) and Policy B baseline filtering (E18). Status as of 2026-04-29:
@@ -114,7 +117,7 @@ The four gaps logged at Phase 2 close (2026-04-23) are largely resolved by Phase
 
 8. **Weak fallback baselines remain a cold-start/identity risk.** Strong rows are close to calibrated (`metadata_name` + `queue+bucket`: `10.2%` run p90 miss, `10.9%` wait p90 miss), but fallback rows are much worse (`task_queue_id` duration fallback `28.7%` run p90 miss; `queue` wait fallback `78.6%` wait p90 miss). This suggests some misses are not model architecture problems; they are missing stable identity, sparse history, or insufficient queue state.
 
-9. **Payload-hidden duration modes are still possible, but not the first fix.** The Code Review payload comparison found no useful pre-run distinction between an under-8s run and an over-800s run; differences appear only in logs, which are not available at prediction time. Payload-derived fingerprints may still help test/chunk jobs where same-named tasks execute different selected tests, but the immediate fix is to stop the p90 model from undercutting a better p90 baseline.
+9. **Payload research split duration misses into no-signal and existing-tag-signal cohorts.** The Code Review payload comparison found no useful pre-run distinction between an under-8s run and an over-800s run; differences appear only in logs, which are not available at prediction time. Mozlint and build tasks are similar: external runtime state dominates. Test tasks are different: `test-suite`, `test-platform`, `test-variant`, and `retrigger` are already in tags, cover a large share of tasks, and should be tried before collector changes. **Mitigation added 2026-05-20:** add those four tags to both configs; next check is walk-forward impact.
 
 ## 5. Next phase
 
@@ -265,8 +268,9 @@ The core predictor is live; the current work is making tail behavior explainable
 2. **Make model-vs-baseline p90 regression a recurring diagnostic.** Add dashboard or manifest tables ranking cohorts where raw model p90 is worse than baseline p90, separately for run and wait.
 3. **Evaluate wait p90 baseline feature and guardrail.** Add `bl_wait_p90` if missing from the wait feature set, then compare raw model p90, baseline p90, and guarded p90 for strong `queue+bucket` baselines with sample-size thresholds.
 4. **Add priority/capacity wait features.** Keep throughput features, but add live worker capacity, claimed/running counts, utilization, and higher-priority queued pressure by shared pool. This targets long-wait/capacity-sensitive queues.
-5. **Investigate stable identity gaps.** For duration fallback rows and selected-test jobs, evaluate pre-run payload fingerprints only if they are stable and do not encode one-off IDs.
-6. **Keep task-level UI and task-group ETA deferred.** The current predictor is useful for diagnostics, but a user-facing ETA needs stable p90/tail behavior. Task-group ETA likely also needs dependency edges and blocked/unscheduled lifecycle data that are not currently collected.
+5. **Run Tier 1 tag-feature walk-forward.** The active configs now include `tags.test-suite`, `tags.test-platform`, `tags.test-variant`, and `tags.retrigger`. Compare against the previous configs, especially on test-task cohorts.
+6. **Defer new payload collection until Tier 1 is measured.** `MOZHARNESS_TEST_PATHS` manifest count is the best Tier 2 candidate, but it requires collector/enrichment work and should wait until the tag-feature result is known.
+7. **Keep task-level UI and task-group ETA deferred.** The current predictor is useful for diagnostics, but a user-facing ETA needs stable p90/tail behavior. Task-group ETA likely also needs dependency edges and blocked/unscheduled lifecycle data that are not currently collected.
 
 ## Recommendation
 
@@ -274,7 +278,7 @@ The core predictor is live; the current work is making tail behavior explainable
 
 The original risk framing — offline/online drift on baseline computation — is mostly mitigated: Policy B is correctly wired through the bundle (`anomaly_filter` in `_feature_schema.json` → `filterFromSchema()` in serving → `<> ALL($2::date[])` clause in baseline SQL). The one residual risk is deviation 1 (cutoff anchored on `now()` not UTC-midnight), which leaves a 24h window for same-day incidents to slip into the baseline before health-monitor flags them. Worth fixing if any regime drift reproduces; not worth blocking shipping for.
 
-The newer risk framing is p90 tail underestimation: a residual model can improve central tendency while still lowering a p90 that the historical baseline estimated better. Run-duration now has an exact-name p90 guardrail; wait-time needs the same evaluation before user-facing ETA work resumes.
+The newer risk framing is p90 tail underestimation: a residual model can improve central tendency while still lowering a p90 that the historical baseline estimated better. Run-duration now has an exact-name p90 guardrail; wait-time needs the same evaluation before user-facing ETA work resumes. The first feature-expansion step is low-risk: use existing `tags.*` fields for test-task identity, then decide whether higher-effort payload collection is justified.
 
 ---
 
