@@ -22,7 +22,13 @@
 
 import * as ort from 'onnxruntime-node';
 import { buildFeatureVector } from './feature-builder.js';
+import { applyDurationP90Guardrail } from './duration-p90-guardrail.js';
 import { getThroughput } from './throughput.js';
+
+// Minimum exact-name baseline sample size required before the historical p90
+// is allowed to floor the served run-duration p90. Keeps high-variance,
+// sparsely-observed cohorts from anchoring predictions to noisy quantiles.
+const DURATION_P90_GUARDRAIL_MIN_SAMPLE = 20;
 
 const FETCH_ROW_SQL = `
 SELECT r.task_id, r.run_id, r.pending_at, r.queue_pending,
@@ -131,7 +137,17 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
   const durRawP90 = await runQuantile(bundles.duration.sessionP90, durTensor);
   const durBl = liveFeatures[bundles.duration.schema.residual.baseline_feature];
   const runP50 = Math.max(0.0, logRatioInverse(durRawP50, durBl));
-  const runP90 = Math.max(runP50, logRatioInverse(durRawP90, durBl));
+  const rawModelRunP90 = Math.max(runP50, logRatioInverse(durRawP90, durBl));
+
+  // Floor the served p90 with the exact-name historical baseline p90 when the
+  // model compresses the tail; only metadata_name with enough samples qualifies.
+  const guardrail = applyDurationP90Guardrail({
+    runP50,
+    rawModelP90: rawModelRunP90,
+    baseline: durationBaseline,
+    minSampleSize: DURATION_P90_GUARDRAIL_MIN_SAMPLE,
+  });
+  const runP90 = guardrail.finalP90;
 
   // Audit payload — full enough to reproduce a prediction offline.
   // JSON.stringify drops NaN to null; that's fine for audit.
@@ -143,6 +159,14 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
       duration: durationBaseline,
     },
     throughput,
+    duration_p90_guardrail: {
+      applied:              guardrail.applied,
+      raw_model_p90_s:      rawModelRunP90,
+      baseline_p90_s:       guardrail.baselineP90,
+      final_p90_s:          guardrail.finalP90,
+      baseline_level:       guardrail.baselineLevel,
+      baseline_sample_size: guardrail.baselineSampleSize,
+    },
     wait_feature_order:     bundles.wait.schema.feature_order,
     wait_vector:            Array.from(waitVec, (x) => (Number.isFinite(x) ? x : null)),
     duration_feature_order: bundles.duration.schema.feature_order,

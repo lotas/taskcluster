@@ -26,6 +26,7 @@ categorical_features:
 numeric_features:
   - max_run_time_s
   - bl_duration_p50
+  - bl_duration_p90
 
 derived_features:
   build_type_regex:

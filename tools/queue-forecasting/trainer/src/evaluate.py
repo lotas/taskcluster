@@ -17,7 +17,8 @@ import pandas as pd
 
 
 def per_row_metrics(y_true: np.ndarray, y_pred: np.ndarray,
-                    y_pred_p90: np.ndarray | None = None) -> dict:
+                    y_pred_p90: np.ndarray | None = None,
+                    y_pred_p90_guarded: np.ndarray | None = None) -> dict:
     yt = np.asarray(y_true, dtype=float)
     yp = np.asarray(y_pred, dtype=float)
     mae_mask = np.isfinite(yt) & np.isfinite(yp)
@@ -42,7 +43,26 @@ def per_row_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         out["pinball_p90"] = pinball_loss(yt, np.asarray(y_pred_p90, dtype=float), alpha=0.9)
         out["p90_coverage"] = p90_coverage(yt, np.asarray(y_pred_p90, dtype=float))
 
+    if y_pred_p90_guarded is not None:
+        ypg = np.asarray(y_pred_p90_guarded, dtype=float)
+        out["pinball_p90_guarded"]  = pinball_loss(yt, ypg, alpha=0.9)
+        out["p90_coverage_guarded"] = p90_coverage(yt, ypg)
+
     return out
+
+
+def compute_guarded_p90(*, p50: np.ndarray, model_p90: np.ndarray,
+                        baseline_p90: np.ndarray) -> np.ndarray:
+    """Floor the model's p90 with the historical baseline p90 (where finite),
+    then floor by p50 so p90 >= p50 always holds.
+
+    NaN baseline rows fall back to model_p90 (no guard applied to that row).
+    """
+    p50 = np.asarray(p50, dtype=float)
+    model_p90 = np.asarray(model_p90, dtype=float)
+    baseline_p90 = np.asarray(baseline_p90, dtype=float)
+    bl_floor = np.where(np.isfinite(baseline_p90), baseline_p90, -np.inf)
+    return np.maximum(p50, np.maximum(model_p90, bl_floor))
 
 
 def pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> dict:
@@ -62,14 +82,20 @@ def p90_coverage(y_true: np.ndarray, y_pred_p90: np.ndarray) -> dict:
 
 
 def compute_day_metrics(meta: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray,
-                        y_pred_p90: np.ndarray | None = None) -> dict[str, dict]:
+                        y_pred_p90: np.ndarray | None = None,
+                        y_pred_p90_guarded: np.ndarray | None = None) -> dict[str, dict]:
     """Per-day metrics keyed by YYYY-MM-DD (UTC date of pending_at)."""
     out: dict[str, dict] = {}
     day_keys = meta["pending_at"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d")
     for day, idx in day_keys.groupby(day_keys).groups.items():
         sel = idx.to_numpy()
         p90_slice = y_pred_p90[sel] if y_pred_p90 is not None else None
-        out[str(day)] = per_row_metrics(y_true[sel], y_pred[sel], y_pred_p90=p90_slice)
+        guarded_slice = y_pred_p90_guarded[sel] if y_pred_p90_guarded is not None else None
+        out[str(day)] = per_row_metrics(
+            y_true[sel], y_pred[sel],
+            y_pred_p90=p90_slice,
+            y_pred_p90_guarded=guarded_slice,
+        )
     return out
 
 
@@ -105,6 +131,18 @@ def aggregate_days(days: Iterable[dict]) -> dict:
         cov_n = sum(d["p90_coverage"]["covered_n"]  for d in days)
         out["p90_coverage"] = {"eligible_n": cov_e, "covered_n": cov_n}
         out["p90_coverage_rate"] = (cov_n / cov_e) if cov_e else float("nan")
+
+    if all("pinball_p90_guarded" in d for d in days) and days:
+        pbg_e = sum(d["pinball_p90_guarded"]["eligible_n"] for d in days)
+        pbg_s = sum(d["pinball_p90_guarded"]["sum"]        for d in days)
+        out["pinball_p90_guarded"] = {"eligible_n": pbg_e, "sum": pbg_s}
+        out["pinball_p90_guarded_avg"] = (pbg_s / pbg_e) if pbg_e else float("nan")
+
+    if all("p90_coverage_guarded" in d for d in days) and days:
+        covg_e = sum(d["p90_coverage_guarded"]["eligible_n"] for d in days)
+        covg_n = sum(d["p90_coverage_guarded"]["covered_n"]  for d in days)
+        out["p90_coverage_guarded"] = {"eligible_n": covg_e, "covered_n": covg_n}
+        out["p90_coverage_guarded_rate"] = (covg_n / covg_e) if covg_e else float("nan")
 
     return out
 
@@ -214,25 +252,41 @@ def load_prior_manifest(run_dir: Path, target: str) -> dict | None:
 def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
              hold_meta: pd.DataFrame, y_true: np.ndarray,
              holdout_day_keys: list[str], baseline_dir: Path,
-             target: str) -> MetricsReport:
+             target: str,
+             baseline_p90: np.ndarray | None = None) -> MetricsReport:
     """Compute per-day + aggregate metrics on primary/supplemental slices
     and load the matching baseline JSONs.
 
     `target` is "duration" or "wait" — selects which field of the baseline
     JSONs to read.
+
+    When ``baseline_p90`` is provided (run-duration runs), the report also
+    carries a guarded p90 view: max(preds_p90, baseline_p90) floored by p50.
+    Coverage and pinball loss for the guarded view are emitted alongside the
+    raw-model p90 metrics so we can compare calibration globally.
     """
     primary_mask      = hold_meta["reason_resolved"].isin(["completed"]).to_numpy()
     supplemental_mask = hold_meta["reason_resolved"].isin(["completed", "failed"]).to_numpy()
 
+    preds_p90_guarded = (
+        compute_guarded_p90(p50=preds_p50, model_p90=preds_p90, baseline_p90=baseline_p90)
+        if baseline_p90 is not None else None
+    )
+
     def _slice(mask):
+        guarded_slice = preds_p90_guarded[mask] if preds_p90_guarded is not None else None
         return (hold_meta[mask].reset_index(drop=True),
-                y_true[mask], preds_p50[mask], preds_p90[mask])
+                y_true[mask], preds_p50[mask], preds_p90[mask], guarded_slice)
 
-    p_meta, p_yt, p_yp, p_yp90 = _slice(primary_mask)
-    s_meta, s_yt, s_yp, s_yp90 = _slice(supplemental_mask)
+    p_meta, p_yt, p_yp, p_yp90, p_yp90g = _slice(primary_mask)
+    s_meta, s_yt, s_yp, s_yp90, s_yp90g = _slice(supplemental_mask)
 
-    primary_per_day      = compute_day_metrics(p_meta, p_yt, p_yp, y_pred_p90=p_yp90)
-    supplemental_per_day = compute_day_metrics(s_meta, s_yt, s_yp, y_pred_p90=s_yp90)
+    primary_per_day      = compute_day_metrics(p_meta, p_yt, p_yp,
+                                               y_pred_p90=p_yp90,
+                                               y_pred_p90_guarded=p_yp90g)
+    supplemental_per_day = compute_day_metrics(s_meta, s_yt, s_yp,
+                                               y_pred_p90=s_yp90,
+                                               y_pred_p90_guarded=s_yp90g)
 
     primary_agg      = aggregate_days(primary_per_day.values())
     supplemental_agg = aggregate_days(supplemental_per_day.values())
