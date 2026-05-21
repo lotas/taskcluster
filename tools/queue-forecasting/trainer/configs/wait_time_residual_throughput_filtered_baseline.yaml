@@ -17,12 +17,8 @@ categorical_features:
   - scheduler_id
   - priority_at_pending
   - tags.kind
-  - tags.test-suite
-  - tags.test-platform
-  - tags.test-variant
   - tags.os
   - tags.project
-  - tags.retrigger
   - tags.worker-implementation
 
 # New numeric features — LightGBM will ignore any that are all-NaN,
