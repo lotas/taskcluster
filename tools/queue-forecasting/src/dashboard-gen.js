@@ -406,14 +406,6 @@ function queryAggregationsByPriority(pool, windowDays) {
   return queryAggByDim(pool, windowDays, `COALESCE(r.priority_at_pending, '(null)')`);
 }
 
-function queryAggregationsByProject(pool, windowDays) {
-  return queryAggByDim(
-    pool, windowDays,
-    `COALESCE(t.project_id, '(null)')`,
-    `JOIN queue_forecast_tasks t USING (task_id)`,
-  );
-}
-
 function queryAggregationsByWaitBaselineLevel(pool, windowDays) {
   return queryAggByDim(
     pool, windowDays,
@@ -1351,10 +1343,6 @@ function renderAggregationsByPriority(rows) {
   return renderBothFlavors(rows, 'priority_at_pending', dimValue);
 }
 
-function renderAggregationsByProject(rows) {
-  return renderBothFlavors(rows, 'project_id', dimValue);
-}
-
 function renderAggregationsByBaselineLevel(rows, side) {
   return renderBothFlavors(rows, `${side} baseline level`, dimValue);
 }
@@ -1661,9 +1649,6 @@ ${data.byScheduler}
 <h2>By priority_at_pending</h2>
 ${data.byPriority}
 
-<h2>By project_id</h2>
-${data.byProject}
-
 <h2>By Wait Baseline Level</h2>
 <div class="meta">Hierarchical fallback level used by the wait baseline (queue+bucket → queue → priority+bucket → global). <code>(none)</code> means no baseline applied.</div>
 ${data.byWaitBaselineLevel}
@@ -1692,11 +1677,63 @@ ${data.topWaitMisses}
 <div class="meta">Highest-volume task names contributing to run p90 misses.</div>
 ${data.topRunMisses}
 `;
+  const tocStyle = `
+  .toc {
+    position: fixed; top: 20px; left: 16px; width: 230px;
+    max-height: calc(100vh - 40px); overflow-y: auto;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 0; font-size: 12px; z-index: 100;
+    scrollbar-width: thin; scrollbar-color: var(--bg3) transparent;
+  }
+  .toc-title {
+    padding: 2px 14px 8px; color: var(--fg2); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+  }
+  .toc a {
+    display: block; padding: 3px 14px; color: var(--fg2); text-decoration: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    border-left: 2px solid transparent;
+  }
+  .toc a:hover { color: var(--fg); background: var(--bg3); }
+  .toc a.active { color: var(--blue); border-left-color: var(--blue); background: rgba(88,166,255,0.06); }
+  body.has-toc { margin-left: 260px; margin-right: 16px; }
+  @media (max-width: 1200px) { .toc { display: none; } body.has-toc { margin-left: auto; margin-right: auto; } }`;
+
+  const tocScript = `
+  (function() {
+    var hh = document.querySelectorAll('h2');
+    if (!hh.length) return;
+    var nav = document.createElement('nav');
+    nav.className = 'toc';
+    nav.innerHTML = '<div class="toc-title">Sections</div>';
+    for (var i = 0; i < hh.length; i++) {
+      hh[i].id = 'sec-' + i;
+      var a = document.createElement('a');
+      a.href = '#sec-' + i;
+      a.textContent = hh[i].textContent;
+      a.title = hh[i].textContent;
+      nav.appendChild(a);
+    }
+    document.body.insertBefore(nav, document.body.firstChild);
+    document.body.classList.add('has-toc');
+    var links = nav.querySelectorAll('a');
+    function update() {
+      var cur = 0;
+      for (var i = 0; i < hh.length; i++) { if (hh[i].getBoundingClientRect().top <= 60) cur = i; }
+      for (var i = 0; i < links.length; i++) links[i].classList.toggle('active', i === cur);
+    }
+    window.addEventListener('scroll', update, { passive: true });
+    update();
+  })();`;
+
   return renderPage({
     title: 'Aggregations — Queue Forecasting',
     h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Prediction Aggregations',
     headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a> · <a href="predictions.html">Predictions</a>`,
     bodyHtml,
+    extraStyle: tocStyle,
+    extraScript: tocScript,
   });
 }
 
@@ -1709,7 +1746,7 @@ async function generate() {
       tableHealth, freshness, ingestion, openIssues, dailyHealth, resolutions, todayHourly,
       predictorHealth, recentResolved, recentUnresolved,
       aggOverall, aggByDay, aggByQueue,
-      aggByReason, aggByScheduler, aggByPriority, aggByProject,
+      aggByReason, aggByScheduler, aggByPriority,
       aggByWaitBaselineLevel, aggByWaitBaselineSample,
       aggByRunBaselineLevel,  aggByRunBaselineSample,
       aggByWaitBucket, aggByRunBucket,
@@ -1731,7 +1768,6 @@ async function generate() {
       queryAggregationsByReason(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByScheduler(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByPriority(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByProject(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByWaitBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByWaitBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByRunBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
@@ -1779,7 +1815,6 @@ async function generate() {
       byReason:               renderAggregationsByReason(aggByReason),
       byScheduler:            renderAggregationsByScheduler(aggByScheduler),
       byPriority:             renderAggregationsByPriority(aggByPriority),
-      byProject:              renderAggregationsByProject(aggByProject),
       byWaitBaselineLevel:    renderAggregationsByBaselineLevel(aggByWaitBaselineLevel, 'wait'),
       byWaitBaselineSample:   renderAggregationsByBaselineSampleSize(aggByWaitBaselineSample, 'wait'),
       byRunBaselineLevel:     renderAggregationsByBaselineLevel(aggByRunBaselineLevel, 'run'),
