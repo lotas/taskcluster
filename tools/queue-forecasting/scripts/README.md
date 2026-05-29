@@ -5,8 +5,11 @@ logic remains reusable.
 
 ## Cron-facing scripts
 
-- `backup.sh` creates the Postgres dump, uploads backup artifacts, syncs
-  `trainer/data`, and owns its own lock.
+- `backup.sh` creates the Postgres dump, uploads it, prunes old dumps on a GFS
+  schedule (7 daily / 4 weekly / 3 monthly, via `KEEP_DAILY` / `KEEP_WEEKLY` /
+  `KEEP_MONTHLY`), and owns its own lock. Trainer-data is regenerable from the
+  DB and is **not** synced by default; pass `--sync-training-data` to opt in.
+  Pass `--no-prune` to keep every dump.
 - `daily_walk_forward.sh` computes the daily UTC as-of date, owns the
   walk-forward lock, starts Postgres, calls `walk_forward.sh`, and refreshes
   `walk_forward_summary.csv`.

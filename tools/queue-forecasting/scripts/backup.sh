@@ -19,11 +19,16 @@ PGUSER="${PGUSER:-postgres}"
 PGDATABASE="${PGDATABASE:-forecasting}"
 DUMP_COMPRESSION="${DUMP_COMPRESSION:-6}"
 LOCK_FILE="${LOCK_FILE:-/tmp/queue-forecasting-backup.lock}"
+KEEP_DAILY="${KEEP_DAILY:-7}"
+KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
+KEEP_MONTHLY="${KEEP_MONTHLY:-3}"
 
 SKIP_DB=0
-SKIP_TRAINING_DATA=0
+# Trainer-data is regenerable from the DB, so it is not synced by default.
+SKIP_TRAINING_DATA=1
 KEEP_LOCAL=0
 DRY_RUN=0
+PRUNE=1
 DELETE_EXTRA_TRAINING_DATA=0
 TIMESTAMP=""
 
@@ -39,11 +44,18 @@ Options:
   --training-data-dir DIR         Local trainer data directory to sync
                                   (default: ${TRAINING_DATA_DIR}).
   --skip-db                       Do not create/upload a Postgres dump.
-  --skip-training-data            Do not sync trainer/data.
-  --delete-extra-training-data    Delete remote trainer-data objects that are
-                                  absent locally. Off by default.
+  --sync-training-data            Sync trainer/data to Cloud Storage. Off by
+                                  default (trainer-data is regenerable from the
+                                  DB).
+  --skip-training-data            Do not sync trainer/data. Now the default;
+                                  kept as a no-op for backward compatibility.
+  --delete-extra-training-data    With --sync-training-data, delete remote
+                                  trainer-data objects that are absent locally.
+                                  Off by default.
+  --no-prune                      Do not prune old DB dumps after upload.
   --keep-local                    Keep the local dump after upload.
-  --dry-run                       Print actions without dumping or uploading.
+  --dry-run                       Print actions without dumping, uploading, or
+                                  deleting.
   --timestamp YYYYMMDDTHHMMSSZ    Override backup timestamp.
   -h, --help                      Show this help.
 
@@ -56,6 +68,9 @@ Environment:
   PGDATABASE                      Postgres database (default: forecasting).
   DUMP_COMPRESSION                pg_dump -Z compression level (default: 6).
   LOCK_FILE                       flock path for cron non-overlap.
+  KEEP_DAILY                      GFS: newest dump per day, last N (default: 7).
+  KEEP_WEEKLY                     GFS: newest dump per ISO week, last N (default: 4).
+  KEEP_MONTHLY                    GFS: newest dump per month, last N (default: 3).
 USAGE
 }
 
@@ -79,6 +94,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-training-data)
       SKIP_TRAINING_DATA=1
+      shift
+      ;;
+    --sync-training-data)
+      SKIP_TRAINING_DATA=0
+      shift
+      ;;
+    --no-prune)
+      PRUNE=0
       shift
       ;;
     --delete-extra-training-data)
@@ -126,6 +149,99 @@ compose() {
   docker compose "$@"
 }
 
+# Convert a 20260529T000001Z stamp into an ISO 8601 string GNU date understands.
+ts_to_iso() {
+  local ts="$1"
+  printf '%s-%s-%sT%s:%s:%sZ' \
+    "${ts:0:4}" "${ts:4:2}" "${ts:6:2}" "${ts:9:2}" "${ts:11:2}" "${ts:13:2}"
+}
+
+# GFS prune of DB dumps and their manifests. Runs after a fresh dump upload, so
+# the newest dump is already in place and is always kept (it owns today's daily
+# bucket). Internal failures are logged but never abort the backup.
+prune_dumps() {
+  section "Prune old dumps (GFS: ${KEEP_DAILY}d/${KEEP_WEEKLY}w/${KEEP_MONTHLY}m)"
+
+  local listing
+  if ! listing="$(gcloud storage ls "${BACKUP_URI}/db/" 2>/dev/null)"; then
+    echo "WARN: could not list ${BACKUP_URI}/db/; skipping prune" >&2
+    return 0
+  fi
+
+  # Collect dated-dump timestamps, excluding latest.dump and anything malformed.
+  local -a stamps=()
+  local line base ts
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    base="${line##*/}"
+    case "$base" in
+      "${PGDATABASE}-"*.dump) ;;
+      *) continue ;;
+    esac
+    ts="${base#"${PGDATABASE}"-}"
+    ts="${ts%.dump}"
+    [[ "$ts" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+    stamps+=("$ts")
+  done <<< "$listing"
+
+  if [[ "${#stamps[@]}" -eq 0 ]]; then
+    echo "no dated dumps found; nothing to prune"
+    return 0
+  fi
+
+  # Descending order; the fixed-width stamp sorts chronologically as text.
+  local -a sorted
+  mapfile -t sorted < <(printf '%s\n' "${stamps[@]}" | sort -r)
+
+  # Keep set: newest dump in each of the most recent N day/week/month buckets.
+  declare -A keep=() seen_day=() seen_week=() seen_month=()
+  local iso daykey weekkey monthkey
+  local n_day=0 n_week=0 n_month=0
+  for ts in "${sorted[@]}"; do
+    iso="$(ts_to_iso "$ts")"
+    daykey="$(date -u -d "$iso" +%Y%m%d 2>/dev/null)" || continue
+    weekkey="$(date -u -d "$iso" +%G%V 2>/dev/null)" || continue
+    monthkey="$(date -u -d "$iso" +%Y%m 2>/dev/null)" || continue
+
+    if [[ -z "${seen_day[$daykey]:-}" && "$n_day" -lt "$KEEP_DAILY" ]]; then
+      seen_day[$daykey]=1; keep[$ts]=1; n_day=$((n_day + 1))
+    fi
+    if [[ -z "${seen_week[$weekkey]:-}" && "$n_week" -lt "$KEEP_WEEKLY" ]]; then
+      seen_week[$weekkey]=1; keep[$ts]=1; n_week=$((n_week + 1))
+    fi
+    if [[ -z "${seen_month[$monthkey]:-}" && "$n_month" -lt "$KEEP_MONTHLY" ]]; then
+      seen_month[$monthkey]=1; keep[$ts]=1; n_month=$((n_month + 1))
+    fi
+  done
+
+  local -a to_delete=()
+  local kept=0
+  for ts in "${sorted[@]}"; do
+    if [[ -n "${keep[$ts]:-}" ]]; then
+      kept=$((kept + 1))
+    else
+      to_delete+=("$ts")
+    fi
+  done
+
+  echo "dumps: ${#sorted[@]} total, ${kept} kept, ${#to_delete[@]} to delete"
+
+  local dump_obj man_obj
+  for ts in "${to_delete[@]}"; do
+    dump_obj="${BACKUP_URI}/db/${PGDATABASE}-${ts}.dump"
+    man_obj="${BACKUP_URI}/manifests/backup-${ts}.txt"
+    if [[ "$DRY_RUN" == 1 ]]; then
+      echo "would delete: $dump_obj"
+      echo "would delete: $man_obj (if present)"
+    else
+      echo "deleting: $dump_obj"
+      gcloud storage rm "$dump_obj" || echo "WARN: failed to delete $dump_obj" >&2
+      # The matching manifest may not exist for every dump; ignore if absent.
+      gcloud storage rm "$man_obj" 2>/dev/null || true
+    fi
+  done
+}
+
 if [[ "$BACKUP_URI" != gs://* ]]; then
   echo "ERROR: --backup-uri must be a gs:// Cloud Storage URI, got: $BACKUP_URI" >&2
   exit 1
@@ -159,6 +275,8 @@ local_backup_dir:   ${LOCAL_BACKUP_DIR}
 training_data_dir:  ${TRAINING_DATA_DIR}
 postgres_service:   ${PG_SERVICE}
 postgres_database:  ${PGDATABASE}
+sync_training_data: $([[ "$SKIP_TRAINING_DATA" == 1 ]] && echo no || echo yes)
+prune:              $([[ "$PRUNE" == 1 ]] && echo "yes (${KEEP_DAILY}d/${KEEP_WEEKLY}w/${KEEP_MONTHLY}m)" || echo no)
 dry_run:            ${DRY_RUN}
 CONFIG
 
@@ -222,6 +340,13 @@ else
   } > "$manifest_path"
   cat "$manifest_path"
   gcloud storage cp "$manifest_path" "${BACKUP_URI}/manifests/${manifest_name}"
+fi
+
+if [[ "$PRUNE" == 1 && "$SKIP_DB" != 1 ]]; then
+  # Pruning must never sink the backup: the fresh dump already succeeded.
+  prune_dumps || echo "WARN: prune step failed; fresh backup is unaffected" >&2
+else
+  [[ "$PRUNE" != 1 ]] && echo "skipping prune (--no-prune)"
 fi
 
 if [[ "$SKIP_TRAINING_DATA" != 1 ]]; then
