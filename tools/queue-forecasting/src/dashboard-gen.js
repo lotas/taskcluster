@@ -13,6 +13,7 @@ const OUTPUT_DIR = process.env.DASHBOARD_OUTPUT_DIR || path.join(PROJECT_ROOT, '
 const MODELS_DIR = path.join(PROJECT_ROOT, 'trainer', 'data', 'models');
 const INTERVAL_MS = parseInt(process.env.DASHBOARD_INTERVAL_MS || '900000', 10); // 15 min
 const AGGREGATIONS_WINDOW_DAYS = parseInt(process.env.AGGREGATIONS_WINDOW_DAYS || '30', 10);
+const DAILY_HEALTH_WINDOW_DAYS = parseInt(process.env.DAILY_HEALTH_WINDOW_DAYS || '60', 10);
 
 function formatInterval(ms) {
   const totalSeconds = Math.round(ms / 1000);
@@ -134,9 +135,9 @@ async function queryDailyHealth(pool) {
       flag_sampler_offline,
       is_anomalous, anomaly_reasons
     FROM queue_forecast_daily_health
-    WHERE sample_date >= current_date - 30
+    WHERE sample_date >= current_date - $1::int
     ORDER BY sample_date DESC;
-  `);
+  `, [DAILY_HEALTH_WINDOW_DAYS]);
   return rows;
 }
 
@@ -1557,7 +1558,7 @@ ${data.manifests}
 <h2>Walk-Forward Evaluation</h2>
 ${data.walkForward}
 
-<h2>Daily Health (last 30d)</h2>
+<h2>Daily Health (last ${DAILY_HEALTH_WINDOW_DAYS}d)</h2>
 ${data.dailyHealth}
 `;
   return renderPage({

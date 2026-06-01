@@ -131,6 +131,39 @@ def is_anomalous_default(flags: dict[str, bool]) -> bool:
     return any(flags[k] for k in _DEFAULT_IS_ANOMALOUS_FLAGS if k in flags)
 
 
+def merge_latched(
+    existing: dict | None,
+    new_flags: dict[str, bool],
+    new_reasons: list[str],
+) -> tuple[dict[str, bool], list[str], bool]:
+    """Latch flags so a day's verdict can only ever gain anomalies, never lose them.
+
+    Once a flag (or ``is_anomalous``) is true in the stored row it stays true on
+    every subsequent recompute. This guarantees a day we marked anomalous is
+    never silently cleared by a later tick — the property the whole baseline /
+    training exclusion relies on for reproducibility.
+
+    Metric columns (counts, rates, capacities) are NOT latched; only the
+    anomaly verdict is. ``existing`` is the previously stored row (or None for a
+    first-time insert). Returns ``(latched_flags, latched_reasons, is_anomalous)``.
+    """
+    if existing is None:
+        flags = dict(new_flags)
+        return flags, list(new_reasons), is_anomalous_default(flags)
+
+    flags = {k: bool(existing.get(k)) or bool(new_flags.get(k)) for k in new_flags}
+
+    # Union reasons, keeping a stable order: previously-stored reasons first,
+    # then any newly-observed ones.
+    reasons = list(existing.get("anomaly_reasons") or [])
+    for r in new_reasons:
+        if r not in reasons:
+            reasons.append(r)
+
+    is_anom = is_anomalous_default(flags) or bool(existing.get("is_anomalous"))
+    return flags, reasons, is_anom
+
+
 def fetch_day(conn, day_start: datetime) -> DailyMetrics:
     day_end = day_start + timedelta(days=1)
     with conn.cursor() as cur:
@@ -191,6 +224,33 @@ def fetch_worker_metrics(conn, day_start: datetime) -> WorkerMetrics:
         utilization_p50    = float(util_p50) if util_p50 is not None else None,
         n_samples          = n_samples,
     )
+
+
+_FLAG_COLUMNS = (
+    "flag_exception_spike", "flag_stuck_pending_spike", "flag_wait_p99_spike",
+    "flag_volume_anomaly", "flag_low_completion",
+    "flag_capacity_drop", "flag_capacity_spike", "flag_low_utilization",
+    "flag_sampler_offline",
+)
+
+
+def fetch_existing_health(conn, day_date) -> dict | None:
+    """Return the previously stored anomaly verdict for a day, or None.
+
+    Used to latch flags (see ``merge_latched``): an existing anomalous marking
+    must survive recomputation. Only the verdict columns are read — metrics are
+    always recomputed fresh.
+    """
+    cols = (*_FLAG_COLUMNS, "is_anomalous", "anomaly_reasons")
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(cols)} FROM queue_forecast_daily_health WHERE sample_date = %(d)s",
+            {"d": day_date},
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return dict(zip(cols, row))
 
 
 def trailing_median(values: list[float | None]) -> float | None:
@@ -313,6 +373,38 @@ def evaluate_flags(today: DailyMetrics, history: list[DailyMetrics]) -> tuple[di
     return flags, reasons, snapshot
 
 
+def process_window(fetch, start, end, rolling_window_days: int):
+    """Evaluate every day in [start, end) with a *deterministic* trailing window.
+
+    The trailing median is always computed over the real ``rolling_window_days``
+    calendar days immediately before each day — seeded from history before the
+    loop begins — so a day's flags never depend on which ``--from`` the run
+    happened to use. Without this seed the first days of a window saw a
+    truncated (or empty) history, which made the same calendar day flip
+    anomalous/clean depending on its position in the sliding loop window.
+
+    ``fetch`` maps a day_start datetime -> DailyMetrics. Yields, for each day in
+    [start, end): ``(metrics, flags, reasons, snapshot, is_anomalous)``.
+    """
+    days_metrics: list[DailyMetrics] = []
+
+    # Seed the trailing window with the real prior N calendar days (not upserted).
+    d = start - timedelta(days=rolling_window_days)
+    while d < start:
+        days_metrics.append(fetch(d))
+        d += timedelta(days=1)
+
+    d = start
+    while d < end:
+        m = fetch(d)
+        history = days_metrics[-rolling_window_days:]
+        flags, reasons, snapshot = evaluate_flags(m, history)
+        is_anom = is_anomalous_default(flags)
+        yield m, flags, reasons, snapshot, is_anom
+        days_metrics.append(m)
+        d += timedelta(days=1)
+
+
 UPSERT_SQL = """
     INSERT INTO queue_forecast_daily_health (
         sample_date,
@@ -356,17 +448,31 @@ UPSERT_SQL = """
         total_running_p50  = EXCLUDED.total_running_p50,
         utilization_p50    = EXCLUDED.utilization_p50,
         n_worker_samples   = EXCLUDED.n_worker_samples,
-        flag_exception_spike     = EXCLUDED.flag_exception_spike,
-        flag_stuck_pending_spike = EXCLUDED.flag_stuck_pending_spike,
-        flag_wait_p99_spike      = EXCLUDED.flag_wait_p99_spike,
-        flag_volume_anomaly      = EXCLUDED.flag_volume_anomaly,
-        flag_low_completion      = EXCLUDED.flag_low_completion,
-        flag_capacity_drop       = EXCLUDED.flag_capacity_drop,
-        flag_capacity_spike      = EXCLUDED.flag_capacity_spike,
-        flag_low_utilization     = EXCLUDED.flag_low_utilization,
-        flag_sampler_offline     = EXCLUDED.flag_sampler_offline,
-        is_anomalous             = EXCLUDED.is_anomalous,
-        anomaly_reasons          = EXCLUDED.anomaly_reasons,
+        -- Latch the anomaly verdict atomically: once a flag is true it stays
+        -- true, regardless of what this writer computed. The OR is evaluated
+        -- against the row's *current* value at update time, so a backfill
+        -- overlapping the hourly monitor can never clear a flag another
+        -- process just set. (merge_latched mirrors this for first inserts and
+        -- for the log/dry-run preview; the OR here is the load-bearing one.)
+        flag_exception_spike     = queue_forecast_daily_health.flag_exception_spike     OR EXCLUDED.flag_exception_spike,
+        flag_stuck_pending_spike = queue_forecast_daily_health.flag_stuck_pending_spike OR EXCLUDED.flag_stuck_pending_spike,
+        flag_wait_p99_spike      = queue_forecast_daily_health.flag_wait_p99_spike      OR EXCLUDED.flag_wait_p99_spike,
+        flag_volume_anomaly      = queue_forecast_daily_health.flag_volume_anomaly      OR EXCLUDED.flag_volume_anomaly,
+        flag_low_completion      = queue_forecast_daily_health.flag_low_completion      OR EXCLUDED.flag_low_completion,
+        flag_capacity_drop       = queue_forecast_daily_health.flag_capacity_drop       OR EXCLUDED.flag_capacity_drop,
+        flag_capacity_spike      = queue_forecast_daily_health.flag_capacity_spike      OR EXCLUDED.flag_capacity_spike,
+        flag_low_utilization     = queue_forecast_daily_health.flag_low_utilization     OR EXCLUDED.flag_low_utilization,
+        flag_sampler_offline     = queue_forecast_daily_health.flag_sampler_offline     OR EXCLUDED.flag_sampler_offline,
+        is_anomalous             = queue_forecast_daily_health.is_anomalous             OR EXCLUDED.is_anomalous,
+        -- Union reasons, preserving first-appearance order (existing first).
+        anomaly_reasons          = ARRAY(
+            SELECT u.r FROM (
+                SELECT r, MIN(ord) AS ord
+                FROM unnest(queue_forecast_daily_health.anomaly_reasons || EXCLUDED.anomaly_reasons)
+                     WITH ORDINALITY AS t(r, ord)
+                GROUP BY r
+            ) u ORDER BY u.ord
+        ),
         threshold_snapshot       = EXCLUDED.threshold_snapshot,
         computed_at              = NOW()
 """
@@ -388,15 +494,20 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: DATABASE_URL not set", file=sys.stderr)
         return 1
 
-    days_metrics: list[DailyMetrics] = []
+    n_days = 0
     flagged_days: list[tuple[datetime, list[str]]] = []
     with psycopg.connect(dsn) as conn:
-        d = start
-        while d < end:
-            m = fetch_day(conn, d)
-            history = days_metrics[-args.rolling_window_days:]   # use prior days only
-            flags, reasons, snapshot = evaluate_flags(m, history)
-            is_anom = is_anomalous_default(flags)
+        for m, flags, reasons, snapshot, is_anom in process_window(
+            lambda d: fetch_day(conn, d), start, end, args.rolling_window_days
+        ):
+            n_days += 1
+
+            # Latch: a day already marked anomalous must never be cleared by a
+            # later recompute. Merge this run's verdict with what's stored so the
+            # log line / dry-run preview reflect the latched outcome. The
+            # authoritative latch happens atomically in UPSERT_SQL's ON CONFLICT.
+            existing = fetch_existing_health(conn, m.sample_date.date())
+            flags, reasons, is_anom = merge_latched(existing, flags, reasons)
 
             print(f"[{m.sample_date.date()}] n={m.n_total:>7,} excp={m.exception_rate or 0:.3f} stuck={m.stuck_pending_rate or 0:.3f} wait_p99={m.wait_p99_s or 0:>7.0f}s anom={is_anom}{' (' + ','.join(reasons) + ')' if reasons else ''}", file=sys.stderr)
 
@@ -423,12 +534,10 @@ def main(argv: list[str] | None = None) -> int:
                     cur.execute(UPSERT_SQL, row)
                 conn.commit()
 
-            days_metrics.append(m)
             if is_anom:
                 flagged_days.append((m.sample_date, reasons))
-            d += timedelta(days=1)
 
-    print(f"\n[health] processed {len(days_metrics)} days; flagged {len(flagged_days)}", file=sys.stderr)
+    print(f"\n[health] processed {n_days} days; flagged {len(flagged_days)}", file=sys.stderr)
     for day, reasons in flagged_days:
         print(f"  {day.date()}: {','.join(reasons)}", file=sys.stderr)
     return 0

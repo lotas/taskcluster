@@ -252,3 +252,105 @@ def test_sampler_offline_in_default_is_anomalous():
     flags, _, _ = evaluate_flags(today, history)
     assert flags["flag_sampler_offline"]
     assert is_anomalous_default(flags)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic trailing window (process_window) — a day's verdict must not
+# depend on where the processed window happens to start.
+# ---------------------------------------------------------------------------
+
+def _all_flags_false():
+    return {
+        "flag_exception_spike": False, "flag_stuck_pending_spike": False,
+        "flag_wait_p99_spike": False, "flag_volume_anomaly": False,
+        "flag_low_completion": False, "flag_capacity_drop": False,
+        "flag_capacity_spike": False, "flag_low_utilization": False,
+        "flag_sampler_offline": False,
+    }
+
+
+def test_process_window_is_position_independent():
+    """The same calendar day must get the same flags whether it's mid-window or
+    the very first day processed. This is the bug: without seeding the trailing
+    window from real prior days, a volume drought on the first day saw an empty
+    history and silently dropped flag_volume_anomaly."""
+    from datetime import datetime, timezone, timedelta
+    from scripts.compute_daily_health import process_window
+
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    target = base + timedelta(days=20)
+
+    def fetch(d):
+        # All days are normal except the target, a 0.2x volume drought that only
+        # trips relative to a trailing median (i.e. needs real history present).
+        n = 2000 if d == target else 10000
+        return _today(sample_date=d, n_total=n)
+
+    def run(start, end):
+        return {
+            m.sample_date: (flags, is_anom)
+            for m, flags, reasons, snap, is_anom in process_window(fetch, start, end, 7)
+        }
+
+    mid = run(target - timedelta(days=2), target + timedelta(days=3))   # target mid-window
+    first = run(target, target + timedelta(days=3))                     # target = first day
+
+    assert mid[target][0]["flag_volume_anomaly"], "drought must flag when mid-window"
+    assert first[target][0]["flag_volume_anomaly"], "drought must STILL flag when first day"
+    assert mid[target] == first[target], "verdict must be position-independent"
+
+
+# ---------------------------------------------------------------------------
+# Latch — once anomalous, always anomalous.
+# ---------------------------------------------------------------------------
+
+def test_merge_latched_keeps_anomaly_sticky():
+    """A stored anomalous day must survive a recompute that now sees a clean day."""
+    from scripts.compute_daily_health import merge_latched
+    existing = {
+        **_all_flags_false(),
+        "flag_volume_anomaly": True,
+        "is_anomalous": True,
+        "anomaly_reasons": ["volume_anomaly"],
+    }
+    flags, reasons, is_anom = merge_latched(existing, _all_flags_false(), [])
+    assert flags["flag_volume_anomaly"] is True
+    assert is_anom is True
+    assert reasons == ["volume_anomaly"]
+
+
+def test_merge_latched_unions_new_anomalies():
+    """New anomalies are added on top of the latched ones; reasons are unioned."""
+    from scripts.compute_daily_health import merge_latched
+    existing = {
+        **_all_flags_false(),
+        "flag_volume_anomaly": True,
+        "is_anomalous": True,
+        "anomaly_reasons": ["volume_anomaly"],
+    }
+    new_flags = {**_all_flags_false(), "flag_exception_spike": True}
+    flags, reasons, is_anom = merge_latched(existing, new_flags, ["exception_spike"])
+    assert flags["flag_volume_anomaly"] is True   # latched
+    assert flags["flag_exception_spike"] is True  # newly observed
+    assert is_anom is True
+    assert reasons == ["volume_anomaly", "exception_spike"]
+
+
+def test_merge_latched_first_insert_uses_new_verdict():
+    """With no stored row, the new computation is used verbatim."""
+    from scripts.compute_daily_health import merge_latched
+    new_flags = {**_all_flags_false(), "flag_low_completion": True}
+    flags, reasons, is_anom = merge_latched(None, new_flags, ["low_completion"])
+    assert flags == new_flags
+    assert reasons == ["low_completion"]
+    assert is_anom is True
+
+
+def test_merge_latched_clean_day_stays_clean():
+    """A clean stored day with a clean recompute stays clean (no false latch)."""
+    from scripts.compute_daily_health import merge_latched
+    existing = {**_all_flags_false(), "is_anomalous": False, "anomaly_reasons": []}
+    flags, reasons, is_anom = merge_latched(existing, _all_flags_false(), [])
+    assert not any(flags.values())
+    assert is_anom is False
+    assert reasons == []
