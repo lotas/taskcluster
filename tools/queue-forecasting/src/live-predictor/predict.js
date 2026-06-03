@@ -23,12 +23,16 @@
 import * as ort from 'onnxruntime-node';
 import { buildFeatureVector } from './feature-builder.js';
 import { applyDurationP90Guardrail } from './duration-p90-guardrail.js';
+import { applyWaitP90Guardrail } from './wait-p90-guardrail.js';
 import { getThroughput } from './throughput.js';
 
 // Minimum exact-name baseline sample size required before the historical p90
 // is allowed to floor the served run-duration p90. Keeps high-variance,
 // sparsely-observed cohorts from anchoring predictions to noisy quantiles.
 const DURATION_P90_GUARDRAIL_MIN_SAMPLE = 20;
+
+// Same idea for wait time, gated on the strong queue+bucket baseline level.
+const WAIT_P90_GUARDRAIL_MIN_SAMPLE = 20;
 
 const FETCH_ROW_SQL = `
 SELECT r.task_id, r.run_id, r.pending_at, r.queue_pending,
@@ -128,7 +132,18 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
   const waitRawP90 = await runQuantile(bundles.wait.sessionP90, waitTensor);
   const waitBl = liveFeatures[bundles.wait.schema.residual.baseline_feature];
   const waitP50 = Math.max(0.0, logRatioInverse(waitRawP50, waitBl));
-  const waitP90 = Math.max(waitP50, logRatioInverse(waitRawP90, waitBl));
+  const rawModelWaitP90 = Math.max(waitP50, logRatioInverse(waitRawP90, waitBl));
+
+  // Floor the served wait p90 with the queue+bucket historical baseline p90
+  // when the model compresses the tail; only the strong queue+bucket level
+  // with enough samples qualifies (weak fallbacks are badly miscalibrated).
+  const waitGuardrail = applyWaitP90Guardrail({
+    waitP50,
+    rawModelP90: rawModelWaitP90,
+    baseline: waitBaseline,
+    minSampleSize: WAIT_P90_GUARDRAIL_MIN_SAMPLE,
+  });
+  const waitP90 = waitGuardrail.finalP90;
 
   // ── Duration model ───────────────────────────────────────────────────────
   const durVec = buildFeatureVector(row, liveFeatures, bundles.duration.schema, bundles.duration.categories);
@@ -166,6 +181,14 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
       final_p90_s:          guardrail.finalP90,
       baseline_level:       guardrail.baselineLevel,
       baseline_sample_size: guardrail.baselineSampleSize,
+    },
+    wait_p90_guardrail: {
+      applied:              waitGuardrail.applied,
+      raw_model_p90_s:      rawModelWaitP90,
+      baseline_p90_s:       waitGuardrail.baselineP90,
+      final_p90_s:          waitGuardrail.finalP90,
+      baseline_level:       waitGuardrail.baselineLevel,
+      baseline_sample_size: waitGuardrail.baselineSampleSize,
     },
     wait_feature_order:     bundles.wait.schema.feature_order,
     wait_vector:            Array.from(waitVec, (x) => (Number.isFinite(x) ? x : null)),
