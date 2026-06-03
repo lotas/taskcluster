@@ -6,7 +6,8 @@
  * Using a different hierarchy here than the trainer used would skew both the
  * baseline feature fed into the ONNX model AND the log_ratio inverse transform.
  *
- * Wait hierarchy:   queue+bucket → queue → priority+bucket → global
+ * Wait hierarchy:   queue+priority+bucket → queue+bucket → queue →
+ *                    priority+bucket → global
  * Duration hierarchy: metadata_name → normalized_name → kind+test-type →
  *                     task_queue_id → scheduler_id → global
  *
@@ -21,6 +22,22 @@ const MIN_SAMPLE_SIZE = 5;
 // ---------------------------------------------------------------------------
 // SQL — each query is tagged with a comment line used to identify it in tests.
 // ---------------------------------------------------------------------------
+
+const WAIT_BY_QUEUE_PRIORITY_AND_BUCKET = (withExclude) => `-- wait_by_queue_priority_and_bucket
+SELECT t.task_queue_id || '|' || r.priority_at_pending || '|' || ${PENDING_BUCKET_SQL} AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
+       count(*) AS sample_size
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.wait_duration_s IS NOT NULL
+  AND t.task_queue_id IS NOT NULL
+  AND r.priority_at_pending IS NOT NULL
+  AND r.started_at IS NOT NULL
+  AND r.resolved_at < $1::timestamptz
+  AND r.resolved_at > $1::timestamptz - INTERVAL '7 days'${withExclude ? `
+  AND r.resolved_at::date <> ALL($2::date[])` : ''}
+GROUP BY t.task_queue_id, r.priority_at_pending, ${PENDING_BUCKET_SQL};`;
 
 const WAIT_BY_QUEUE_AND_BUCKET = (withExclude) => `-- wait_by_queue_and_bucket
 SELECT t.task_queue_id || '|' || ${PENDING_BUCKET_SQL} AS key,
@@ -210,6 +227,7 @@ export class BaselineStats {
     this._refreshTimer   = null;
 
     this._wait = {
+      byQueuePriorityAndBucket: new Map(),
       byQueueAndBucket: new Map(),
       byQueue: new Map(),
       byPriorityAndBucket: new Map(),
@@ -255,7 +273,8 @@ export class BaselineStats {
     const we = this._waitFilter;
     const de = this._durationFilter;
 
-    const [wb, wq, wp, wg, dm, dn, dk, dq, ds, dg] = await Promise.all([
+    const [wpb, wb, wq, wp, wg, dm, dn, dk, dq, ds, dg] = await Promise.all([
+      this._pool.query(WAIT_BY_QUEUE_PRIORITY_AND_BUCKET(we), waitParams),
       this._pool.query(WAIT_BY_QUEUE_AND_BUCKET(we), waitParams),
       this._pool.query(WAIT_BY_QUEUE(we), waitParams),
       this._pool.query(WAIT_BY_PRIORITY_AND_BUCKET(we), waitParams),
@@ -269,6 +288,7 @@ export class BaselineStats {
     ]);
 
     this._wait = {
+      byQueuePriorityAndBucket: toMap(wpb.rows),
       byQueueAndBucket:   toMap(wb.rows),
       byQueue:            toMap(wq.rows),
       byPriorityAndBucket: toMap(wp.rows),
@@ -291,6 +311,13 @@ export class BaselineStats {
    */
   predictWait(task) {
     const bucket = pendingBucket(task.queue_pending);
+
+    // Most specific: queue + priority + depth bucket. Priority dominates wait
+    // in deep queues, so a priority-blind baseline mis-anchors the model.
+    if (task.task_queue_id && task.priority_at_pending != null && bucket != null) {
+      const s = this._wait.byQueuePriorityAndBucket.get(`${task.task_queue_id}|${task.priority_at_pending}|${bucket}`);
+      if (s) return { level: 'queue+priority+bucket', ...s };
+    }
 
     if (task.task_queue_id && bucket != null) {
       const s = this._wait.byQueueAndBucket.get(`${task.task_queue_id}|${bucket}`);

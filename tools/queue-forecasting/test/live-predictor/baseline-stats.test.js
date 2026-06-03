@@ -32,6 +32,10 @@ const fullPool = fakePool({
     [{ key: 'gecko', p50: '80', p90: '200', sample_size: '70' }],
   'duration_global':
     [{ p50: '70', p90: '180', sample_size: '500' }],
+  // Most-specific wait level must be listed first: the fakePool matches by
+  // substring and 'wait_by_queue' is a substring of every wait-by-queue query.
+  'wait_by_queue_priority_and_bucket':
+    [{ key: 'proj-a/linux|high|low', p50: '2', p90: '9', sample_size: '12' }],
   'wait_by_queue_and_bucket':
     [{ key: 'proj-a/linux|low', p50: '5', p90: '20', sample_size: '15' }],
   'wait_by_queue':
@@ -45,10 +49,21 @@ const fullPool = fakePool({
      { sample_date: new Date('2026-04-24T00:00:00Z') }],
 });
 
-test('wait lookup: queue+bucket wins when present (bucket=low for queue_pending=5)', async () => {
+test('wait lookup: queue+priority+bucket wins when present (queue_pending=5→low, priority=high)', async () => {
   const stats = new BaselineStats(fullPool);
   await stats.refresh();
   const r = stats.predictWait({ task_queue_id: 'proj-a/linux', queue_pending: 5, priority_at_pending: 'high' });
+  assert.equal(r.level, 'queue+priority+bucket');
+  assert.equal(r.p50, 2);
+  assert.equal(r.p90, 9);
+});
+
+test('wait lookup: queue+bucket when priority+bucket key missing (different priority)', async () => {
+  const stats = new BaselineStats(fullPool);
+  await stats.refresh();
+  // priority='low' → key 'proj-a/linux|low|low' absent → falls back to
+  // queue+bucket 'proj-a/linux|low' (present).
+  const r = stats.predictWait({ task_queue_id: 'proj-a/linux', queue_pending: 5, priority_at_pending: 'low' });
   assert.equal(r.level, 'queue+bucket');
   assert.equal(r.p50, 5);
   assert.equal(r.p90, 20);

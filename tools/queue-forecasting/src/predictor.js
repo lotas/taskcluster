@@ -275,6 +275,22 @@ async function loadBulkStats(date) {
 
 // --- Wait Time Prediction (queue-aware) ---
 
+const BULK_WAIT_STATS_BY_QUEUE_PRIORITY_AND_BUCKET = `
+SELECT t.task_queue_id || '|' || r.priority_at_pending || '|' || ${PENDING_BUCKET_SQL} AS key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p90,
+       count(*) AS sample_size
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.wait_duration_s IS NOT NULL
+  AND t.task_queue_id IS NOT NULL
+  AND r.priority_at_pending IS NOT NULL
+  AND r.started_at IS NOT NULL
+  AND r.resolved_at < $1::date
+  AND r.resolved_at > $1::date - INTERVAL '7 days'
+GROUP BY t.task_queue_id, r.priority_at_pending, ${PENDING_BUCKET_SQL};
+`;
+
 const BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET = `
 SELECT t.task_queue_id || '|' || ${PENDING_BUCKET_SQL} AS key,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY r.wait_duration_s) AS p50,
@@ -329,7 +345,8 @@ WHERE r.wait_duration_s IS NOT NULL
 `;
 
 async function loadBulkWaitStats(date) {
-  const [byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all([
+  const [byQueuePriorityBucket, byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all([
+    pool.query(BULK_WAIT_STATS_BY_QUEUE_PRIORITY_AND_BUCKET, [date]),
     pool.query(BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET, [date]),
     pool.query(BULK_WAIT_STATS_BY_QUEUE, [date]),
     pool.query(BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET, [date]),
@@ -352,6 +369,7 @@ async function loadBulkWaitStats(date) {
     : null;
 
   return {
+    byQueuePriorityAndBucket: toMap(byQueuePriorityBucket.rows),
     byQueueAndBucket: toMap(byQueueBucket.rows),
     byQueue: toMap(byQueue.rows),
     byPriorityAndBucket: toMap(byPriorityBucket.rows),
@@ -362,25 +380,33 @@ async function loadBulkWaitStats(date) {
 function predictWaitFromStats(task, waitStats) {
   const bucket = pendingBucket(task.queue_pending);
 
-  // Level 1: queue + pending bucket (skip when queue_pending unknown)
+  // Level 1: queue + priority + pending bucket — the most specific. Wait time
+  // in a deep queue is dominated by priority, so a priority-blind baseline
+  // badly mis-anchors high/low-priority tasks. Skip when priority/bucket unknown.
+  if (task.task_queue_id && task.priority_at_pending != null && bucket != null) {
+    const s = waitStats.byQueuePriorityAndBucket.get(`${task.task_queue_id}|${task.priority_at_pending}|${bucket}`);
+    if (s) return { level: 'queue+priority+bucket', ...s };
+  }
+
+  // Level 2: queue + pending bucket (skip when queue_pending unknown)
   if (task.task_queue_id && bucket != null) {
     const s = waitStats.byQueueAndBucket.get(`${task.task_queue_id}|${bucket}`);
     if (s) return { level: 'queue+bucket', ...s };
   }
 
-  // Level 2: queue only
+  // Level 3: queue only
   if (task.task_queue_id) {
     const s = waitStats.byQueue.get(task.task_queue_id);
     if (s) return { level: 'queue', ...s };
   }
 
-  // Level 3: priority + pending bucket (skip when queue_pending unknown)
+  // Level 4: priority + pending bucket (skip when queue_pending unknown)
   if (task.priority_at_pending != null && bucket != null) {
     const s = waitStats.byPriorityAndBucket.get(`${task.priority_at_pending}|${bucket}`);
     if (s) return { level: 'priority+bucket', ...s };
   }
 
-  // Level 4: global
+  // Level 5: global
   if (waitStats.global) return { level: 'global', ...waitStats.global };
 
   return null;
@@ -518,6 +544,7 @@ async function loadBulkStatsForCutoff(cutoff, excludeDates = []) {
 
 async function loadBulkWaitStatsForCutoff(cutoff, excludeDates = []) {
   const q = [
+    BULK_WAIT_STATS_BY_QUEUE_PRIORITY_AND_BUCKET,
     BULK_WAIT_STATS_BY_QUEUE_AND_BUCKET,
     BULK_WAIT_STATS_BY_QUEUE,
     BULK_WAIT_STATS_BY_PRIORITY_AND_BUCKET,
@@ -525,7 +552,7 @@ async function loadBulkWaitStatsForCutoff(cutoff, excludeDates = []) {
   ].map(sql => toPendingHistorySql(sql, excludeDates));
 
   const params = excludeDates.length > 0 ? [cutoff, excludeDates] : [cutoff];
-  const [byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all(
+  const [byQueuePriorityBucket, byQueueBucket, byQueue, byPriorityBucket, globalRes] = await Promise.all(
     q.map(sql => pool.query(sql, params))
   );
 
@@ -545,6 +572,7 @@ async function loadBulkWaitStatsForCutoff(cutoff, excludeDates = []) {
     : null;
 
   return {
+    byQueuePriorityAndBucket: toMap(byQueuePriorityBucket.rows),
     byQueueAndBucket: toMap(byQueueBucket.rows),
     byQueue: toMap(byQueue.rows),
     byPriorityAndBucket: toMap(byPriorityBucket.rows),
