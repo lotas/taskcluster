@@ -500,6 +500,37 @@ async function queryAggregationsByWaitBucket(pool, windowDays) {
   return rows;
 }
 
+// First-class tail miss-rate table: of the completed runs in each actual-wait
+// bucket where we emitted a wait p90, how many exceeded it (actual > p90). The
+// 30m+ row is the headline tail metric we gate on (<35% experimental / <30%
+// broad). Wrapped in a subquery so ORDER BY's CASE can reference `dim` (same
+// reason as queryAggregationsByWaitBucket). Counts are returned raw; the render
+// step computes bad/n so it can guard n=0.
+async function queryWaitTailMissRate(pool, windowDays) {
+  const eligible = `r.reason_resolved = 'completed' AND r.wait_duration_s IS NOT NULL AND p.wait_p90_s IS NOT NULL`;
+  const { rows } = await pool.query(`
+    SELECT * FROM (
+      SELECT
+        ${WAIT_DURATION_BUCKET_SQL} AS dim,
+        count(*) FILTER (WHERE ${eligible})                                AS n,
+        count(*) FILTER (WHERE ${eligible} AND r.wait_duration_s > p.wait_p90_s) AS bad
+      FROM queue_forecast_run_predictions p
+      JOIN queue_forecast_task_runs r USING (task_id, run_id)
+      WHERE r.resolved_at IS NOT NULL
+        AND r.resolved_at >= now() - ($1 || ' days')::interval
+      GROUP BY 1
+    ) s
+    ORDER BY CASE s.dim
+      WHEN '<1m'       THEN 1
+      WHEN '1-5m'      THEN 2
+      WHEN '5-30m'     THEN 3
+      WHEN '30m+'      THEN 4
+      WHEN '(no wait)' THEN 9
+      ELSE 8 END;
+  `, [windowDays]);
+  return rows;
+}
+
 async function queryAggregationsByRunBucket(pool, windowDays) {
   const { rows } = await pool.query(`
     SELECT * FROM (
@@ -1360,6 +1391,35 @@ function renderAggregationsByRunBucket(rows) {
   return renderBothFlavors(rows, 'actual run bucket', dimValue);
 }
 
+// Tail miss-rate table. One row per actual-wait bucket; the 30m+ row is the
+// metric we gate on, so it's highlighted and annotated against the two gates:
+// <35% (experimental) and <30% (broad). Miss rate = bad/n, '—' when n=0.
+function renderWaitTailMissRate(rows) {
+  if (!rows.length) return '<p class="muted">No resolved predictions in window.</p>';
+  let html = `<table><thead><tr>
+    <th>actual wait bucket</th><th class="r">n</th><th class="r">misses (&gt;p90)</th><th class="r">miss rate</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const n = Number(r.n) || 0;
+    const bad = Number(r.bad) || 0;
+    const rate = n > 0 ? bad / n : null;
+    const isTail = r.dim === '30m+';
+    // Gate only the headline tail row; <30% is good, <35% is the experimental
+    // ceiling (warn), above is a miss.
+    let rateCell = `<td class="r">${fmtPct(rate)}</td>`;
+    if (isTail && rate != null) {
+      const cls = rate < 0.30 ? 'cell-good' : rate < 0.35 ? 'cell-warn' : 'cell-bad';
+      rateCell = `<td class="r ${cls}">${fmtPct(rate)}</td>`;
+    }
+    const dimCell = isTail
+      ? `<td><b>${esc(r.dim)}</b></td>`
+      : `<td>${esc(r.dim)}</td>`;
+    html += `<tr>${dimCell}<td class="r">${fmtNum(n)}</td><td class="r">${fmtNum(bad)}</td>${rateCell}</tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
 function fmtDur(s) {
   if (s == null) return '—';
   const x = Number(s);
@@ -1667,6 +1727,10 @@ ${data.byRunBaselineSample}
 <h2>By Actual Wait Bucket</h2>
 ${data.byWaitBucket}
 
+<h2>Wait p90 Miss Rate by Actual Wait Bucket</h2>
+<div class="meta">Of completed runs with an emitted wait p90, the share whose actual wait exceeded the p90 (a tail miss). The <b>30m+</b> row is the headline tail metric we gate on: <span class="text-warn">&lt;35% experimental</span>, &lt;30% broad.</div>
+${data.waitTailMissRate}
+
 <h2>By Actual Run Bucket</h2>
 ${data.byRunBucket}
 
@@ -1751,6 +1815,7 @@ async function generate() {
       aggByWaitBaselineLevel, aggByWaitBaselineSample,
       aggByRunBaselineLevel,  aggByRunBaselineSample,
       aggByWaitBucket, aggByRunBucket,
+      waitTailMissRate,
       topWaitMisses, topRunMisses,
     ] = await Promise.all([
       queryTableHealth(pool),
@@ -1775,6 +1840,7 @@ async function generate() {
       queryAggregationsByRunBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByWaitBucket(pool, AGGREGATIONS_WINDOW_DAYS),
       queryAggregationsByRunBucket(pool, AGGREGATIONS_WINDOW_DAYS),
+      queryWaitTailMissRate(pool, AGGREGATIONS_WINDOW_DAYS),
       queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'wait'),
       queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'run'),
     ]);
@@ -1821,6 +1887,7 @@ async function generate() {
       byRunBaselineLevel:     renderAggregationsByBaselineLevel(aggByRunBaselineLevel, 'run'),
       byRunBaselineSample:    renderAggregationsByBaselineSampleSize(aggByRunBaselineSample, 'run'),
       byWaitBucket:           renderAggregationsByWaitBucket(aggByWaitBucket),
+      waitTailMissRate:       renderWaitTailMissRate(waitTailMissRate),
       byRunBucket:            renderAggregationsByRunBucket(aggByRunBucket),
       topWaitMisses:          renderTopMisses(topWaitMisses, 'wait'),
       topRunMisses:           renderTopMisses(topRunMisses, 'run'),

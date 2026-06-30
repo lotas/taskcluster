@@ -213,6 +213,10 @@ async function testEnrichmentUpdate() {
     scheduler_id: 'gecko-level-3',
     project_id: 'mozilla-central',
     max_run_time_s: 3600,
+    repo_family: 'central',
+    repo_family_source: 'route',
+    repo_family_evidence: 'index.gecko.v2.mozilla-central',
+    repo_family_derivation_version: 1,
   });
 
   const task = await getTaskRow('task-8');
@@ -221,6 +225,10 @@ async function testEnrichmentUpdate() {
   assert(task.scheduler_id === 'gecko-level-3', 'scheduler_id enriched');
   assert(task.project_id === 'mozilla-central', 'project_id enriched');
   assert(task.max_run_time_s === 3600, 'max_run_time_s enriched');
+  assert(task.repo_family === 'central', 'repo_family enriched');
+  assert(task.repo_family_source === 'route', 'repo_family_source enriched');
+  assert(task.repo_family_evidence === 'index.gecko.v2.mozilla-central', 'repo_family_evidence enriched');
+  assert(task.repo_family_derivation_version === 1, 'repo_family_derivation_version enriched');
   assert(task.enriched_at !== null, 'enriched_at set');
 }
 

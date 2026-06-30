@@ -97,6 +97,10 @@ UPDATE queue_forecast_tasks SET
   scheduler_id      = COALESCE($9, scheduler_id),
   project_id        = COALESCE($10, project_id),
   max_run_time_s    = COALESCE($11, max_run_time_s),
+  repo_family                    = COALESCE($12, repo_family),
+  repo_family_source             = COALESCE($13, repo_family_source),
+  repo_family_evidence           = COALESCE($14, repo_family_evidence),
+  repo_family_derivation_version = COALESCE($15, repo_family_derivation_version),
   enriched_at       = COALESCE(enriched_at, now())
 WHERE task_id = $1;
 `;
@@ -108,6 +112,8 @@ export async function enrichTask(pool, taskId, enrichment) {
     task_queue_id = null, task_group_id = null,
     scheduler_id = null, project_id = null,
     max_run_time_s = null,
+    repo_family = null, repo_family_source = null,
+    repo_family_evidence = null, repo_family_derivation_version = null,
   } = enrichment;
 
   await pool.query(ENRICH_TASK_SQL, [
@@ -118,6 +124,7 @@ export async function enrichTask(pool, taskId, enrichment) {
     task_queue_id, task_group_id,
     scheduler_id, project_id,
     max_run_time_s,
+    repo_family, repo_family_source, repo_family_evidence, repo_family_derivation_version,
   ]);
 }
 
@@ -136,4 +143,32 @@ export async function getUnenrichedTaskIds(pool, limit = 200, excludeTaskIds = [
   const excludeParam = excludeTaskIds.length > 0 ? excludeTaskIds : null;
   const res = await pool.query(UNENRICHED_TASKS_SQL, [limit, excludeParam]);
   return res.rows.map(r => r.task_id);
+}
+
+// --- Repo-family backfill ---
+
+const UPDATE_REPO_FAMILY_SQL = `
+UPDATE queue_forecast_tasks SET
+  repo_family = $2, repo_family_source = $3,
+  repo_family_evidence = $4, repo_family_derivation_version = $5
+WHERE task_id = $1;
+`;
+
+export async function updateRepoFamily(pool, taskId, rf) {
+  await pool.query(UPDATE_REPO_FAMILY_SQL, [taskId, rf.family, rf.source, rf.evidence, rf.version]);
+}
+
+const SELECT_REPO_FAMILY_BACKFILL_SQL = `
+SELECT task_id FROM queue_forecast_tasks
+WHERE repo_family_derivation_version IS DISTINCT FROM $1
+  AND task_id IN (
+    SELECT DISTINCT task_id FROM queue_forecast_task_runs
+    WHERE pending_at >= $2::timestamptz AND pending_at < $3::timestamptz
+  )
+LIMIT $4;
+`;
+
+export async function selectTasksNeedingRepoFamily(pool, version, fromTs, toTs, limit) {
+  const { rows } = await pool.query(SELECT_REPO_FAMILY_BACKFILL_SQL, [version, fromTs, toTs, limit]);
+  return rows.map(r => r.task_id);
 }

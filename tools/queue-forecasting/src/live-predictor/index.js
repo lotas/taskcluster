@@ -34,6 +34,28 @@ const DURATION_STEM  = 'run_duration_residual';
 const MAX_INFLIGHT   = 4;
 const POLL_INTERVAL_MS = Number(process.env.LIVE_PREDICTOR_POLL_MS || 5000);
 
+// Prediction watermark (DEFAULT OFF). When >0, only score a row once at least
+// this many seconds have elapsed since its pending_at, so same-instant sibling
+// pending events have had time to land before the queue-context backlog is
+// snapshotted. The tradeoff: the watermark improves same-instant sibling
+// completeness but biases coverage toward longer-lived tasks — any task that
+// resolves within the delay window is never scored (it gets a resolved_at and
+// drops out of the unresolved poll), skewing live accuracy metrics toward
+// slow tasks.
+//
+// The tie-break LOGIC is independently correct (proven by 420/420 cross-language
+// parity on complete data), so it does NOT need the watermark to be right; the
+// watermark only buys completeness when sibling pending events arrive late.
+// Default 0 therefore restores full fast-task coverage. With delay=0 the WHERE
+// clause `pending_at <= now() - '0 seconds'` is a no-op (pending_at is always
+// <= now()). Set the env to a few seconds only if same-instant accuracy is
+// observed to matter more than fast-task coverage on production data.
+//
+// Deferred option (out of scope here): score resolved rows too — that would
+// recover fast-task coverage without any watermark, but the poller is built
+// around the `resolved_at IS NULL` partial index and would need a redesign.
+const QUEUE_CONTEXT_PREDICT_DELAY_S = Number(process.env.QUEUE_CONTEXT_PREDICT_DELAY_S || 0);
+
 // Each poll cycle keyset-paginates through unpredicted unresolved rows.
 // Uses the existing partial index idx_qf_task_runs_unresolved
 // (`(pending_at) WHERE resolved_at IS NULL`) for an index-only scan.
@@ -51,6 +73,7 @@ WHERE r.resolved_at IS NULL
     WHERE p.task_id = r.task_id AND p.run_id = r.run_id
   )
   AND (r.pending_at, r.task_id, r.run_id) > ($1::timestamptz, $2::text, $3::int)
+  AND r.pending_at <= now() - (($4)::int || ' seconds')::interval
 ORDER BY r.pending_at, r.task_id, r.run_id
 LIMIT ${BATCH_SIZE}
 ;`;
@@ -163,7 +186,7 @@ async function main() {
       let cycleCount      = 0;
 
       while (!shuttingDown) {
-        const batch = await pool.query(POLL_SQL, [cursorPendingAt, cursorTaskId, cursorRunId]);
+        const batch = await pool.query(POLL_SQL, [cursorPendingAt, cursorTaskId, cursorRunId, QUEUE_CONTEXT_PREDICT_DELAY_S]);
         if (batch.rowCount === 0) break;
         await Promise.all(batch.rows.map(r => processOne(r.task_id, r.run_id)));
         const last = batch.rows[batch.rows.length - 1];

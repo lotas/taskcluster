@@ -20,6 +20,11 @@ from src.config import Config, compute_windows
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 
+# Keep in sync with REPO_FAMILY_DERIVATION_VERSION in src/repo-family.js.
+# Bump this whenever the repo_family derivation LOGIC changes; the queue-context
+# reference cache filename embeds it so a logic bump auto-invalidates the cache.
+REPO_FAMILY_DERIVATION_VERSION = 1
+
 
 def cache_key(c: Config) -> str:
     """8-hex-char SHA256 over the query-shaping config."""
@@ -69,6 +74,7 @@ def serving_hash(c: Config) -> str:
         "baseline_dir":        c.baseline_dir,
         "anomaly_filter":      c.anomaly_filter,
         "throughput_features": c.throughput_features,
+        "queue_context_features": getattr(c, "queue_context_features", None),
         "velocity_features":   getattr(c, "velocity_features", None),
     }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
@@ -149,6 +155,7 @@ def _build_query(c: Config) -> str:
         "max_run_time_s":      "t.max_run_time_s",
         "priority_at_pending": "r.priority_at_pending",
         "queue_pending":       "r.queue_pending",
+        "repo_family":         "t.repo_family",
         "tags":                "t.tags",
     }
     needed: set[str] = set()
@@ -204,6 +211,8 @@ def load_worker_counts(
     c: Config,
     train_start: datetime,
     as_of_date: datetime,
+    *,
+    refresh_cache: bool = False,
 ) -> pd.DataFrame:
     """Load worker-count time-series from Postgres, cached to Parquet.
 
@@ -221,7 +230,7 @@ def load_worker_counts(
     to_str = fetch_to.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
     cache_file = CACHE_DIR / f"worker_counts_{from_str}_{to_str}.parquet"
 
-    if cache_file.exists():
+    if cache_file.exists() and not refresh_cache:
         return pd.read_parquet(cache_file)
 
     dsn = os.environ["DATABASE_URL"]
@@ -274,6 +283,8 @@ def load_task_runs_for_throughput(
     c: Config,
     window_start: datetime,
     window_end: datetime,
+    *,
+    refresh_cache: bool = False,
 ) -> pd.DataFrame:
     """Load task-run history needed by add_throughput_features, cached to Parquet.
 
@@ -294,7 +305,7 @@ def load_task_runs_for_throughput(
     to_str   = window_end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
     cache_file = CACHE_DIR / f"throughput_runs_{from_str}_{to_str}.parquet"
 
-    if cache_file.exists():
+    if cache_file.exists() and not refresh_cache:
         return pd.read_parquet(cache_file)
 
     dsn = os.environ["DATABASE_URL"]
@@ -313,6 +324,75 @@ WHERE r.resolved_at IS NOT NULL
   AND t.task_queue_id IS NOT NULL;
 """
     params = {"window_start": window_start, "window_end": window_end}
+    with psycopg.connect(dsn) as conn:
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        except Exception:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                columns = [d.name for d in cur.description]
+                df = pd.DataFrame(rows, columns=columns)
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_file, index=False)
+    return df
+
+
+def load_task_runs_for_queue_context(
+    c: Config,
+    window_start: datetime,
+    as_of_date: datetime,
+    *,
+    refresh_cache: bool = False,
+) -> pd.DataFrame:
+    """Reference runs whose pending interval can overlap any training row's
+    pending_at, used by add_queue_context_features, cached to Parquet.
+
+    Returns columns: task_id, run_id, pending_at, started_at, resolved_at,
+    priority_at_pending, task_queue_id, repo_family.
+
+    A reference run is relevant to a training row at time T iff it was pending
+    at T (pending_at <= T and (exit is NULL or exit > T), where
+    exit = COALESCE(started_at, resolved_at)). We load every run that pended
+    before as_of_date and had not yet exited the pending state at window_start
+    (still pending, or exited after window_start), which is a superset of what
+    any training row in the window can see; the leakage-safe per-target
+    filtering happens in add_queue_context_features.
+    """
+    from_str = window_start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    to_str   = as_of_date.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    # Cache invalidation: the filename embeds REPO_FAMILY_DERIVATION_VERSION, so
+    # a bump of the derivation LOGIC version auto-invalidates the cache. BUT
+    # repo_family is a MUTABLE, out-of-band-backfilled column — a *same-version*
+    # backfill that fills previously-NULL rows does NOT change the version and so
+    # will NOT auto-invalidate this cache. Therefore the repo_family backfill MUST
+    # run BEFORE the ablation, or trainer/data/cache/queue_context_runs_* must be
+    # cleared after a backfill, otherwise Tier D trains on stale/NULL repo_family.
+    cache_file = CACHE_DIR / f"queue_context_runs_{from_str}_{to_str}_rfv{REPO_FAMILY_DERIVATION_VERSION}.parquet"
+
+    if cache_file.exists() and not refresh_cache:
+        return pd.read_parquet(cache_file)
+
+    dsn = os.environ["DATABASE_URL"]
+    # task_queue_id / repo_family live on queue_forecast_tasks.
+    query = """
+SELECT r.task_id,
+       r.run_id,
+       r.pending_at,
+       r.started_at,
+       r.resolved_at,
+       r.priority_at_pending,
+       t.task_queue_id,
+       t.repo_family
+FROM queue_forecast_task_runs r
+JOIN queue_forecast_tasks t ON r.task_id = t.task_id
+WHERE r.pending_at < %(as_of)s
+  AND (COALESCE(r.started_at, r.resolved_at) IS NULL
+       OR COALESCE(r.started_at, r.resolved_at) > %(wstart)s)
+  AND t.task_queue_id IS NOT NULL;
+"""
+    params = {"as_of": as_of_date, "wstart": window_start}
     with psycopg.connect(dsn) as conn:
         try:
             df = pd.read_sql_query(query, conn, params=params)
@@ -416,7 +496,7 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
         from src.velocity_features import add_velocity_features
 
         w = compute_windows(c)
-        worker_counts = load_worker_counts(c, w.train_start, w.as_of_date)
+        worker_counts = load_worker_counts(c, w.train_start, w.as_of_date, refresh_cache=refresh_cache)
         if worker_pools is None:
             worker_pools = load_worker_pools()
         trailing = tuple(c.velocity_features.get("trailing_windows_minutes", [60]))
@@ -437,7 +517,20 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
             c,
             w.train_start - pd.Timedelta(minutes=max_window + 30),
             w.as_of_date,
+            refresh_cache=refresh_cache,
         )
         df = add_throughput_features(df, runs_df, windows_minutes=windows)
+
+    if getattr(c, "queue_context_features", None) and c.queue_context_features.get("enabled"):
+        from src.queue_context import add_queue_context_features
+
+        w = compute_windows(c)
+        runs_qc = load_task_runs_for_queue_context(
+            c, w.train_start - pd.Timedelta(minutes=90), w.as_of_date,
+            refresh_cache=refresh_cache,
+        )
+        wc = load_worker_counts(c, w.train_start - pd.Timedelta(minutes=30), w.as_of_date,
+                                refresh_cache=refresh_cache)
+        df = add_queue_context_features(df, runs_qc, wc)
 
     return df

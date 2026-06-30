@@ -25,6 +25,7 @@ import { buildFeatureVector } from './feature-builder.js';
 import { applyDurationP90Guardrail } from './duration-p90-guardrail.js';
 import { applyWaitP90Guardrail } from './wait-p90-guardrail.js';
 import { getThroughput } from './throughput.js';
+import { getQueueContext, QUEUE_CONTEXT_FEATURE_VERSION } from './queue-context.js';
 
 // Minimum exact-name baseline sample size required before the historical p90
 // is allowed to floor the served run-duration p90. Keeps high-variance,
@@ -38,7 +39,8 @@ const FETCH_ROW_SQL = `
 SELECT r.task_id, r.run_id, r.pending_at, r.queue_pending,
        r.priority_at_pending, r.started_at, r.resolved_at,
        t.task_queue_id, t.scheduler_id, t.metadata_name,
-       t.normalized_name, t.max_run_time_s, t.tags, t.enriched_at
+       t.normalized_name, t.max_run_time_s, t.tags, t.enriched_at,
+       t.repo_family
 FROM queue_forecast_task_runs r
 JOIN queue_forecast_tasks t ON r.task_id = t.task_id
 WHERE r.task_id = $1 AND r.run_id = $2
@@ -114,6 +116,8 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
 
   const throughput = await getThroughput(pool, row.task_queue_id, row.pending_at, taskId, runId);
 
+  const queueContext = await getQueueContext(pool, row);
+
   // liveFeatures supplies every column not on `row` directly: baseline
   // values + throughput aggregates. Baseline-feature names match the
   // training config: bl_wait_p50 / bl_duration_p50 (used by residual inverse).
@@ -123,6 +127,7 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
     bl_duration_p50: durationBaseline ? Number(durationBaseline.p50) : NaN,
     bl_duration_p90: durationBaseline ? Number(durationBaseline.p90) : NaN,
     ...throughput,
+    ...queueContext,
   };
 
   // ── Wait model ───────────────────────────────────────────────────────────
@@ -174,6 +179,10 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
       duration: durationBaseline,
     },
     throughput,
+    queue_context_at_pending: {
+      feature_version: QUEUE_CONTEXT_FEATURE_VERSION,
+      ...queueContext,
+    },
     duration_p90_guardrail: {
       applied:              guardrail.applied,
       raw_model_p90_s:      rawModelRunP90,

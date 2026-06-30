@@ -1,9 +1,21 @@
 # Queue Forecasting — Phase 2 Decision
 
 **Created:** 2026-04-23
-**Last updated:** 2026-05-20 (live calibration review; p90 baseline-regression findings; run-duration p90 guardrail; Tier 1 tag features evaluated; `bl_wait_p90` added)
-**Companion to:** `trainer-spec.md`, `trainer-plan.md`
+**Last updated:** 2026-06-30 (tail-accuracy program / Bet 1 queue-context features — see §0)
+**Companion to:** `trainer-spec.md`, `trainer-plan.md`, `bet1-queue-context-features-design.md`
 **Authors:** residual-model experiment, wait-time transform variants, run-duration residual experiment
+
+## 0. Current status & direction (2026-06-30)
+
+**Where we are.** The residual wait/duration models (Phase 2/3, below) are live and broadly calibrated, and a **priority-aware wait p90 guardrail** shipped 2026-06-04 — verified healthy on live data 2026-06-25 (overall wait & run bands ≈ 50% ≤ p50 / 40% / 10% > p90; the earlier priority-blind over-inflation, e.g. osx-1015 at ~30×, is gone). The one stubborn weakness is the **long-wait tail**: completed-only 30m+ waits still exceed their p90 ~38% of the time, and weak-fallback / capacity-sensitive pools underestimate.
+
+**The north star.** The goal is a `mach try` **group ETA** — "when will my whole push finish." Group completion is the *max* over the push's tasks of (wait + run), and that max is dominated by the single slowest task — which lives in exactly the long tail above. So the tail has to be accurate *per task* before a group ETA can be trustworthy. We nail individual tasks first; group composition and dependency/priority-ordering are separate, later problems.
+
+**Current work — Bet 1: queue-context features.** The tail is first an *information* problem: at pending time the model knows the task's own priority and the aggregate queue depth, but not *what is ahead of it*. A `try` task with 50 low-priority tasks ahead and one with 50 beta/autoland tasks ahead look identical today, yet wait very differently. Bet 1 reconstructs, at the task's pending moment: the **priority backlog** ahead of it (higher / same / lower priority, FIFO-correct), recent **arrival & drain flow**, worker **capacity / utilization**, and **repo-family backlog** (try / autoland / central / beta-release) on shared pools. Status: **implemented, reviewed, and parity-verified locally; pending a walk-forward ablation on production data to decide go/no-go.** Gate: 30m+ wait p90 miss materially down (<35% experimental, <30% broad), no regression on overall p90 / p50 / within-2x / MAE.
+
+**Next bets (after Bet 1).** Bet 2 — model the full predictive *distribution* of time-to-completion (a survival/hazard model for wait), giving a calibrated tail at any quantile and letting a prediction **update live as a task keeps waiting**. Bet 3 — compose per-task distributions into a group-max completion ETA for the push.
+
+**Honest status.** This remains a diagnostics/dashboard tool, not a broad Treeherder/UI ETA surface. The per-task tail and the group-composition story both have to stabilize first. Detailed phase history and the per-cohort experiment log follow below.
 
 ## 1. Decision (architecture current — 2026-04-29; live status updated 2026-05-20)
 

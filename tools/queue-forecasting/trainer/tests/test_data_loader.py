@@ -66,3 +66,99 @@ def test_load_baseline_predictions(tmp_path):
     import numpy as np
     assert np.isnan(df.iloc[1]["bl_duration_p50"])
     assert df.iloc[1]["bl_wait_p50"] == 45.5
+
+
+def test_repo_family_derivation_version_matches_js():
+    """The Python constant must stay in lockstep with src/repo-family.js."""
+    import re
+    from pathlib import Path
+
+    js = Path(__file__).resolve().parents[2] / "src" / "repo-family.js"
+    text = js.read_text()
+    m = re.search(r"REPO_FAMILY_DERIVATION_VERSION\s*=\s*(\d+)", text)
+    assert m, "could not find REPO_FAMILY_DERIVATION_VERSION in repo-family.js"
+    assert int(m.group(1)) == dl.REPO_FAMILY_DERIVATION_VERSION
+
+
+def test_queue_context_cache_filename_embeds_rfv(monkeypatch):
+    """The queue-context reference cache path is version-keyed (rfv<N>)."""
+    captured = {}
+
+    def fake_read_parquet(path):
+        captured["path"] = str(path)
+        raise AssertionError("stop after path is built")
+
+    # Make the cache "exist" so the function builds the path then reads it.
+    monkeypatch.setattr(dl.Path, "exists", lambda self: True)
+    monkeypatch.setattr(dl.pd, "read_parquet", fake_read_parquet)
+
+    c = _cfg()
+    try:
+        dl.load_task_runs_for_queue_context(
+            c,
+            datetime(2026, 4, 1, tzinfo=timezone.utc),
+            datetime(2026, 4, 24, tzinfo=timezone.utc),
+        )
+    except AssertionError:
+        pass
+    assert "queue_context_runs_" in captured["path"]
+    assert f"_rfv{dl.REPO_FAMILY_DERIVATION_VERSION}.parquet" in captured["path"]
+
+
+def test_queue_context_refresh_cache_bypasses_parquet(monkeypatch, tmp_path):
+    """--refresh-cache must reach the queue-context loader: refresh_cache=False
+    serves the cached parquet without touching the DB; refresh_cache=True bypasses
+    the cache and enters the query path (re-running the DB read + parquet write).
+    """
+    import pandas as pd
+
+    # Isolate the cache to a tmp dir.
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+
+    window_start = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    as_of_date = datetime(2026, 4, 24, tzinfo=timezone.utc)
+
+    # Reproduce the exact cache filename the function builds.
+    from_str = window_start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    to_str = as_of_date.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    cache_file = tmp_path / (
+        f"queue_context_runs_{from_str}_{to_str}"
+        f"_rfv{dl.REPO_FAMILY_DERIVATION_VERSION}.parquet"
+    )
+
+    # Write a 1-row dummy parquet with the columns the query produces.
+    dummy = pd.DataFrame([{
+        "task_id": "dummy-task",
+        "run_id": 0,
+        "pending_at": window_start,
+        "started_at": None,
+        "resolved_at": None,
+        "priority_at_pending": "normal",
+        "task_queue_id": "q/dummy",
+        "repo_family": "from-cache",
+    }])
+    dummy.to_parquet(cache_file, index=False)
+
+    class _ConnectCalled(Exception):
+        pass
+
+    def _sentinel_connect(*args, **kwargs):
+        raise _ConnectCalled()
+
+    monkeypatch.setattr(dl.psycopg, "connect", _sentinel_connect)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+
+    c = _cfg()
+
+    # refresh_cache=False -> cache hit, DB never touched, dummy returned.
+    out = dl.load_task_runs_for_queue_context(
+        c, window_start, as_of_date, refresh_cache=False
+    )
+    assert list(out["repo_family"]) == ["from-cache"]
+
+    # refresh_cache=True -> cache bypassed, query path entered (connect called).
+    import pytest
+    with pytest.raises(_ConnectCalled):
+        dl.load_task_runs_for_queue_context(
+            c, window_start, as_of_date, refresh_cache=True
+        )

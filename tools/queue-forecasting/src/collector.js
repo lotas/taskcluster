@@ -7,6 +7,7 @@ import { createNoOpMonitor } from './monitor.js';
 import { createTaskCache } from './cache.js';
 import { createPool, upsertTask, upsertTaskRun, enrichTask, getUnenrichedTaskIds } from './db.js';
 import { normalizeMetadataName } from './utils.js';
+import { deriveRepoFamily } from './repo-family.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ERROR_LOG_PATH = process.env.COLLECTOR_ERROR_LOG || path.join(__dirname, '..', 'collector-errors.log');
@@ -255,6 +256,11 @@ async function backgroundApiFetch(taskId, status) {
   inFlightTaskIds.add(taskId);
   try {
     const taskDef = await queueClient.task(taskId);
+    const rf = deriveRepoFamily({
+      routes: taskDef.routes || [],
+      metadataSource: taskDef.metadata?.source ?? null,
+      schedulerId: taskDef.schedulerId || status.schedulerId || null,
+    });
     const metadataName = taskDef.metadata?.name || null;
     const enrichment = {
       metadata_name: metadataName,
@@ -267,6 +273,10 @@ async function backgroundApiFetch(taskId, status) {
       scheduler_id: taskDef.schedulerId || status.schedulerId,
       project_id: taskDef.projectId || status.projectId,
       max_run_time_s: taskDef.payload?.maxRunTime ?? null,
+      repo_family: rf.family,
+      repo_family_source: rf.source,
+      repo_family_evidence: rf.evidence,
+      repo_family_derivation_version: rf.version,
     };
     await enrichTask(pool, taskId, enrichment);
     taskCache.set(taskId, enrichment);

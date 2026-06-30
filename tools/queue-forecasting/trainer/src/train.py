@@ -193,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         "residual":             c.residual,
         "anomaly_filter":       c.anomaly_filter,
         "throughput_features":  c.throughput_features,
+        "queue_context_features": getattr(c, "queue_context_features", None),
         "velocity_features":    getattr(c, "velocity_features", None),
         "quantile_models": {
             str(q): f"{run_stem}_p{int(q * 100)}.onnx" for q in sorted(models)

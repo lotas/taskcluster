@@ -31,6 +31,7 @@ FIELDNAMES = [
     "p90_coverage",
     "lt1m_mae", "1-5m_mae", "5-30m_mae", "30mplus_mae",
     "lt1m_within_2x", "1-5m_within_2x", "5-30m_within_2x", "30mplus_within_2x",
+    "30mplus_wait_p90_miss",
     "hold_rows",
     "cohort_is_anomalous",
 ]
@@ -103,6 +104,24 @@ def _load_anomalous_dates_from_db() -> set[str]:
         return set()
 
 
+def extract_30mplus_wait_p90_miss(eval_obj: dict) -> float | None:
+    """Pull the 30m+ actual-wait bucket p90 miss rate from a manifest dict.
+
+    Sourced from evaluate.py's per-bucket p90_coverage on the completed-only
+    primary slice (the same 30m+ bucket used for 30mplus_within_2x). p90 miss =
+    fraction with actual > predicted p90 = 1 - coverage. Returns None when the
+    run isn't the wait target, or the bucket / metric is absent (older
+    manifests predate the per-bucket p90 metric).
+    """
+    if eval_obj.get("target") != "wait_time":
+        return None
+    buckets = (eval_obj.get("evaluation", {}).get("primary", {}) or {}).get("buckets_aggregate") or {}
+    miss = (buckets.get("30m+") or {}).get("p90_miss_rate")
+    if miss is None or miss != miss:  # None or NaN
+        return None
+    return miss
+
+
 def extract_row(manifest_path: Path, anomalous_dates: set[str] | None = None) -> dict | None:
     data = json.loads(manifest_path.read_text())
     # Cohort × config combinations the trainer skipped (e.g. anomaly filter
@@ -145,6 +164,7 @@ def extract_row(manifest_path: Path, anomalous_dates: set[str] | None = None) ->
         "model_within_2x": model_w2x,
         "delta_within_2x_pp": _pp(model_w2x, baseline_w2x),
         "p90_coverage": p90,
+        "30mplus_wait_p90_miss": extract_30mplus_wait_p90_miss(data),
         "hold_rows": (data.get("windows", {}).get("holdout") or {}).get("rows"),
         "cohort_is_anomalous": cohort_is_anomalous,
     }
@@ -212,6 +232,11 @@ def _print_target_block(target: str, target_rows: list[dict]) -> None:
         if bucket_30m:
             over_50 = sum(1 for b in bucket_30m if b >= 0.50)
             print(f"  30m+ w/in2x: mean={_fmt(stats.mean(bucket_30m) * 100, '%')}  ≥50%: {over_50}/{len(bucket_30m)}", file=sys.stderr)
+        miss30 = [r["30mplus_wait_p90_miss"] for r in cfg_rows if r.get("30mplus_wait_p90_miss") is not None]
+        if miss30:
+            under_35 = sum(1 for m in miss30 if m < 0.35)
+            under_30 = sum(1 for m in miss30 if m < 0.30)
+            print(f"  30m+ wait p90 miss: mean={_fmt(stats.mean(miss30) * 100, '%')}  <35%: {under_35}/{len(miss30)}  <30%: {under_30}/{len(miss30)}", file=sys.stderr)
         print("", file=sys.stderr)
 
     # Win counts — only within this target's configs, and only counting cohorts

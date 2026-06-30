@@ -45,6 +45,7 @@ class Config:
     residual: dict[str, Any] | None = None
     velocity_features: dict[str, Any] | None = None
     throughput_features: dict[str, Any] | None = None
+    queue_context_features: dict[str, Any] | None = None
     anomaly_filter: dict[str, Any] | None = None
     baseline_dir: str | None = None
     source_path: Path = field(default_factory=Path)
@@ -81,6 +82,7 @@ def load_config(
         residual=raw.get("residual"),
         velocity_features=raw.get("velocity_features"),
         throughput_features=raw.get("throughput_features"),
+        queue_context_features=raw.get("queue_context_features"),
         anomaly_filter=raw.get("anomaly_filter"),
         baseline_dir=raw.get("baseline_dir"),
         source_path=p,

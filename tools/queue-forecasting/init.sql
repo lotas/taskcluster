@@ -21,7 +21,11 @@ CREATE TABLE IF NOT EXISTS queue_forecast_tasks (
     metadata_name      TEXT,
     normalized_name    TEXT,
     original_priority  TEXT,
-    tags               JSONB
+    tags               JSONB,
+    repo_family        TEXT,
+    repo_family_source TEXT,
+    repo_family_evidence TEXT,
+    repo_family_derivation_version INTEGER
 );
 
 -- ==========================================
