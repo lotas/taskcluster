@@ -64,7 +64,7 @@ const FEATURE_COLUMNS = [
 //                  features (arrivals/starts) must sweep over `events`, not the
 //                  pending-only `ahead` CTE (mirrors Python's event sweep).
 //   `allpending` - runs pending at T INCLUDING the target, for coverage.
-const BACKLOG_SQL = `-- queue_context_backlog
+export const BACKLOG_SQL = `-- queue_context_backlog
 WITH ahead AS (
   SELECT r.priority_at_pending AS pr, r.pending_at, r.started_at, t.repo_family,
          r.task_id, r.run_id,
@@ -89,6 +89,17 @@ events AS (
   FROM queue_forecast_task_runs r
   JOIN queue_forecast_tasks t ON r.task_id = t.task_id
   WHERE t.task_queue_id = $1
+    -- Bound to the windows the outer query actually reads: arrivals (≤60m by
+    -- pending_at) and starts (≤15m by started_at). A row can land in the starts
+    -- window with an old pending_at (long wait, then a recent start), so the
+    -- lower bound is an OR across both columns; the pending_at <= T upper bound
+    -- is safe because anything started by T necessarily pended by T. Without
+    -- this, the CTE materialized the queue's ENTIRE history on every prediction
+    -- (minutes of runtime + GBs of pgsql_tmp spill). The 15/60m literals here
+    -- must stay >= the largest window referenced in the SELECT below.
+    AND r.pending_at <= $2::timestamptz
+    AND (r.pending_at  > $2::timestamptz - INTERVAL '60 minutes'
+         OR r.started_at > $2::timestamptz - INTERVAL '15 minutes')
     AND NOT (r.task_id = $4 AND r.run_id = $5)
 ),
 allpending AS (
