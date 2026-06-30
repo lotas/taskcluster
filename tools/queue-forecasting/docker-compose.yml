@@ -2,6 +2,23 @@ services:
   postgres:
     image: postgres:15
     shm_size: "2gb"
+    # Memory tuning — stock PG15 defaults (work_mem=4MB, shared_buffers=128MB)
+    # are sized to boot anywhere, not for this 30GB box. The tiny work_mem made
+    # the live-predictor's per-prediction throughput join spill to pgsql_tmp on
+    # nearly every run (sustained temp-file churn). These raise the routine
+    # ceilings; the trainer's heavy batch queries set a larger work_mem
+    # per-session instead (see trainer/src/data_loader.py) to avoid the
+    # per-connection × max_connections multiplier.
+    command:
+      - postgres
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=16GB
     ports:
       - "127.0.0.1:5433:5432"
     environment:

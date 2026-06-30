@@ -20,6 +20,18 @@ from src.config import Config, compute_windows
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 
+# The trainer pulls 14–30 days of rows and does large joins/sorts. Give its
+# connections a generous work_mem set PER SESSION (via libpq startup options)
+# rather than globally in postgresql.conf — the trainer is one batch connection
+# at a time, so the blast radius is just this query, not max_connections × the
+# global value. The modest global default lives in docker-compose.yml.
+TRAINER_WORK_MEM = os.environ.get("TRAINER_WORK_MEM", "512MB")
+
+
+def _connect(dsn: str):
+    """psycopg connection with a generous session work_mem for batch queries."""
+    return psycopg.connect(dsn, options=f"-c work_mem={TRAINER_WORK_MEM}")
+
 # Keep in sync with REPO_FAMILY_DERIVATION_VERSION in src/repo-family.js.
 # Bump this whenever the repo_family derivation LOGIC changes; the queue-context
 # reference cache filename embeds it so a logic bump auto-invalidates the cache.
@@ -242,7 +254,7 @@ WHERE sampled_at >= %(fetch_from)s
 ORDER BY task_queue_id, sampled_at;
 """
     params = {"fetch_from": fetch_from, "fetch_to": fetch_to}
-    with psycopg.connect(dsn) as conn:
+    with _connect(dsn) as conn:
         try:
             df = pd.read_sql_query(query, conn, params=params)
         except Exception:
@@ -267,7 +279,7 @@ def load_worker_pools() -> pd.DataFrame:
 SELECT task_queue_id, pool_kind, provider_type
 FROM queue_forecast_worker_pools;
 """
-    with psycopg.connect(dsn) as conn:
+    with _connect(dsn) as conn:
         try:
             df = pd.read_sql_query(query, conn)
         except Exception:
@@ -324,7 +336,7 @@ WHERE r.resolved_at IS NOT NULL
   AND t.task_queue_id IS NOT NULL;
 """
     params = {"window_start": window_start, "window_end": window_end}
-    with psycopg.connect(dsn) as conn:
+    with _connect(dsn) as conn:
         try:
             df = pd.read_sql_query(query, conn, params=params)
         except Exception:
@@ -393,7 +405,7 @@ WHERE r.pending_at < %(as_of)s
   AND t.task_queue_id IS NOT NULL;
 """
     params = {"as_of": as_of_date, "wstart": window_start}
-    with psycopg.connect(dsn) as conn:
+    with _connect(dsn) as conn:
         try:
             df = pd.read_sql_query(query, conn, params=params)
         except Exception:
@@ -444,7 +456,7 @@ def load_anomalous_dates(c: Config) -> set[datetime.date]:
     else:
         condition = "is_anomalous = TRUE"
     query = f"SELECT sample_date FROM queue_forecast_daily_health WHERE {condition}"
-    with psycopg.connect(dsn) as conn:
+    with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(query)
             return {r[0] for r in cur.fetchall()}
@@ -462,7 +474,7 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
             "train_start": w.train_start,
             "as_of_date":  w.as_of_date,
         }
-        with psycopg.connect(dsn) as conn:
+        with _connect(dsn) as conn:
             try:
                 df = pd.read_sql_query(query, conn, params=params)
             except Exception:
