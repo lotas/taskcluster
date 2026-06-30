@@ -42,6 +42,7 @@ Standalone tool for predicting Taskcluster task wait times and run durations. Bu
 | **predictor** | Node.js | Hierarchical percentile baseline (metadata_name → normalized_name → tags → queue → scheduler → global). Two output modes: per-day eval JSONs and an aggregate residual-feature NDJSON. Supports `--exclude-dates` to drop anomalous days from the 7-day history window. |
 | **trainer** | Python / LightGBM | Quantile regression (p50, p90) over engineered features (queue depth, throughput, time-of-day, worker-pool kind). Residual mode trains on the log-ratio residual against the percentile baseline. |
 | **live-predictor** | Node.js | Consumes the trainer's ONNX bundles and writes a prediction row to `queue_forecast_run_predictions` for every new task-pending event. Polls every few seconds (`LIVE_PREDICTOR_POLL_MS`, default 5000) for currently-unresolved unpredicted rows, keyset-paginated through any backlog. |
+| **retention** | Node.js | Daily job (`RETENTION_INTERVAL_SECONDS`, default 86400) that batch-deletes rows older than `RETENTION_DAYS` (default 60) from `queue_forecast_tasks` (cascades to `task_runs`), `queue_forecast_run_predictions`, and `queue_forecast_worker_counts`, keeping the Postgres volume bounded. |
 
 ## First-time setup (new host / VM)
 
@@ -121,6 +122,7 @@ docker compose up -d --build
 
 # 3. Apply additive schema migrations (idempotent — safe to re-run)
 docker compose exec -T postgres psql -U postgres -d forecasting < migrate.sql
+docker compose exec -T postgres psql -U postgres -d forecasting < migrate-retention.sql
 
 # 4. Re-run the anomaly detector to backfill any new flag columns
 #    (e.g. when worker-count flags were added)
@@ -319,6 +321,29 @@ and `run_duration_residual_*`).
 | `queue_forecast_daily_health` | one row per `sample_date` | health-monitor |
 
 Schema in `init.sql`; additive migrations in `migrate.sql`. Test suites drop and recreate the `public` schema — never run them against production data.
+
+## Retention
+
+The collection services only ever INSERT, so the tables grow unbounded (~300 MB/day of DB at fxci scale). The **retention** service prunes rows older than `RETENTION_DAYS` (default **60**) once a day, in committed batches so it never blocks the collector.
+
+`RETENTION_DAYS` is sized off what training needs: a single run reaches `lookback + holdout + val` back (38d for `run_duration`), and a walk-forward sweep slides that across cohorts — worst realistic reach ≈ 55d. 60d leaves margin; don't drop below ~55d or sweeps will request pruned data. `queue_forecast_task_runs` is pruned implicitly via its `ON DELETE CASCADE` FK to `queue_forecast_tasks`.
+
+```bash
+# Start it (also included in the `full` profile)
+docker compose --profile retention up -d retention
+docker compose logs -f retention
+```
+
+**First run on an existing DB:** `DELETE` marks rows dead but does not return disk to the OS, so the very first prune (which removes months of backlog) won't shrink the volume on its own. Reclaim it once, in a quiet window after the trainer is idle (each `VACUUM FULL` takes an exclusive lock for its duration):
+
+```bash
+for t in queue_forecast_tasks queue_forecast_task_runs \
+         queue_forecast_run_predictions queue_forecast_worker_counts; do
+  docker compose exec -T postgres psql -U postgres -d forecasting -c "VACUUM (FULL, ANALYZE) $t;"
+done
+```
+
+Steady-state daily pruning is a small trickle that autovacuum reclaims in place — no `VACUUM FULL` needed after the first time.
 
 ## Tests
 

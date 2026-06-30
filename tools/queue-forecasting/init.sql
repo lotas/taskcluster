@@ -106,6 +106,11 @@ CREATE INDEX IF NOT EXISTS idx_qf_tasks_unenriched
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_queue_id
     ON queue_forecast_tasks (task_queue_id);
 
+-- Retention: prune tasks older than the retention window by task_created
+-- (deleting old tasks cascades to their task_runs via the FK).
+CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_created
+    ON queue_forecast_tasks (task_created);
+
 CREATE INDEX IF NOT EXISTS idx_qf_task_runs_resolved_at
     ON queue_forecast_task_runs (resolved_at)
     WHERE resolved_at IS NOT NULL;

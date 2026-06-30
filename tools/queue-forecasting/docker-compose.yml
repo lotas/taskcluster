@@ -187,6 +187,28 @@ services:
     volumes:
       - ./trainer:/app/trainer
 
+  retention:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    command: ["node", "src/retention.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 10s
+    restart: unless-stopped
+    profiles:
+      - retention
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      RETENTION_DAYS: "60"
+      RETENTION_INTERVAL_SECONDS: "86400"
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+
 volumes:
   pgdata:
   dashboard-html:
