@@ -158,17 +158,57 @@ export async function updateRepoFamily(pool, taskId, rf) {
   await pool.query(UPDATE_REPO_FAMILY_SQL, [taskId, rf.family, rf.source, rf.evidence, rf.version]);
 }
 
+// "Needs work" is expressed canonically as repo_family_derivation_version IS NULL.
+// That predicate is matched by the partial index idx_qf_tasks_needs_repo_family, so
+// selection is O(remaining) instead of re-scanning the (mostly-done) table each batch.
+//
+// Why not `IS DISTINCT FROM $version`: a partial index `WHERE ... IS NULL` is only
+// usable when the query predicate implies it, and IS DISTINCT FROM does not — so it
+// forced a full nested-loop probe of every in-window task (see resetStaleRepoFamily
+// for how a derivation-version bump re-establishes the NULL invariant).
+//
+// Window membership is a correlated EXISTS driven by queue_forecast_task_runs' PK
+// (task_id, run_id), replacing an `IN (SELECT DISTINCT ...)` that rebuilt a full-window
+// hash-aggregate on every batch. ORDER BY task_id keeps the scan forward-only: a row
+// leaves the partial index the moment its version is set, so batches never rescan it.
 const SELECT_REPO_FAMILY_BACKFILL_SQL = `
-SELECT task_id FROM queue_forecast_tasks
-WHERE repo_family_derivation_version IS DISTINCT FROM $1
-  AND task_id IN (
-    SELECT DISTINCT task_id FROM queue_forecast_task_runs
-    WHERE pending_at >= $2::timestamptz AND pending_at < $3::timestamptz
+SELECT t.task_id
+FROM queue_forecast_tasks t
+WHERE t.repo_family_derivation_version IS NULL
+  AND EXISTS (
+    SELECT 1 FROM queue_forecast_task_runs r
+    WHERE r.task_id = t.task_id
+      AND r.pending_at >= $1::timestamptz AND r.pending_at < $2::timestamptz
   )
-LIMIT $4;
+ORDER BY t.task_id
+LIMIT $3;
 `;
 
-export async function selectTasksNeedingRepoFamily(pool, version, fromTs, toTs, limit) {
-  const { rows } = await pool.query(SELECT_REPO_FAMILY_BACKFILL_SQL, [version, fromTs, toTs, limit]);
+export async function selectTasksNeedingRepoFamily(pool, fromTs, toTs, limit) {
+  const { rows } = await pool.query(SELECT_REPO_FAMILY_BACKFILL_SQL, [fromTs, toTs, limit]);
   return rows.map(r => r.task_id);
+}
+
+// On a derivation-LOGIC change the version constant is bumped; rows carrying an older
+// (non-NULL, non-current) version within the window must be reprocessed. Re-NULLing
+// their derivation version restores the "needs work <=> IS NULL" invariant so the fast
+// path above re-selects them. Already-NULL and current-version rows are untouched. Only
+// the version is cleared (not the family value), matching prior behaviour where a row
+// keeps its last value until reprocessing overwrites it. Scoped to the same window as
+// the backfill via EXISTS. Run once at backfill startup.
+const RESET_STALE_REPO_FAMILY_SQL = `
+UPDATE queue_forecast_tasks t
+SET repo_family_derivation_version = NULL
+WHERE t.repo_family_derivation_version IS NOT NULL
+  AND t.repo_family_derivation_version <> $1
+  AND EXISTS (
+    SELECT 1 FROM queue_forecast_task_runs r
+    WHERE r.task_id = t.task_id
+      AND r.pending_at >= $2::timestamptz AND r.pending_at < $3::timestamptz
+  );
+`;
+
+export async function resetStaleRepoFamily(pool, version, fromTs, toTs) {
+  const { rowCount } = await pool.query(RESET_STALE_REPO_FAMILY_SQL, [version, fromTs, toTs]);
+  return rowCount;
 }

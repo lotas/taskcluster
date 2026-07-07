@@ -7,7 +7,7 @@
 // Usage: node scripts/backfill_repo_family.js --from 2026-05-26 --to 2026-06-26
 import { fileURLToPath } from 'node:url';
 import taskcluster from '@taskcluster/client';
-import { createPool, updateRepoFamily, selectTasksNeedingRepoFamily } from '../src/db.js';
+import { createPool, updateRepoFamily, selectTasksNeedingRepoFamily, resetStaleRepoFamily } from '../src/db.js';
 import { deriveRepoFamily, REPO_FAMILY_DERIVATION_VERSION } from '../src/repo-family.js';
 
 const MAX_CONCURRENT = 20;
@@ -43,10 +43,16 @@ async function main() {
   const pool = createPool(process.env.DATABASE_URL);
   const queue = new taskcluster.Queue({ rootUrl: process.env.TASKCLUSTER_ROOT_URL });
 
+  // Re-establish the "needs work <=> derivation_version IS NULL" invariant that the
+  // selection fast path relies on: if the derivation logic/version has advanced, rows
+  // in this window still carrying an older version are re-NULLed so they get reprocessed.
+  const reset = await resetStaleRepoFamily(pool, REPO_FAMILY_DERIVATION_VERSION, from, to);
+  if (reset > 0) console.log(`[backfill] reset ${reset} stale-version rows in window for reprocessing`);
+
   let done = 0, derived = 0, gone = 0, transient = 0;
   let loggedTransient = false;
   for (;;) {
-    const ids = await selectTasksNeedingRepoFamily(pool, REPO_FAMILY_DERIVATION_VERSION, from, to, BATCH);
+    const ids = await selectTasksNeedingRepoFamily(pool, from, to, BATCH);
     if (ids.length === 0) break;
 
     // Track DB writes this batch. Transient rows keep derivation_version NULL,

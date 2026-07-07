@@ -57,6 +57,7 @@ services:
       DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
     volumes:
       - ./src:/app/tools/queue-forecasting/src
+      - ./scripts:/app/tools/queue-forecasting/scripts
 
   predictor:
     build:

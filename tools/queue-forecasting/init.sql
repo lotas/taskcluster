@@ -102,6 +102,13 @@ CREATE INDEX IF NOT EXISTS idx_qf_tasks_unenriched
     ON queue_forecast_tasks (task_id)
     WHERE metadata_name IS NULL;
 
+-- Repo-family backfill: find tasks still needing derivation. Partial + task_id-ordered
+-- so selectTasksNeedingRepoFamily() is an O(remaining) index scan instead of a full
+-- nested-loop probe of every in-window task each batch.
+CREATE INDEX IF NOT EXISTS idx_qf_tasks_needs_repo_family
+    ON queue_forecast_tasks (task_id)
+    WHERE repo_family_derivation_version IS NULL;
+
 -- Live predictor: throughput query support
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_queue_id
     ON queue_forecast_tasks (task_queue_id);
