@@ -1,7 +1,13 @@
 services:
   postgres:
     image: postgres:15
-    shm_size: "2gb"
+    # /dev/shm backs Postgres' dynamic shared memory (parallel-query workers).
+    # Baseline regeneration fans out ~12 concurrent parallel aggregations
+    # (predictor.js loadBulkStats*ForCutoff), whose combined DSM peaked past 2gb
+    # and hit "could not resize shared memory segment: No space left on device".
+    # The box has ~25Gi free RAM and tmpfs only consumes what's used, so give it
+    # headroom. Pair with max_parallel_workers_per_gather below if it recurs.
+    shm_size: "6gb"
     # Memory tuning — stock PG15 defaults (work_mem=4MB, shared_buffers=128MB)
     # are sized to boot anywhere, not for this 30GB box. The tiny work_mem made
     # the live-predictor's per-prediction throughput join spill to pgsql_tmp on
