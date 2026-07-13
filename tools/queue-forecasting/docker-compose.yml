@@ -25,6 +25,14 @@ services:
       - shared_buffers=2GB
       - -c
       - effective_cache_size=16GB
+      - -c
+      # Default is 2; the trainer's reference-run queries now legitimately scan
+      # ~half of the (60-day-retention-capped) task_runs/tasks tables per cohort
+      # (confirmed via EXPLAIN — a bound helped but this is still a big seq scan,
+      # not a missing-index problem). Box has 8 cores and the trainer container
+      # is I/O-waiting on this query, not competing for CPU, so give it more
+      # workers. shm_size=6gb already has headroom for the extra DSM.
+      - max_parallel_workers_per_gather=4
     # Observed steady-state ~9.2-9.4GB; cap well above that so a runaway query
     # can't starve the rest of the box, but this container's own cgroup gets
     # OOM-killed (visible, restartable) instead of the whole VM thrashing.
