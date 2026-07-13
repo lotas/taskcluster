@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.config import Config
 from src import data_loader as dl
@@ -162,3 +162,53 @@ def test_queue_context_refresh_cache_bypasses_parquet(monkeypatch, tmp_path):
         dl.load_task_runs_for_queue_context(
             c, window_start, as_of_date, refresh_cache=True
         )
+
+
+def test_queue_context_query_bounds_pending_at_and_task_created(monkeypatch, tmp_path):
+    """load_task_runs_for_queue_context must floor pending_at/task_created at
+    (window_start - lookback_days). Without this the reference-run query scans
+    the FULL history of an ever-growing table on every cohort (confirmed live
+    via EXPLAIN: Seq Scan on both queue_forecast_task_runs and
+    queue_forecast_tasks, multi-TB cumulative read profile).
+    """
+    import pandas as pd
+
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)  # force a cache miss
+
+    captured = {}
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_connect(dsn):
+        return _FakeConn()
+
+    def _fake_read_sql_query(query, conn, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame(columns=[
+            "task_id", "run_id", "pending_at", "started_at", "resolved_at",
+            "priority_at_pending", "task_queue_id", "repo_family",
+        ])
+
+    monkeypatch.setattr(dl, "_connect", _fake_connect)
+    monkeypatch.setattr(dl.pd, "read_sql_query", _fake_read_sql_query)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+
+    c = _cfg(lookback_days=14)
+    window_start = datetime(2026, 5, 30, tzinfo=timezone.utc)
+    as_of_date = datetime(2026, 6, 13, tzinfo=timezone.utc)
+
+    dl.load_task_runs_for_queue_context(c, window_start, as_of_date)
+
+    query, params = captured["query"], captured["params"]
+    assert "r.pending_at >= %(ref_lower)s" in query
+    assert "t.task_created >= %(ref_lower)s" in query
+    assert params["ref_lower"] == window_start - timedelta(days=c.lookback_days)
+    # Sanity: the floor must be strictly before window_start, not after it —
+    # a wrong-direction bound would silently exclude the whole training window.
+    assert params["ref_lower"] < window_start

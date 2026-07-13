@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -371,6 +371,21 @@ def load_task_runs_for_queue_context(
     (still pending, or exited after window_start), which is a superset of what
     any training row in the window can see; the leakage-safe per-target
     filtering happens in add_queue_context_features.
+
+    `pending_at`/`task_created` are additionally floored at
+    `window_start - lookback_days` (2x lookback_days of total reach from
+    as_of_date): without a floor, both sides of the join scan the FULL history
+    of an ever-growing table on every call (confirmed via EXPLAIN: a multi-TB
+    read profile), and the cost only worsens as more days of data accumulate.
+    A reference run open (never started, never resolved) for longer than one
+    full training window before that window even starts is, for real
+    Taskcluster CI tasks, essentially always a collection artifact rather than
+    real queue backlog — the floor is deliberately generous (a full
+    lookback_days of grace, not e.g. a handful of days) to avoid excluding
+    anything real. The tasks-side floor lets that join use the existing
+    idx_qf_tasks_task_created index instead of a full-table scan; it's safe
+    without a NULL guard because task_created is set by the same upsertTask
+    insert that sets task_queue_id (already required NOT NULL by this query).
     """
     from_str = window_start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
     to_str   = as_of_date.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -400,11 +415,14 @@ SELECT r.task_id,
 FROM queue_forecast_task_runs r
 JOIN queue_forecast_tasks t ON r.task_id = t.task_id
 WHERE r.pending_at < %(as_of)s
+  AND r.pending_at >= %(ref_lower)s
   AND (COALESCE(r.started_at, r.resolved_at) IS NULL
        OR COALESCE(r.started_at, r.resolved_at) > %(wstart)s)
-  AND t.task_queue_id IS NOT NULL;
+  AND t.task_queue_id IS NOT NULL
+  AND t.task_created >= %(ref_lower)s;
 """
-    params = {"as_of": as_of_date, "wstart": window_start}
+    ref_lower = window_start - timedelta(days=c.lookback_days)
+    params = {"as_of": as_of_date, "wstart": window_start, "ref_lower": ref_lower}
     with _connect(dsn) as conn:
         try:
             df = pd.read_sql_query(query, conn, params=params)

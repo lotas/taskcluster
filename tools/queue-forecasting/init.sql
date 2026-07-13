@@ -113,6 +113,16 @@ CREATE INDEX IF NOT EXISTS idx_qf_tasks_needs_repo_family
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_queue_id
     ON queue_forecast_tasks (task_queue_id);
 
+-- Trainer queue-context reference load (load_task_runs_for_queue_context):
+-- bounded to [window_start - lookback_days, as_of) x still-open-or-recently-exited.
+-- Without these, both sides of the join scanned the full history of an
+-- ever-growing table on every cohort (confirmed via EXPLAIN: multi-TB read
+-- profile). idx_qf_tasks_task_created (below) covers the tasks-side floor.
+CREATE INDEX IF NOT EXISTS idx_qf_task_runs_pending_at
+    ON queue_forecast_task_runs (pending_at);
+CREATE INDEX IF NOT EXISTS idx_qf_task_runs_coalesce_exit
+    ON queue_forecast_task_runs (COALESCE(started_at, resolved_at));
+
 -- Retention: prune tasks older than the retention window by task_created
 -- (deleting old tasks cascades to their task_runs via the FK).
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_created
