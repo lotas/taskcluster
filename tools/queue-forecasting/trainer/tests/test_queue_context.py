@@ -490,3 +490,59 @@ def test_sweep_is_subquadratic():
         f"speedup={oracle_small_s / max(sweep_small_s, 1e-9):.1f}x"
     )
     assert oracle_small_s / max(sweep_small_s, 1e-9) >= 5.0
+
+
+def test_sweep_stays_linear_at_production_scale():
+    """20k (the test above) didn't catch three separate O(n*m) terms that only
+    dominated at the real production hot-queue scale (measured live:
+    4,038,298 target rows / 479 queues in one cohort) -- self_mask's full-array
+    `(tids==tid)&(rids==rid)` scan (fixed: O(1) dict lookup), same_ahead's
+    slice+sum (fixed: subtract-two-sorted-counts identity), and the oldest-age
+    prefix scan (fixed: monotonic prefix-max + binary search). Before those
+    fixes: 100k/100k took 56s and 200k/200k took 196s (~3.5x for a 2x input --
+    superlinear). After: ~5.8s and ~12s (~2.1x -- linear). This asserts a
+    bound that fails loudly (not silently, hours later, on a live cohort) if
+    any of those terms regresses, while leaving real margin for slower CI
+    hardware than the ~57us/row measured during the investigation.
+    """
+    rng = np.random.default_rng(2)
+    base = pd.Timestamp("2026-06-01T00:00:00Z").value
+    span = 14 * 24 * 3600 * 1_000_000_000
+    n = 100_000
+
+    p = base + rng.integers(0, span, size=n)
+    started = p + rng.integers(1, span, size=n)
+    runs = pd.DataFrame({
+        "task_id": [f"t{i}" for i in range(n)],
+        "run_id": 0,
+        "pending_at": pd.to_datetime(p, utc=True),
+        "started_at": pd.to_datetime(started, utc=True),
+        "resolved_at": pd.NaT,
+        "priority_at_pending": "medium",
+        "task_queue_id": "q/hot",
+        "repo_family": "try",
+    })
+    # Targets are the SAME rows as the reference set, so self-exclusion (the
+    # self_mask fix) is actually exercised for every row, matching the
+    # real training case where a task's own run also appears as a reference.
+    df = pd.DataFrame({
+        "task_id": [f"t{i}" for i in range(n)],
+        "run_id": 0,
+        "pending_at": pd.to_datetime(p, utc=True),
+        "priority_at_pending": "medium",
+        "task_queue_id": "q/hot",
+        "repo_family": "try",
+        "queue_pending": 10,
+    })
+    wc = pd.DataFrame(
+        columns=[
+            "task_queue_id", "sampled_at", "running_workers",
+            "existing_capacity", "claimed_tasks",
+        ]
+    )
+
+    t0 = time.perf_counter()
+    add_queue_context_features(df.copy(), runs.copy(), wc.copy())
+    sweep_s = time.perf_counter() - t0
+    print(f"\n[timing] sweep 100k/100k (self-referencing) = {sweep_s:.2f}s")
+    assert sweep_s < 20.0, f"100k/100k sweep too slow: {sweep_s:.2f}s (was 56s pre-fix)"

@@ -397,6 +397,11 @@ def _sweep_queue(
     rank_p_byp: dict[int, np.ndarray] = {}
     rank_exit_byp: dict[int, np.ndarray] = {}
     rank_tie_byp: dict[int, np.ndarray] = {}
+    # Running max of exit_byp (monotonic non-decreasing since it's a prefix
+    # max). Lets the oldest-age query below binary-search for the smallest
+    # index whose exit exceeds T in O(log m), instead of scanning a prefix of
+    # up to the whole rank's ref count per target row (see its usage below).
+    rank_prefix_max_exit: dict[int, np.ndarray] = {}
     fam_keys = ("try", "autoland", "release_beta")
     rank_fam_p: dict[tuple[int, str], np.ndarray] = {}
     rank_fam_exit: dict[tuple[int, str], np.ndarray] = {}
@@ -419,6 +424,7 @@ def _sweep_queue(
         rank_exit_byp[rvi] = exit_m[order]
         # ties is an object array of tuples; index via the same order.
         rank_tie_byp[rvi] = ties_m[order]
+        rank_prefix_max_exit[rvi] = np.maximum.accumulate(rank_exit_byp[rvi])
 
         for fk in fam_keys:
             fm = fams_m == fk
@@ -430,6 +436,19 @@ def _sweep_queue(
             np.searchsorted(exit_arr_sorted, T, side="right")
         )
 
+    # (task_id, run_id) is unique per PRIMARY KEY on queue_forecast_task_runs,
+    # so at most one reference row can match a given target's own key. Was:
+    # `(tids == tid) & (rids == rid)` -- two full-array comparisons over the
+    # WHOLE queue's reference set (size m), executed unconditionally at the
+    # top of EVERY target row's iteration. That's an O(n*m) term paid by every
+    # row regardless of whether self-exclusion even applies, and profiling
+    # showed it as the single largest contributor to production-scale runtime
+    # (see the same_ahead/oldest-age fixes above for the other two). One O(m)
+    # dict build per queue replaces it with an O(1) lookup per target row.
+    self_idx_by_key: dict[tuple, int] = {
+        (t, r): i for i, (t, r) in enumerate(zip(tids, rids))
+    }
+
     for pos in positions:
         T = out_t_ns[pos]
         target_rank = out_rank[pos]
@@ -437,17 +456,17 @@ def _sweep_queue(
         tid = out_tid[pos]
         rid = out_rid[pos]
 
-        # Self rows present in this reference group (same task_id & run_id). The
-        # oracle excludes exactly these from every count.
-        self_mask = (tids == tid) & (rids == rid)
-        self_present = bool(self_mask.any())
+        # Self row present in this reference group (same task_id & run_id). The
+        # oracle excludes exactly this from every count.
+        self_idx = self_idx_by_key.get((tid, rid))
+        self_present = self_idx is not None
         if self_present:
-            self_p = p_ns[self_mask]
-            self_exit = exit_ns[self_mask]
-            self_started = s_ns[self_mask]
-            self_rank = ranks[self_mask]
-            self_fam = fams[self_mask]
-            self_tie = ties[self_mask]
+            self_p = p_ns[self_idx : self_idx + 1]
+            self_exit = exit_ns[self_idx : self_idx + 1]
+            self_started = s_ns[self_idx : self_idx + 1]
+            self_rank = ranks[self_idx : self_idx + 1]
+            self_fam = fams[self_idx : self_idx + 1]
+            self_tie = ties[self_idx : self_idx + 1]
 
         # --- pending-at-T counts by rank class (raw, incl any self). ---
         n_higher = 0
@@ -471,12 +490,27 @@ def _sweep_queue(
             p_byp = rank_p_byp[target_rank]
             exit_byp = rank_exit_byp[target_rank]
             tie_byp = rank_tie_byp[target_rank]
-            # earlier: p < T AND exit > T.
+            # earlier: p < T AND exit > T. Was: exit_byp[:lt] > T).sum() -- an
+            # O(lt) slice+sum per target row (lt up to the whole rank's ref
+            # count), which is the O(n*m) term that dominated wall-clock at
+            # production scale (measured: 100k/100k=56s, 200k/200k=196s --
+            # ~3.5x for a 2x input, far worse than the O((n+m)log n) the rest
+            # of this function achieves). Same subtract-two-sorted-counts
+            # identity as pending_count() above, restricted to strict p<T:
+            #   count(p<T & exit>T) = count(p<T) - count(exit<=T)
+            #                         + count(p==T & exit==T)
+            # The correction undoes exit<=T rows with p==T (zero-duration,
+            # exit>=p forces exit==T exactly) that count(exit<=T) included but
+            # count(p<T) didn't -- bounded by the same-instant cohort size
+            # (already sliced below for the tie-break loop), not by m.
             lt = int(np.searchsorted(p_byp, T, side="left"))  # entries with p<T
+            rt = int(np.searchsorted(p_byp, T, side="right"))  # end of p==T block
             if lt > 0:
-                same_ahead += int((exit_byp[:lt] > T).sum())
+                count_exit_le = int(np.searchsorted(rank_exit_sorted[target_rank], T, side="right"))
+                same_ahead += lt - count_exit_le
+                if rt > lt:
+                    same_ahead += int((exit_byp[lt:rt] == T).sum())
             # same-instant block: p == T.
-            rt = int(np.searchsorted(p_byp, T, side="right"))
             if rt > lt:
                 si_exit = exit_byp[lt:rt]
                 si_tie = tie_byp[lt:rt]
@@ -522,14 +556,21 @@ def _sweep_queue(
             if rvi < target_rank:
                 continue
             p_byp = rank_p_byp[rvi]
-            exit_byp = rank_exit_byp[rvi]
             hi = int(np.searchsorted(p_byp, T, side="right"))
             if hi == 0:
                 continue
-            still = exit_byp[:hi] > T
-            if not still.any():
+            # Was: exit_byp[:hi] > T).any() + argmax -- an O(hi) scan per rank
+            # per target row (hi up to the whole rank's ref count), the second
+            # O(n*m)-shaped term found at production scale (paired with the
+            # same_ahead fix above; see its comment for the measured impact).
+            # rank_prefix_max_exit is monotonic non-decreasing (a running max),
+            # so binary-searching it for where it first exceeds T finds the
+            # smallest index whose exit_byp value itself exceeds T: if an
+            # earlier index qualified, the prefix max would already have
+            # exceeded T there. O(log m) instead of O(hi).
+            first = int(np.searchsorted(rank_prefix_max_exit[rvi], T, side="right"))
+            if first >= hi:
                 continue
-            first = int(np.argmax(still))  # first True == smallest pending
             cand = int(p_byp[first])
             if oldest_p is None or cand < oldest_p:
                 oldest_p = cand
