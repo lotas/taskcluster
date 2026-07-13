@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -480,10 +481,20 @@ def load_anomalous_dates(c: Config) -> set[datetime.date]:
             return {r[0] for r in cur.fetchall()}
 
 
+def _log_step(label: str, t0: float) -> None:
+    """Bracket-style timing log, matching this codebase's plain-print
+    convention elsewhere (e.g. [backfill], [ensure-baseline]). Temporary
+    instrumentation to localize which stage of load() is slow now that the
+    queue-context SQL query itself is no longer the bottleneck (2026-07)."""
+    print(f"[data_loader] {label}: {time.monotonic() - t0:.1f}s", flush=True)
+
+
 def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame | None = None) -> pd.DataFrame:
     path = cache_path(c)
+    t0 = time.monotonic()
     if path.exists() and not refresh_cache:
         df = pd.read_parquet(path)
+        _log_step("main dataset (cache hit)", t0)
     else:
         dsn = os.environ["DATABASE_URL"]
         w = compute_windows(c)
@@ -506,8 +517,10 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
 
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path, index=False)
+        _log_step(f"main dataset (SQL fetch, {len(df)} rows)", t0)
 
     if c.residual:
+        t0 = time.monotonic()
         bl_dir = c.baseline_dir or "baseline"
         # Strip leading "data/" so configs can spell either "baseline_filtered" or
         # "data/baseline_filtered" interchangeably; both resolve under data/.
@@ -521,10 +534,12 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
             raise RuntimeError(
                 f"Baseline join changed row count: {before} -> {len(df)} (duplicate keys?)"
             )
+        _log_step("residual baseline join", t0)
 
     if c.velocity_features and c.velocity_features.get("enabled"):
         from src.velocity_features import add_velocity_features
 
+        t0 = time.monotonic()
         w = compute_windows(c)
         worker_counts = load_worker_counts(c, w.train_start, w.as_of_date, refresh_cache=refresh_cache)
         if worker_pools is None:
@@ -536,6 +551,7 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
             tolerance_minutes=tol,
             trailing_windows_minutes=trailing,
         )
+        _log_step("velocity features (load + compute)", t0)
 
     if c.throughput_features and c.throughput_features.get("enabled"):
         from src.queue_throughput import add_throughput_features
@@ -543,24 +559,34 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
         w = compute_windows(c)
         windows = tuple(c.throughput_features.get("windows_minutes", [15, 60]))
         max_window = max(windows) if windows else 60
+        t0 = time.monotonic()
         runs_df = load_task_runs_for_throughput(
             c,
             w.train_start - pd.Timedelta(minutes=max_window + 30),
             w.as_of_date,
             refresh_cache=refresh_cache,
         )
+        _log_step(f"throughput reference load (SQL, {len(runs_df)} rows)", t0)
+        t0 = time.monotonic()
         df = add_throughput_features(df, runs_df, windows_minutes=windows)
+        _log_step("throughput features (compute)", t0)
 
     if getattr(c, "queue_context_features", None) and c.queue_context_features.get("enabled"):
         from src.queue_context import add_queue_context_features
 
         w = compute_windows(c)
+        t0 = time.monotonic()
         runs_qc = load_task_runs_for_queue_context(
             c, w.train_start - pd.Timedelta(minutes=90), w.as_of_date,
             refresh_cache=refresh_cache,
         )
+        _log_step(f"queue-context reference load (SQL, {len(runs_qc)} rows)", t0)
+        t0 = time.monotonic()
         wc = load_worker_counts(c, w.train_start - pd.Timedelta(minutes=30), w.as_of_date,
                                 refresh_cache=refresh_cache)
+        _log_step(f"worker-counts load (SQL, {len(wc)} rows)", t0)
+        t0 = time.monotonic()
         df = add_queue_context_features(df, runs_qc, wc)
+        _log_step(f"queue-context features (compute, {len(df)} rows)", t0)
 
     return df
