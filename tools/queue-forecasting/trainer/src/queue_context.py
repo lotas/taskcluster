@@ -25,6 +25,8 @@ Two implementations live here and MUST agree byte-for-byte:
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 
@@ -234,7 +236,27 @@ def add_queue_context_features(
 
     ref_by_queue = {q: g for q, g in ref.groupby("task_queue_id", sort=False)}
 
-    for qid, positions in target_pos_by_queue.items():
+    # Temporary instrumentation (2026-07): localize the actual per-queue
+    # throughput now that this runs against production-scale reference sets
+    # (millions of rows) rather than the 20k-row scale this was benchmarked
+    # at. Prints a heartbeat every ~5% of queues so a slow run is visible
+    # within minutes instead of only at completion.
+    n_queues = len(target_pos_by_queue)
+    print(f"[queue_context] sweeping {n} target rows across {n_queues} queues "
+          f"({len(ref)} reference rows)", flush=True)
+    _sweep_t0 = time.monotonic()
+    _heartbeat_every = max(1, n_queues // 20)
+    _targets_done = 0
+
+    for _qi, (qid, positions) in enumerate(target_pos_by_queue.items()):
+        if _qi % _heartbeat_every == 0:
+            elapsed = time.monotonic() - _sweep_t0
+            rate = _targets_done / elapsed if elapsed > 0 else 0.0
+            print(f"[queue_context] queue {_qi}/{n_queues}, "
+                  f"{_targets_done}/{n} target rows done, "
+                  f"{elapsed:.1f}s elapsed, {rate:.0f} rows/s", flush=True)
+        _targets_done += len(positions)
+
         g = ref_by_queue.get(qid)
         if g is None or len(g) == 0:
             # No reference runs: counts stay 0; oldest NaN. Coverage handled below.
@@ -270,6 +292,9 @@ def add_queue_context_features(
             he_incl_self_arr,
             coverage_arr,
         )
+
+    print(f"[queue_context] sweep done: {n} rows / {n_queues} queues in "
+          f"{time.monotonic() - _sweep_t0:.1f}s", flush=True)
 
     out["pending_higher_priority_same_queue"] = higher_arr
     out["pending_same_priority_same_queue"] = same_arr
