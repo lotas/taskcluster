@@ -1,5 +1,5 @@
 import { createPool } from './db.js';
-import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL } from './utils.js';
+import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL, writeLineWithBackpressure } from './utils.js';
 
 const pool = createPool(process.env.DATABASE_URL);
 
@@ -618,7 +618,7 @@ async function runExportBaselinePredictions({ fromDate, toDate, outputPath, excl
     for (const row of rowsRes.rows) {
       const blD = predictDurationFromStats(row, stats);
       const blW = predictWaitFromStats(row, waitStats);
-      out.write(JSON.stringify({
+      await writeLineWithBackpressure(out, JSON.stringify({
         task_id: row.task_id,
         run_id:  row.run_id,
         pending_at: row.pending_at instanceof Date ? row.pending_at.toISOString() : row.pending_at,

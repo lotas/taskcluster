@@ -3,6 +3,22 @@ export function normalizeMetadataName(name) {
   return name.replace(/@[0-9a-f]{12,}$/i, '').trim();
 }
 
+/**
+ * Write a line to a stream, awaiting 'drain' if the internal buffer is over
+ * highWaterMark (backpressure). Without this, writing faster than the
+ * underlying disk can flush queues chunks in memory unboundedly -- observed
+ * live during a ~22-day baseline regen in predictor.js: ~2.44M buffered
+ * lines, "JavaScript heap out of memory".
+ */
+export function writeLineWithBackpressure(stream, line) {
+  const ok = stream.write(line);
+  if (ok) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    stream.once('drain', resolve);
+    stream.once('error', reject);
+  });
+}
+
 export function pendingBucket(queuePending) {
   if (queuePending == null) return null;
   const n = parseInt(queuePending, 10);
