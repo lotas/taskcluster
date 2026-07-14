@@ -62,3 +62,17 @@ test('writeLineWithBackpressure rejects if the stream errors while waiting', asy
   await assert.rejects(second, /disk full/);
   await first.catch(() => {}); // first may also reject on destroy; not under test here
 });
+
+test('writeLineWithBackpressure does not leak listeners across many backpressure events', async () => {
+  // Regression test: the first fix waited for 'drain' correctly but left the
+  // sibling 'error' (or 'drain') once-listener registered forever whenever
+  // the other one fired -- an unbounded leak across a multi-million-row
+  // export that surfaced live as MaxListenersExceededWarning and eventual
+  // heap OOM, despite backpressure being awaited correctly.
+  const { stream } = makeSlowStream({ drainDelayMs: 0 });
+  for (let i = 0; i < 200; i++) {
+    await writeLineWithBackpressure(stream, `${i}\n`);
+  }
+  assert.equal(stream.listenerCount('drain'), 0);
+  assert.equal(stream.listenerCount('error'), 0);
+});

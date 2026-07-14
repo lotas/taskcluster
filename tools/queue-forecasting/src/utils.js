@@ -14,8 +14,20 @@ export function writeLineWithBackpressure(stream, line) {
   const ok = stream.write(line);
   if (ok) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    stream.once('drain', resolve);
-    stream.once('error', reject);
+    // Only one of these fires per pending write. Each must remove the
+    // other, or the one that didn't fire lingers on the stream forever --
+    // observed live as an unbounded 'error' listener leak (Max
+    // ListenersExceededWarning) across a multi-million-row export.
+    const onDrain = () => {
+      stream.removeListener('error', onError);
+      resolve();
+    };
+    const onError = (err) => {
+      stream.removeListener('drain', onDrain);
+      reject(err);
+    };
+    stream.once('drain', onDrain);
+    stream.once('error', onError);
   });
 }
 
