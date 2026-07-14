@@ -311,9 +311,12 @@ def add_queue_context_features(
     out[_HIGHER_OR_EQUAL_INCL_SELF] = he_incl_self_arr
     out["backlog_coverage_ratio"] = coverage_arr
 
+    _cap_t0 = time.monotonic()
     out = _attach_capacity(
         out, worker_counts, capacity_staleness_s=capacity_staleness_s
     )
+    print(f"[queue_context] capacity attach done: {n} rows in "
+          f"{time.monotonic() - _cap_t0:.1f}s", flush=True)
 
     drop_cols = ["_rank", "_t_ns", "_tie", _HIGHER_OR_EQUAL_INCL_SELF]
     return out.drop(columns=[c for c in drop_cols if c in out.columns])
@@ -920,16 +923,28 @@ def _attach_capacity(
     Per-capacity ratios are NaN (never imputed 0) when capacity is NULL or 0.
     """
     n = len(out)
-    out["running_workers"] = np.nan
-    out["existing_capacity"] = np.nan
-    out["claimed_tasks"] = np.nan
-    out["capacity_sample_age_s"] = np.nan
-    out["capacity_null_reason"] = "no_sample"
-    out["pending_total_per_capacity"] = np.nan
-    out["pending_higher_or_equal_per_capacity"] = np.nan
-    out["running_per_capacity"] = np.nan
 
-    if n == 0:
+    running_arr = np.full(n, np.nan)
+    capacity_arr = np.full(n, np.nan)
+    claimed_arr = np.full(n, np.nan)
+    age_arr = np.full(n, np.nan)
+    reason_arr = np.full(n, "no_sample", dtype=object)
+    total_per_cap = np.full(n, np.nan)
+    he_per_cap = np.full(n, np.nan)
+    running_per_cap = np.full(n, np.nan)
+
+    def _write_columns() -> None:
+        out["running_workers"] = running_arr
+        out["existing_capacity"] = capacity_arr
+        out["claimed_tasks"] = claimed_arr
+        out["capacity_sample_age_s"] = age_arr
+        out["capacity_null_reason"] = reason_arr
+        out["pending_total_per_capacity"] = total_per_cap
+        out["pending_higher_or_equal_per_capacity"] = he_per_cap
+        out["running_per_capacity"] = running_per_cap
+
+    if n == 0 or worker_counts is None or len(worker_counts) == 0:
+        _write_columns()
         return out
 
     queue_pending = pd.to_numeric(out["queue_pending"], errors="coerce").to_numpy(
@@ -937,73 +952,99 @@ def _attach_capacity(
     )
     he_incl_self = out[_HIGHER_OR_EQUAL_INCL_SELF].to_numpy(dtype=float)
     t_ns = out["_t_ns"].to_numpy()
-
-    if worker_counts is None or len(worker_counts) == 0:
-        return out
+    qids = out["task_queue_id"].to_numpy()
 
     wc = worker_counts.copy()
     wc["sampled_at"] = pd.to_datetime(wc["sampled_at"], utc=True).astype(
         "datetime64[ns, UTC]"
     )
     wc["_s_ns"] = wc["sampled_at"].astype("int64")
-    wc_by_queue = {q: g.sort_values("_s_ns") for q, g in wc.groupby("task_queue_id")}
 
-    for pos, idx in enumerate(out.index):
-        qid = out.at[idx, "task_queue_id"]
-        T = t_ns[pos]
-        g = wc_by_queue.get(qid)
-        if g is None or len(g) == 0:
+    # Group target rows by queue once, then for each queue binary-search each
+    # target's timestamp into that queue's (sorted) sample timestamps instead
+    # of rescanning the whole per-queue sample array for every row -- the
+    # previous version recomputed `s_ns <= T` (O(samples)) inside a Python
+    # loop over every one of the n target rows (O(n x samples) overall, plus
+    # ~8 `.at[]` scalar writes per row), which is what made this the
+    # remaining bottleneck once the sweep itself was fixed.
+    target_pos_by_queue: dict[object, list[int]] = {}
+    for pos, qid in enumerate(qids):
+        target_pos_by_queue.setdefault(qid, []).append(pos)
+
+    for qid, g in wc.groupby("task_queue_id", sort=False):
+        positions = target_pos_by_queue.get(qid)
+        if not positions:
             continue
 
-        s_ns = g["_s_ns"].to_numpy()
-        eligible = s_ns <= T
-        if not eligible.any():
+        g_sorted = g.sort_values("_s_ns")
+        s_ns = g_sorted["_s_ns"].to_numpy()
+        running_vals = pd.to_numeric(
+            g_sorted["running_workers"], errors="coerce"
+        ).to_numpy(dtype=float)
+        cap_vals = pd.to_numeric(
+            g_sorted["existing_capacity"], errors="coerce"
+        ).to_numpy(dtype=float)
+        claimed_vals = pd.to_numeric(
+            g_sorted["claimed_tasks"], errors="coerce"
+        ).to_numpy(dtype=float)
+
+        positions = np.asarray(positions)
+        T = t_ns[positions]
+        # Index of the latest sample with sampled_at <= T (searchsorted on a
+        # sorted array is the vectorized equivalent of the old
+        # flatnonzero(s_ns <= T)[-1]); -1 means no eligible sample.
+        sample_idx = np.searchsorted(s_ns, T, side="right") - 1
+        has_sample = sample_idx >= 0
+        if not has_sample.any():
             continue
 
-        # Latest sample at or before T.
-        sel = np.flatnonzero(eligible)[-1]
-        # Enforce the staleness bound: a sample older than capacity_staleness_s
-        # is no usable reading -> leave as no_sample / NaN (matches JS).
-        age_s = (T - s_ns[sel]) / 1_000_000_000.0
-        if age_s > capacity_staleness_s:
+        sp = positions[has_sample]
+        si = sample_idx[has_sample]
+        age_s = (T[has_sample] - s_ns[si]) / 1_000_000_000.0
+
+        # Enforce the staleness bound: a sample older than
+        # capacity_staleness_s is no usable reading -> leave as
+        # no_sample / NaN (matches JS).
+        fresh = age_s <= capacity_staleness_s
+        if not fresh.any():
             continue
-        row = g.iloc[sel]
 
-        running = row["running_workers"]
-        cap = row["existing_capacity"]
-        claimed = row["claimed_tasks"]
+        fp = sp[fresh]
+        fi = si[fresh]
+        fage = age_s[fresh]
 
-        out.at[idx, "running_workers"] = running
-        out.at[idx, "existing_capacity"] = cap
-        out.at[idx, "claimed_tasks"] = claimed
-        out.at[idx, "capacity_sample_age_s"] = age_s
+        running_arr[fp] = running_vals[fi]
+        capacity_arr[fp] = cap_vals[fi]
+        claimed_arr[fp] = claimed_vals[fi]
+        age_arr[fp] = fage
 
-        cap_is_null = (
-            cap is None
-            or (isinstance(cap, float) and np.isnan(cap))
-            or pd.isna(cap)
+        cap_f = capacity_arr[fp]
+        cap_null = np.isnan(cap_f)
+        reason_arr[fp[cap_null]] = "static_pool_null"
+
+        nonnull = ~cap_null
+        zero_cap = nonnull & (cap_f == 0)
+        reason_arr[fp[zero_cap]] = "zero_capacity"
+
+        ok = nonnull & (cap_f != 0)
+        if not ok.any():
+            continue
+        ok_pos = fp[ok]
+        ok_cap = cap_f[ok]
+        reason_arr[ok_pos] = "ok"
+
+        qp_ok = queue_pending[ok_pos]
+        finite_qp = np.isfinite(qp_ok)
+        total_per_cap[ok_pos[finite_qp]] = qp_ok[finite_qp] / ok_cap[finite_qp]
+
+        he_per_cap[ok_pos] = he_incl_self[ok_pos] / ok_cap
+
+        running_ok = running_arr[ok_pos]
+        running_finite = np.isfinite(running_ok)
+        running_per_cap[ok_pos[running_finite]] = (
+            running_ok[running_finite] / ok_cap[running_finite]
         )
-        if cap_is_null:
-            out.at[idx, "capacity_null_reason"] = "static_pool_null"
-            continue
-        cap_val = float(cap)
-        if cap_val == 0:
-            out.at[idx, "capacity_null_reason"] = "zero_capacity"
-            continue
 
-        out.at[idx, "capacity_null_reason"] = "ok"
-        qp = queue_pending[pos]
-        if np.isfinite(qp):
-            out.at[idx, "pending_total_per_capacity"] = qp / cap_val
-        out.at[idx, "pending_higher_or_equal_per_capacity"] = (
-            he_incl_self[pos] / cap_val
-        )
-        running_val = (
-            float(running)
-            if running is not None and not pd.isna(running)
-            else np.nan
-        )
-        if np.isfinite(running_val):
-            out.at[idx, "running_per_capacity"] = running_val / cap_val
+    _write_columns()
 
     return out
