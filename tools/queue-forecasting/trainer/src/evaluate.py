@@ -172,16 +172,25 @@ WAIT_BUCKETS = [
 
 
 def compute_bucket_metrics(y_true: np.ndarray, y_pred: np.ndarray,
-                           y_pred_p90: np.ndarray | None = None) -> dict[str, dict]:
+                           y_pred_p90: np.ndarray | None = None,
+                           y_pred_p90_guarded: np.ndarray | None = None) -> dict[str, dict]:
     """Per-bucket (MAE + within_2x) keyed by bucket name. Uses actual (y_true)
     to assign buckets, half-open intervals matching predictor.js.
 
     When ``y_pred_p90`` is supplied, each bucket also carries a raw-count
     ``p90_coverage`` entry ({eligible_n, covered_n}) — same shape as the
-    aggregate p90_coverage — so the tail (p90 miss) can be tracked per bucket."""
+    aggregate p90_coverage — so the tail (p90 miss) can be tracked per bucket.
+
+    ``y_pred_p90_guarded`` (the production guardrail floor applied to
+    ``y_pred_p90``) adds a parallel ``p90_coverage_guarded`` entry. The two
+    diverge whenever the guardrail floor binds -- which per the wait-model
+    guardrail is the common case on strong cells -- so a bucket's raw
+    ``p90_coverage`` does NOT represent what is actually served live; callers
+    that want the served miss rate must use the guarded entry."""
     yt = np.asarray(y_true, dtype=float)
     yp = np.asarray(y_pred, dtype=float)
     yp90 = np.asarray(y_pred_p90, dtype=float) if y_pred_p90 is not None else None
+    yp90g = np.asarray(y_pred_p90_guarded, dtype=float) if y_pred_p90_guarded is not None else None
     out: dict[str, dict] = {}
     for name, lo, hi in WAIT_BUCKETS:
         mask = np.isfinite(yt) & (yt >= lo) & (yt < hi)
@@ -192,18 +201,23 @@ def compute_bucket_metrics(y_true: np.ndarray, y_pred: np.ndarray,
             }
             if yp90 is not None:
                 empty["p90_coverage"] = {"eligible_n": 0, "covered_n": 0}
+            if yp90g is not None:
+                empty["p90_coverage_guarded"] = {"eligible_n": 0, "covered_n": 0}
             out[name] = empty
             continue
         row = per_row_metrics(y_true=yt[mask], y_pred=yp[mask],
-                              y_pred_p90=(yp90[mask] if yp90 is not None else None))
+                              y_pred_p90=(yp90[mask] if yp90 is not None else None),
+                              y_pred_p90_guarded=(yp90g[mask] if yp90g is not None else None))
         # Strip any extra keys to keep shape identical to predictor.js output,
-        # plus the optional per-bucket p90_coverage when p90 was supplied.
+        # plus the optional per-bucket p90 coverage entries when supplied.
         bucket = {
             "mae":       row["mae"],
             "within_2x": row["within_2x"],
         }
         if "p90_coverage" in row:
             bucket["p90_coverage"] = row["p90_coverage"]
+        if "p90_coverage_guarded" in row:
+            bucket["p90_coverage_guarded"] = row["p90_coverage_guarded"]
         out[name] = bucket
     return out
 
@@ -223,6 +237,10 @@ def aggregate_buckets(day_buckets: list[dict[str, dict]]) -> dict[str, dict]:
         "p90_coverage" in day[name]
         for day in day_buckets for name, _, _ in WAIT_BUCKETS if name in day
     )
+    has_p90_guarded = bool(day_buckets) and all(
+        "p90_coverage_guarded" in day[name]
+        for day in day_buckets for name, _, _ in WAIT_BUCKETS if name in day
+    )
     for day in day_buckets:
         for name, _, _ in WAIT_BUCKETS:
             if name not in day:
@@ -235,6 +253,10 @@ def aggregate_buckets(day_buckets: list[dict[str, dict]]) -> dict[str, dict]:
                 agg[name].setdefault("p90_coverage", {"eligible_n": 0, "covered_n": 0})
                 agg[name]["p90_coverage"]["eligible_n"] += day[name]["p90_coverage"]["eligible_n"]
                 agg[name]["p90_coverage"]["covered_n"]  += day[name]["p90_coverage"]["covered_n"]
+            if has_p90_guarded:
+                agg[name].setdefault("p90_coverage_guarded", {"eligible_n": 0, "covered_n": 0})
+                agg[name]["p90_coverage_guarded"]["eligible_n"] += day[name]["p90_coverage_guarded"]["eligible_n"]
+                agg[name]["p90_coverage_guarded"]["covered_n"]  += day[name]["p90_coverage_guarded"]["covered_n"]
     # Derived rates (so the manifest is self-contained)
     for name in list(agg.keys()):
         mae = agg[name]["mae"]
@@ -247,6 +269,13 @@ def aggregate_buckets(day_buckets: list[dict[str, dict]]) -> dict[str, dict]:
             # p90 miss = fraction with actual > predicted p90 = 1 - coverage.
             agg[name]["p90_coverage_rate"] = (cov["covered_n"] / e) if e else float("nan")
             agg[name]["p90_miss_rate"]     = (1.0 - cov["covered_n"] / e) if e else float("nan")
+        covg = agg[name].get("p90_coverage_guarded")
+        if covg is not None:
+            eg = covg["eligible_n"]
+            # This is the miss rate that matters for the gate: it reflects the
+            # guardrail-floored p90 actually served live, not the raw model head.
+            agg[name]["p90_coverage_guarded_rate"] = (covg["covered_n"] / eg) if eg else float("nan")
+            agg[name]["p90_miss_rate_guarded"]      = (1.0 - covg["covered_n"] / eg) if eg else float("nan")
     return agg
 
 
@@ -339,7 +368,8 @@ def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
         for day, idx in day_keys_series.groupby(day_keys_series).groups.items():
             sel = idx.to_numpy()
             primary_buckets_per_day[str(day)] = compute_bucket_metrics(
-                p_yt[sel], p_yp[sel], y_pred_p90=p_yp90[sel])
+                p_yt[sel], p_yp[sel], y_pred_p90=p_yp90[sel],
+                y_pred_p90_guarded=(p_yp90g[sel] if p_yp90g is not None else None))
         primary_buckets_agg = aggregate_buckets(list(primary_buckets_per_day.values()))
 
         # Baseline-side: pull from the JSONs

@@ -89,6 +89,36 @@ def test_extract_row_and_summary(tmp_path, monkeypatch, capsys):
     assert rows_no_header == [], f"wait_time_residual should not appear: {rows_no_header}"
 
 
+def test_extract_30mplus_wait_p90_miss_prefers_guarded():
+    """The raw model p90 head is not what's served live -- the production
+    guardrail floors it by the baseline p90 first. p90_miss_rate_guarded is
+    the metric that reflects what's actually served; the plain
+    p90_miss_rate (pre-guard) must stay available separately for diagnosis,
+    not be silently blended into the same column."""
+    import scripts.summarize_walk_forward as swf
+
+    with_guarded = {
+        "target": "wait_time",
+        "evaluation": {"primary": {"buckets_aggregate": {
+            "30m+": {"p90_miss_rate": 0.10, "p90_miss_rate_guarded": 0.40},
+        }}},
+    }
+    assert swf.extract_30mplus_wait_p90_miss(with_guarded) == 0.10
+    assert swf.extract_30mplus_wait_p90_miss_guarded(with_guarded) == 0.40
+
+    # Older manifest predating the guarded-metric fix: guarded extractor
+    # returns None rather than silently falling back to the raw value, so
+    # the CSV can't blend the two under one column across manifest vintages.
+    raw_only = {
+        "target": "wait_time",
+        "evaluation": {"primary": {"buckets_aggregate": {
+            "30m+": {"p90_miss_rate": 0.10},
+        }}},
+    }
+    assert swf.extract_30mplus_wait_p90_miss(raw_only) == 0.10
+    assert swf.extract_30mplus_wait_p90_miss_guarded(raw_only) is None
+
+
 def test_skipped_manifests_excluded_from_csv(tmp_path, monkeypatch):
     """Skip-manifests written by train.py when anomaly filter empties train/val
     must not appear as all-NaN rows in the summary CSV."""

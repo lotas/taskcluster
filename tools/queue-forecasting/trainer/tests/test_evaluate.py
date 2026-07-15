@@ -162,6 +162,59 @@ def test_compute_bucket_metrics_assigns_correctly():
     assert buckets["30m+"]["mae"]["eligible_n"] == 1
 
 
+def test_compute_bucket_metrics_can_report_guarded_p90_coverage():
+    # True 30m+ wait = 2000s. Raw model p90 undershoots badly (1500s -> miss).
+    # The production guardrail floor (baseline p90 = 2500s) would have
+    # covered it -- what's actually served differs from the raw model head.
+    # compute_bucket_metrics had no way to report this: it only ever accepted
+    # the raw model p90, so the bucket-level miss rate (the walk-forward
+    # ablation's primary gate metric) never reflected what's served live.
+    y_true = np.array([2000.0])
+    y_pred = np.array([1800.0])
+    y_pred_p90_raw = np.array([1500.0])
+    y_pred_p90_guarded = np.array([2500.0])
+
+    from src.evaluate import compute_bucket_metrics
+
+    raw_only = compute_bucket_metrics(y_true, y_pred, y_pred_p90=y_pred_p90_raw)
+    assert raw_only["30m+"]["p90_coverage"]["covered_n"] == 0
+
+    with_guard = compute_bucket_metrics(
+        y_true, y_pred,
+        y_pred_p90=y_pred_p90_raw,
+        y_pred_p90_guarded=y_pred_p90_guarded,
+    )
+    # Raw coverage is unchanged...
+    assert with_guard["30m+"]["p90_coverage"]["covered_n"] == 0
+    # ...but the guarded view (what's actually served) shows it covered.
+    assert with_guard["30m+"]["p90_coverage_guarded"]["covered_n"] == 1
+    assert with_guard["30m+"]["p90_coverage_guarded"]["eligible_n"] == 1
+
+
+def test_aggregate_buckets_aggregates_guarded_p90_and_derives_miss_rate():
+    from src.evaluate import aggregate_buckets
+
+    d1 = {
+        "30m+": {
+            "mae": {"eligible_n": 2, "sum_abs_error": 100.0},
+            "within_2x": {"eligible_n": 2, "hit_n": 1},
+            "p90_coverage_guarded": {"eligible_n": 2, "covered_n": 2},
+        },
+    }
+    d2 = {
+        "30m+": {
+            "mae": {"eligible_n": 2, "sum_abs_error": 100.0},
+            "within_2x": {"eligible_n": 2, "hit_n": 1},
+            "p90_coverage_guarded": {"eligible_n": 2, "covered_n": 0},
+        },
+    }
+    agg = aggregate_buckets([d1, d2])
+    assert agg["30m+"]["p90_coverage_guarded"]["eligible_n"] == 4
+    assert agg["30m+"]["p90_coverage_guarded"]["covered_n"] == 2
+    assert np.isclose(agg["30m+"]["p90_coverage_guarded_rate"], 0.5)
+    assert np.isclose(agg["30m+"]["p90_miss_rate_guarded"], 0.5)
+
+
 def test_aggregate_buckets_sums_raw_counts():
     from src.evaluate import aggregate_buckets
     d1 = {

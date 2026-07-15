@@ -32,6 +32,7 @@ FIELDNAMES = [
     "lt1m_mae", "1-5m_mae", "5-30m_mae", "30mplus_mae",
     "lt1m_within_2x", "1-5m_within_2x", "5-30m_within_2x", "30mplus_within_2x",
     "30mplus_wait_p90_miss",
+    "30mplus_wait_p90_miss_guarded",
     "hold_rows",
     "cohort_is_anomalous",
 ]
@@ -105,7 +106,11 @@ def _load_anomalous_dates_from_db() -> set[str]:
 
 
 def extract_30mplus_wait_p90_miss(eval_obj: dict) -> float | None:
-    """Pull the 30m+ actual-wait bucket p90 miss rate from a manifest dict.
+    """Pull the 30m+ actual-wait bucket RAW model p90 miss rate from a
+    manifest dict. NOTE: this is the miss rate of the model's own p90 head,
+    BEFORE the production guardrail floor is applied -- it does not reflect
+    what's actually served live (see extract_30mplus_wait_p90_miss_guarded).
+    Kept around for diagnosing the model head itself.
 
     Sourced from evaluate.py's per-bucket p90_coverage on the completed-only
     primary slice (the same 30m+ bucket used for 30mplus_within_2x). p90 miss =
@@ -117,6 +122,28 @@ def extract_30mplus_wait_p90_miss(eval_obj: dict) -> float | None:
         return None
     buckets = (eval_obj.get("evaluation", {}).get("primary", {}) or {}).get("buckets_aggregate") or {}
     miss = (buckets.get("30m+") or {}).get("p90_miss_rate")
+    if miss is None or miss != miss:  # None or NaN
+        return None
+    return miss
+
+
+def extract_30mplus_wait_p90_miss_guarded(eval_obj: dict) -> float | None:
+    """Pull the 30m+ actual-wait bucket GUARDED p90 miss rate -- i.e. the
+    miss rate of what's actually served live (model p90 floored by the
+    baseline p90 guardrail, per src/predictor.js). This is the metric the
+    Bet-1 design doc's primary gate (<35%/<30%) is actually defined against;
+    the plain p90_miss_rate measures the raw model head instead and can
+    diverge sharply since the guardrail floor binds on most strong cells.
+
+    Returns None when the run isn't the wait target, or the manifest
+    predates the guarded per-bucket metric (added 2026-07-15) -- deliberately
+    does NOT fall back to the raw rate, so older and newer manifests are
+    never silently blended under one number.
+    """
+    if eval_obj.get("target") != "wait_time":
+        return None
+    buckets = (eval_obj.get("evaluation", {}).get("primary", {}) or {}).get("buckets_aggregate") or {}
+    miss = (buckets.get("30m+") or {}).get("p90_miss_rate_guarded")
     if miss is None or miss != miss:  # None or NaN
         return None
     return miss
@@ -165,6 +192,7 @@ def extract_row(manifest_path: Path, anomalous_dates: set[str] | None = None) ->
         "delta_within_2x_pp": _pp(model_w2x, baseline_w2x),
         "p90_coverage": p90,
         "30mplus_wait_p90_miss": extract_30mplus_wait_p90_miss(data),
+        "30mplus_wait_p90_miss_guarded": extract_30mplus_wait_p90_miss_guarded(data),
         "hold_rows": (data.get("windows", {}).get("holdout") or {}).get("rows"),
         "cohort_is_anomalous": cohort_is_anomalous,
     }
@@ -232,11 +260,16 @@ def _print_target_block(target: str, target_rows: list[dict]) -> None:
         if bucket_30m:
             over_50 = sum(1 for b in bucket_30m if b >= 0.50)
             print(f"  30m+ w/in2x: mean={_fmt(stats.mean(bucket_30m) * 100, '%')}  ≥50%: {over_50}/{len(bucket_30m)}", file=sys.stderr)
+        miss30g = [r["30mplus_wait_p90_miss_guarded"] for r in cfg_rows if r.get("30mplus_wait_p90_miss_guarded") is not None]
+        if miss30g:
+            under_35 = sum(1 for m in miss30g if m < 0.35)
+            under_30 = sum(1 for m in miss30g if m < 0.30)
+            print(f"  30m+ wait p90 miss (served/guarded): mean={_fmt(stats.mean(miss30g) * 100, '%')}  <35%: {under_35}/{len(miss30g)}  <30%: {under_30}/{len(miss30g)}", file=sys.stderr)
+        else:
+            print("  30m+ wait p90 miss (served/guarded): n/a -- manifest predates the guarded metric, rerun to get it", file=sys.stderr)
         miss30 = [r["30mplus_wait_p90_miss"] for r in cfg_rows if r.get("30mplus_wait_p90_miss") is not None]
         if miss30:
-            under_35 = sum(1 for m in miss30 if m < 0.35)
-            under_30 = sum(1 for m in miss30 if m < 0.30)
-            print(f"  30m+ wait p90 miss: mean={_fmt(stats.mean(miss30) * 100, '%')}  <35%: {under_35}/{len(miss30)}  <30%: {under_30}/{len(miss30)}", file=sys.stderr)
+            print(f"  30m+ wait p90 miss (raw model head, NOT what's served): mean={_fmt(stats.mean(miss30) * 100, '%')}", file=sys.stderr)
         print("", file=sys.stderr)
 
     # Win counts — only within this target's configs, and only counting cohorts
