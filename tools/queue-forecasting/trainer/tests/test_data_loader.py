@@ -164,6 +164,36 @@ def test_queue_context_refresh_cache_bypasses_parquet(monkeypatch, tmp_path):
         )
 
 
+def test_downcast_categorical_columns_converts_present_columns():
+    import pandas as pd
+
+    df = pd.DataFrame({
+        "task_queue_id": ["q/a", "q/b", "q/a"],
+        "scheduler_id": ["s1", "s1", "s2"],
+        "metadata_name": ["m1", "m2", "m1"],
+        "normalized_name": ["n1", "n2", "n1"],
+        "repo_family": ["try", "autoland", "try"],
+        "priority_at_pending": ["high", "low", "high"],
+        "queue_pending": [1, 2, 3],
+    })
+    out = dl._downcast_categorical_columns(df)
+    for col in ["task_queue_id", "scheduler_id", "metadata_name",
+                "normalized_name", "repo_family", "priority_at_pending"]:
+        assert isinstance(out[col].dtype, pd.CategoricalDtype), col
+    # Values are unchanged, just the dtype/storage.
+    assert list(out["task_queue_id"]) == ["q/a", "q/b", "q/a"]
+    # Untouched columns keep their original dtype.
+    assert out["queue_pending"].dtype.kind in "iu"
+
+
+def test_downcast_categorical_columns_skips_absent_columns():
+    import pandas as pd
+
+    df = pd.DataFrame({"queue_pending": [1, 2, 3]})
+    out = dl._downcast_categorical_columns(df)  # no candidate columns present
+    assert list(out.columns) == ["queue_pending"]
+
+
 def test_queue_context_query_bounds_pending_at_and_task_created(monkeypatch, tmp_path):
     """load_task_runs_for_queue_context must floor pending_at/task_created at
     (window_start - lookback_days). Without this the reference-run query scans

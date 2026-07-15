@@ -34,6 +34,7 @@ FIELDNAMES = [
     "30mplus_wait_p90_miss",
     "30mplus_wait_p90_miss_guarded",
     "hold_rows",
+    "peak_rss_mb",
     "cohort_is_anomalous",
 ]
 
@@ -170,6 +171,9 @@ def extract_row(manifest_path: Path, anomalous_dates: set[str] | None = None) ->
     model_w2x = agg.get("within_2x_rate")
     baseline_w2x = baseline_agg.get("within_2x_rate")
     p90 = agg.get("p90_coverage_rate")
+    # None for manifests written before 2026-07-15 (predates this field) --
+    # not a fallback/estimate, just absent, so it can't be mistaken for "0".
+    peak_rss_mb = data.get("resource_usage", {}).get("peak_rss_mb")
 
     # Cohort flagged anomalous if ANY day in its holdout window is flagged.
     # Missing days (e.g. daily_health not yet populated) count as non-anomalous.
@@ -194,6 +198,7 @@ def extract_row(manifest_path: Path, anomalous_dates: set[str] | None = None) ->
         "30mplus_wait_p90_miss": extract_30mplus_wait_p90_miss(data),
         "30mplus_wait_p90_miss_guarded": extract_30mplus_wait_p90_miss_guarded(data),
         "hold_rows": (data.get("windows", {}).get("holdout") or {}).get("rows"),
+        "peak_rss_mb": peak_rss_mb,
         "cohort_is_anomalous": cohort_is_anomalous,
     }
     for bk, csv_key in zip(BUCKET_KEYS, BUCKET_CSV_KEYS):
@@ -270,6 +275,9 @@ def _print_target_block(target: str, target_rows: list[dict]) -> None:
         miss30 = [r["30mplus_wait_p90_miss"] for r in cfg_rows if r.get("30mplus_wait_p90_miss") is not None]
         if miss30:
             print(f"  30m+ wait p90 miss (raw model head, NOT what's served): mean={_fmt(stats.mean(miss30) * 100, '%')}", file=sys.stderr)
+        rss = [r["peak_rss_mb"] for r in cfg_rows if r.get("peak_rss_mb") is not None]
+        if rss:
+            print(f"  peak RSS : mean={_fmt(stats.mean(rss))}MB  max={_fmt(max(rss))}MB  (watch for a trend toward the container's mem_limit)", file=sys.stderr)
         print("", file=sys.stderr)
 
     # Win counts — only within this target's configs, and only counting cohorts

@@ -119,6 +119,45 @@ def test_extract_30mplus_wait_p90_miss_prefers_guarded():
     assert swf.extract_30mplus_wait_p90_miss_guarded(raw_only) is None
 
 
+def test_extract_row_includes_peak_rss_mb(tmp_path, monkeypatch):
+    """peak_rss_mb (added to train.py's manifest 2026-07-15, after
+    run_duration_residual was OOM-killed twice with zero visibility into how
+    close prior runs had come) must surface in the summary CSV, not just sit
+    unread in individual manifest.json files -- that's the whole point."""
+    import scripts.summarize_walk_forward as swf
+
+    fake_root = tmp_path / "models"
+    day_dir = fake_root / "2026-07-14"
+    day_dir.mkdir(parents=True)
+    (day_dir / "run_duration_residual_manifest.json").write_text(json.dumps({
+        "target": "run_duration",
+        "evaluation": {"primary": {
+            "aggregate": {"mae_s": 130.0, "within_2x_rate": 0.85, "p90_coverage_rate": 0.88},
+            "baseline_aggregate": {"mae_s": 150.0, "within_2x_rate": 0.80},
+            "buckets_aggregate": {},
+        }},
+        "windows": {"holdout": {"rows": 500000}},
+        "resource_usage": {"peak_rss_mb": 11234.5},
+    }))
+    monkeypatch.setattr(swf, "MODELS_DIR", fake_root)
+
+    row = swf.extract_row(day_dir / "run_duration_residual_manifest.json")
+    assert row["peak_rss_mb"] == 11234.5
+
+    # Older manifest predating this field: stays None, not a KeyError/crash.
+    (day_dir / "wait_time_residual_throughput_filtered_baseline_manifest.json").write_text(json.dumps({
+        "target": "wait_time",
+        "evaluation": {"primary": {
+            "aggregate": {"mae_s": 400.0, "within_2x_rate": 0.55, "p90_coverage_rate": 0.88},
+            "baseline_aggregate": {"mae_s": 450.0, "within_2x_rate": 0.50},
+            "buckets_aggregate": {},
+        }},
+        "windows": {"holdout": {"rows": 500000}},
+    }))
+    row2 = swf.extract_row(day_dir / "wait_time_residual_throughput_filtered_baseline_manifest.json")
+    assert row2["peak_rss_mb"] is None
+
+
 def test_skipped_manifests_excluded_from_csv(tmp_path, monkeypatch):
     """Skip-manifests written by train.py when anomaly filter empties train/val
     must not appear as all-NaN rows in the summary CSV."""

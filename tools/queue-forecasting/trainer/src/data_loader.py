@@ -28,6 +28,30 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 # global value. The modest global default lives in docker-compose.yml.
 TRAINER_WORK_MEM = os.environ.get("TRAINER_WORK_MEM", "512MB")
 
+# High-cardinality string columns that repeat heavily across rows (queue ids,
+# scheduler ids, task/normalized names, repo family, priority). These stay
+# object dtype for the full lifetime of the loaded DataFrame -- through every
+# join and feature-computation step -- unless downcast right after the fetch.
+# At production data volumes that's the dominant fixable memory cost: observed
+# live 2026-07-15, run_duration_residual OOM-killed twice against a 12g cgroup
+# limit (dmesg: anon-rss ~11.6-11.8GB) on a config with no other known
+# per-row-blowup bug, just a wide object-dtype frame held for the whole run.
+CATEGORICAL_DOWNCAST_COLUMNS = [
+    "task_queue_id", "scheduler_id", "metadata_name", "normalized_name",
+    "repo_family", "priority_at_pending",
+]
+
+
+def _downcast_categorical_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast whichever of CATEGORICAL_DOWNCAST_COLUMNS are present to pandas
+    'category' dtype, in place. Values and comparisons are unaffected --
+    groupby/merge/`.to_numpy()` all still see the original string values --
+    this only changes how repeated values are stored in memory."""
+    for col in CATEGORICAL_DOWNCAST_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    return df
+
 
 def _connect(dsn: str):
     """psycopg connection with a generous session work_mem for batch queries."""
@@ -515,9 +539,15 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
                     columns = [d.name for d in cur.description]
                     df = pd.DataFrame(rows, columns=columns)
 
+        df = _downcast_categorical_columns(df)
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path, index=False)
         _log_step(f"main dataset (SQL fetch, {len(df)} rows)", t0)
+
+    # Idempotent (astype("category") on an already-categorical column is a
+    # cheap no-op) -- also covers cache-hit reads of parquet files written
+    # before this downcast existed, without needing a cache-format bump.
+    df = _downcast_categorical_columns(df)
 
     if c.residual:
         t0 = time.monotonic()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import resource
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +40,19 @@ def _baseline_dir(c: cfg.Config) -> Path:
     if c.baseline_dir:
         return TRAINER_ROOT / "data" / _strip_data_prefix(c.baseline_dir)
     return TRAINER_ROOT / "data" / "baseline"
+
+
+def _peak_rss_mb() -> float:
+    """Process peak resident set size so far, in MB.
+
+    `ru_maxrss` is a running high-watermark for this process's whole
+    lifetime (Linux reports it in KB) -- reading it late in the run (right
+    before the manifest is written) captures the true peak without needing
+    to sample repeatedly. Added 2026-07-15 after run_duration_residual was
+    OOM-killed twice with no visibility into how close prior runs had come
+    to the ceiling -- this puts the number in every manifest going forward so
+    a growth trend shows up before the next OOM does."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def _split_by_pending_at(df: pd.DataFrame, c: cfg.Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -98,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
 
     train_df, val_df, hold_df = _split_by_pending_at(df, c)
     print(f"  train={len(train_df):,}  val={len(val_df):,}  hold={len(hold_df):,}")
+    # _split_by_pending_at copies each slice out (boolean-mask indexing always
+    # copies in pandas); df itself is never referenced again but stays alive
+    # for the rest of this function otherwise, doubling the peak footprint of
+    # the whole train+val+holdout window for no reason.
+    del df
 
     # Dates actually excluded from train/val; captured here so lineage records
     # the exact set used, not a re-query that could differ if the health table
@@ -358,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "model_params": c.model_params,
         "quantiles": c.quantiles,
+        "resource_usage": {"peak_rss_mb": round(_peak_rss_mb(), 1)},
         "evaluation": {
             "primary": {
                 "slice": "reason_resolved = 'completed'",
@@ -415,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     p90_cov_rate = report.primary_agg.get("p90_coverage_rate")
     if p90_cov_rate is not None and p90_cov_rate == p90_cov_rate:  # NaN check
         print(f"  p90 coverage: {p90_cov_rate * 100:.1f}% (target [85%, 95%])")
+    print(f"  peak RSS: {manifest['resource_usage']['peak_rss_mb']:,.0f} MB")
 
     # Per-bucket breakdown for wait target
     if c.target == "wait_time" and report.primary_buckets_agg:
