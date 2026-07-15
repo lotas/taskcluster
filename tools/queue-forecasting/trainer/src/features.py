@@ -97,9 +97,17 @@ class FeatureBuilder:
             if isinstance(tags, dict):
                 return tags.get(key)
             return None
+        categorical = set(self.config.categorical_features)
         for feat in tag_features:
             key = feat.split(".", 1)[1]
-            df[feat] = df["tags"].apply(lambda t, k=key: _get(t, k))
+            series = df["tags"].apply(lambda t, k=key: _get(t, k))
+            # .apply() always produces object dtype (dict values aren't
+            # natively categorical); downcast immediately for declared
+            # categorical tag features rather than leaving them object dtype
+            # through the rest of this wide intermediate frame -- for a
+            # tag-heavy config (run_duration_residual has 9 of these) that's
+            # real, avoidable peak memory (observed live 2026-07-15).
+            df[feat] = series.astype("category") if feat in categorical else series
         return df
 
     def _apply_derived(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -116,7 +124,12 @@ class FeatureBuilder:
             spec = derived["build_type_regex"]
             src = spec["source"]
             pattern = spec["pattern"]
-            df["build_type"] = df[src].astype("string").str.extract(pattern, expand=False)
+            series = df[src].astype("string").str.extract(pattern, expand=False)
+            df["build_type"] = (
+                series.astype("category")
+                if "build_type" in self.config.categorical_features
+                else series
+            )
         return df
 
     def _stats(self, X: pd.DataFrame, unseen: dict[str, float] | None) -> dict:

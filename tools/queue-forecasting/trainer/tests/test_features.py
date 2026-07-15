@@ -107,6 +107,44 @@ def test_build_type_regex_extraction():
     assert pd.isna(vals[2])
 
 
+def test_extract_tags_downcasts_categorical_tag_columns_immediately():
+    """tags.* columns are built object dtype by .apply() regardless (dict
+    values aren't natively categorical); for a tag-heavy config (e.g.
+    run_duration_residual's 9 tags.* fields) letting all of them sit object
+    dtype through the rest of _derive()'s wide intermediate frame -- rather
+    than downcasting the instant each is created -- is real, avoidable peak
+    memory (2026-07-15, alongside the same fix for the raw columns loaded in
+    data_loader.py)."""
+    c = _cfg(categorical_features=["tags.kind"], numeric_features=[])
+    b = FeatureBuilder(c)
+    df = _frame([{"tags": {"kind": "build"}}, {"tags": {"kind": "test"}}])
+    out = b._extract_tags(df)
+    assert isinstance(out["tags.kind"].dtype, pd.CategoricalDtype)
+    assert list(out["tags.kind"]) == ["build", "test"]
+
+
+def test_extract_tags_leaves_numeric_tag_columns_uncast():
+    c = _cfg(categorical_features=[], numeric_features=["tags.retries"])
+    b = FeatureBuilder(c)
+    df = _frame([{"tags": {"retries": "2"}}])
+    out = b._extract_tags(df)
+    assert not isinstance(out["tags.retries"].dtype, pd.CategoricalDtype)
+
+
+def test_apply_derived_downcasts_build_type_when_categorical():
+    c = _cfg(
+        target="run_duration", categorical_features=["build_type"], numeric_features=[],
+        derived_features={"build_type_regex": {"source": "metadata_name", "pattern": "/(debug|opt)[-/]"}},
+    )
+    b = FeatureBuilder(c)
+    df = _frame([
+        {"metadata_name": "test-linux2404-64/debug-mochitest-1"},
+        {"metadata_name": "test-linux2404-64/opt-mochitest-2"},
+    ])
+    out = b._apply_derived(df)
+    assert isinstance(out["build_type"].dtype, pd.CategoricalDtype)
+
+
 def test_dump_categories_round_trip(tmp_path):
     c = _cfg()
     train = _frame([

@@ -155,20 +155,27 @@ services:
       context: ../..
       dockerfile: tools/queue-forecasting/trainer/Dockerfile
     # Was 12g (observed peak ~9.4-9.6GB for a single run at the time). Raised
-    # 2026-07-15: run_duration_residual OOM-killed twice in a row against the
-    # 12g ceiling (dmesg: anon-rss ~11.6-11.8GB both times, oom_score_adj=200)
-    # -- a reproducible, current data-volume need above the old baseline, not
-    # a fluke. ~4.2GB actual usage of everything else combined (per `docker
-    # stats`) leaves plenty of room on this box's ~29.4GB physical RAM. The
-    # cap's PURPOSE is still
-    # bounding a runaway or an accidental second concurrent run so IT gets
-    # OOM-killed (visible, resumable via manifest-skip) instead of the whole
-    # VM thrashing (2026-07 incidents: 3 concurrent trainers exceeded
-    # physical RAM + swap and froze the host, twice) -- raising the number
-    # doesn't change that defense, it just stops single-run false positives.
-    # oom_score_adj makes this the first thing sacrificed if the kernel OOM
-    # killer has to choose outside any single container's cap.
-    mem_limit: "18g"
+    # to 18g 2026-07-15 after run_duration_residual OOM-killed twice at the
+    # 12g ceiling (anon-rss ~11.6-11.8GB) -- then OOM-killed AGAIN at 18g
+    # (anon-rss ~17.5GB) on a run that predated the features.py tags.*
+    # categorical downcast fix (9 tags.* columns for this config alone,
+    # previously all object dtype). Raised again to 22g alongside shipping
+    # that fix, rather than gambling the fix alone clears 18g on the next
+    # attempt -- each failed attempt costs a real ~15-20min SQL-fetch replay.
+    # ~4.2GB actual usage of everything else combined (per `docker stats`)
+    # leaves room on this box's ~29.4GB physical RAM (22g + ~4.5g others
+    # concurrent ~= 26.5g, ~3GB slack). If this OOMs again even with the
+    # categorical fixes deployed, that's a real leak or a genuine data-volume
+    # jump worth profiling directly rather than raising the number a third
+    # time. The cap's PURPOSE is still bounding a runaway or an accidental
+    # second concurrent run so IT gets OOM-killed (visible, resumable via
+    # manifest-skip) instead of the whole VM thrashing (2026-07 incidents: 3
+    # concurrent trainers exceeded physical RAM + swap and froze the host,
+    # twice) -- raising the number doesn't change that defense, it just stops
+    # single-run false positives. oom_score_adj makes this the first thing
+    # sacrificed if the kernel OOM killer has to choose outside any single
+    # container's cap.
+    mem_limit: "22g"
     oom_score_adj: 200
     depends_on:
       postgres:
