@@ -76,6 +76,24 @@ WITH ahead AS (
   JOIN queue_forecast_tasks t ON r.task_id = t.task_id
   WHERE t.task_queue_id = $1
     AND r.pending_at <= $2::timestamptz
+    -- Unlike the events CTE below, these "still pending" features have no
+    -- natural time window to bound against losslessly -- a task can in principle
+    -- still be pending from arbitrarily long ago. This bound is the same
+    -- "deliberately generous grace period, not a tight bound" tradeoff the
+    -- Python trainer already makes (queue_context.py/data_loader.py
+    -- ref_lower). 72h (not 24h) specifically so a catch-up pass after a
+    -- multi-day outage -- collector/live-predictor down, real Taskcluster
+    -- task_runs backfilled afterward with their true original pending_at --
+    -- still sees the FULL backlog for T = each row's own pending_at
+    -- (leakage-safe anchor, not wall-clock "now"; see module docstring), not
+    -- just an accidentally-truncated slice of it. Undercounting only kicks
+    -- in for a row whose peers waited >72h relative to ITS OWN pending_at,
+    -- which is a real anomaly rather than routine catch-up latency -- an
+    -- acceptable cost for turning an O(queue's entire retained history) scan
+    -- back into a bounded one. Observed live 2026-07-15: unbounded, this CTE
+    -- took ~3 minutes per prediction with 7 concurrent connections stuck on
+    -- it simultaneously, degrading live serving throughput queue-wide.
+    AND r.pending_at > $2::timestamptz - INTERVAL '72 hours'
     AND (COALESCE(r.started_at, r.resolved_at) IS NULL
          OR COALESCE(r.started_at, r.resolved_at) > $2::timestamptz)
     AND NOT (r.task_id = $4 AND r.run_id = $5)
@@ -108,6 +126,11 @@ allpending AS (
   JOIN queue_forecast_tasks t ON r.task_id = t.task_id
   WHERE t.task_queue_id = $1
     AND r.pending_at <= $2::timestamptz
+    -- Same bound and tradeoff as the ahead CTE above -- must match it, since
+    -- pending_total_incl_target (from this CTE) is the denominator paired
+    -- against ahead-derived numerators; a mismatched bound between the two
+    -- would silently skew backlog_coverage_ratio.
+    AND r.pending_at > $2::timestamptz - INTERVAL '72 hours'
     AND (COALESCE(r.started_at, r.resolved_at) IS NULL
          OR COALESCE(r.started_at, r.resolved_at) > $2::timestamptz)
 )

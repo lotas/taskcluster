@@ -15,6 +15,25 @@ const INTERVAL_MS = parseInt(process.env.DASHBOARD_INTERVAL_MS || '900000', 10);
 const AGGREGATIONS_WINDOW_DAYS = parseInt(process.env.AGGREGATIONS_WINDOW_DAYS || '30', 10);
 const DAILY_HEALTH_WINDOW_DAYS = parseInt(process.env.DAILY_HEALTH_WINDOW_DAYS || '60', 10);
 
+// Per-query timing: generate() fans out ~22 queries through a pool capped at
+// max:3, so a single query slowing down as tables grow can stretch the whole
+// Promise.all to many minutes with zero visibility into which one is at
+// fault (observed live 2026-07-15: dashboard stale for 3.5+ days, generate()
+// silent for 9+ minutes, no way to tell which of the 22 queries was slow).
+function timed(label, promise) {
+  const t0 = Date.now();
+  return promise.then(
+    (result) => {
+      console.log(`[dashboard-gen] ${label}: ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return result;
+    },
+    (err) => {
+      console.log(`[dashboard-gen] ${label} FAILED after ${((Date.now() - t0) / 1000).toFixed(1)}s: ${err.message}`);
+      throw err;
+    },
+  );
+}
+
 function formatInterval(ms) {
   const totalSeconds = Math.round(ms / 1000);
   if (totalSeconds % 3600 === 0) return `${totalSeconds / 3600}h`;
@@ -1818,31 +1837,31 @@ async function generate() {
       waitTailMissRate,
       topWaitMisses, topRunMisses,
     ] = await Promise.all([
-      queryTableHealth(pool),
-      queryFreshness(pool),
-      queryIngestion(pool),
-      queryOpenIssues(pool),
-      queryDailyHealth(pool),
-      queryRecentResolutions(pool),
-      queryTodayHourly(pool),
-      queryPredictorHealth(pool),
-      queryRecentResolved(pool),
-      queryRecentUnresolved(pool),
-      queryAggregationsOverall(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByDay(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByQueue(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByReason(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByScheduler(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByPriority(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByWaitBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByWaitBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByRunBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByRunBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByWaitBucket(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryAggregationsByRunBucket(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryWaitTailMissRate(pool, AGGREGATIONS_WINDOW_DAYS),
-      queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'wait'),
-      queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'run'),
+      timed('queryTableHealth', queryTableHealth(pool)),
+      timed('queryFreshness', queryFreshness(pool)),
+      timed('queryIngestion', queryIngestion(pool)),
+      timed('queryOpenIssues', queryOpenIssues(pool)),
+      timed('queryDailyHealth', queryDailyHealth(pool)),
+      timed('queryRecentResolutions', queryRecentResolutions(pool)),
+      timed('queryTodayHourly', queryTodayHourly(pool)),
+      timed('queryPredictorHealth', queryPredictorHealth(pool)),
+      timed('queryRecentResolved', queryRecentResolved(pool)),
+      timed('queryRecentUnresolved', queryRecentUnresolved(pool)),
+      timed('queryAggregationsOverall', queryAggregationsOverall(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByDay', queryAggregationsByDay(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByQueue', queryAggregationsByQueue(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByReason', queryAggregationsByReason(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByScheduler', queryAggregationsByScheduler(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByPriority', queryAggregationsByPriority(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByWaitBaselineLevel', queryAggregationsByWaitBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByWaitBaselineSampleSize', queryAggregationsByWaitBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByRunBaselineLevel', queryAggregationsByRunBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByRunBaselineSampleSize', queryAggregationsByRunBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByWaitBucket', queryAggregationsByWaitBucket(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryAggregationsByRunBucket', queryAggregationsByRunBucket(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryWaitTailMissRate', queryWaitTailMissRate(pool, AGGREGATIONS_WINDOW_DAYS)),
+      timed('queryTopMissesByName(wait)', queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'wait')),
+      timed('queryTopMissesByName(run)', queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'run')),
     ]);
 
     const manifests = loadLatestManifests();
