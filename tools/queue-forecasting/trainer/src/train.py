@@ -165,6 +165,14 @@ def main(argv: list[str] | None = None) -> int:
     train = builder.fit_transform(train_df)
     val   = builder.transform(val_df)
     hold  = builder.transform(hold_df)
+    # Captured before deleting -- the only remaining uses of train_df/val_df/
+    # hold_df were len() calls in the manifest, written after model training
+    # and evaluation. Without this, all three full-size DataFrames (train_df
+    # alone can be millions of rows) stay alive through the heaviest part of
+    # the run -- LightGBM training's own internal binned copy, prediction,
+    # evaluation -- for the sake of a row count read at the very end.
+    n_train_rows, n_val_rows, n_hold_rows = len(train_df), len(val_df), len(hold_df)
+    del train_df, val_df, hold_df
 
     # Train one model per quantile.
     def _make_model(alpha: float) -> LightGBMQuantileModel:
@@ -364,9 +372,9 @@ def main(argv: list[str] | None = None) -> int:
             "lookback_days":   c.lookback_days,
             "validation_days": c.validation_days,
             "holdout_days":    c.holdout_days,
-            "train":   {"start": w.train_start.isoformat(), "end": w.train_end.isoformat(), "rows": int(len(train_df))},
-            "val":     {"start": w.val_start.isoformat(),   "end": w.val_end.isoformat(),   "rows": int(len(val_df))},
-            "holdout": {"start": w.hold_start.isoformat(),  "end": w.hold_end.isoformat(),  "rows": int(len(hold_df))},
+            "train":   {"start": w.train_start.isoformat(), "end": w.train_end.isoformat(), "rows": n_train_rows},
+            "val":     {"start": w.val_start.isoformat(),   "end": w.val_end.isoformat(),   "rows": n_val_rows},
+            "holdout": {"start": w.hold_start.isoformat(),  "end": w.hold_end.isoformat(),  "rows": n_hold_rows},
         },
         "features": {
             "categorical":           c.categorical_features,
