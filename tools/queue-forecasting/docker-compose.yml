@@ -91,7 +91,11 @@ services:
     command: ["node", "src/predictor.js", "--date", "${PREDICT_DATE:-2026-04-20}"]
     # Baseline export buffers many days x hundreds-of-thousands of rows before
     # writing NDJSON; give more headroom than the other lightweight Node services.
-    mem_limit: "4g"
+    # postgres (14g) + live-predictor (3g) + this (6g) = 23g concurrent worst
+    # case, comfortably under the box's ~29.4GB physical RAM -- trainer (12g)
+    # runs at a different point in daily_walk_forward.sh, not concurrently
+    # with this container's baseline-export step.
+    mem_limit: "6g"
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,6 +106,17 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      # V8's default old-space ceiling is ~2GB regardless of the container's
+      # mem_limit above -- observed live as repeated "Reached heap limit ...
+      # 2040ish MB" crashes at wildly different cumulative row counts (2.44M,
+      # 4.76M, 2.23M), the signature of hitting a fixed ceiling rather than a
+      # size-proportional one. Deliberately kept well BELOW mem_limit (~75%),
+      # not equal to it: if this ever equaled mem_limit, V8's non-heap
+      # overhead (young-gen space, code space, native/off-heap buffers from
+      # the pg driver) would push RSS past the cgroup limit and the KERNEL
+      # would silently SIGKILL the container -- worse than the clean "FATAL
+      # ERROR: Reached heap limit" this setup is meant to surface instead.
+      NODE_OPTIONS: "--max-old-space-size=4608"
     volumes:
       - ./src:/app/tools/queue-forecasting/src
       # Mount the whole trainer/data tree so any baseline_dir variant (default
