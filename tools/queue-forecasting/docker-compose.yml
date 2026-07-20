@@ -241,12 +241,19 @@ services:
       - dashboard-html:/dashboard
 
   dashboard:
-    image: nginx:alpine
+    image: caddy:2-alpine
     mem_limit: "512m"
     ports:
       - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+      - "0.0.0.0:443:443/udp"
+    environment:
+      DASHBOARD_DOMAIN: ${DASHBOARD_DOMAIN:-queue-forecasting.taskcluster.net}
     volumes:
-      - dashboard-html:/usr/share/nginx/html:ro
+      - dashboard-html:/usr/share/caddy:ro
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
     restart: unless-stopped
     profiles:
       - dashboard
@@ -304,3 +311,5 @@ services:
 volumes:
   pgdata:
   dashboard-html:
+  caddy-data:
+  caddy-config:
