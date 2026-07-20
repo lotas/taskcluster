@@ -1301,6 +1301,153 @@ function renderDailyHealth(rows) {
   return html;
 }
 
+// ─── Daily Health Trend Charts ──────────────────────────────────────────────
+// Simplistic inline-SVG line charts (no charting deps). One series per metric,
+// tabbed via the same switchTab() mechanism as the manifest/walk-forward tabs.
+// Anomalous days get a marker so a visible step/spike can be checked against
+// the flags already surfaced in the table below.
+
+const CHART_W = 760, CHART_H = 220;
+const CHART_PAD = { top: 14, right: 14, bottom: 26, left: 54 };
+
+function fmtAxisValue(unit, v) {
+  if (unit === 'pct') return (v * 100).toFixed(0) + '%';
+  if (unit === 'duration') return fmtDur(v);
+  return fmtNum(Math.round(v));
+}
+
+function chartDateStr(r) {
+  return r.sample_date?.toISOString?.()
+    ? r.sample_date.toISOString().slice(0, 10)
+    : String(r.sample_date).slice(0, 10);
+}
+
+// `points`: ascending-by-date [{date, value, anomalous}]. `value` may be null
+// (rendered as a gap in the line). `clamp` optionally bounds the y-axis
+// (e.g. [0,1] for rate metrics) after the usual 10% padding.
+function renderLineChart(points, unit, clamp) {
+  const plotW = CHART_W - CHART_PAD.left - CHART_PAD.right;
+  const plotH = CHART_H - CHART_PAD.top - CHART_PAD.bottom;
+
+  const finiteValues = points.map(p => p.value).filter(v => v != null && Number.isFinite(v));
+  if (finiteValues.length === 0) return '<p class="muted">No data.</p>';
+
+  let yMin = Math.min(...finiteValues);
+  let yMax = Math.max(...finiteValues);
+  if (yMin === yMax) { yMin -= 1; yMax += 1; }
+  const pad = (yMax - yMin) * 0.1;
+  yMin -= pad; yMax += pad;
+  if (clamp) {
+    yMin = Math.max(clamp[0], yMin);
+    yMax = Math.min(clamp[1], yMax);
+  }
+
+  const n = points.length;
+  const xAt = (i) => CHART_PAD.left + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  const yAt = (v) => CHART_PAD.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  const coords = points.map((p, i) => ({
+    x: xAt(i),
+    y: (p.value != null && Number.isFinite(p.value)) ? yAt(p.value) : null,
+    date: p.date,
+    value: p.value,
+    anomalous: !!p.anomalous,
+  }));
+
+  let d = '';
+  let started = false;
+  for (const c of coords) {
+    if (c.y == null) { started = false; continue; }
+    d += (started ? ' L ' : ' M ') + c.x.toFixed(1) + ' ' + c.y.toFixed(1);
+    started = true;
+  }
+
+  const TICKS = 4;
+  let gridSvg = '';
+  for (let t = 0; t <= TICKS; t++) {
+    const v = yMin + (yMax - yMin) * (t / TICKS);
+    const y = yAt(v);
+    gridSvg += `<line x1="${CHART_PAD.left}" y1="${y.toFixed(1)}" x2="${CHART_W - CHART_PAD.right}" y2="${y.toFixed(1)}" class="chart-grid"/>`;
+    gridSvg += `<text x="${CHART_PAD.left - 8}" y="${(y + 3).toFixed(1)}" class="chart-axis-label" text-anchor="end">${esc(fmtAxisValue(unit, v))}</text>`;
+  }
+
+  const xTickCount = Math.min(6, n);
+  let xLabelsSvg = '';
+  for (let t = 0; t < xTickCount; t++) {
+    const i = Math.round(t * (n - 1) / (xTickCount - 1 || 1));
+    xLabelsSvg += `<text x="${coords[i].x.toFixed(1)}" y="${CHART_H - 6}" class="chart-axis-label" text-anchor="middle">${esc(points[i].date.slice(5))}</text>`;
+  }
+
+  let anomSvg = '';
+  for (const c of coords) {
+    if (c.anomalous && c.y != null) {
+      anomSvg += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" class="chart-anom-dot"/>`;
+    }
+  }
+
+  let lastSvg = '';
+  for (let i = coords.length - 1; i >= 0; i--) {
+    if (coords[i].y != null) {
+      lastSvg = `<circle cx="${coords[i].x.toFixed(1)}" cy="${coords[i].y.toFixed(1)}" r="3.5" class="chart-last-dot"/>`;
+      break;
+    }
+  }
+
+  const jsonAttr = JSON.stringify(coords)
+    .replace(/&/g, '&amp;')
+    .replace(/'/g, '&#39;');
+
+  return `
+  <div class="chart-wrap">
+    <svg class="chart-svg" viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none"
+         data-points='${jsonAttr}' data-unit="${unit}"
+         onmousemove="chartHover(event, this)" onmouseleave="chartHoverEnd(this)">
+      ${gridSvg}
+      <path d="${d}" class="chart-line"/>
+      ${anomSvg}
+      ${lastSvg}
+      ${xLabelsSvg}
+      <line class="chart-crosshair" x1="0" y1="${CHART_PAD.top}" x2="0" y2="${CHART_PAD.top + plotH}" style="display:none"/>
+      <circle class="chart-hover-dot" r="4" style="display:none"/>
+    </svg>
+    <div class="chart-tooltip" style="display:none"></div>
+  </div>`;
+}
+
+const DAILY_HEALTH_CHART_METRICS = [
+  { key: 'utilization', label: 'Utilization',   unit: 'pct',      clamp: [0, 1], get: r => r.utilization_p50 },
+  { key: 'total',        label: 'Total Tasks',   unit: 'count',   clamp: null,   get: r => r.n_total },
+  { key: 'completed',    label: 'Completed %',   unit: 'pct',     clamp: [0, 1], get: r => r.completion_rate },
+  { key: 'exceptions',   label: 'Exceptions %',  unit: 'pct',     clamp: [0, 1], get: r => r.exception_rate },
+  { key: 'waitp99',      label: 'Wait p99',      unit: 'duration', clamp: null,  get: r => r.wait_p99_s },
+  { key: 'capp50',       label: 'Cap p50',       unit: 'count',   clamp: null,   get: r => r.total_capacity_p50 },
+];
+
+function renderDailyHealthCharts(rows) {
+  if (!rows.length) return '<p class="muted">No daily health data.</p>';
+  const asc = [...rows].sort((a, b) => chartDateStr(a) < chartDateStr(b) ? -1 : 1);
+
+  let html = '<div class="tabs">';
+  DAILY_HEALTH_CHART_METRICS.forEach((m, i) => {
+    const active = i === 0 ? ' active' : '';
+    html += `<button class="tab-btn${active}" onclick="switchTab('healthchart', ${i}, this)">${esc(m.label)}</button>`;
+  });
+  html += '</div>';
+
+  DAILY_HEALTH_CHART_METRICS.forEach((m, i) => {
+    const points = asc.map(r => ({
+      date: chartDateStr(r),
+      value: m.get(r) != null ? Number(m.get(r)) : null,
+      anomalous: r.is_anomalous,
+    }));
+    const display = i === 0 ? 'block' : 'none';
+    html += `<div class="tab-panel healthchart-panel" id="healthchart-${i}" style="display:${display}">`;
+    html += renderLineChart(points, m.unit, m.clamp);
+    html += '</div>';
+  });
+  return html;
+}
+
 // Pull the {n,good,warn,bad} group for one flavor (`all` or `done`) out of a
 // row, given a wait/run prefix. Lets the band renderer stay flavor-agnostic.
 function pickBand(row, prefix, flavor) {
@@ -1563,6 +1710,21 @@ const CSS = `
   .mono { font-family: inherit; font-size: 12px; color: var(--fg2); }
   .task-link { color: var(--blue); text-decoration: none; }
   .task-link:hover { text-decoration: underline; }
+  .chart-wrap { position: relative; margin-bottom: 16px; }
+  .chart-svg { width: 100%; height: auto; display: block; }
+  .chart-grid { stroke: var(--border); stroke-width: 1; }
+  .chart-axis-label { fill: var(--fg2); font-size: 10px; font-family: inherit; }
+  .chart-line { fill: none; stroke: var(--blue); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart-anom-dot { fill: var(--yellow); }
+  .chart-last-dot { fill: var(--blue); stroke: var(--bg); stroke-width: 1.5; }
+  .chart-crosshair { stroke: var(--fg3); stroke-width: 1; }
+  .chart-hover-dot { fill: var(--fg); stroke: var(--bg); stroke-width: 1.5; }
+  .chart-tooltip {
+    position: absolute; pointer-events: none; z-index: 10;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 8px; font-size: 12px; color: var(--fg); white-space: nowrap;
+  }
+  .chart-tooltip-anom { color: var(--yellow); }
 `;
 
 const TAB_JS = `
@@ -1571,6 +1733,62 @@ function switchTab(group, idx, btn) {
   document.getElementById(group + '-' + idx).style.display = 'block';
   btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
+}
+
+function chartUnitFormat(unit, v) {
+  if (v == null) return '—';
+  if (unit === 'pct') return (v * 100).toFixed(1) + '%';
+  if (unit === 'duration') {
+    if (v < 60) return v.toFixed(1) + 's';
+    if (v < 3600) return (v / 60).toFixed(1) + 'm';
+    return (v / 3600).toFixed(1) + 'h';
+  }
+  return Math.round(v).toLocaleString('en-US');
+}
+
+function chartHover(evt, svg) {
+  const pts = JSON.parse(svg.dataset.points);
+  const unit = svg.dataset.unit;
+  const rect = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  const mouseX = (evt.clientX - rect.left) * (vb.width / rect.width);
+
+  let nearest = pts[0], bestDist = Infinity;
+  for (const p of pts) {
+    const dist = Math.abs(p.x - mouseX);
+    if (dist < bestDist) { bestDist = dist; nearest = p; }
+  }
+
+  const crosshair = svg.querySelector('.chart-crosshair');
+  const dot = svg.querySelector('.chart-hover-dot');
+  crosshair.setAttribute('x1', nearest.x);
+  crosshair.setAttribute('x2', nearest.x);
+  crosshair.style.display = 'block';
+
+  const tooltip = svg.parentElement.querySelector('.chart-tooltip');
+  if (nearest.value == null) {
+    dot.style.display = 'none';
+    tooltip.innerHTML = '<strong>' + nearest.date + '</strong><br>No data';
+  } else {
+    dot.setAttribute('cx', nearest.x);
+    dot.setAttribute('cy', nearest.y);
+    dot.style.display = 'block';
+    tooltip.innerHTML = '<strong>' + nearest.date + '</strong><br>' + chartUnitFormat(unit, nearest.value) +
+      (nearest.anomalous ? ' <span class="chart-tooltip-anom">&#9679; anomaly</span>' : '');
+  }
+  tooltip.style.display = 'block';
+
+  const wrapRect = svg.parentElement.getBoundingClientRect();
+  const mouseXInWrap = evt.clientX - wrapRect.left;
+  const maxLeft = wrapRect.width - 150;
+  tooltip.style.left = Math.min(mouseXInWrap + 12, Math.max(0, maxLeft)) + 'px';
+  tooltip.style.top = Math.max(0, evt.clientY - wrapRect.top - 36) + 'px';
+}
+
+function chartHoverEnd(svg) {
+  svg.querySelector('.chart-crosshair').style.display = 'none';
+  svg.querySelector('.chart-hover-dot').style.display = 'none';
+  svg.parentElement.querySelector('.chart-tooltip').style.display = 'none';
 }
 `;
 
@@ -1638,6 +1856,7 @@ ${data.manifests}
 ${data.walkForward}
 
 <h2>Daily Health (last ${DAILY_HEALTH_WINDOW_DAYS}d)</h2>
+${data.dailyHealthCharts}
 ${data.dailyHealth}
 `;
   return renderPage({
@@ -1877,6 +2096,7 @@ async function generate() {
       manifests: renderManifestsTabs(manifests),
       manifestsDir: `Latest: trainer/data/models/${latestDir}/`,
       dailyHealth: renderDailyHealth(dailyHealth),
+      dailyHealthCharts: renderDailyHealthCharts(dailyHealth),
       todayHourly: renderTodayHourly(todayHourly),
       walkForward: renderWalkForwardSummary(wfRows),
     });
