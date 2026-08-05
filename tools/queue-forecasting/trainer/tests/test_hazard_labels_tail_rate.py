@@ -51,6 +51,54 @@ def test_censored_row_outside_terminal_bin_does_not_contribute():
     assert rate == pytest.approx(1.0 / 200.0)
 
 
+def test_still_pending_row_contributes_its_person_time():
+    """A row still pending inside the terminal bin is right-censored, not
+    absent: it contributes exposure (no event) to the exponential MLE.
+    Dropping its person-time would inflate the rate and shorten every
+    deep-tail prediction -- the exact survivorship bias Bet 2 exists to fix.
+
+    Row A starts 100s into the terminal bin; row B is still pending 400s
+    into it. rate = 1 event / (100 + 400)s person-time."""
+    pending = pd.Series([CUTOFF - pd.Timedelta(seconds=1000), CUTOFF - pd.Timedelta(seconds=700)])
+    resolved = pd.Series([pd.NaT, pd.NaT])
+    wait = pd.Series([300.0 + 100.0, np.nan])  # row B never started
+    rate = fit_exponential_tail_rate(pending, resolved, wait, CUTOFF, EDGES)
+    assert rate == pytest.approx(1.0 / 500.0)
+
+
+def test_still_pending_row_short_of_terminal_bin_contributes_nothing():
+    """Censored rows only count once they actually reach the terminal bin --
+    a row pending just 200s has no exposure past t_last=300s."""
+    pending = pd.Series([CUTOFF - pd.Timedelta(seconds=1000), CUTOFF - pd.Timedelta(seconds=200)])
+    resolved = pd.Series([pd.NaT, pd.NaT])
+    wait = pd.Series([300.0 + 100.0, np.nan])
+    rate = fit_exponential_tail_rate(pending, resolved, wait, CUTOFF, EDGES)
+    assert rate == pytest.approx(1.0 / 100.0)
+
+
+def test_mle_is_unbiased_under_heavy_censoring():
+    """The property that matters: with a known exponential tail and most
+    terminal-bin rows still pending, the fitted rate must recover the truth.
+    Excluding censored person-time inflates this by >3x at this censoring
+    level, which would turn a true ~55h deep-tail quantile into ~15h."""
+    rng = np.random.default_rng(0)
+    n = 20_000
+    t_last = 300.0
+    true_rate = 1.0 / 1800.0
+    # Observation window is short relative to the mean tail wait, so most
+    # terminal-bin rows are still pending at cutoff.
+    age_s = t_last + rng.uniform(0.0, 1800.0, size=n)
+    pending = pd.Series(CUTOFF - pd.to_timedelta(age_s, unit="s"))
+    true_wait = t_last + rng.exponential(1.0 / true_rate, size=n)
+    started = true_wait <= age_s
+    wait = pd.Series(np.where(started, true_wait, np.nan))
+    resolved = pd.Series([pd.NaT] * n)
+
+    assert (~started).mean() > 0.5, "test setup must be heavily censored"
+    rate = fit_exponential_tail_rate(pending, resolved, wait, CUTOFF, EDGES)
+    assert rate == pytest.approx(true_rate, rel=0.05)
+
+
 def test_started_after_cutoff_excluded_from_tail_fit():
     """Leak-guard: a row whose real start happens after cutoff must not
     contribute to the tail-rate fit, even though it's a genuine
@@ -61,7 +109,8 @@ def test_started_after_cutoff_excluded_from_tail_fit():
     resolved = pd.Series([pd.NaT])
     wait = pd.Series([300.0 + 200.0])  # real start is 200s into the terminal bin, i.e. after cutoff
     rate = fit_exponential_tail_rate(pending, resolved, wait, cutoff, EDGES)
-    # The row falls through to censored-at-cutoff (elapsed = 350s, still in
-    # the terminal bin, contributes no event and is excluded from person-time
-    # per the "censored rows excluded from their own containing bin" rule).
+    # The row falls through to censored-at-cutoff (elapsed = 350s). It still
+    # contributes its 50s of terminal-bin person-time, but contributes no
+    # event -- so the fit is degenerate and returns 0.0 rather than crediting
+    # a start the split was never allowed to see.
     assert rate == 0.0

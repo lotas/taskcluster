@@ -63,6 +63,30 @@ def _connect(dsn: str):
 REPO_FAMILY_DERIVATION_VERSION = 1
 
 
+def resolve_baseline_file(c: Config) -> str | None:
+    """Which baseline-predictions file (if any) to join into the loaded
+    dataframe.
+
+    Historically this join only ever happened for residual configs (the
+    join target doubled as the residual transform's reference point). A
+    discrete-hazard config wants the same baseline percentile columns
+    (bl_wait_p50/bl_wait_p90) as plain informative features and for the
+    evaluation guardrail floor, without a residual target transform -- so
+    `baseline_features` is a second, residual-free way to request the same
+    join."""
+    if c.residual and c.baseline_features:
+        raise ValueError(
+            "Config sets both `residual` and `baseline_features`; they request the same "
+            "baseline join from different files. Use `residual` for a target transform, "
+            "`baseline_features` for baseline columns without one -- not both."
+        )
+    if c.residual:
+        return c.residual["baseline_file"]
+    if c.baseline_features:
+        return c.baseline_features["baseline_file"]
+    return None
+
+
 def cache_key(c: Config) -> str:
     """8-hex-char SHA256 over the query-shaping config."""
     shaping = {
@@ -109,6 +133,8 @@ def serving_hash(c: Config) -> str:
         "quantiles":           list(c.quantiles),
         "residual":            c.residual,
         "baseline_dir":        c.baseline_dir,
+        "baseline_features":   c.baseline_features,
+        "hazard_bins_minutes": c.hazard_bins_minutes,
         "anomaly_filter":      c.anomaly_filter,
         "throughput_features": c.throughput_features,
         "queue_context_features": getattr(c, "queue_context_features", None),
@@ -549,14 +575,15 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
     # before this downcast existed, without needing a cache-format bump.
     df = _downcast_categorical_columns(df)
 
-    if c.residual:
+    baseline_file = resolve_baseline_file(c)
+    if baseline_file:
         t0 = time.monotonic()
         bl_dir = c.baseline_dir or "baseline"
         # Strip leading "data/" so configs can spell either "baseline_filtered" or
         # "data/baseline_filtered" interchangeably; both resolve under data/.
         if bl_dir.startswith("data/"):
             bl_dir = bl_dir[len("data/"):]
-        bl_path = CACHE_DIR.parent / bl_dir / c.residual["baseline_file"]
+        bl_path = CACHE_DIR.parent / bl_dir / baseline_file
         bl = load_baseline_predictions(bl_path)
         before = len(df)
         df = df.merge(bl, on=["task_id", "run_id"], how="left")
@@ -564,7 +591,7 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
             raise RuntimeError(
                 f"Baseline join changed row count: {before} -> {len(df)} (duplicate keys?)"
             )
-        _log_step("residual baseline join", t0)
+        _log_step("baseline join", t0)
 
     if c.velocity_features and c.velocity_features.get("enabled"):
         from src.velocity_features import add_velocity_features

@@ -11,7 +11,7 @@ import pandas as pd
 from src.config import Config
 
 
-META_COLUMNS = ["pending_at", "reason_resolved", "task_id", "run_id"]
+META_COLUMNS = ["pending_at", "resolved_at", "reason_resolved", "task_id", "run_id"]
 
 
 @dataclass

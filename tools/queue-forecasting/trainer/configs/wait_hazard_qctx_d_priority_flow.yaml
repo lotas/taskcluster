@@ -1,0 +1,109 @@
+target: wait_time
+target_column: wait_duration_s
+
+lookback_days: 14
+holdout_days: 5
+validation_days: 1
+as_of_date: null
+
+# Unlike the quantile-regression wait configs, this one must NOT filter on
+# r.started_at IS NOT NULL or r.wait_duration_s IS NOT NULL -- either one
+# alone silently excludes every currently-pending row from training, which
+# is the exact survivorship-bias bug Bet 2 exists to fix (see
+# bet2-hazard-survival-design.md and the "Training-set construction"
+# section of hazard_labels.py). The sanity check on wait_duration_s must
+# allow NULL through (it's NULL for resolved-without-start and censored
+# rows), not just non-negative.
+filters:
+  - "r.queue_pending IS NOT NULL"
+  - "(r.wait_duration_s IS NULL OR r.wait_duration_s >= 0)"
+
+categorical_features:
+  - task_queue_id
+  - scheduler_id
+  - priority_at_pending
+  - tags.kind
+  - tags.os
+  - tags.project
+  - tags.worker-implementation
+
+# Deliberately omits every capacity-touching feature, matching
+# wait_qctx_d_priority_flow.yaml's feature set exactly -- see that config's
+# comment for the full ablation rationale (qctx_b beats qctx_a; qctx_c is
+# statistically indistinguishable from qctx_b; capacity appears to actively
+# dilute the model, not just sit inert). This config tests the same
+# priority+flow feature set against the hazard modeling approach instead
+# of quantile regression.
+numeric_features:
+  - queue_pending
+  - max_run_time_s
+  - hour_sin
+  - hour_cos
+  - day_sin
+  - day_cos
+  - bl_wait_p50
+  - bl_wait_p90
+  - queue_tasks_started_15m
+  - queue_tasks_completed_15m
+  - queue_avg_wait_15m
+  - queue_avg_run_time_15m
+  - queue_tasks_started_60m
+  - queue_tasks_completed_60m
+  - queue_avg_wait_60m
+  - queue_avg_run_time_60m
+  - backlog_coverage_ratio
+  - pending_higher_priority_same_queue
+  - pending_same_priority_same_queue
+  - pending_lower_priority_same_queue
+  - oldest_higher_or_equal_pending_age_same_queue
+  - arrivals_15m_same_queue
+  - arrivals_60m_same_queue
+  - arrivals_higher_or_equal_15m_same_queue
+  - arrivals_higher_or_equal_60m_same_queue
+  - starts_higher_or_equal_15m_same_queue
+
+derived_features:
+  cyclical_time:
+    source: pending_at
+
+model_type: discrete_hazard
+quantiles: [0.5, 0.9]  # not used to loop training (one hazard model, not per-quantile) -- kept for manifest/doc consistency with other configs; evaluate.py's do_eval() hard-requires exactly a p50/p90 pair
+model_params:
+  num_leaves: 63
+  learning_rate: 0.05
+  n_estimators: 500
+  # Lower than the quantile-regression default (100): the hazard model's
+  # per-bin risk sets shrink monotonically across bins, and the terminal
+  # bin in particular can have far fewer at-risk rows than a full-dataset
+  # quantile regressor ever sees. Too high a value risks a degenerate
+  # (near-constant) far-bin classifier. Revisit per-bin if walk-forward
+  # runs show issues.
+  min_data_in_leaf: 50
+  early_stopping_rounds: 20
+
+# 0-5m, 5-15m, 15-30m, 30-60m, 60-120m, 120-240m, 240-480m, 480m+ -- matches
+# hazard_labels.DEFAULT_BIN_EDGES_MINUTES, spelled out explicitly here since
+# this is the first config of this model_type.
+hazard_bins_minutes: [0, 5, 15, 30, 60, 120, 240, 480, .inf]
+
+# Residual-free equivalent of the `residual:` block other wait configs use --
+# still joins bl_wait_p50/bl_wait_p90 into the dataframe (as plain features
+# and for do_eval's guardrail floor), without a residual target transform
+# (the hazard model predicts per-bin hazard probabilities directly, not a
+# baseline-relative residual).
+baseline_features:
+  baseline_file: baseline_predictions.ndjson
+
+throughput_features:
+  enabled: true
+  windows_minutes: [15, 60]
+
+queue_context_features:
+  enabled: true
+  version: 1
+
+baseline_dir: data/baseline_filtered
+
+anomaly_filter:
+  enabled: true
+  mode: baseline

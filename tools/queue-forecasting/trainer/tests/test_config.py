@@ -443,3 +443,157 @@ def test_resolve_holdout_days_cli(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["2026-04-21", "2026-04-22", "2026-04-23"]
+
+
+def test_config_baseline_features_default_none(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.baseline_features is None
+
+
+def test_config_parses_baseline_features(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: discrete_hazard
+        quantiles: [0.5, 0.9]
+        model_params: {}
+        baseline_features:
+          baseline_file: baseline_predictions.ndjson
+    """)
+    c = cfg.load_config(path)
+    assert c.baseline_features == {"baseline_file": "baseline_predictions.ndjson"}
+
+
+def test_config_hazard_bins_minutes_default_none(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5]
+        model_params: {}
+    """)
+    c = cfg.load_config(path)
+    assert c.hazard_bins_minutes is None
+
+
+def test_config_parses_hazard_bins_minutes(tmp_path):
+    path = _write(tmp_path, """
+        target: wait_time
+        target_column: wait_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: discrete_hazard
+        quantiles: [0.5, 0.9]
+        model_params: {}
+        hazard_bins_minutes: [0, 5, 15, 30, 60, 120, 240, 480, .inf]
+    """)
+    c = cfg.load_config(path)
+    assert c.hazard_bins_minutes[0] == 0
+    assert c.hazard_bins_minutes[-1] == float("inf")
+
+
+@pytest.mark.parametrize(
+    "target, target_column",
+    [
+        ("run_duration", "run_duration_s"),  # wrong target entirely
+        ("wait_time", "run_duration_s"),     # right target, wrong column
+    ],
+)
+def test_discrete_hazard_rejects_non_wait_targets(tmp_path, target, target_column):
+    """discrete_hazard's fate/censoring semantics are wait-specific, and
+    _run_discrete_hazard_training hardcodes wait baselines and wait buckets.
+    A non-wait hazard config would otherwise train successfully and then be
+    scored against the wrong baseline -- a silently misleading evaluation.
+    Fail at config load, before any query runs."""
+    path = _write(tmp_path, f"""
+        target: {target}
+        target_column: {target_column}
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {{}}
+        model_type: discrete_hazard
+        quantiles: [0.5, 0.9]
+        model_params: {{}}
+    """)
+    with pytest.raises(ValueError, match="discrete_hazard"):
+        cfg.load_config(path)
+
+
+def test_non_hazard_model_types_are_unconstrained(tmp_path):
+    """The wait-only rule must apply to discrete_hazard alone -- the
+    quantile path still supports run_duration."""
+    path = _write(tmp_path, """
+        target: run_duration
+        target_column: run_duration_s
+        lookback_days: 14
+        holdout_days: 5
+        validation_days: 1
+        as_of_date: 2026-04-24
+        filters: []
+        categorical_features: []
+        numeric_features: []
+        derived_features: {}
+        model_type: lightgbm
+        quantiles: [0.5, 0.9]
+        model_params: {}
+    """)
+    assert cfg.load_config(path).target == "run_duration"
+
+
+def test_hazard_config_drops_survivorship_bias_filters():
+    """Regression guard for the exact bug bet2-hazard-survival-design.md
+    exists to fix: the wait hazard config must NOT filter on
+    r.started_at IS NOT NULL or r.wait_duration_s IS NOT NULL (either one
+    alone silently excludes every currently-pending row from training)."""
+    config_path = Path(__file__).resolve().parent.parent / "configs" / "wait_hazard_qctx_d_priority_flow.yaml"
+    c = cfg.load_config(config_path, as_of_date_override="2026-04-24")
+    joined_filters = " ".join(c.filters)
+    assert "started_at IS NOT NULL" not in joined_filters
+    assert "wait_duration_s IS NOT NULL" not in joined_filters
+    assert c.model_type == "discrete_hazard"
+    from src.hazard_labels import DEFAULT_BIN_EDGES_MINUTES
+    assert c.hazard_bins_minutes == list(DEFAULT_BIN_EDGES_MINUTES)
+    assert c.baseline_features == {"baseline_file": "baseline_predictions.ndjson"}
+    assert c.residual is None

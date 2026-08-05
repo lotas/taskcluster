@@ -78,7 +78,7 @@ declare -A GROUP_BASELINE_REL
 declare -A GROUP_EXCLUDES
 
 for CFG in "${CONFIG_LIST[@]}"; do
-  if ! grep -q '^residual:' "trainer/${CFG}"; then continue; fi
+  if ! grep -qE '^(residual|baseline_features):' "trainer/${CFG}"; then continue; fi
 
   baseline_rel=$(docker compose run --rm \
     --entrypoint uv \

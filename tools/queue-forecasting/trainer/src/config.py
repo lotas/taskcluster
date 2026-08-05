@@ -48,6 +48,8 @@ class Config:
     queue_context_features: dict[str, Any] | None = None
     anomaly_filter: dict[str, Any] | None = None
     baseline_dir: str | None = None
+    baseline_features: dict[str, Any] | None = None
+    hazard_bins_minutes: list[float] | None = None
     source_path: Path = field(default_factory=Path)
 
 
@@ -64,6 +66,8 @@ def load_config(
     if as_of_date_override is not None:
         raw_as_of = as_of_date_override
     as_of_date = _resolve_as_of_date(raw_as_of)
+
+    _validate_model_type_target(raw)
 
     return Config(
         target=raw["target"],
@@ -85,8 +89,37 @@ def load_config(
         queue_context_features=raw.get("queue_context_features"),
         anomaly_filter=raw.get("anomaly_filter"),
         baseline_dir=raw.get("baseline_dir"),
+        baseline_features=raw.get("baseline_features"),
+        hazard_bins_minutes=(
+            [float(x) for x in raw["hazard_bins_minutes"]]
+            if raw.get("hazard_bins_minutes") is not None else None
+        ),
         source_path=p,
     )
+
+
+def _validate_model_type_target(raw: dict[str, Any]) -> None:
+    """discrete_hazard is wait-only, by design and by implementation.
+
+    Its whole fate/censoring model is wait-specific (pending_at -> started_at,
+    with "resolved without ever starting" as the competing risk), and
+    train.py's _run_discrete_hazard_training hardcodes the wait baseline
+    columns and wait bucket breakdown. A `target: run_duration` hazard config
+    would train without complaint and then be scored against wait baselines
+    -- wrong numbers that look right. Reject it here, before any query runs,
+    rather than at the far end of a training run.
+    """
+    if raw.get("model_type") != "discrete_hazard":
+        return
+    target, target_column = raw.get("target"), raw.get("target_column")
+    if target != "wait_time" or target_column != "wait_duration_s":
+        raise ValueError(
+            f"model_type: discrete_hazard supports only target: wait_time / "
+            f"target_column: wait_duration_s; got target: {target!r} / "
+            f"target_column: {target_column!r}. The hazard model's censoring "
+            f"semantics and its evaluation path are both wait-specific "
+            f"(see bet2-hazard-survival-design.md)."
+        )
 
 
 def _resolve_as_of_date(value: Any) -> datetime:

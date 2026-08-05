@@ -24,6 +24,12 @@ def _cfg(**overrides):
 
 
 def _frame(rows):
+    # META_COLUMNS includes resolved_at (needed by the discrete-hazard path);
+    # default it to NaT for fixtures that don't care about it, so existing
+    # test rows don't all need updating individually.
+    rows = [dict(r) for r in rows]
+    for r in rows:
+        r.setdefault("resolved_at", pd.NaT)
     return pd.DataFrame(rows)
 
 
@@ -62,7 +68,7 @@ def test_fit_transform_and_transform_preserve_category_codes():
     assert pd.isna(unseen_row["tags.kind"])
 
     # Meta carries slice columns
-    assert list(ho.meta.columns) == ["pending_at", "reason_resolved", "task_id", "run_id"]
+    assert list(ho.meta.columns) == ["pending_at", "resolved_at", "reason_resolved", "task_id", "run_id"]
     assert ho.meta["reason_resolved"].iloc[1] == "failed"
 
 

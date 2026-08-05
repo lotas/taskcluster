@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from src.config import Config
 from src import data_loader as dl
 
@@ -242,3 +244,27 @@ def test_queue_context_query_bounds_pending_at_and_task_created(monkeypatch, tmp
     # Sanity: the floor must be strictly before window_start, not after it —
     # a wrong-direction bound would silently exclude the whole training window.
     assert params["ref_lower"] < window_start
+
+
+def test_resolve_baseline_file_none_when_neither_set():
+    c = _cfg()
+    assert dl.resolve_baseline_file(c) is None
+
+
+def test_resolve_baseline_file_from_residual():
+    c = _cfg(residual={"baseline_file": "baseline_predictions.ndjson", "baseline_feature": "bl_wait_p50"})
+    assert dl.resolve_baseline_file(c) == "baseline_predictions.ndjson"
+
+
+def test_resolve_baseline_file_from_baseline_features():
+    c = _cfg(baseline_features={"baseline_file": "hazard_baseline.ndjson"})
+    assert dl.resolve_baseline_file(c) == "hazard_baseline.ndjson"
+
+
+def test_resolve_baseline_file_raises_when_both_set():
+    c = _cfg(
+        residual={"baseline_file": "residual.ndjson", "baseline_feature": "bl_wait_p50"},
+        baseline_features={"baseline_file": "hazard.ndjson"},
+    )
+    with pytest.raises(ValueError, match="both"):
+        dl.resolve_baseline_file(c)

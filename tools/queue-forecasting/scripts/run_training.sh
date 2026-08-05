@@ -115,7 +115,7 @@ mkdir -p "trainer/${BASELINE_REL}"
 #
 # Window: [as_of - lookback_days - validation_days - holdout_days, as_of)
 # matches the trainer's compute_windows() math; +2 days padding for safety.
-if grep -q '^residual:' "trainer/${CONFIG}"; then
+if grep -qE '^(residual|baseline_features):' "trainer/${CONFIG}"; then
   AS_OF_FOR_NDJSON="${AS_OF_DATE:-$(date -u +%F)}"
   NDJSON_FROM=$(python3 -c "
 import sys, yaml

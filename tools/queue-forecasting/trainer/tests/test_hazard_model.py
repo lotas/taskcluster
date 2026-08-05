@@ -283,3 +283,67 @@ def test_predict_quantile_matches_hand_computed_crossing_time():
     expected_b = t_last - math.log(s_star_b / s1) / model.tail_rate_
     got_b = model.predict_quantile(X, 1.0 - s_star_b)[0]
     assert got_b == pytest.approx(expected_b, rel=1e-9)
+
+
+def test_save_load_round_trip(tmp_path, scenario_a):
+    model, hold_df, rate, _, _, _ = scenario_a
+    p50_before = model.predict_quantile(hold_df[["x"]], 0.5)
+    p90_before = model.predict_quantile(hold_df[["x"]], 0.9)
+
+    model_dir = tmp_path / "hazard_model"
+    model.save(model_dir)
+    loaded = DiscreteHazardModel.load(model_dir)
+
+    assert loaded.edges_minutes == model.edges_minutes
+    assert loaded.feature_names_ == model.feature_names_
+    assert loaded.tail_rate_ == model.tail_rate_
+
+    p50_after = loaded.predict_quantile(hold_df[["x"]], 0.5)
+    p90_after = loaded.predict_quantile(hold_df[["x"]], 0.9)
+    assert np.allclose(p50_before, p50_after)
+    assert np.allclose(p90_before, p90_after)
+    assert np.allclose(model.predict_hazard(hold_df[["x"]]), loaded.predict_hazard(hold_df[["x"]]))
+
+
+def test_save_raises_before_fit(tmp_path):
+    model = DiscreteHazardModel(edges_minutes=[0, 5, math.inf])
+    with pytest.raises(RuntimeError, match="model not fit"):
+        model.save(tmp_path / "unfit_model")
+
+
+def test_save_clears_stale_artifacts_from_prior_save(tmp_path, scenario_a):
+    """A second save() into the same directory (e.g. a smaller model
+    replacing a larger one) must not leave the prior save's files behind --
+    otherwise an interrupted re-save could leave load() able to silently
+    combine new boosters with a stale meta.json/older boosters."""
+    model, _, _, _, _, _ = scenario_a          # 5 bins
+    small = DiscreteHazardModel(edges_minutes=[0, 10, math.inf])
+    small.boosters = model.boosters[:2]
+    small.feature_names_ = model.feature_names_
+    small.tail_rate_ = model.tail_rate_
+    d = tmp_path / "hz"
+    model.save(d)
+    small.save(d)
+    assert sorted(p.name for p in d.iterdir()) == ["bin_0.lgb", "bin_1.lgb", "meta.json"]
+    assert len(DiscreteHazardModel.load(d).boosters) == 2
+
+
+def test_predict_hazard_is_column_order_invariant():
+    """LightGBM does not reorder a DataFrame by column name -- predict_hazard
+    must explicitly reorder X to match feature_names_, or a column-reordered
+    caller (e.g. a loaded model used from a different process) silently
+    mispredicts with no error."""
+    rng = np.random.default_rng(1)
+    n = 300
+    X = pd.DataFrame({"a": rng.normal(size=n), "b": rng.normal(size=n)})
+    y = pd.Series(np.where(X["a"] + X["b"] > 0, rng.exponential(200, n), rng.exponential(2000, n)))
+    pending_at = pd.Series(pd.Timestamp("2026-01-01T00:00:00Z") + pd.to_timedelta(rng.uniform(0, 5 * 86400, n), unit="s"))
+    meta = pd.DataFrame({"pending_at": pending_at, "resolved_at": pd.Series(pd.NaT, index=range(n))})
+    cutoff = pending_at.max() + pd.Timedelta(hours=6)
+
+    model = DiscreteHazardModel(edges_minutes=[0, 5, 15, math.inf], params={"n_estimators": 15, "min_data_in_leaf": 10, "early_stopping_rounds": 5})
+    model.fit(X.iloc[:200], meta.iloc[:200], y.iloc[:200], cutoff, X.iloc[200:], meta.iloc[200:], y.iloc[200:], cutoff)
+
+    correct_order = model.predict_hazard(X[["a", "b"]])
+    reordered = model.predict_hazard(X[["b", "a"]])
+    assert np.allclose(correct_order, reordered)

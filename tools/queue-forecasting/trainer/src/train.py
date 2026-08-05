@@ -13,7 +13,9 @@ import pandas as pd
 
 from src import config as cfg
 from src import data_loader
-from src.features import FeatureBuilder
+from src import hazard_labels
+from src.features import FeatureBuilder, Split
+from src.hazard_model import DiscreteHazardModel
 from src.model import LightGBMQuantileModel, ResidualLightGBMQuantileModel
 from src.evaluate import evaluate as do_eval, load_prior_manifest
 
@@ -77,6 +79,123 @@ def _require_baselines(holdout_day_keys: list[str], baseline_dir: Path) -> None:
             f"      --pending-eval-date YYYY-MM-DD \\\n"
             f"      --output-json /app/tools/queue-forecasting/{baseline_dir.relative_to(TRAINER_ROOT.parent)}/YYYY-MM-DD.json"
         )
+
+
+def _run_discrete_hazard_training(
+    c: cfg.Config,
+    w: cfg.Windows,
+    holdout_day_keys: list[str],
+    baseline_dir: Path,
+    train: Split,
+    val: Split,
+    hold: Split,
+    n_train_rows: int,
+    n_val_rows: int,
+    n_hold_rows: int,
+) -> dict:
+    """Train + evaluate a DiscreteHazardModel (Bet 2's discrete-time hazard
+    model for wait_time) and write its manifest + model artifacts.
+
+    Deliberately reuses evaluate.py's existing do_eval() unchanged, so the
+    resulting 30m+ wait p90 miss number is directly comparable to the
+    quantile-regression path's numbers -- per bet2-hazard-survival-design.md's
+    "Apples-to-apples with Bet 1's numbers", no new evaluation code is needed
+    to get the primary-gate figure.
+
+    Does not touch the ONNX/quantile-dict machinery in main()'s existing
+    path below this function -- the hazard model has its own save format
+    (one booster per bin, not a single quantile head) and doesn't support
+    live serving yet (see bet2-hazard-survival-design.md's serving scope).
+    """
+    edges_minutes = c.hazard_bins_minutes or hazard_labels.DEFAULT_BIN_EDGES_MINUTES
+    model = DiscreteHazardModel(edges_minutes=edges_minutes, params=c.model_params)
+    model.fit(
+        train.X, train.meta[["pending_at", "resolved_at"]], train.y, w.train_end,
+        val.X,   val.meta[["pending_at", "resolved_at"]],   val.y,   w.val_end,
+    )
+
+    preds_p50 = model.predict_quantile(hold.X, 0.5)
+    preds_p90 = model.predict_quantile(hold.X, 0.9)
+
+    n_bad = int((~np.isfinite(preds_p90)).sum())
+    if n_bad:
+        print(f"  WARNING: {n_bad:,}/{len(preds_p90):,} holdout p90s non-finite "
+              f"(tail_rate_={model.tail_rate_!r}); these rows are excluded from all metrics")
+
+    # Hardcoded because discrete_hazard is wait-only; config.load_config
+    # rejects any other target up front, but re-check here so a hand-built
+    # Config can't route run_duration predictions into wait baselines.
+    if c.target != "wait_time":
+        raise ValueError(f"discrete_hazard supports only target: wait_time, got {c.target!r}")
+    target_key = "wait"
+    p90_col = f"bl_{target_key}_p90"
+    baseline_p90 = hold.X[p90_col].to_numpy() if p90_col in hold.X.columns else None
+
+    report = do_eval(
+        preds_p50=preds_p50,
+        preds_p90=preds_p90,
+        hold_meta=hold.meta,
+        y_true=hold.y.to_numpy(),
+        holdout_day_keys=holdout_day_keys,
+        baseline_dir=baseline_dir,
+        target=target_key,
+        baseline_p90=baseline_p90,
+    )
+
+    run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
+    run_stem = c.source_path.stem
+    run_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = run_dir / f"{run_stem}_hazard_model"
+    model.save(model_dir)
+
+    manifest = {
+        "target": c.target,
+        "config_path": str(c.source_path),
+        "model_type": c.model_type,
+        "hazard_bins_minutes": [e if e != float("inf") else None for e in edges_minutes],
+        "tail_rate": model.tail_rate_,
+        "model_artifact_dir": model_dir.name,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "lightgbm_version": lgb.__version__,
+        "windows": {
+            "as_of_date":      c.as_of_date.isoformat(),
+            "lookback_days":   c.lookback_days,
+            "validation_days": c.validation_days,
+            "holdout_days":    c.holdout_days,
+            "train":   {"start": w.train_start.isoformat(), "end": w.train_end.isoformat(), "rows": n_train_rows},
+            "val":     {"start": w.val_start.isoformat(),   "end": w.val_end.isoformat(),   "rows": n_val_rows},
+            "holdout": {"start": w.hold_start.isoformat(),  "end": w.hold_end.isoformat(),  "rows": n_hold_rows},
+        },
+        "features": {
+            "categorical": c.categorical_features,
+            "numeric":     c.numeric_features,
+            "cardinalities": train.stats.get("cardinalities", {}),
+            "null_rates":    train.stats.get("null_rates", {}),
+            "unseen_rates_holdout": hold.stats.get("unseen_rate", {}),
+        },
+        "model_params": c.model_params,
+        "resource_usage": {"peak_rss_mb": round(_peak_rss_mb(), 1)},
+        "evaluation": {
+            "primary": {
+                "slice": "reason_resolved = 'completed'",
+                "per_day": report.primary_per_day,
+                "aggregate": report.primary_agg,
+                "baseline_per_day": report.baseline_per_day,
+                "baseline_aggregate": report.baseline_agg,
+                "buckets_per_day": report.primary_buckets_per_day,
+                "buckets_aggregate": report.primary_buckets_agg,
+                "baseline_buckets_per_day": report.baseline_buckets_per_day,
+                "baseline_buckets_aggregate": report.baseline_buckets_agg,
+            },
+            "supplemental": {
+                "slice": "reason_resolved IN ('completed','failed')",
+                "per_day": report.supplemental_per_day,
+                "aggregate": report.supplemental_agg,
+            },
+        },
+    }
+    (run_dir / f"{run_stem}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    return manifest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -173,6 +292,21 @@ def main(argv: list[str] | None = None) -> int:
     # evaluation -- for the sake of a row count read at the very end.
     n_train_rows, n_val_rows, n_hold_rows = len(train_df), len(val_df), len(hold_df)
     del train_df, val_df, hold_df
+
+    if c.model_type == "discrete_hazard":
+        manifest = _run_discrete_hazard_training(
+            c, w, holdout_day_keys, baseline_dir,
+            train, val, hold, n_train_rows, n_val_rows, n_hold_rows,
+        )
+        run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
+        buckets30 = manifest["evaluation"]["primary"]["buckets_aggregate"].get("30m+", {})
+        def _pct(v):
+            return f"{v * 100:.1f}%" if v is not None and v == v else "n/a"
+        guarded = buckets30.get("p90_miss_rate_guarded")
+        raw = buckets30.get("p90_miss_rate")
+        print(f"\n=== Discrete hazard model — 30m+ wait p90 miss: {_pct(guarded)} guarded (gate bar: 34.49%) / {_pct(raw)} raw ===")
+        print(f"Models + manifest in {run_dir}")
+        return 0
 
     # Train one model per quantile.
     def _make_model(alpha: float) -> LightGBMQuantileModel:

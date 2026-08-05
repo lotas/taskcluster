@@ -5,6 +5,9 @@ See bet2-hazard-survival-design.md.
 """
 from __future__ import annotations
 
+import json
+import math
+from pathlib import Path
 from typing import Any, Sequence
 
 import lightgbm as lgb
@@ -76,6 +79,8 @@ class DiscreteHazardModel:
         """Per-bin conditional hazard P(event in bin i | survived to bin i's start), shape (n_rows, n_bins)."""
         if not self.boosters:
             raise RuntimeError("model not fit")
+        if self.feature_names_ and list(X.columns) != self.feature_names_:
+            X = X[self.feature_names_]  # raises KeyError if a required column is missing
         return np.column_stack([b.predict(X) for b in self.boosters])
 
     def predict_survival_grid(self, X: pd.DataFrame) -> np.ndarray:
@@ -153,3 +158,43 @@ class DiscreteHazardModel:
             result[~resolved] = tail_result
 
         return result
+
+    def save(self, dir_path: Path) -> None:
+        """Save all per-bin boosters plus metadata (edges, tail rate,
+        feature order) to a directory -- this model has N boosters, not
+        one, so it doesn't fit the single-file save() convention used by
+        LightGBMQuantileModel."""
+        if not self.boosters:
+            raise RuntimeError("model not fit")
+        dir_path = Path(dir_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        # Clear this directory's own prior artifacts first -- an interrupted
+        # re-save (e.g. OOM mid-training) must not leave load() able to
+        # silently combine new boosters with a stale meta.json/older boosters
+        # from a previous save into this same directory.
+        (dir_path / "meta.json").unlink(missing_ok=True)
+        for stale in dir_path.glob("bin_*.lgb"):
+            stale.unlink()
+        for i, booster in enumerate(self.boosters):
+            booster.save_model(str(dir_path / f"bin_{i}.lgb"))
+        meta = {
+            "edges_minutes": [e if math.isfinite(e) else None for e in self.edges_minutes],
+            "tail_rate": self.tail_rate_,
+            "feature_names": self.feature_names_,
+            "n_bins": len(self.boosters),
+        }
+        (dir_path / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    @classmethod
+    def load(cls, dir_path: Path) -> "DiscreteHazardModel":
+        dir_path = Path(dir_path)
+        meta = json.loads((dir_path / "meta.json").read_text())
+        edges_minutes = [e if e is not None else math.inf for e in meta["edges_minutes"]]
+        m = cls(edges_minutes=edges_minutes)
+        m.tail_rate_ = meta["tail_rate"]
+        m.feature_names_ = meta["feature_names"]
+        m.boosters = [
+            lgb.Booster(model_file=str(dir_path / f"bin_{i}.lgb"))
+            for i in range(meta["n_bins"])
+        ]
+        return m

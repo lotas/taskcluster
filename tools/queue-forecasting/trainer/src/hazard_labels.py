@@ -197,12 +197,18 @@ def fit_exponential_tail_rate(
 
     fate_kind, elapsed_s = determine_fates(pending_at, resolved_at, wait_duration_s, cutoff)
 
-    # The terminal bin's at-risk set is exactly the started/resolved_no_start
-    # rows whose elapsed time reached the last finite edge -- censored rows
-    # currently inside the terminal bin are excluded (see
-    # build_bin_risk_and_labels: at_risk_censored never includes a row's own
-    # containing bin), so they must not contribute person-time here either.
-    in_terminal_risk_set = (elapsed_s >= t_last) & (fate_kind != FATE_CENSORED)
+    # Every row whose elapsed time reached the last finite edge contributes,
+    # including rows still pending there. This deliberately differs from
+    # build_bin_risk_and_labels' discrete per-bin risk set, which excludes a
+    # censored row from its own containing bin: that classifier needs a known
+    # binary outcome for the whole bin, which a censored row does not have.
+    # A continuous-time exponential MLE has no such need -- partial exposure
+    # is exactly what its person-time denominator is for. Dropping these rows
+    # would remove exposure without removing events, inflating the rate in
+    # proportion to how censored the tail is (>3x when most terminal-bin rows
+    # are still pending) and shortening every deep-tail quantile -- which is
+    # the survivorship bias Bet 2 exists to remove.
+    in_terminal_risk_set = elapsed_s >= t_last
     if not in_terminal_risk_set.any():
         return 0.0
 
