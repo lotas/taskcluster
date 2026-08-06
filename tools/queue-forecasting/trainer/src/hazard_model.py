@@ -22,6 +22,17 @@ from src.hazard_labels import (
 )
 
 
+# A validation risk set smaller than this can't support early stopping --
+# the "best iteration" it picks is noise. Bins are checked against it
+# individually because per-bin risk sets shrink monotonically.
+MIN_VAL_ROWS_FOR_EARLY_STOP = 50
+
+# Rounds used for a bin with no usable validation set, when no other bin
+# early-stopped either (so there's no observed best-iteration to borrow).
+# Deliberately conservative: these bins have the least data to fit.
+FALLBACK_BOOST_ROUNDS = 100
+
+
 class DiscreteHazardModel:
     def __init__(self, edges_minutes: Sequence[float] = DEFAULT_BIN_EDGES_MINUTES, params: dict[str, Any] | None = None):
         self.edges_minutes = list(edges_minutes)
@@ -29,6 +40,7 @@ class DiscreteHazardModel:
         self.boosters: list[lgb.Booster] = []
         self.feature_names_: list[str] = []
         self.tail_rate_: float | None = None
+        self.degraded_bins_: list[dict[str, Any]] = []
 
     def fit(
         self,
@@ -43,20 +55,48 @@ class DiscreteHazardModel:
         at_risk_va, label_va = build_bin_risk_and_labels(
             meta_val["pending_at"], meta_val["resolved_at"], y_val, cutoff_val, self.edges_minutes)
 
+        min_val = int(self.params.get("min_val_rows_for_early_stop", MIN_VAL_ROWS_FOR_EARLY_STOP))
+
         boosters = []
+        self.degraded_bins_ = []
+        best_iters: list[int] = []
         for i in range(n_bins):
             mtr, mva = at_risk_tr[:, i], at_risk_va[:, i]
-            if mtr.sum() == 0:
-                raise RuntimeError(f"bin {i} has an empty training risk set -- widen the cohort or coarsen bins")
-            if mva.sum() == 0:
-                raise RuntimeError(f"bin {i} has an empty validation risk set -- widen the cohort or coarsen bins")
-            boosters.append(self._fit_one_bin(X_train[mtr], label_tr[mtr, i], X_val[mva], label_va[mva, i]))
+            n_tr, n_va = int(mtr.sum()), int(mva.sum())
+            if n_tr == 0:
+                raise RuntimeError(
+                    f"bin {i} has an empty training risk set -- widen the cohort or coarsen bins")
+            if n_va >= min_val:
+                booster = self._fit_one_bin(X_train[mtr], label_tr[mtr, i], X_val[mva], label_va[mva, i])
+                if booster.best_iteration:
+                    best_iters.append(int(booster.best_iteration))
+            else:
+                # Too few validation rows to early-stop on. This is a normal
+                # data condition, not a config error: the later bins' risk
+                # sets shrink by construction, and a low-volume validation day
+                # (a weekend is ~20x quieter than a weekday) can leave the
+                # terminal bins with nothing. Failing here would abandon a run
+                # that is otherwise complete -- and for the terminal bin,
+                # predict_quantile never even reads the resulting booster (it
+                # slices hazard[:, :n_bins-1] and uses tail_rate_ beyond the
+                # last finite edge). Train with a fixed round count instead,
+                # borrowed from the bins that did early-stop, and record it.
+                rounds = int(np.median(best_iters)) if best_iters else FALLBACK_BOOST_ROUNDS
+                booster = self._fit_one_bin(X_train[mtr], label_tr[mtr, i], None, None, rounds=rounds)
+                self.degraded_bins_.append({"bin": i, "n_val_rows": n_va, "n_train_rows": n_tr, "rounds": rounds})
+                print(f"  WARNING: bin {i} has {n_va} validation rows (< {min_val}); "
+                      f"trained without early stopping at {rounds} rounds")
+            boosters.append(booster)
         self.boosters = boosters
         self.feature_names_ = list(X_train.columns)
         self.tail_rate_ = fit_exponential_tail_rate(
             meta_train["pending_at"], meta_train["resolved_at"], y_train, cutoff_train, self.edges_minutes)
 
-    def _fit_one_bin(self, X_tr: pd.DataFrame, y_tr: np.ndarray, X_va: pd.DataFrame, y_va: np.ndarray) -> lgb.Booster:
+    def _fit_one_bin(self, X_tr: pd.DataFrame, y_tr: np.ndarray,
+                     X_va: pd.DataFrame | None, y_va: np.ndarray | None,
+                     rounds: int | None = None) -> lgb.Booster:
+        """Train one bin's classifier. X_va=None means "no usable validation
+        set": train a fixed `rounds` boosters with no early stopping."""
         n_estimators = int(self.params.get("n_estimators", 500))
         early_stop = int(self.params.get("early_stopping_rounds", 20))
         lgb_params = {
@@ -68,6 +108,8 @@ class DiscreteHazardModel:
             "min_data_in_leaf": int(self.params.get("min_data_in_leaf", 100)),
         }
         train_set = lgb.Dataset(X_tr, label=y_tr, categorical_feature="auto", free_raw_data=False)
+        if X_va is None:
+            return lgb.train(lgb_params, train_set, num_boost_round=int(rounds or FALLBACK_BOOST_ROUNDS))
         val_set = lgb.Dataset(X_va, label=y_va, categorical_feature="auto", reference=train_set, free_raw_data=False)
         return lgb.train(
             lgb_params, train_set, num_boost_round=n_estimators,

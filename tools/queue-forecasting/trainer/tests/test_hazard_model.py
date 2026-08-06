@@ -6,7 +6,7 @@ import pytest
 
 import src.hazard_model as hazard_model_module
 from src.hazard_labels import DEFAULT_BIN_EDGES_MINUTES, build_bin_risk_and_labels
-from src.hazard_model import DiscreteHazardModel
+from src.hazard_model import FALLBACK_BOOST_ROUNDS, DiscreteHazardModel
 
 SCENARIO_A_EDGES = [0, 2, 5, 15, 40, math.inf]  # minutes; matched to a ~10min-mean exponential
 
@@ -126,21 +126,67 @@ def test_fit_raises_on_empty_training_risk_set():
                    X, pd.DataFrame({"pending_at": pending_at, "resolved_at": resolved_at}), y, cutoff)
 
 
-def test_fit_raises_on_empty_validation_risk_set():
-    """Train has some rows reaching bin 1 ([5,10)min), but val has none --
-    the empty-risk-set guard must fire on the validation side too, not
-    just training."""
-    n = 200
+def _thin_val_setup(n=300):
+    """Bins are [0,5)[5,10)[10,inf) minutes. Training waits span all three
+    (60s / 400s / 700s); every validation row resolves in 60s, so bins 1
+    and 2 have an empty validation risk set but a populated training one --
+    the real shape of a quiet weekend validation day."""
     pending_at = pd.Series(pd.Timestamp("2026-01-01T00:00:00Z") + pd.to_timedelta(np.arange(n), unit="s"))
     resolved_at = pd.Series(pd.NaT, index=range(n))
+    meta = pd.DataFrame({"pending_at": pending_at, "resolved_at": resolved_at})
+    X = pd.DataFrame({"x": np.arange(n, dtype=float) % 7})
+    cutoff = pending_at.max() + pd.Timedelta(hours=1)
+    y_train = pd.Series(np.select(
+        [np.arange(n) % 3 == 0, np.arange(n) % 3 == 1], [60.0, 400.0], default=700.0))
+    y_val = pd.Series(np.full(n, 60.0))
+    return X, meta, y_train, y_val, cutoff
+
+
+def test_fit_degrades_instead_of_failing_on_thin_validation_risk_set():
+    """A validation risk set too thin to early-stop on is a normal data
+    condition -- a quiet weekend validation day leaves the later bins with
+    nothing, and for the terminal bin predict_quantile never even reads the
+    resulting booster. Abandoning an otherwise-complete run (~40min of data
+    loading) over it is the wrong trade. Train the bin at a fixed round
+    count and record the degradation instead."""
+    X, meta, y_train, y_val, cutoff = _thin_val_setup()
+    model = DiscreteHazardModel(edges_minutes=[0, 5, 10, math.inf], params={"n_estimators": 5})
+    model.fit(X, meta, y_train, cutoff, X, meta, y_val, cutoff)
+
+    assert len(model.boosters) == 3
+    assert [d["bin"] for d in model.degraded_bins_] == [1, 2]
+    assert all(d["n_val_rows"] == 0 for d in model.degraded_bins_)
+    # Still a usable model: quantiles come out finite and ordered.
+    p50, p90 = model.predict_quantile(X, 0.5), model.predict_quantile(X, 0.9)
+    assert np.all(np.isfinite(p50)) and np.all(p90 >= p50)
+
+
+def test_fit_still_raises_on_empty_training_risk_set_when_val_is_thin():
+    """Degrading on a thin *validation* set must not soften the training-side
+    guard -- with no training rows there is nothing to fit at all."""
+    n = 200
+    pending_at = pd.Series(pd.Timestamp("2026-01-01T00:00:00Z") + pd.to_timedelta(np.arange(n), unit="s"))
+    meta = pd.DataFrame({"pending_at": pending_at, "resolved_at": pd.Series(pd.NaT, index=range(n))})
     X = pd.DataFrame({"x": np.zeros(n)})
     cutoff = pending_at.max() + pd.Timedelta(hours=1)
-    y_train = pd.Series(np.where(np.arange(n) % 2 == 0, 400.0, 60.0))
-    y_val = pd.Series(np.full(n, 60.0))
+    y = pd.Series(np.full(n, 60.0))
     model = DiscreteHazardModel(edges_minutes=[0, 5, 10, math.inf], params={"n_estimators": 5})
-    with pytest.raises(RuntimeError, match="bin 1 has an empty validation risk set"):
-        model.fit(X, pd.DataFrame({"pending_at": pending_at, "resolved_at": resolved_at}), y_train, cutoff,
-                   X, pd.DataFrame({"pending_at": pending_at, "resolved_at": resolved_at}), y_val, cutoff)
+    with pytest.raises(RuntimeError, match="bin 1 has an empty training risk set"):
+        model.fit(X, meta, y, cutoff, X, meta, y, cutoff)
+
+
+def test_thin_validation_threshold_is_configurable_and_borrows_best_iteration():
+    """A bin below min_val_rows_for_early_stop is trained at the median
+    best_iteration of the bins that did early-stop, not at n_estimators."""
+    X, meta, y_train, y_val, cutoff = _thin_val_setup()
+    model = DiscreteHazardModel(
+        edges_minutes=[0, 5, 10, math.inf],
+        params={"n_estimators": 5, "min_val_rows_for_early_stop": 10},
+    )
+    model.fit(X, meta, y_train, cutoff, X, meta, y_val, cutoff)
+    borrowed = {d["rounds"] for d in model.degraded_bins_}
+    assert borrowed and borrowed != {FALLBACK_BOOST_ROUNDS}, (
+        "should borrow bin 0's observed best_iteration, not the no-information fallback")
 
 
 @pytest.fixture(scope="module")

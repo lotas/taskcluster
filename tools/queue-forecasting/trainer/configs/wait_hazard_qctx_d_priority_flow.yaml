@@ -3,7 +3,19 @@ target_column: wait_duration_s
 
 lookback_days: 14
 holdout_days: 5
-validation_days: 1
+# 3, not the sibling quantile configs' 1. The hazard model splits its
+# validation set across 8 per-bin risk sets that shrink monotonically, so it
+# needs far more validation volume than a 2-quantile head does. With
+# validation_days: 1 the val window is a single day at as_of-6, and weekend
+# CI volume is ~20x lower than a weekday (~12k rows vs ~250k) -- 8 of every
+# 28 consecutive cohorts land on an all-weekend val window, leaving the
+# 2h+/4h+ bins with too few rows to early-stop on. Those are exactly the
+# bins behind the 30m+ tail gate metric. Three consecutive days always
+# contain at least one weekday, so this makes that failure mode impossible
+# rather than merely unlikely. Holdout is unaffected (it depends only on
+# as_of_date and holdout_days), so evaluation stays comparable to the
+# quantile configs; only the train window shifts 2 days earlier.
+validation_days: 3
 as_of_date: null
 
 # Unlike the quantile-regression wait configs, this one must NOT filter on

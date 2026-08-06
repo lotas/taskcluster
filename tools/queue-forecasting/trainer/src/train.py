@@ -154,6 +154,7 @@ def _run_discrete_hazard_training(
         "model_type": c.model_type,
         "hazard_bins_minutes": [e if e != float("inf") else None for e in edges_minutes],
         "tail_rate": model.tail_rate_,
+        "degraded_bins": model.degraded_bins_,
         "model_artifact_dir": model_dir.name,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "lightgbm_version": lgb.__version__,
