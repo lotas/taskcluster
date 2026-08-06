@@ -5,11 +5,10 @@ see data_loader.load, whose parquet cache covers only the raw SQL fetch) and
 then refits selected bins across a matrix of variants in memory. One load
 buys a dozen configurations instead of one.
 
-The decisive variant is `random_split`: it early-stops on a random 10% of the
-bin's OWN training risk set instead of the temporal validation split. If a
-bin fits deeply against a random split but stops at 1-2 trees against the
-temporal one, the problem is train/val distribution mismatch (the validation
-window is a different regime), not capacity and not absent signal.
+Compare variants by val AUC, not by tree count. Every variant except
+`blocked_val` shares one validation set, so their AUCs are directly
+comparable; `blocked_val` answers the separate question of whether the real
+validation WINDOW is an unrepresentative regime.
 
 Usage:
   docker compose run --rm --entrypoint uv trainer run python -m scripts.probe_hazard_bins \
@@ -22,6 +21,7 @@ import argparse
 
 import lightgbm as lgb
 import numpy as np
+import pandas as pd
 
 from src import config as cfg
 from src import data_loader
@@ -29,15 +29,30 @@ from src.features import FeatureBuilder
 from src.hazard_labels import DEFAULT_BIN_EDGES_MINUTES, build_bin_risk_and_labels
 from src.train import _split_by_pending_at
 
-# Each variant is a (name, param-overrides, use_random_split) triple. Params
-# layer on top of the config's own model_params.
-VARIANTS: list[tuple[str, dict, bool]] = [
-    ("baseline",         {},                                              False),
-    ("random_split",     {},                                              True),
-    ("low_capacity",     {"num_leaves": 15, "min_data_in_leaf": 200},     False),
-    ("tame_categorical", {"cat_smooth": 200, "min_data_per_group": 500},  False),
-    ("both",             {"num_leaves": 15, "min_data_in_leaf": 200,
-                          "cat_smooth": 200, "min_data_per_group": 500},  False),
+CAT_TAME = {"cat_smooth": 200, "min_data_per_group": 500}
+
+# (name, param-overrides, split, drop_cols). Params layer on top of the
+# config's own model_params.
+#
+# split="temporal" uses the real validation window. split="blocked" instead
+# holds out the LAST 2 DAYS of the training window, by pending_at.
+#
+# There is deliberately no random-row split here. An earlier version of this
+# probe had one and it scored AUC 0.9997-1.0000 on every bin -- not signal,
+# but leakage: CI submits tasks in large per-push batches, so rows sharing a
+# queue and an instant have near-identical features AND near-identical fates.
+# A random split scatters each batch across both sides and the model
+# memorizes neighbours. Any split of this data must be temporal.
+VARIANTS: list[tuple[str, dict, str, list[str]]] = [
+    ("baseline",       {},                                          "temporal", []),
+    ("blocked_val",    {},                                          "blocked",  []),
+    ("leaves31",       {"num_leaves": 31, "min_data_in_leaf": 100},  "temporal", []),
+    ("leaves15",       {"num_leaves": 15, "min_data_in_leaf": 200},  "temporal", []),
+    ("leaves7",        {"num_leaves": 7,  "min_data_in_leaf": 500},  "temporal", []),
+    ("cat_tame",       {**CAT_TAME},                                 "temporal", []),
+    ("leaves15_cat",   {"num_leaves": 15, "min_data_in_leaf": 200, **CAT_TAME}, "temporal", []),
+    ("leaves7_cat",    {"num_leaves": 7,  "min_data_in_leaf": 500, **CAT_TAME}, "temporal", []),
+    ("no_queue_id",    {},                                          "temporal", ["task_queue_id"]),
 ]
 
 
@@ -64,7 +79,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--config", required=True)
     p.add_argument("--as-of-date", default=None)
     p.add_argument("--bins", default="3,4,5,6", help="comma-separated bin indices to probe")
-    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
 
     c = cfg.load_config(args.config, as_of_date_override=args.as_of_date)
@@ -94,26 +108,28 @@ def main(argv: list[str] | None = None) -> int:
     n_estimators = int(base_params.pop("n_estimators", 500))
     patience = int(base_params.pop("early_stopping_rounds", 20))
     base_params.pop("min_val_rows_for_early_stop", None)
-    rng = np.random.default_rng(args.seed)
 
     print(f"\n{'bin':>4} {'variant':<18} {'n_tr':>8} {'n_va':>7} {'best_it':>8} {'val_auc':>8} {'val_loss':>9}")
     print("-" * 68)
     for i in target_bins:
         mtr, mva = at_risk_tr[:, i], at_risk_va[:, i]
         X_tr_all, y_tr_all = train.X[mtr], label_tr[mtr, i]
+        pending_tr = train.meta["pending_at"][mtr]
         X_va_tmp, y_va_tmp = val.X[mva], label_va[mva, i]
 
-        for name, overrides, random_split in VARIANTS:
-            if random_split:
-                # Hold out a random 10% of THIS bin's own training risk set.
-                n = len(X_tr_all)
-                idx = rng.permutation(n)
-                cut = max(1, n // 10)
-                va_idx, tr_idx = idx[:cut], idx[cut:]
-                X_tr, y_tr = X_tr_all.iloc[tr_idx], y_tr_all[tr_idx]
-                X_va, y_va = X_tr_all.iloc[va_idx], y_tr_all[va_idx]
+        # Blocked split: last 2 days of the training window, by pending_at.
+        block_cut = w.train_end - pd.Timedelta(days=2)
+        blk = (pending_tr >= block_cut).to_numpy()
+
+        for name, overrides, split, drop_cols in VARIANTS:
+            if split == "blocked":
+                X_tr, y_tr = X_tr_all[~blk], y_tr_all[~blk]
+                X_va, y_va = X_tr_all[blk], y_tr_all[blk]
             else:
                 X_tr, y_tr, X_va, y_va = X_tr_all, y_tr_all, X_va_tmp, y_va_tmp
+            if drop_cols:
+                keep = [col for col in X_tr.columns if col not in drop_cols]
+                X_tr, X_va = X_tr[keep], X_va[keep]
 
             if len(X_va) < 50 or len(np.unique(y_va)) < 2:
                 print(f"{i:>4} {name:<18} {len(X_tr):>8,} {len(X_va):>7,}  (skipped: degenerate val)")
@@ -127,9 +143,11 @@ def main(argv: list[str] | None = None) -> int:
         print("-" * 68)
 
     print("\nReading the table:")
-    print("  random_split deep but baseline shallow -> train/val DISTRIBUTION MISMATCH")
-    print("  tame_categorical/low_capacity deep      -> OVERFITTING, fixable via model_params")
-    print("  all variants shallow AND val_auc ~0.5   -> no signal in these features for this bin")
+    print("  blocked_val >> baseline           -> the real val WINDOW is a different regime")
+    print("  a capacity variant >> baseline    -> OVERFITTING; adopt it per-bin")
+    print("  no_queue_id >> baseline           -> high-cardinality categorical is the culprit")
+    print("  everything flat at auc ~0.5       -> no signal in these features for this bin")
+    print("\nCompare AUC, not tree count. All rows except blocked_val share one val set.")
     return 0
 
 
