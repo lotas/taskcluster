@@ -41,6 +41,7 @@ class DiscreteHazardModel:
         self.feature_names_: list[str] = []
         self.tail_rate_: float | None = None
         self.degraded_bins_: list[dict[str, Any]] = []
+        self.bin_fit_: list[dict[str, Any]] = []
 
     def fit(
         self,
@@ -59,6 +60,7 @@ class DiscreteHazardModel:
 
         boosters = []
         self.degraded_bins_ = []
+        self.bin_fit_ = []
         best_iters: list[int] = []
         for i in range(n_bins):
             mtr, mva = at_risk_tr[:, i], at_risk_va[:, i]
@@ -66,10 +68,16 @@ class DiscreteHazardModel:
             if n_tr == 0:
                 raise RuntimeError(
                     f"bin {i} has an empty training risk set -- widen the cohort or coarsen bins")
+            n_events = float(np.nansum(label_tr[mtr, i]))
             if n_va >= min_val:
                 booster = self._fit_one_bin(X_train[mtr], label_tr[mtr, i], X_val[mva], label_va[mva, i])
                 if booster.best_iteration:
                     best_iters.append(int(booster.best_iteration))
+                self.bin_fit_.append({
+                    "bin": i, "n_train_rows": n_tr, "n_val_rows": n_va,
+                    "train_event_rate": round(n_events / n_tr, 6) if n_tr else None,
+                    "best_iteration": int(booster.best_iteration or 0), "early_stopped": True,
+                })
             else:
                 # Too few validation rows to early-stop on. This is a normal
                 # data condition, not a config error: the later bins' risk
@@ -84,6 +92,11 @@ class DiscreteHazardModel:
                 rounds = int(np.median(best_iters)) if best_iters else FALLBACK_BOOST_ROUNDS
                 booster = self._fit_one_bin(X_train[mtr], label_tr[mtr, i], None, None, rounds=rounds)
                 self.degraded_bins_.append({"bin": i, "n_val_rows": n_va, "n_train_rows": n_tr, "rounds": rounds})
+                self.bin_fit_.append({
+                    "bin": i, "n_train_rows": n_tr, "n_val_rows": n_va,
+                    "train_event_rate": round(n_events / n_tr, 6) if n_tr else None,
+                    "best_iteration": rounds, "early_stopped": False,
+                })
                 print(f"  WARNING: bin {i} has {n_va} validation rows (< {min_val}); "
                       f"trained without early stopping at {rounds} rounds")
             boosters.append(booster)
