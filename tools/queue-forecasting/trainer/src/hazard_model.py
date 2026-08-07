@@ -73,9 +73,11 @@ class DiscreteHazardModel:
                 booster = self._fit_one_bin(X_train[mtr], label_tr[mtr, i], X_val[mva], label_va[mva, i])
                 if booster.best_iteration:
                     best_iters.append(int(booster.best_iteration))
+                leaves, min_data = self._capacity_for(n_tr)
                 self.bin_fit_.append({
                     "bin": i, "n_train_rows": n_tr, "n_val_rows": n_va,
                     "train_event_rate": round(n_events / n_tr, 6) if n_tr else None,
+                    "num_leaves": leaves, "min_data_in_leaf": min_data,
                     "best_iteration": int(booster.best_iteration or 0), "early_stopped": True,
                 })
             else:
@@ -92,9 +94,11 @@ class DiscreteHazardModel:
                 rounds = int(np.median(best_iters)) if best_iters else FALLBACK_BOOST_ROUNDS
                 booster = self._fit_one_bin(X_train[mtr], label_tr[mtr, i], None, None, rounds=rounds)
                 self.degraded_bins_.append({"bin": i, "n_val_rows": n_va, "n_train_rows": n_tr, "rounds": rounds})
+                leaves, min_data = self._capacity_for(n_tr)
                 self.bin_fit_.append({
                     "bin": i, "n_train_rows": n_tr, "n_val_rows": n_va,
                     "train_event_rate": round(n_events / n_tr, 6) if n_tr else None,
+                    "num_leaves": leaves, "min_data_in_leaf": min_data,
                     "best_iteration": rounds, "early_stopped": False,
                 })
                 print(f"  WARNING: bin {i} has {n_va} validation rows (< {min_val}); "
@@ -105,6 +109,30 @@ class DiscreteHazardModel:
         self.tail_rate_ = fit_exponential_tail_rate(
             meta_train["pending_at"], meta_train["resolved_at"], y_train, cutoff_train, self.edges_minutes)
 
+    def _capacity_for(self, n_rows: int) -> tuple[int, int]:
+        """Tree capacity for a bin, reduced once its risk set gets small.
+
+        Measured 2026-08-06 on as_of=2026-07-18: at a flat num_leaves=63 /
+        min_data_in_leaf=50, the later bins overfit their first tree so badly
+        that early stopping halted them at 1-2 trees. Bin 6 (240-480m, 14,797
+        rows) scored val AUC 0.479 -- worse than a coin flip -- and recovered
+        to 0.856 at num_leaves=31 / min_data_in_leaf=100. Averaged over bins
+        3-6, 31/100 beat every other setting probed (mean AUC 0.736 vs 0.644),
+        and unlike the per-bin winners it never collapsed on any bin.
+
+        Deliberately a two-tier step, not a per-bin tuned table: the per-bin
+        argmaxes came from 8 candidates scored on 3.8k-14.5k validation rows,
+        which is selection on validation noise. See
+        trainer/scripts/probe_hazard_bins.py to re-measure.
+        """
+        big_leaves = int(self.params.get("num_leaves", 63))
+        big_min_data = int(self.params.get("min_data_in_leaf", 100))
+        threshold = int(self.params.get("small_bin_threshold_rows", 200_000))
+        if n_rows >= threshold:
+            return big_leaves, big_min_data
+        return (int(self.params.get("small_bin_num_leaves", 31)),
+                int(self.params.get("small_bin_min_data_in_leaf", 100)))
+
     def _fit_one_bin(self, X_tr: pd.DataFrame, y_tr: np.ndarray,
                      X_va: pd.DataFrame | None, y_va: np.ndarray | None,
                      rounds: int | None = None) -> lgb.Booster:
@@ -112,13 +140,14 @@ class DiscreteHazardModel:
         set": train a fixed `rounds` boosters with no early stopping."""
         n_estimators = int(self.params.get("n_estimators", 500))
         early_stop = int(self.params.get("early_stopping_rounds", 20))
+        num_leaves, min_data = self._capacity_for(len(X_tr))
         lgb_params = {
             "objective": "binary",
             "metric": "binary_logloss",
             "verbosity": -1,
-            "num_leaves": int(self.params.get("num_leaves", 63)),
+            "num_leaves": num_leaves,
             "learning_rate": float(self.params.get("learning_rate", 0.05)),
-            "min_data_in_leaf": int(self.params.get("min_data_in_leaf", 100)),
+            "min_data_in_leaf": min_data,
         }
         train_set = lgb.Dataset(X_tr, label=y_tr, categorical_feature="auto", free_raw_data=False)
         if X_va is None:

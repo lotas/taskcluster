@@ -142,6 +142,44 @@ def _thin_val_setup(n=300):
     return X, meta, y_train, y_val, cutoff
 
 
+def test_capacity_drops_for_small_risk_sets():
+    """Bins above the row threshold keep the configured capacity; bins below
+    it drop to the small-bin tier. Guards the 2026-08-06 finding that a flat
+    num_leaves=63 drove bin 6 to val AUC 0.479 (worse than chance)."""
+    m = DiscreteHazardModel(params={"num_leaves": 63, "min_data_in_leaf": 50})
+    assert m._capacity_for(2_802_380) == (63, 50)   # bin 0
+    assert m._capacity_for(237_894) == (63, 50)     # bin 2, just above threshold
+    assert m._capacity_for(125_126) == (31, 100)    # bin 3, just below
+    assert m._capacity_for(14_797) == (31, 100)     # bin 6
+
+
+def test_capacity_tiers_are_configurable():
+    m = DiscreteHazardModel(params={
+        "num_leaves": 63, "min_data_in_leaf": 50,
+        "small_bin_threshold_rows": 1000,
+        "small_bin_num_leaves": 7, "small_bin_min_data_in_leaf": 500,
+    })
+    assert m._capacity_for(5000) == (63, 50)
+    assert m._capacity_for(999) == (7, 500)
+
+
+def test_fit_records_capacity_actually_used_per_bin():
+    """bin_fit must report the capacity that ran, not the config's headline
+    values -- otherwise a manifest silently misdescribes the small bins."""
+    X, meta, y_train, y_val, cutoff = _thin_val_setup()
+    m = DiscreteHazardModel(
+        edges_minutes=[0, 5, 10, math.inf],
+        params={"n_estimators": 5, "num_leaves": 63, "min_data_in_leaf": 50,
+                "small_bin_threshold_rows": 200, "small_bin_num_leaves": 7,
+                "small_bin_min_data_in_leaf": 500},
+    )
+    m.fit(X, meta, y_train, cutoff, X, meta, y_val, cutoff)
+    by_bin = {b["bin"]: b for b in m.bin_fit_}
+    assert by_bin[0]["n_train_rows"] >= 200 and by_bin[0]["num_leaves"] == 63
+    assert by_bin[2]["n_train_rows"] < 200 and by_bin[2]["num_leaves"] == 7
+    assert by_bin[2]["min_data_in_leaf"] == 500
+
+
 def test_fit_degrades_instead_of_failing_on_thin_validation_risk_set():
     """A validation risk set too thin to early-stop on is a normal data
     condition -- a quiet weekend validation day leaves the later bins with
