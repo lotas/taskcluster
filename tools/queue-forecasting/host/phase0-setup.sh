@@ -651,8 +651,10 @@ cmd_egress() {
   step "Task 7: egress allowlist"
   local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  if would "install tinyproxy and nftables"; then
+  if would "install tinyproxy and the nft tool"; then
     sudo apt-get update -qq
+    # Installs the nft binary. The distro nftables.service is deliberately NOT
+    # enabled - its stock config flushes the whole ruleset, Docker included.
     sudo apt-get install -y -qq tinyproxy nftables
   fi
 
@@ -672,20 +674,43 @@ LIST
     sudo systemctl is-active tinyproxy
   fi
 
-  if would "install nftables rules pinning $RESEARCH_USER to the proxy"; then
+  # Docker's NAT/filter rules go through iptables, which on current systems is
+  # the iptables-nft backend - so they live in the nftables ruleset. A
+  # `flush ruleset` (as a stock /etc/nftables.conf does) would wipe Docker's
+  # chains and break container networking and the published postgres port.
+  # Manage ONLY our own table, and never write /etc/nftables.conf.
+  local docker_nft
+  docker_nft="$(sudo nft list ruleset 2>/dev/null | grep -ciE 'DOCKER|br-[0-9a-f]{12}' || true)"
+  info "existing nftables lines referencing docker: ${docker_nft:-0}"
+  if [ -f /etc/nftables.conf ] && grep -q 'flush ruleset' /etc/nftables.conf 2>/dev/null; then
+    warn "/etc/nftables.conf contains 'flush ruleset'."
+    warn "This script does not modify that file, but if nftables.service is"
+    warn "enabled it will wipe Docker's rules on the next boot. Worth fixing"
+    warn "separately: systemctl is-enabled nftables"
+  fi
+
+  if would "install a dedicated 'inet qf' nftables table (Docker rules untouched)"; then
     local uid; uid="$(id -u "$RESEARCH_USER")"
-    sudo tee /etc/nftables.conf >/dev/null <<NFT
+    sudo mkdir -p /etc/nftables.d
+    sudo tee /etc/nftables.d/qf-research.nft >/dev/null <<NFT
 #!/usr/sbin/nft -f
-flush ruleset
+# Egress restriction for the auto-research agent user.
+#
+# Scoped to a single table so it can be replaced atomically without touching
+# Docker's chains. The create-then-delete-then-define idiom is the supported
+# way to replace one table: the empty 'table' line makes the delete safe on a
+# first run. There is deliberately NO 'flush ruleset' here.
+table inet qf {}
+delete table inet qf
 
 table inet qf {
   chain output {
     type filter hook output priority 0; policy accept;
 
-    # Only the research uid is constrained.
+    # Only the research uid is constrained; everything else is untouched.
     meta skuid != ${uid} accept
 
-    # Loopback reaches the proxy on 127.0.0.1:${PROXY_PORT}.
+    # Loopback reaches the filtering proxy on 127.0.0.1:${PROXY_PORT}.
     oifname "lo" accept
 
     # DNS.
@@ -697,7 +722,35 @@ table inet qf {
   }
 }
 NFT
-    sudo systemctl enable --now nftables
+    sudo nft -f /etc/nftables.d/qf-research.nft \
+      || die "nft failed to load /etc/nftables.d/qf-research.nft; nothing else was changed."
+
+    # Persist across reboot with our own unit, rather than the distro
+    # nftables.service whose default config flushes everything.
+    sudo tee /etc/systemd/system/qf-nftables.service >/dev/null <<'UNIT'
+[Unit]
+Description=Load the inet qf egress table for the auto-research agents
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/qf-research.nft
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now qf-nftables.service
+    sudo nft list table inet qf
+
+    local docker_after
+    docker_after="$(sudo nft list ruleset 2>/dev/null | grep -ciE 'DOCKER|br-[0-9a-f]{12}' || true)"
+    info "docker-related nftables lines after: ${docker_after:-0} (was ${docker_nft:-0})"
+    if [ "${docker_nft:-0}" -gt 0 ] && [ "${docker_after:-0}" -eq 0 ]; then
+      die "Docker's nftables rules disappeared. Restore with: sudo systemctl restart docker"
+    fi
   fi
 
   if would "set proxy environment for $RESEARCH_USER"; then

@@ -306,13 +306,35 @@ Expected: note whether `nftables` is present (Task 7 assumes it), the DNS resolv
 
 ## Phase 0c — Postgres authentication and roles
 
+### Tasks 3–4 — DONE 2026-08-24
+
+> Applied via `host/phase0-setup.sh db-auth`. Verified: `pg_hba` has no
+> host-type `trust` rules; an unauthenticated network connection is refused
+> while an authenticated one succeeds; collector and live-predictor both run
+> with a credential-bearing `DATABASE_URL`; task ingestion confirmed.
+>
+> **Two findings that changed the tooling, worth carrying forward:**
+>
+> 1. **Every application service in `docker-compose.yml` declares `profiles:`;
+>    only `postgres` does not.** So bare `docker compose config` renders
+>    postgres alone, and bare `docker compose up -d` would restart postgres
+>    alone. Anything that must see or act on the app services has to enable
+>    every declared profile — but must still name services explicitly, because
+>    `--profile full` would start the six services deliberately not running.
+> 2. **`environment:` overrides `env_file:`.** The services hardcoded a
+>    password-less `DATABASE_URL`, so editing `.env` changed nothing. All eight
+>    are now `${DATABASE_URL:?...}`, and `.env` must supply both
+>    `DATABASE_URL` and `POSTGRES_PASSWORD` or compose refuses to render.
+>    Container env is fixed at creation, so picking up a changed `.env`
+>    requires `--force-recreate`, not `restart`.
+
 ### Task 3: Set passwords before changing authentication
 
 Order matters. Setting passwords first means that when `trust` is replaced in Task 4, every identity already has a working credential. Doing it the other way locks the services out.
 
 **Files:** none (host state).
 
-- [ ] **Step 1: Generate and store passwords**
+- [x] **Step 1: Generate and store passwords**
 
 On the host, as the deploy user:
 
@@ -327,7 +349,7 @@ ls -l ~/qf-secrets
 
 Expected: four files, mode `-rw-------`. These must never be readable by `research` (asserted by negative control 3).
 
-- [ ] **Step 2: Set the superuser password**
+- [x] **Step 2: Set the superuser password**
 
 ```bash
 docker compose exec -T postgres psql -U postgres -d forecasting \
@@ -336,7 +358,7 @@ docker compose exec -T postgres psql -U postgres -d forecasting \
 
 Expected: `ALTER ROLE`.
 
-- [ ] **Step 3: Verify it was stored as SCRAM, not md5**
+- [x] **Step 3: Verify it was stored as SCRAM, not md5**
 
 ```bash
 docker compose exec -T postgres psql -U postgres -d forecasting \
@@ -349,7 +371,7 @@ Expected: `scheme` begins `SCRAM-SHA-256`. If it reads `md5`, stop: `password_en
 
 **Files:** `pg_hba.conf` inside the postgres volume (backed up in Task 2).
 
-- [ ] **Step 1: Write the new `pg_hba.conf`**
+- [x] **Step 1: Write the new `pg_hba.conf`**
 
 ```bash
 docker compose exec -T postgres bash -c 'cat > /var/lib/postgresql/data/pg_hba.conf <<HBA
@@ -370,7 +392,7 @@ docker compose exec -T postgres cat /var/lib/postgresql/data/pg_hba.conf
 
 Expected: the file reads back exactly as above.
 
-- [ ] **Step 2: Reload and confirm the file took effect**
+- [x] **Step 2: Reload and confirm the file took effect**
 
 ```bash
 docker compose exec -T postgres psql -U postgres -d forecasting -c "SELECT pg_reload_conf();"
@@ -380,7 +402,7 @@ docker compose exec -T postgres psql -U postgres -d forecasting \
 
 Expected: no row shows `trust` for a `host` type; `error` column (if shown) is null on every row.
 
-- [ ] **Step 3: Prove that unauthenticated network access is now refused**
+- [x] **Step 3: Prove that unauthenticated network access is now refused**
 
 ```bash
 docker compose exec -T postgres psql "postgresql://postgres@127.0.0.1:5432/forecasting" -c "SELECT 1;"
@@ -388,7 +410,7 @@ docker compose exec -T postgres psql "postgresql://postgres@127.0.0.1:5432/forec
 
 Expected: **fails** with `no password supplied` or `password authentication failed`. If it succeeds, `pg_hba.conf` did not take effect — stop and roll back with Step 5.
 
-- [ ] **Step 4: Update the services' `DATABASE_URL` and restart**
+- [x] **Step 4: Update the services' `DATABASE_URL` and restart**
 
 Edit `.env` on the host so `DATABASE_URL` carries the password:
 
@@ -420,7 +442,7 @@ docker compose exec -T postgres psql -U postgres -d forecasting \
 
 Expected: non-zero, and growing on a second run a minute later.
 
-- [ ] **Step 5: Rollback procedure (only if Step 4 fails)**
+- [x] **Step 5: Rollback procedure (only if Step 4 fails)**
 
 ```bash
 docker compose exec -T postgres cp /var/lib/postgresql/data/pg_hba.conf.pre-scram \
@@ -432,11 +454,24 @@ docker compose up -d
 
 Then report what failed before continuing.
 
+### Task 5 — DONE 2026-08-24 (except Step 6, `db-app-cutover`)
+
+> Applied via `host/phase0-setup.sh db-roles`. Grant list derived from the live
+> database matched the six expected tables exactly. Read-only proof passed:
+> `forecast_experiment` SELECT ok, DELETE refused, CREATE refused — negative
+> control 1 satisfied.
+>
+> **Step 6 (`db-app-cutover`, moving services off the postgres superuser) is
+> deliberately NOT done.** It recreates containers, so it carries the same risk
+> class as the SCRAM cutover. Phase 0's requirement is that
+> `forecast_experiment` is genuinely read-only, which is now proven; the
+> superuser migration is hygiene and can wait until the current state has held.
+
 ### Task 5: Create the experiment, migrator, and app roles
 
 **Files:** none (host state).
 
-- [ ] **Step 1: Create the three roles**
+- [x] **Step 1: Create the three roles**
 
 Substitute the generated passwords. `forecast_experiment` and `forecast_migrator` are `NOLOGIN`-free but strictly limited; none is a superuser.
 
@@ -450,7 +485,7 @@ SQL
 
 Expected: three `CREATE ROLE` lines.
 
-- [ ] **Step 2: Remove the implicit public schema grant**
+- [x] **Step 2: Remove the implicit public schema grant**
 
 Postgres 15 already revokes `CREATE` on `public` from `PUBLIC`, but assert it rather than assume:
 
@@ -463,7 +498,7 @@ SQL
 
 Expected: `REVOKE` twice.
 
-- [ ] **Step 3: Grant read-only access to `forecast_experiment`**
+- [x] **Step 3: Grant read-only access to `forecast_experiment`**
 
 ```bash
 docker compose exec -T postgres psql -U postgres -d forecasting <<'SQL'
@@ -493,7 +528,7 @@ Expected: `GRANT` ×3 then `ALTER ROLE` ×6.
 
 If Task 2 Step 1 showed tables beyond the six listed, add them to the `GRANT SELECT` list now. A missing grant surfaces later as a confusing trainer failure.
 
-- [ ] **Step 4: Grant the migrator exactly what it needs**
+- [x] **Step 4: Grant the migrator exactly what it needs**
 
 ```bash
 docker compose exec -T postgres psql -U postgres -d forecasting <<'SQL'
@@ -507,7 +542,7 @@ The migrator needs `CREATE` to add columns and tables. The additive-only restric
 
 Expected: `GRANT` ×3.
 
-- [ ] **Step 5: Prove the experiment role is read-only**
+- [x] **Step 5: Prove the experiment role is read-only**
 
 This is negative control 1, run manually before it is scripted:
 
@@ -528,7 +563,7 @@ Expected: the `SELECT` succeeds; the `DELETE` fails with `cannot execute DELETE 
 
 Note the `WHERE false` on the delete: even the refusal path must not risk data.
 
-- [ ] **Step 6: Migrate the services off the superuser**
+- [x] **Step 6: Migrate the services off the superuser**
 
 Grant `forecast_app` full access to the existing tables, then switch `DATABASE_URL` to it. This is the last risky step in this task and is independently revertible.
 
