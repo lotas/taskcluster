@@ -186,9 +186,31 @@ cmd_db_auth() {
   fi
 
   # --- already done? ------------------------------------------------------
-  local trust_rules
+  # Two independent sources, because a single silent query returning the wrong
+  # answer previously made this step claim success without doing anything.
+  local trust_rules trust_in_file
   trust_rules="$(psql_super -tAc \
     "SELECT count(*) FROM pg_hba_file_rules WHERE type='host' AND auth_method='trust';")"
+  trust_rules="$(printf '%s' "$trust_rules" | tr -d '[:space:]')"
+  trust_in_file="$(compose exec -T postgres bash -c \
+    "grep -cE '^[[:space:]]*host[[:space:]]+.*[[:space:]]trust[[:space:]]*\$' \
+       /var/lib/postgresql/data/pg_hba.conf" 2>/dev/null || echo 0)"
+  trust_in_file="$(printf '%s' "$trust_in_file" | tr -d '[:space:]')"
+
+  case "$trust_rules" in
+    ''|*[!0-9]*) die "the pg_hba_file_rules count returned '$trust_rules', not a
+     number. Run this by hand and report the output:
+       docker compose exec -T postgres psql -U postgres -d forecasting \\
+         -c \"SELECT type,auth_method FROM pg_hba_file_rules;\"" ;;
+  esac
+
+  info "host-type trust rules: view=$trust_rules file=$trust_in_file"
+  if [ "$trust_rules" != "$trust_in_file" ]; then
+    die "the pg_hba_file_rules view ($trust_rules) and the file itself
+     ($trust_in_file) disagree about how many host trust rules exist.
+     Refusing to act on a state I cannot read consistently."
+  fi
+
   if [ "$trust_rules" = "0" ]; then
     skip "no host-type trust rules remain; pg_hba already migrated"
   else
@@ -214,14 +236,36 @@ HBA'
 
   # --- prove unauthenticated network access is refused --------------------
   if [ "$CHECK" = 0 ]; then
-    # -w: never prompt. Without it psql can block waiting on a tty that
-    # `compose exec -T` does not provide.
-    if compose exec -T postgres \
-         psql -w "postgresql://postgres@127.0.0.1:5432/forecasting" -c 'SELECT 1;' >/dev/null 2>&1; then
-      die "an unauthenticated network connection still succeeded.
+    # Positive control first. Without it, a psql that fails for ANY reason
+    # (wrong port, missing client, mangled URI) reads as "refused" and this
+    # check silently passes while proving nothing. That exact false positive
+    # previously reported a cutover that had not happened.
+    local probe_pw probe_out probe_rc
+    probe_pw="$(printf '%s' "$pg_pw" | urlencode)"
+    if ! compose exec -T postgres psql -w \
+           "postgresql://postgres:${probe_pw}@127.0.0.1:5432/forecasting" \
+           -c 'SELECT 1;' >/dev/null 2>&1; then
+      die "the positive control failed: even an AUTHENTICATED connection to
+     127.0.0.1:5432 did not work. psql, the port, or the URI is the problem -
+     not authentication. Nothing was changed."
+    fi
+    info "positive control: authenticated connection works"
+
+    set +e
+    probe_out="$(compose exec -T postgres psql -w \
+      "postgresql://postgres@127.0.0.1:5432/forecasting" -c 'SELECT 1;' 2>&1)"
+    probe_rc=$?
+    set -e
+    if [ "$probe_rc" = 0 ]; then
+      die "an unauthenticated network connection still SUCCEEDED.
      pg_hba did not take effect. Run: $0 rollback-db-auth"
     fi
-    info "unauthenticated network connection refused (as intended)"
+    case "$probe_out" in
+      *[Pp]assword*|*authentication*) info "unauthenticated connection refused (as intended)" ;;
+      *) die "the unauthenticated probe failed, but not for an authentication
+     reason. Refusing to treat this as proof. psql said:
+       $probe_out" ;;
+    esac
   fi
 
   # --- .env cutover -------------------------------------------------------
