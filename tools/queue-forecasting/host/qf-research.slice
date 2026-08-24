@@ -1,0 +1,13 @@
+[Unit]
+Description=Resource caps for the auto-research agents
+Before=slices.target
+
+[Slice]
+# Agents run as ordinary shells outside any experiment container, so their
+# resource use is capped here rather than by a container runtime. Sized so
+# agent activity cannot starve the collector, live-predictor, or Postgres.
+MemoryMax=4G
+MemoryHigh=3G
+CPUQuota=200%
+TasksMax=512
+IOWeight=50

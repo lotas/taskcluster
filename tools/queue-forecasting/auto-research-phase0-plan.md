@@ -18,6 +18,14 @@
 - JS tests run per-file: `node test/<name>.test.js`.
 - The single `forecasting` database is shared by all services. There is no staging DB. Every host step is written to be reversible, and destructive-adjacent steps carry an explicit rollback.
 
+> **Tasks 2–9 are implemented by `host/phase0-setup.sh`.** Run the script
+> rather than pasting the commands below by hand — it is idempotent, has a
+> `--check` dry-run mode, derives the grant list from the live database, and
+> auto-rolls-back the `pg_hba` cutover if collection stops. This document
+> remains the narrative: why each step exists, what to expect, and what to do
+> when something is unexpected. If the two ever disagree, the script is what
+> actually runs — fix the document.
+
 **Acceptance for the whole phase:** negative controls 1–6 (§13.1 of the spec) all fail closed, evidenced by the output of `nc-suite.sh`.
 
 ---
