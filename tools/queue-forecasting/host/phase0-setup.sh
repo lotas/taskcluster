@@ -752,7 +752,11 @@ table inet qf {
     tcp dport 53 accept
 
     # Everything else leaving the box from this uid is denied.
-    counter reject with icmp type admin-prohibited
+    #
+    # icmpx, NOT icmp. In an inet table, 'reject with icmp' is IPv4-only, and
+    # nft silently narrows the rule with 'meta nfproto ipv4' - leaving IPv6
+    # egress to fall through to the accept policy. icmpx covers both families.
+    counter reject with icmpx type admin-prohibited
   }
 }
 NFT
@@ -825,7 +829,17 @@ ENVV
   info "denied host blocked"
   run_research "curl -sS -o /dev/null --max-time 20 --noproxy '*' https://api.github.com" 2>/dev/null \
     && die "proxy bypass succeeded. nftables is not constraining the research uid."
-  info "proxy bypass blocked"
+  info "proxy bypass blocked (ipv4)"
+
+  # Canary: only meaningful if this host has a global IPv6 address at all.
+  if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+    run_research "curl -6 -sS -o /dev/null --max-time 20 --noproxy '*' https://api.github.com" 2>/dev/null \
+      && die "IPv6 proxy bypass succeeded. The reject rule is IPv4-only - check
+     that the table uses 'reject with icmpx', not 'reject with icmp'."
+    info "proxy bypass blocked (ipv6)"
+  else
+    skip "no global IPv6 address on this host; IPv6 bypass check not applicable"
+  fi
 }
 
 # --------------------------------------------------------------------------
