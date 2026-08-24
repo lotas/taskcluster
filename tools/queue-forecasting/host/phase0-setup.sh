@@ -170,9 +170,11 @@ cmd_db_auth() {
   pg_pw="$(require_secret postgres)"
   if would "set the postgres role password (stored in $SECRETS_DIR/postgres.pw)"; then
     psql_super -c "ALTER ROLE postgres WITH PASSWORD '$pg_pw';" >/dev/null
-    local scheme
-    scheme="$(psql_super -tAc "SELECT left(rolpassword,14) FROM pg_authid WHERE rolname='postgres';")"
-    [ "$scheme" = "SCRAM-SHA-256" ] || die "password stored as '$scheme', expected SCRAM-SHA-256."
+    local is_scram
+    is_scram="$(psql_super -tAc \
+      "SELECT starts_with(rolpassword,'SCRAM-SHA-256') FROM pg_authid WHERE rolname='postgres';")"
+    [ "$is_scram" = "t" ] || die "postgres password is not stored as SCRAM-SHA-256.
+     Check: SELECT left(rolpassword,20) FROM pg_authid WHERE rolname='postgres';"
     info "stored as SCRAM-SHA-256"
   fi
 
@@ -212,8 +214,10 @@ HBA'
 
   # --- prove unauthenticated network access is refused --------------------
   if [ "$CHECK" = 0 ]; then
+    # -w: never prompt. Without it psql can block waiting on a tty that
+    # `compose exec -T` does not provide.
     if compose exec -T postgres \
-         psql "postgresql://postgres@127.0.0.1:5432/forecasting" -c 'SELECT 1;' >/dev/null 2>&1; then
+         psql -w "postgresql://postgres@127.0.0.1:5432/forecasting" -c 'SELECT 1;' >/dev/null 2>&1; then
       die "an unauthenticated network connection still succeeded.
      pg_hba did not take effect. Run: $0 rollback-db-auth"
     fi
@@ -223,15 +227,23 @@ HBA'
   # --- .env cutover -------------------------------------------------------
   local envf="$DEPLOY_DIR/.env"
   [ -f "$envf" ] || die "no .env at $envf"
-  if grep -q '^DATABASE_URL=.*:.*@' "$envf"; then
+  # Must match user:password@, NOT the scheme colon. The naive pattern
+  # '^DATABASE_URL=.*:.*@' matches postgresql://postgres@postgres:5432/...
+  # (the colon from "postgresql:") and would wrongly skip the rewrite,
+  # leaving the services with no password after the pg_hba cutover.
+  if grep -Eq '^DATABASE_URL=postgresql://[^:@/]+:[^@/]+@' "$envf"; then
     skip ".env DATABASE_URL already carries a password"
   else
     if would "rewrite DATABASE_URL in .env to authenticate as postgres"; then
+      grep -q '^DATABASE_URL=' "$envf" \
+        || die "no DATABASE_URL line in $envf; refusing to guess. Add it by hand."
       cp "$envf" "$envf.pre-scram"
       local enc_pw
       enc_pw="$(printf '%s' "$pg_pw" | urlencode)"
       sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql://postgres:${enc_pw}@postgres:5432/forecasting|" "$envf"
       chmod 600 "$envf"
+      grep -Eq '^DATABASE_URL=postgresql://[^:@/]+:[^@/]+@' "$envf" \
+        || die "the DATABASE_URL rewrite did not take. Restore: cp $envf.pre-scram $envf"
       info "backup at $envf.pre-scram"
     fi
   fi
@@ -354,14 +366,14 @@ SQL
   exp_pw="$(printf '%s' "$(require_secret forecast_experiment)" | urlencode)"
   exp_url="postgresql://forecast_experiment:${exp_pw}@127.0.0.1:5432/forecasting"
 
-  compose exec -T postgres psql "$exp_url" -c 'SELECT 1;' >/dev/null 2>&1 \
+  compose exec -T postgres psql -w "$exp_url" -c 'SELECT 1;' >/dev/null 2>&1 \
     || die "forecast_experiment cannot even connect; grants are wrong."
   # WHERE false: even the refusal path must not risk data.
-  if compose exec -T postgres psql "$exp_url" \
+  if compose exec -T postgres psql -w "$exp_url" \
        -c 'DELETE FROM queue_forecast_tasks WHERE false;' >/dev/null 2>&1; then
     die "forecast_experiment was able to DELETE. The role is not read-only."
   fi
-  if compose exec -T postgres psql "$exp_url" \
+  if compose exec -T postgres psql -w "$exp_url" \
        -c 'CREATE TABLE agent_escape (x int);' >/dev/null 2>&1; then
     psql_super -c 'DROP TABLE IF EXISTS agent_escape;' >/dev/null
     die "forecast_experiment was able to CREATE TABLE. Schema grants are wrong."
