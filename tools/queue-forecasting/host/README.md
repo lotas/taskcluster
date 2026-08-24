@@ -30,8 +30,21 @@ observed healthy.
 
 ## What the script will not do
 
-1. **Write API keys.** Create `/home/research/.config/qf/agent-env` yourself,
-   mode 0600, then re-run `agent-cli`.
+1. **Log the agents in.** Authentication is interactive SSO, not API keys, so
+   there is no key file. Do this once, as `research`, **before `egress`** — the
+   OAuth flow reaches your SSO provider and the vendors' auth domains, which
+   the allowlist does not permit:
+
+   ```bash
+   sudo -u research -i
+   claude          # then /login
+   codex login
+   exit
+   ```
+
+   Then re-run `agent-cli`. Afterwards, `auth-check` is the standing probe:
+   SSO tokens refresh against an auth endpoint, and if the allowlist blocks it
+   the agents work for days and then stop silently.
 2. **Fix `password_encryption=md5`.** It stops. Setting passwords in the wrong
    scheme and then flipping `pg_hba` locks the services out.
 3. **Decide about unexpected tables.** Grants are derived from the live table
@@ -48,6 +61,10 @@ observed healthy.
 | `tinyproxy-allowlist.conf` | `/etc/tinyproxy/tinyproxy.conf` | Egress allowlist (domains in `/etc/tinyproxy/allowlist.txt`) |
 | `nc-suite.sh` | run in place | Negative controls 1–6; must exit 0 |
 | `nc-evidence-phase0.txt` | — | Baseline evidence from the first passing run |
+
+Run order matters: `research-user` → `agent-cli` → **interactive login** →
+`egress` → `auth-check` → `verify`. Logging in after the egress lock-down
+will fail.
 
 Deliberately not in this repo: `pg_hba.conf` (inside the postgres volume,
 backed up as `pg_hba.conf.pre-scram`), `/etc/nftables.conf`, `~/qf-secrets/*.pw`,

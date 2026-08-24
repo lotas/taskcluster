@@ -698,8 +698,16 @@ Prerequisites, before *any* unattended execution:
 
 Standing rails: shared heavy-training lock; sandboxed experiment containers
 with no egress and no credentials; **no model promotion without a
-human-approved PR**; live-predictor restarts remain human; daily token/cost
-budget; `research/PAUSE` kill switch; retention ≥55 days.
+human-approved PR**; live-predictor restarts remain human; usage budget; `research/PAUSE` kill switch; retention ≥55 days.
+
+**Authentication is interactive SSO, not API keys** (the account sits behind
+Mozilla SSO). Three consequences: the binding constraint is the account's rate
+and usage limits rather than spend, so the budget mechanism backs off on
+rate-limit responses instead of counting dollars; the one-time login must
+happen **before** the egress allowlist is applied, since the OAuth flow reaches
+the IdP and the vendors' auth domains; and token refresh must keep working
+afterwards, so `phase0-setup.sh auth-check` runs periodically. An SSO token
+that silently fails to refresh stops the loop with no other symptom.
 
 ### 13.1 Negative-control suite, by phase
 
@@ -823,7 +831,8 @@ deployed, health-gated, and appears in `deploys.jsonl` with coverage tracked.
 | Primary and non-overlapping estimates disagree in sign | Robustness check (§8.4.4) | Verdict forced to `INCONCLUSIVE` |
 | Narrative projection rewritten or force-pushed | SQLite hash-chain mismatch | Ledger, bus, and job/result projection rebuilt from SQLite; `features.yaml` re-synthesised from recorded evidence; issue opened |
 | Agent loops on a dead hypothesis | Daily copilot audit | `SHELVED` with reason |
-| Runaway cost | Daily budget check | Tick exits early |
+| Runaway usage | Budget / rate-limit check | Tick exits early with backoff |
+| SSO token stops refreshing | Periodic `auth-check` | Escalate; likely a missing auth domain in the allowlist |
 
 ## 16. Open decisions
 
@@ -833,7 +842,7 @@ deployed, health-gated, and appears in `deploys.jsonl` with coverage tracked.
 2. Cron cadence (3 hours is the starting assumption).
 3. Screen cohort set and subsample rate — must be fixed in the contract before
    the first screen and calibrated for both error directions.
-4. Daily token budget figure.
+4. Usage budget: the rate-limit backoff policy, and how a tick detects it.
 5. Whether the deploy step polls GitHub or is webhook-triggered.
 6. Whether the audit tick may re-open a `REFUTED` hypothesis, or only
    `SHELVED` ones.

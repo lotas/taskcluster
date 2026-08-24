@@ -24,6 +24,7 @@
 #   ./phase0-setup.sh egress
 #   ./phase0-setup.sh agent-cli
 #   ./phase0-setup.sh verify                  # negative controls 1-6
+#   ./phase0-setup.sh auth-check              # agent logins still working
 #   ./phase0-setup.sh all                     # every step in order, stop on first failure
 #
 # ENVIRONMENT:
@@ -825,31 +826,67 @@ cmd_agent_cli() {
     || $as_research 'npm install -g @openai/codex'
   $as_research 'claude --version && codex --version'
 
-  local keyfile="/home/$RESEARCH_USER/.config/qf/agent-env"
-  if sudo test -f "$keyfile"; then
-    skip "agent-env already present"
-  else
-    warn "API keys are the one thing this script will not write for you."
-    warn "Create $keyfile as $RESEARCH_USER, mode 0600, containing:"
-    warn "    export ANTHROPIC_API_KEY=..."
-    warn "    export OPENAI_API_KEY=..."
-    warn "Then re-run: $0 agent-cli"
+  # Auth is interactive SSO login, not API keys - so there is no key file to
+  # write. The probe below IS the check: if a CLI can complete a request, it is
+  # authenticated; if it cannot, it needs a one-time login.
+  info "probing both CLIs..."
+  local claude_ok=1 codex_ok=1
+  $as_research 'claude -p "reply with the single word: ready"' >/dev/null 2>&1 || claude_ok=0
+  $as_research 'codex exec "reply with the single word: ready"'  >/dev/null 2>&1 || codex_ok=0
+
+  if [ "$claude_ok" = 1 ] && [ "$codex_ok" = 1 ]; then
+    info "both CLIs authenticated and reachable"
     return 0
   fi
 
-  info "checking both CLIs work non-interactively through the proxy..."
-  local ok=1
-  $as_research '. ~/.config/qf/agent-env; claude -p "reply with the single word: ready"' \
-    || { warn "claude could not complete a request"; ok=0; }
-  $as_research '. ~/.config/qf/agent-env; codex exec "reply with the single word: ready"' \
-    || { warn "codex could not complete a request"; ok=0; }
-  if [ "$ok" = 0 ]; then
-    die "a CLI failed to reach its API. This is fail-closed, not a hole, but it
-     blocks the loop. Most likely it does not honour HTTPS_PROXY. Applying an
-     nftables IP-set exception is a decision, not an automation - see the plan,
-     Task 8 Step 4, and record any exception in host/README.md."
-  fi
-  info "both CLIs reachable through the allowlist"
+  warn "one or both CLIs are not authenticated yet:"
+  [ "$claude_ok" = 1 ] && info "  claude: ok" || warn "  claude: NOT authenticated"
+  [ "$codex_ok" = 1 ]  && info "  codex:  ok" || warn "  codex:  NOT authenticated"
+  cat <<INSTRUCTIONS
+
+   Log in interactively as the research user, ONE TIME, before running
+   '$0 egress'. The OAuth flow reaches your SSO provider and the vendors' auth
+   domains, none of which the egress allowlist permits - so it must happen
+   first.
+
+       sudo -u $RESEARCH_USER -i
+       claude            # then: /login   (paste the URL into a browser,
+                         #                 paste the code back)
+       codex login
+       exit
+
+   Then re-run:  $0 agent-cli
+
+INSTRUCTIONS
+  # Not an error: the operator has work to do, and the script has done its part.
+  return 0
+}
+
+# Standing check that authentication still works. Interactive SSO tokens are
+# refreshed against an auth endpoint; if the egress allowlist does not permit
+# it, the agents keep working for days and then stop silently. Run this after
+# egress, and periodically thereafter.
+cmd_auth_check() {
+  step "Agent authentication health"
+  local as_research="sudo -u $RESEARCH_USER -i bash -lc"
+  local failed=0
+  local out
+  for cli in claude codex; do
+    if [ "$cli" = claude ]; then
+      out="$($as_research 'claude -p "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
+    else
+      out="$($as_research 'codex exec "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
+    fi
+    case "$out" in
+      FAILED:*) warn "$cli: $out"; failed=1 ;;
+      *) info "$cli: ok" ;;
+    esac
+  done
+  [ "$failed" = 0 ] || die "an agent CLI cannot reach its API. If this began after
+     '$0 egress', a token-refresh or auth domain is missing from
+     /etc/tinyproxy/allowlist.txt. Add it, restart tinyproxy, record the
+     addition in host/README.md, and re-run."
+  info "both CLIs authenticated"
 }
 
 # --------------------------------------------------------------------------
@@ -897,9 +934,10 @@ main() {
     egress)           cmd_egress ;;
     agent-cli)        cmd_agent_cli ;;
     verify)           cmd_verify ;;
+    auth-check)       cmd_auth_check ;;
     all)
       cmd_discover; cmd_db_auth; cmd_db_roles
-      cmd_research_user; cmd_egress; cmd_agent_cli; cmd_verify
+      cmd_research_user; cmd_agent_cli; cmd_egress; cmd_auth_check; cmd_verify
       step "Phase 0 complete except db-app-cutover"
       info "Run '$0 db-app-cutover' separately once you have watched the"
       info "services run healthily as the superuser for a while."
