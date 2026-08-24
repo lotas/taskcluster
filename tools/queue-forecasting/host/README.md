@@ -79,3 +79,24 @@ and `/home/research/.config/qf/agent-env`.
 
 None. If a CLI is found not to honour `HTTPS_PROXY` and a direct nftables
 allowance is added for it, record the endpoint, the reason, and the date here.
+
+## PATH gotcha for anything non-interactive (cron included)
+
+Debian's `~/.bashrc` starts with
+
+```sh
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+```
+
+so it returns immediately for non-interactive shells — and that is where nvm's
+initialisation lives. A `bash -lc` login shell is still non-interactive, so
+`node`, `npm`, `claude`, and `codex` are all invisible to it.
+
+`phase0-setup.sh` works around this with `run_research`, which sources
+`$NVM_DIR/nvm.sh` before every command. **The Phase 4 cron tick must do the
+same**, or it will fail with `command not found` and no other clue. Either
+source nvm in the tick script, or invoke the CLIs by absolute path
+(`/home/research/.nvm/versions/node/v24.*/bin/claude`).

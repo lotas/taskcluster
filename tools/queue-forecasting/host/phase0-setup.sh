@@ -130,6 +130,17 @@ require_secret() {  # require_secret <role> -> generates once, reuses thereafter
 
 urlencode() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read(),safe=""))'; }
 
+# Run a command as the research user with nvm actually on PATH.
+#
+# `bash -lc` is NON-interactive, and Debian's ~/.bashrc returns early for
+# non-interactive shells (`case $- in *i*) ;; *) return;; esac`) - which is
+# where nvm's init lives. So node/npm/claude/codex are invisible unless nvm is
+# sourced explicitly. The cron tick must do the same thing.
+NVM_PRELUDE='export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true; '
+run_research() {
+  sudo -u "$RESEARCH_USER" -i bash -lc "${NVM_PRELUDE}$*"
+}
+
 # --------------------------------------------------------------------------
 # task 2 - discovery (read-only)
 # --------------------------------------------------------------------------
@@ -165,7 +176,9 @@ cmd_discover() {
     "SELECT type, database, user_name, address, auth_method FROM pg_hba_file_rules ORDER BY line_number;"
 
   info "--- host facts ---"
-  info "nftables: $(command -v nft >/dev/null && nft --version || echo 'NOT INSTALLED')"
+  # nft lives in /usr/sbin, which is not on a normal user's PATH - check with
+  # sudo or the plain binary path, otherwise this reports a false negative.
+  info "nftables: $(sudo nft --version 2>/dev/null || echo 'NOT INSTALLED')"
   info "tinyproxy: $(command -v tinyproxy >/dev/null && echo present || echo 'NOT INSTALLED')"
   info "psql client: $(command -v psql >/dev/null && psql --version || echo 'NOT INSTALLED')"
   info "docker group members: $(getent group docker | cut -d: -f4)"
@@ -780,14 +793,13 @@ ENVV
 
   [ "$CHECK" = 1 ] && return 0
 
-  local as_research="sudo -u $RESEARCH_USER -i bash -lc"
-  $as_research 'curl -sS -o /dev/null --max-time 20 https://api.github.com' \
+  run_research 'curl -sS -o /dev/null --max-time 20 https://api.github.com' \
     || die "allowed host unreachable through the proxy. Egress is too tight to run agents."
   info "allowed host reachable"
-  $as_research 'curl -sS -o /dev/null --max-time 20 https://pypi.org' 2>/dev/null \
+  run_research 'curl -sS -o /dev/null --max-time 20 https://pypi.org' 2>/dev/null \
     && die "denied host was reachable. The allowlist is not being enforced."
   info "denied host blocked"
-  $as_research "curl -sS -o /dev/null --max-time 20 --noproxy '*' https://api.github.com" 2>/dev/null \
+  run_research "curl -sS -o /dev/null --max-time 20 --noproxy '*' https://api.github.com" 2>/dev/null \
     && die "proxy bypass succeeded. nftables is not constraining the research uid."
   info "proxy bypass blocked"
 }
@@ -798,7 +810,6 @@ ENVV
 
 cmd_agent_cli() {
   step "Task 8: agent CLIs for $RESEARCH_USER"
-  local as_research="sudo -u $RESEARCH_USER -i bash -lc"
 
   # psql is required by negative control NC1; without it the canary voids the
   # whole group and the read-only assertion proves nothing.
@@ -829,33 +840,33 @@ cmd_agent_cli() {
     info "removed the temporary allowlist entry"
   }
 
-  if ! $as_research 'node --version' >/dev/null 2>&1; then
+  if ! run_research 'node --version' >/dev/null 2>&1; then
     info "installing node via nvm"
     temp_allow
     # Revoke even if the install fails, so a failure cannot leave egress wider
     # than intended.
-    if ! $as_research 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash' \
-       || ! $as_research 'nvm install 24'; then
+    if ! run_research 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash' \
+       || ! run_research 'nvm install 24'; then
       temp_revoke
       die "node installation failed. Nothing else was changed."
     fi
     temp_revoke
   fi
-  $as_research 'node --version'
+  run_research 'node --version'
 
-  $as_research 'command -v claude' >/dev/null 2>&1 \
-    || $as_research 'npm install -g @anthropic-ai/claude-code'
-  $as_research 'command -v codex' >/dev/null 2>&1 \
-    || $as_research 'npm install -g @openai/codex'
-  $as_research 'claude --version && codex --version'
+  run_research 'command -v claude' >/dev/null 2>&1 \
+    || run_research 'npm install -g @anthropic-ai/claude-code'
+  run_research 'command -v codex' >/dev/null 2>&1 \
+    || run_research 'npm install -g @openai/codex'
+  run_research 'claude --version && codex --version'
 
   # Auth is interactive SSO login, not API keys - so there is no key file to
   # write. The probe below IS the check: if a CLI can complete a request, it is
   # authenticated; if it cannot, it needs a one-time login.
   info "probing both CLIs..."
   local claude_ok=1 codex_ok=1
-  $as_research 'claude -p "reply with the single word: ready"' >/dev/null 2>&1 || claude_ok=0
-  $as_research 'codex exec "reply with the single word: ready"'  >/dev/null 2>&1 || codex_ok=0
+  run_research 'claude -p "reply with the single word: ready"' >/dev/null 2>&1 || claude_ok=0
+  run_research 'codex exec "reply with the single word: ready"'  >/dev/null 2>&1 || codex_ok=0
 
   if [ "$claude_ok" = 1 ] && [ "$codex_ok" = 1 ]; then
     info "both CLIs authenticated and reachable"
@@ -891,14 +902,13 @@ INSTRUCTIONS
 # egress, and periodically thereafter.
 cmd_auth_check() {
   step "Agent authentication health"
-  local as_research="sudo -u $RESEARCH_USER -i bash -lc"
   local failed=0
   local out
   for cli in claude codex; do
     if [ "$cli" = claude ]; then
-      out="$($as_research 'claude -p "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
+      out="$(run_research 'claude -p "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
     else
-      out="$($as_research 'codex exec "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
+      out="$(run_research 'codex exec "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
     fi
     case "$out" in
       FAILED:*) warn "$cli: $out"; failed=1 ;;
