@@ -136,7 +136,15 @@ urlencode() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.s
 # non-interactive shells (`case $- in *i*) ;; *) return;; esac`) - which is
 # where nvm's init lives. So node/npm/claude/codex are invisible unless nvm is
 # sourced explicitly. The cron tick must do the same thing.
-NVM_PRELUDE='export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true; '
+# Do not rely on nvm's shell FUNCTION being available - it is defined by
+# sourcing nvm.sh, which is exactly what a non-interactive shell skips. Put the
+# installed node's bin directory on PATH directly instead. This is also what
+# cron needs: deterministic, no shell plumbing.
+NVM_PRELUDE='export NVM_DIR="$HOME/.nvm"; \
+_nvmbin="$(ls -d "$NVM_DIR"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"; \
+[ -n "$_nvmbin" ] && export PATH="$_nvmbin:$PATH"; \
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1; \
+true; '
 run_research() {
   sudo -u "$RESEARCH_USER" -i bash -lc "${NVM_PRELUDE}$*"
 }
@@ -840,17 +848,26 @@ cmd_agent_cli() {
     info "removed the temporary allowlist entry"
   }
 
-  if ! run_research 'node --version' >/dev/null 2>&1; then
-    info "installing node via nvm"
+  if run_research 'node --version' >/dev/null 2>&1; then
+    info "node found: $(run_research 'node --version' 2>/dev/null)"
+  else
+    info "no node on PATH for $RESEARCH_USER; installing via nvm"
     temp_allow
-    # Revoke even if the install fails, so a failure cannot leave egress wider
-    # than intended.
+    # Revoke even if this fails, so a failure cannot leave egress wider than
+    # intended. nvm's installer defines `nvm` only in the shell that sources
+    # nvm.sh, so run the source and the install in ONE shell invocation.
     if ! run_research 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash' \
-       || ! run_research 'nvm install 24'; then
+       || ! run_research 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install 24'; then
       temp_revoke
-      die "node installation failed. Nothing else was changed."
+      die "node installation failed. Run this by hand and report the output:
+       sudo -u $RESEARCH_USER -i bash -lc 'export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; nvm install 24'
+     Alternatively install node system-wide (apt/NodeSource) - for a cron-driven
+     loop a /usr/bin/node is more robust than a per-user version manager."
     fi
     temp_revoke
+    run_research 'node --version' >/dev/null 2>&1 \
+      || die "node still not on PATH after install. Check:
+       sudo -u $RESEARCH_USER -i bash -lc 'ls -d \$HOME/.nvm/versions/node/*/bin'"
   fi
   run_research 'node --version'
 

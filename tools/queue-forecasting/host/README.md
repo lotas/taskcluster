@@ -95,8 +95,21 @@ so it returns immediately for non-interactive shells — and that is where nvm's
 initialisation lives. A `bash -lc` login shell is still non-interactive, so
 `node`, `npm`, `claude`, and `codex` are all invisible to it.
 
-`phase0-setup.sh` works around this with `run_research`, which sources
-`$NVM_DIR/nvm.sh` before every command. **The Phase 4 cron tick must do the
-same**, or it will fail with `command not found` and no other clue. Either
-source nvm in the tick script, or invoke the CLIs by absolute path
-(`/home/research/.nvm/versions/node/v24.*/bin/claude`).
+Sourcing `nvm.sh` from the tick script is *not* a reliable fix either — it
+defines `nvm` as a shell function, and whether that survives depends on the
+invocation. `phase0-setup.sh` instead resolves the installed node's bin
+directory and prepends it to `PATH`:
+
+```sh
+export NVM_DIR="$HOME/.nvm"
+_nvmbin="$(ls -d "$NVM_DIR"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+[ -n "$_nvmbin" ] && export PATH="$_nvmbin:$PATH"
+```
+
+**The Phase 4 cron tick must do the same**, or it fails with `command not
+found` and no other clue.
+
+Worth reconsidering at Phase 4: for a cron-driven loop, a system-wide
+`/usr/bin/node` (apt/NodeSource) is more robust than a per-user version
+manager. The only cost of switching is reinstalling the two CLIs; their
+credentials live in `~/.claude` and `~/.codex` and would survive.
