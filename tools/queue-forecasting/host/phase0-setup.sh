@@ -178,6 +178,16 @@ cmd_db_auth() {
     info "stored as SCRAM-SHA-256"
   fi
 
+  # --- verify the services could authenticate, BEFORE changing anything ----
+  # Ordering matters: this used to run after the pg_hba rewrite, so a failure
+  # here left Postgres demanding SCRAM while the services still had no
+  # credential. Nothing below this point is reversible without a restart.
+  if [ "$CHECK" = 0 ]; then
+    compose config --quiet \
+      || die "docker compose config does not render (most likely a missing
+     variable in $DEPLOY_DIR/.env). pg_hba has NOT been touched."
+  fi
+
   # --- backup pg_hba ------------------------------------------------------
   if would "back up pg_hba.conf to pg_hba.conf.pre-scram"; then
     compose exec -T postgres bash -c \
@@ -192,10 +202,12 @@ cmd_db_auth() {
   trust_rules="$(psql_super -tAc \
     "SELECT count(*) FROM pg_hba_file_rules WHERE type='host' AND auth_method='trust';")"
   trust_rules="$(printf '%s' "$trust_rules" | tr -d '[:space:]')"
+  # grep -c exits 1 when the count is zero, so `|| echo 0` used to append a
+  # second value and produce "00". Force success and take the last line only.
   trust_in_file="$(compose exec -T postgres bash -c \
     "grep -cE '^[[:space:]]*host[[:space:]]+.*[[:space:]]trust[[:space:]]*\$' \
-       /var/lib/postgresql/data/pg_hba.conf" 2>/dev/null || echo 0)"
-  trust_in_file="$(printf '%s' "$trust_in_file" | tr -d '[:space:]')"
+       /var/lib/postgresql/data/pg_hba.conf || true" 2>/dev/null | tail -1)"
+  trust_in_file="$(printf '%s' "${trust_in_file:-0}" | tr -d '[:space:]')"
 
   case "$trust_rules" in
     ''|*[!0-9]*) die "the pg_hba_file_rules count returned '$trust_rules', not a
@@ -390,10 +402,28 @@ else:
 
 db_auth_rollback() {
   warn "rolling back pg_hba and .env"
-  compose exec -T postgres bash -c \
-    'cp /var/lib/postgresql/data/pg_hba.conf.pre-scram /var/lib/postgresql/data/pg_hba.conf' || true
+  # Use `docker exec` on the container id, NOT `docker compose exec`. Compose
+  # refuses to run at all if interpolation fails (a missing required variable),
+  # which would make the escape hatch depend on the thing being escaped from.
+  local cid
+  cid="$(docker ps -qf name=postgres | head -1)"
+  if [ -z "$cid" ]; then
+    warn "no running postgres container found; cannot restore pg_hba"
+  else
+    docker exec -i "$cid" bash -c \
+      'cp /var/lib/postgresql/data/pg_hba.conf.pre-scram /var/lib/postgresql/data/pg_hba.conf' \
+      || warn "pg_hba restore failed"
+    # A copy alone changes nothing until the server re-reads it.
+    docker exec -i "$cid" psql -U postgres -d forecasting -c 'SELECT pg_reload_conf();' >/dev/null \
+      || warn "pg_reload_conf failed - the restored file is NOT active yet"
+    local remaining
+    remaining="$(docker exec -i "$cid" psql -U postgres -d forecasting -tAc \
+      "SELECT count(*) FROM pg_hba_file_rules WHERE type='host' AND auth_method='trust';" \
+      2>/dev/null | tr -d '[:space:]')"
+    info "host trust rules after rollback: ${remaining:-unknown}"
+  fi
   [ -f "$DEPLOY_DIR/.env.pre-scram" ] && cp "$DEPLOY_DIR/.env.pre-scram" "$DEPLOY_DIR/.env"
-  compose up -d >/dev/null || true
+  compose up -d >/dev/null 2>&1 || warn "compose up failed; containers left as they are"
   sleep 10
 }
 
