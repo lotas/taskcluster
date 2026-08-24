@@ -302,16 +302,51 @@ HBA'
     || die "docker compose config failed to render. Most likely DATABASE_URL or
      POSTGRES_PASSWORD is missing from $DEPLOY_DIR/.env. Nothing was restarted."
 
-  local rendered
-  rendered="$(compose config 2>/dev/null | grep -m1 -oE 'DATABASE_URL: .*' || true)"
-  case "$rendered" in
-    *'@'*) : ;;
-    *) die "the rendered compose config has no password in DATABASE_URL:
-     $rendered
-     Editing .env is not enough if a service hardcodes DATABASE_URL under
-     environment:. Nothing was restarted." ;;
+  # Parse the rendered config as data, not by grepping YAML whose exact shape
+  # varies by compose version. Crucially: distinguish "found a URL with no
+  # credential" (a real problem) from "could not find any URL" (my parser is
+  # wrong). Reporting the second as the first is how this check lied before.
+  local verdict
+  verdict="$(compose config --format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception as exc:
+    print("UNPARSEABLE " + str(exc)); raise SystemExit(0)
+bad, seen = [], 0
+for name, svc in (doc.get("services") or {}).items():
+    env = svc.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(e.split("=", 1) for e in env if "=" in e)
+    url = env.get("DATABASE_URL")
+    if url is None:
+        continue
+    seen += 1
+    host = url.split("://", 1)[-1].split("/", 1)[0]
+    if "@" not in host or ":" not in host.split("@", 1)[0]:
+        bad.append(name)
+if seen == 0:
+    print("NONE")
+elif bad:
+    print("MISSING " + ",".join(sorted(bad)))
+else:
+    print("OK %d" % seen)
+' 2>/dev/null || echo "UNPARSEABLE")"
+
+  case "$verdict" in
+    OK\ *)
+      info "rendered config: ${verdict#OK } service(s) carry a credential" ;;
+    MISSING\ *)
+      die "these services would start with a password-less DATABASE_URL:
+       ${verdict#MISSING }
+     An explicit environment: value overrides env_file:, so editing .env is
+     not enough. Nothing was restarted." ;;
+    NONE|UNPARSEABLE*)
+      die "could not determine DATABASE_URL from the rendered compose config
+     ($verdict). This is a defect in THIS CHECK, not necessarily in your
+     configuration - so nothing was restarted rather than guessing.
+     Show me:  docker compose config | grep -n -A2 -i database_url" ;;
   esac
-  info "rendered compose config carries a credential"
 
   local before after
   before="$(psql_super -tAc 'SELECT count(*) FROM queue_forecast_tasks;')"
