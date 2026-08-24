@@ -85,6 +85,29 @@ psql_super() {  # psql as the superuser over the container's local socket
 
 compose() { docker compose -f "$DEPLOY_DIR/docker-compose.yml" "$@"; }
 
+# Every application service in this compose file declares `profiles:`; only
+# postgres does not. With no profile active, `compose config` renders postgres
+# alone and `compose up -d` would restart postgres alone. Anything that needs
+# to SEE all services must enable every declared profile.
+COMPOSE_PROFILE_ARGS=()
+load_profile_args() {
+  local p
+  COMPOSE_PROFILE_ARGS=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && COMPOSE_PROFILE_ARGS+=(--profile "$p")
+  done < <(compose config --profiles 2>/dev/null)
+}
+compose_all() {
+  docker compose -f "$DEPLOY_DIR/docker-compose.yml" "${COMPOSE_PROFILE_ARGS[@]}" "$@"
+}
+
+# Compose service names of containers actually running for this project.
+running_services() {
+  docker ps --format '{{.Label "com.docker.compose.project.config_files"}}\t{{.Label "com.docker.compose.service"}}' \
+    | awk -F'\t' -v cfg="$DEPLOY_DIR/docker-compose.yml" '$1==cfg && $2!="" {print $2}' \
+    | sort -u
+}
+
 require_secret() {  # require_secret <role> -> generates once, reuses thereafter
   # Separate `local` statements on purpose: `local a=$1 b=$a` does NOT work in
   # bash. All names are made local (and unset) before any assignment runs, so
@@ -183,7 +206,7 @@ cmd_db_auth() {
   # here left Postgres demanding SCRAM while the services still had no
   # credential. Nothing below this point is reversible without a restart.
   if [ "$CHECK" = 0 ]; then
-    compose config --quiet \
+    compose_all config --quiet \
       || die "docker compose config does not render (most likely a missing
      variable in $DEPLOY_DIR/.env). pg_hba has NOT been touched."
   fi
@@ -319,7 +342,7 @@ HBA'
   # credential" (a real problem) from "could not find any URL" (my parser is
   # wrong). Reporting the second as the first is how this check lied before.
   local verdict
-  verdict="$(compose config --format json 2>/dev/null | python3 -c '
+  verdict="$(compose_all config --format json 2>/dev/null | python3 -c '
 import json, sys
 try:
     doc = json.load(sys.stdin)
@@ -360,20 +383,44 @@ else:
      Show me:  docker compose config | grep -n -A2 -i database_url" ;;
   esac
 
+  # Which services are actually up? Never start ones the operator chose not to
+  # run: `--profile full` would silently bring up the whole stack.
+  local svcs stale svc eff
+  svcs="$(running_services)"
+  [ -n "$svcs" ] || die "no running containers found for $DEPLOY_DIR/docker-compose.yml"
+  info "running services: $(echo "$svcs" | tr '\n' ' ')"
+
+  # A container's environment is fixed at creation, so a changed .env only
+  # takes effect on RECREATE - `restart` is not enough.
+  stale=""
+  for svc in $svcs; do
+    eff="$(compose_all exec -T "$svc" printenv DATABASE_URL 2>/dev/null || echo MISSING)"
+    case "$eff" in
+      *:*@*) : ;;
+      *) stale="$stale $svc" ;;
+    esac
+  done
+
   local before after
   before="$(psql_super -tAc 'SELECT count(*) FROM queue_forecast_tasks;')"
-  info "restarting services..."
-  compose up -d >/dev/null
-  sleep 25
 
-  local effective
-  effective="$(compose exec -T collector printenv DATABASE_URL 2>/dev/null || echo MISSING)"
-  case "$effective" in
-    *:*@*) info "collector's effective DATABASE_URL carries a credential" ;;
-    *) db_auth_rollback
-       die "the collector container's effective DATABASE_URL has no credential
-     ($effective). Rolled back." ;;
-  esac
+  if [ -z "$stale" ]; then
+    skip "every running service already has a credential-bearing DATABASE_URL"
+  else
+    info "recreating:$stale"
+    # shellcheck disable=SC2086
+    compose_all up -d --force-recreate $stale >/dev/null
+    sleep 25
+    for svc in $stale; do
+      eff="$(compose_all exec -T "$svc" printenv DATABASE_URL 2>/dev/null || echo MISSING)"
+      case "$eff" in
+        *:*@*) info "$svc: effective DATABASE_URL carries a credential" ;;
+        *) db_auth_rollback
+           die "$svc still has no credential in DATABASE_URL after recreate. Rolled back." ;;
+      esac
+    done
+  fi
+  after="$before"
 
   if ! compose ps --status running --quiet | grep -q .; then
     db_auth_rollback; die "no services running after restart; rolled back."
@@ -390,7 +437,7 @@ else:
   if [ "$later" -le "$after" ]; then
     warn "task count did not grow ($after -> $later)."
     warn "This can be a genuinely quiet period, or a broken collector."
-    compose logs --tail 30 collector || true
+    compose_all logs --tail 30 collector || true
     die "not auto-rolling back, because a quiet queue looks identical to a
      broken collector and reverting blindly could be the wrong move.
      Check the log above. If the collector is failing to authenticate:
@@ -773,6 +820,7 @@ main() {
   command -v docker >/dev/null || die "docker not found"
   command -v python3 >/dev/null || die "python3 not found (needed to URL-encode passwords)"
   detect_deploy_dir
+  load_profile_args
 
   case "$cmd" in
     discover)         cmd_discover ;;
