@@ -821,8 +821,8 @@ cmd_agent_cli() {
 
   # psql is required by negative control NC1; without it the canary voids the
   # whole group and the read-only assertion proves nothing.
-  if would "install postgresql-client"; then
-    sudo apt-get install -y -qq postgresql-client
+  if would "install postgresql-client and bubblewrap"; then
+    sudo apt-get install -y -qq postgresql-client bubblewrap
   fi
 
   if [ "$CHECK" = 1 ]; then skip "node + CLI install (dry run)"; return 0; fi
@@ -883,7 +883,7 @@ cmd_agent_cli() {
   info "probing both CLIs..."
   local claude_ok=1 codex_ok=1
   run_research 'claude -p "reply with the single word: ready"' >/dev/null 2>&1 || claude_ok=0
-  run_research 'codex exec "reply with the single word: ready"'  >/dev/null 2>&1 || codex_ok=0
+  run_research 'codex exec --skip-git-repo-check "reply with the single word: ready"'  >/dev/null 2>&1 || codex_ok=0
 
   if [ "$claude_ok" = 1 ] && [ "$codex_ok" = 1 ]; then
     info "both CLIs authenticated and reachable"
@@ -925,7 +925,7 @@ cmd_auth_check() {
     if [ "$cli" = claude ]; then
       out="$(run_research 'claude -p "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
     else
-      out="$(run_research 'codex exec "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
+      out="$(run_research 'codex exec --skip-git-repo-check "reply with the single word: ready"' 2>&1)" || out="FAILED: $out"
     fi
     case "$out" in
       FAILED:*) warn "$cli: $out"; failed=1 ;;
