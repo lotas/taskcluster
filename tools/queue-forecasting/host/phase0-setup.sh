@@ -86,8 +86,18 @@ psql_super() {  # psql as the superuser over the container's local socket
 compose() { docker compose -f "$DEPLOY_DIR/docker-compose.yml" "$@"; }
 
 require_secret() {  # require_secret <role> -> generates once, reuses thereafter
-  local role="$1" f="$SECRETS_DIR/$role.pw"
+  # Separate `local` statements on purpose: `local a=$1 b=$a` does NOT work in
+  # bash. All names are made local (and unset) before any assignment runs, so
+  # b would expand an unset a and trip `set -u`.
+  local role="$1"
+  local f="$SECRETS_DIR/$role.pw"
   if [ ! -f "$f" ]; then
+    # --check advertises that it touches nothing, so it must not create
+    # secrets either. Hand back a placeholder that is never applied.
+    if [ "$CHECK" = 1 ]; then
+      printf 'WOULD-GENERATE-%s' "$role"
+      return 0
+    fi
     ( umask 077; mkdir -p "$SECRETS_DIR"; openssl rand -base64 32 | tr -d '\n' > "$f" )
     chmod 700 "$SECRETS_DIR"; chmod 600 "$f"
   fi
