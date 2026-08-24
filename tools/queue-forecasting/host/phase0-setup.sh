@@ -130,23 +130,23 @@ require_secret() {  # require_secret <role> -> generates once, reuses thereafter
 
 urlencode() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read(),safe=""))'; }
 
-# Run a command as the research user with nvm actually on PATH.
+# Run a command as the research user, with node on PATH.
 #
-# `bash -lc` is NON-interactive, and Debian's ~/.bashrc returns early for
-# non-interactive shells (`case $- in *i*) ;; *) return;; esac`) - which is
-# where nvm's init lives. So node/npm/claude/codex are invisible unless nvm is
-# sourced explicitly. The cron tick must do the same thing.
-# Do not rely on nvm's shell FUNCTION being available - it is defined by
-# sourcing nvm.sh, which is exactly what a non-interactive shell skips. Put the
-# installed node's bin directory on PATH directly instead. This is also what
-# cron needs: deterministic, no shell plumbing.
-NVM_PRELUDE='export NVM_DIR="$HOME/.nvm"; \
-_nvmbin="$(ls -d "$NVM_DIR"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"; \
-[ -n "$_nvmbin" ] && export PATH="$_nvmbin:$PATH"; \
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1; \
-true; '
+# TWO traps, both of which bit us:
+#
+# 1. NOT `sudo -i`. With -i, sudo joins its arguments into one string and hands
+#    that to the target's login shell, which re-parses it - quoting and
+#    newlines are destroyed. `sudo -H -u user bash -lc "$cmd"` passes argv
+#    through untouched. Verified: -i turned `export NVM_DIR=...` into a bare
+#    `export` that dumped the environment.
+#
+# 2. Do not rely on nvm's shell FUNCTION. It only exists after sourcing
+#    nvm.sh, which non-interactive shells skip (Debian's ~/.bashrc returns
+#    early). Resolve the installed node's bin directory and prepend it to PATH.
+#    Keep this on ONE line - embedded newlines are a needless risk.
+NVM_PRELUDE='export NVM_DIR="$HOME/.nvm"; _nvmbin="$(ls -d "$NVM_DIR"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"; [ -n "$_nvmbin" ] && export PATH="$_nvmbin:$PATH"; true; '
 run_research() {
-  sudo -u "$RESEARCH_USER" -i bash -lc "${NVM_PRELUDE}$*"
+  sudo -H -u "$RESEARCH_USER" bash -lc "${NVM_PRELUDE}$*"
 }
 
 # --------------------------------------------------------------------------
@@ -860,14 +860,14 @@ cmd_agent_cli() {
        || ! run_research 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install 24'; then
       temp_revoke
       die "node installation failed. Run this by hand and report the output:
-       sudo -u $RESEARCH_USER -i bash -lc 'export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; nvm install 24'
+       sudo -H -u $RESEARCH_USER bash -lc 'export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; nvm install 24'
      Alternatively install node system-wide (apt/NodeSource) - for a cron-driven
      loop a /usr/bin/node is more robust than a per-user version manager."
     fi
     temp_revoke
     run_research 'node --version' >/dev/null 2>&1 \
       || die "node still not on PATH after install. Check:
-       sudo -u $RESEARCH_USER -i bash -lc 'ls -d \$HOME/.nvm/versions/node/*/bin'"
+       sudo -H -u $RESEARCH_USER bash -lc 'ls -d \$HOME/.nvm/versions/node/*/bin'"
   fi
   run_research 'node --version'
 

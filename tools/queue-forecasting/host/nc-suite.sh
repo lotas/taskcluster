@@ -11,6 +11,10 @@
 # fails, the group's result is void and the suite exits non-zero.
 #
 # Exit 0 = all controls fail closed. Exit 1 = at least one control is open or void.
+#
+# Note the invocation: `sudo -H -u research bash -lc`, NOT `sudo -i`. With -i,
+# sudo re-joins and re-parses the command string, so a mangled command fails
+# for the wrong reason and `refuse` reads that as a pass.
 
 set -uo pipefail
 
@@ -21,7 +25,7 @@ fail=0
 
 refuse() {   # refuse <name> <command...>  -> passes when the command FAILS
   local name="$1"; shift
-  if sudo -u research -i bash -lc "$*" >/dev/null 2>&1; then
+  if sudo -H -u research bash -lc "$*" >/dev/null 2>&1; then
     echo "FAIL  $name  (action was PERMITTED)"
     fail=$((fail + 1))
   else
@@ -32,7 +36,7 @@ refuse() {   # refuse <name> <command...>  -> passes when the command FAILS
 
 canary() {   # canary <name> <command...> -> passes when the command SUCCEEDS
   local name="$1"; shift
-  if sudo -u research -i bash -lc "$*" >/dev/null 2>&1; then
+  if sudo -H -u research bash -lc "$*" >/dev/null 2>&1; then
     echo "ok    $name  (canary: attempt is possible)"
     pass=$((pass + 1))
   else

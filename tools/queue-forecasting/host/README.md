@@ -80,6 +80,16 @@ and `/home/research/.config/qf/agent-env`.
 None. If a CLI is found not to honour `HTTPS_PROXY` and a direct nftables
 allowance is added for it, record the endpoint, the reason, and the date here.
 
+## Two invocation traps (both cost real debugging time)
+
+**Never `sudo -i` with a command.** With `-i`, sudo joins its arguments into a
+single string and hands that to the target user's login shell, which re-parses
+it — quoting and newlines are destroyed. Use `sudo -H -u research bash -lc
+"$cmd"`, which passes argv through untouched. Observed failure: `export
+NVM_DIR="$HOME/.nvm"; ...` became a bare `export` that dumped the environment,
+leaving `$NVM_DIR` empty and every later command broken. This also silently
+weakens `nc-suite.sh`, where a command mangled into failure reads as "refused".
+
 ## PATH gotcha for anything non-interactive (cron included)
 
 Debian's `~/.bashrc` starts with
