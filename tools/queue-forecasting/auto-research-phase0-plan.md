@@ -597,6 +597,14 @@ Expected: all services running, no permission errors in logs, task count non-zer
 
 ---
 
+## Phase 0d–0e — Tasks 6–9 — DONE 2026-08-24
+
+> Applied via `host/phase0-setup.sh research-user | egress | agent-cli | verify`.
+> Slice enforcing (`MemoryMax=4294967296`, `CPUQuotaPerSecUSec=2s`,
+> `TasksMax=512`). Negative controls: **passed=16 failed=0**, with `podman` and
+> `/srv/qf-platform` skipped as expected. Evidence in
+> `host/nc-evidence-phase0.txt`.
+
 ## Phase 0d — The `research` user
 
 ### Task 6: Create the user and cap its resources
@@ -605,7 +613,7 @@ Expected: all services running, no permission errors in logs, task count non-zer
 - Create: `tools/queue-forecasting/host/qf-research.slice`
 - Create: `tools/queue-forecasting/host/README.md`
 
-- [ ] **Step 1: Create the user**
+- [x] **Step 1: Create the user**
 
 ```bash
 sudo useradd --create-home --shell /bin/bash research
@@ -621,7 +629,7 @@ getent group docker
 
 Expected: the `docker` group's member list does not contain `research`.
 
-- [ ] **Step 2: Write the slice unit**
+- [x] **Step 2: Write the slice unit**
 
 Create `tools/queue-forecasting/host/qf-research.slice`. Size `MemoryMax` and `CPUQuota` from the numbers recorded in Task 2 Step 4. The values below assume the observed ~30 GB / 8 core box, leaving the service stack and the trainer their existing headroom.
 
@@ -641,7 +649,7 @@ TasksMax=512
 IOWeight=50
 ```
 
-- [ ] **Step 3: Install and start the slice**
+- [x] **Step 3: Install and start the slice**
 
 ```bash
 sudo cp tools/queue-forecasting/host/qf-research.slice /etc/systemd/system/
@@ -652,7 +660,7 @@ systemctl show qf-research.slice -p MemoryMax -p CPUQuota -p TasksMax
 
 Expected: `MemoryMax=4294967296`, `CPUQuotaPerSecUSec=2s`, `TasksMax=512`.
 
-- [ ] **Step 4: Bind the user's sessions to the slice**
+- [x] **Step 4: Bind the user's sessions to the slice**
 
 ```bash
 RESEARCH_UID=$(id -u research)
@@ -669,7 +677,7 @@ Expected: the override prints, showing `Slice=qf-research.slice`.
 
 If `user@.service` is not in use on this host (no logind user sessions), skip this and instead launch the agents' cron entries with `systemd-run --slice=qf-research.slice`, which Phase 4 will do anyway.
 
-- [ ] **Step 5: Verify the credentials directory is unreadable**
+- [x] **Step 5: Verify the credentials directory is unreadable**
 
 ```bash
 sudo -u research cat ~/qf-secrets/forecast_app.pw; echo "exit=$?"
@@ -683,7 +691,7 @@ chmod 600 /srv/queue-forecasting/.env
 chmod 700 ~/qf-secrets
 ```
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 ```bash
 git add tools/queue-forecasting/host/qf-research.slice tools/queue-forecasting/host/README.md
@@ -698,7 +706,7 @@ The agents need `api.anthropic.com`, `api.openai.com`, and `github.com`. Everyth
 **Files:**
 - Create: `tools/queue-forecasting/host/tinyproxy-allowlist.conf`
 
-- [ ] **Step 1: Install and configure the proxy**
+- [x] **Step 1: Install and configure the proxy**
 
 ```bash
 sudo apt-get update && sudo apt-get install -y tinyproxy nftables
@@ -727,7 +735,7 @@ LogFile "/var/log/tinyproxy/tinyproxy.log"
 LogLevel Connect
 ```
 
-- [ ] **Step 2: Write the domain allowlist**
+- [x] **Step 2: Write the domain allowlist**
 
 ```bash
 sudo tee /etc/tinyproxy/allowlist.txt >/dev/null <<'LIST'
@@ -748,7 +756,7 @@ Expected: `active (running)`.
 
 `chatgpt.com` is included because the Codex CLI may authenticate against it; if Step 5 shows it is unused, remove it and re-run Step 5.
 
-- [ ] **Step 3: Force `research` through the proxy with nftables**
+- [x] **Step 3: Force `research` through the proxy with nftables**
 
 ```bash
 RESEARCH_UID=$(id -u research)
@@ -782,7 +790,7 @@ sudo nft list ruleset
 
 Expected: the ruleset prints with the `qf` table present.
 
-- [ ] **Step 4: Set the proxy environment for `research`**
+- [x] **Step 4: Set the proxy environment for `research`**
 
 ```bash
 sudo tee /home/research/.profile.d-proxy >/dev/null <<'ENVV'
@@ -794,7 +802,7 @@ echo '. /home/research/.profile.d-proxy' | sudo tee -a /home/research/.bashrc
 sudo chown research:research /home/research/.profile.d-proxy
 ```
 
-- [ ] **Step 5: Verify allow and deny both work**
+- [x] **Step 5: Verify allow and deny both work**
 
 ```bash
 sudo -u research -i bash -lc 'curl -sS -o /dev/null -w "%{http_code}\n" https://api.github.com'
@@ -804,7 +812,7 @@ sudo -u research -i bash -lc 'curl -sS --noproxy "*" -o /dev/null -w "%{http_cod
 
 Expected, in order: a 2xx/4xx status (reachable); a failure or `403` from the proxy filter (blocked by allowlist); a connection failure (blocked by nftables — proves the proxy cannot be bypassed).
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 ```bash
 git add tools/queue-forecasting/host/tinyproxy-allowlist.conf
@@ -818,7 +826,7 @@ The CLIs' own permission models are **not** the containment boundary — Tasks 3
 
 **Files:** none (host state).
 
-- [ ] **Step 1: Install Node for `research`**
+- [x] **Step 1: Install Node for `research`**
 
 ```bash
 # psql is required by negative control NC1 - without it the canary voids the
@@ -834,7 +842,7 @@ Expected: `psql (PostgreSQL) 15.x` or newer, then `v24.x` from node.
 
 If the nvm installer is blocked, add `raw.githubusercontent.com` to `/etc/tinyproxy/allowlist.txt`, restart tinyproxy, and retry — then remove it again after installation, since the agents do not need it at runtime.
 
-- [ ] **Step 2: Install both CLIs**
+- [x] **Step 2: Install both CLIs**
 
 ```bash
 sudo -u research -i bash -lc 'npm install -g @anthropic-ai/claude-code @openai/codex'
@@ -843,7 +851,7 @@ sudo -u research -i bash -lc 'claude --version && codex --version'
 
 Expected: both print versions.
 
-- [ ] **Step 3: Store API keys readable only by `research`**
+- [x] **Step 3: Store API keys readable only by `research`**
 
 Use API keys, not interactive subscription login: cron-driven use must be non-interactive, and the daily token budget in the design needs metered billing to mean anything.
 
@@ -859,7 +867,7 @@ Expected: mode `-rw-------`, owner `research`.
 
 Paste the real keys in place of the placeholders when running the command — they are the only values in this plan that cannot be written down ahead of time.
 
-- [ ] **Step 4: Prove each CLI works non-interactively through the proxy**
+- [x] **Step 4: Prove each CLI works non-interactively through the proxy**
 
 ```bash
 sudo -u research -i bash -lc '. ~/.config/qf/agent-env; claude -p "reply with the single word: ready"'
@@ -870,7 +878,7 @@ Expected: each prints `ready`.
 
 **If a CLI fails to connect**, it does not honour `HTTPS_PROXY`. That is a fail-closed outcome, not a security hole, but it blocks the loop. The fallback, applied only to the failing tool: add an `nftables` set of that endpoint's resolved addresses, refreshed by a timer, and allow uid `research` direct egress to that set on 443. Record the exception in `host/README.md` — an undocumented hole is worse than a documented one.
 
-- [ ] **Step 5: Confirm the CLIs cannot reach a denied host**
+- [x] **Step 5: Confirm the CLIs cannot reach a denied host**
 
 ```bash
 sudo -u research -i bash -lc 'curl -sS -o /dev/null -w "%{http_code}\n" https://pypi.org'
@@ -889,7 +897,7 @@ Spec §13.1 Phase 0. Each test must be **refused**; the script fails if any is p
 **Files:**
 - Create: `tools/queue-forecasting/host/nc-suite.sh`
 
-- [ ] **Step 1: Write the suite**
+- [x] **Step 1: Write the suite**
 
 Create `tools/queue-forecasting/host/nc-suite.sh`:
 
@@ -1001,14 +1009,14 @@ podman` are skipped rather than faked when their targets do not yet exist, and
 `NC5` is counted as a failure if its directory is missing, because a vacuous
 control is worse than an absent one.
 
-- [ ] **Step 2: Make it executable and stage it**
+- [x] **Step 2: Make it executable and stage it**
 
 ```bash
 chmod +x tools/queue-forecasting/host/nc-suite.sh
 git add tools/queue-forecasting/host/nc-suite.sh
 ```
 
-- [ ] **Step 3: Confirm NC5's target actually exists**
+- [x] **Step 3: Confirm NC5's target actually exists**
 
 ```bash
 ls -ld /srv/queue-forecasting/trainer/data/models
@@ -1016,7 +1024,7 @@ ls -ld /srv/queue-forecasting/trainer/data/models
 
 Expected: the directory exists and is not writable by `research`. If it does not exist, the control is vacuous — create it or point `DEPLOY_DIR` at the real deploy path.
 
-- [ ] **Step 4: Run the suite**
+- [x] **Step 4: Run the suite**
 
 ```bash
 sudo DEPLOY_DIR=/srv/queue-forecasting SECRETS_DIR=$HOME/qf-secrets \
@@ -1029,7 +1037,7 @@ Expected: every line begins `ok` or `skip`, and the final line reads
 `skip` lines. Any `VOID` line is a failure: it means a control could not be
 meaningfully attempted.
 
-- [ ] **Step 5: Record the evidence**
+- [x] **Step 5: Record the evidence**
 
 Save the full output to `tools/queue-forecasting/host/nc-evidence-phase0.txt` and stage it. The spec requires this suite to be re-run before Phases 4 and 5; the baseline makes a regression visible.
 
@@ -1039,7 +1047,7 @@ sudo DEPLOY_DIR=/srv/queue-forecasting SECRETS_DIR=$HOME/qf-secrets \
 git add tools/queue-forecasting/host/nc-evidence-phase0.txt
 ```
 
-- [ ] **Step 6: Write `host/README.md`**
+- [x] **Step 6: Write `host/README.md`**
 
 Create `tools/queue-forecasting/host/README.md`:
 
@@ -1066,7 +1074,7 @@ None. If a CLI is found not to honour `HTTPS_PROXY` and a direct nftables
 allowance is added for it, record the endpoint, the reason, and the date here.
 ```
 
-- [ ] **Step 7: Checkpoint**
+- [x] **Step 7: Checkpoint**
 
 ```bash
 git add tools/queue-forecasting/host/README.md
@@ -1078,11 +1086,11 @@ Stop. The user commits.
 
 ## Phase 0 acceptance
 
-- [ ] `node test/smoke-guard.test.js` passes and `node test/smoke.js` refuses to run with no environment.
-- [ ] `pg_hba.conf` contains no `trust` rule for `host` connections, and an unauthenticated network connection is refused.
-- [ ] `forecast_experiment` can `SELECT` and cannot `DELETE` or `CREATE`.
-- [ ] Services run as `forecast_app`, not the superuser, and collection is confirmed still ingesting.
-- [ ] `nc-suite.sh` exits 0 with `failed=0`, and the output is recorded in `host/nc-evidence-phase0.txt`.
-- [ ] Both `claude -p` and `codex exec` return `ready` as the `research` user, through the proxy.
+- [x] `node test/smoke-guard.test.js` passes and `node test/smoke.js` refuses to run with no environment.
+- [x] `pg_hba.conf` contains no `trust` rule for `host` connections, and an unauthenticated network connection is refused.
+- [x] `forecast_experiment` can `SELECT` and cannot `DELETE` or `CREATE`.
+- [ ] Services run as `forecast_app`, not the superuser  — **deferred**, see `db-app-cutover`, and collection is confirmed still ingesting.
+- [x] `nc-suite.sh` exits 0 with `failed=0`, and the output is recorded in `host/nc-evidence-phase0.txt`.
+- [x] Both `claude -p` and `codex exec` return `ready` as the `research` user, through the proxy.
 
 When all six hold, Phase 1 (repository extraction and credential scoping) can begin.

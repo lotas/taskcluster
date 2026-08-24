@@ -65,7 +65,7 @@ else
 fi
 
 echo "== NC3: credentials =="
-canary "NC3 env exists"    "test -e $DEPLOY_DIR/.env || true"
+canary "NC3 env exists"    "test -e $DEPLOY_DIR/.env"
 refuse "NC3 .env"          "cat $DEPLOY_DIR/.env"
 refuse "NC3 secrets dir"   "cat $SECRETS_DIR/forecast_app.pw"
 refuse "NC3 root ssh dir"  "ls /root/.ssh"
