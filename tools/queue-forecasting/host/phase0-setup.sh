@@ -808,15 +808,38 @@ cmd_agent_cli() {
 
   if [ "$CHECK" = 1 ]; then skip "node + CLI install (dry run)"; return 0; fi
 
-  if ! $as_research 'node --version' >/dev/null 2>&1; then
-    info "installing node via nvm (temporarily allowing raw.githubusercontent.com)"
-    sudo sed -i '1i ^raw\.githubusercontent\.com$' /etc/tinyproxy/allowlist.txt
+  # The allowlist only exists once `egress` has run. Installing agent-cli first
+  # (the recommended order) means there is no restriction yet and nothing to
+  # punch through - so only do the temporary-allow dance if the file is there.
+  local ALLOWLIST=/etc/tinyproxy/allowlist.txt
+  local TEMP_HOST='^raw\.githubusercontent\.com$'
+
+  temp_allow() {
+    [ -f "$ALLOWLIST" ] || { info "no egress allowlist yet; installing directly"; return 0; }
+    grep -qxF "$TEMP_HOST" "$ALLOWLIST" && return 0
+    info "temporarily allowing raw.githubusercontent.com"
+    printf '%s\n' "$TEMP_HOST" | sudo tee -a "$ALLOWLIST" >/dev/null
     sudo systemctl restart tinyproxy
-    $as_research 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
-    $as_research 'nvm install 24'
-    sudo sed -i '/^\^raw\\\.githubusercontent\\\.com\$$/d' /etc/tinyproxy/allowlist.txt
+  }
+  temp_revoke() {
+    [ -f "$ALLOWLIST" ] || return 0
+    grep -vxF "$TEMP_HOST" "$ALLOWLIST" | sudo tee "$ALLOWLIST".new >/dev/null
+    sudo mv "$ALLOWLIST".new "$ALLOWLIST"
     sudo systemctl restart tinyproxy
     info "removed the temporary allowlist entry"
+  }
+
+  if ! $as_research 'node --version' >/dev/null 2>&1; then
+    info "installing node via nvm"
+    temp_allow
+    # Revoke even if the install fails, so a failure cannot leave egress wider
+    # than intended.
+    if ! $as_research 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash' \
+       || ! $as_research 'nvm install 24'; then
+      temp_revoke
+      die "node installation failed. Nothing else was changed."
+    fi
+    temp_revoke
   fi
   $as_research 'node --version'
 
