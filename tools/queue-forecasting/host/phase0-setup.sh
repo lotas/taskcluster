@@ -251,11 +251,38 @@ HBA'
   # --- restart and health-gate, with rollback -----------------------------
   if [ "$CHECK" = 1 ]; then skip "restart + health gate (dry run)"; return 0; fi
 
+  # Editing .env proves nothing. Compose gives an explicit `environment:` value
+  # precedence over `env_file:`, so a hardcoded URL silently wins. Validate the
+  # rendered config BEFORE restarting, then the container's effective env after.
+  compose config --quiet \
+    || die "docker compose config failed to render. Most likely DATABASE_URL or
+     POSTGRES_PASSWORD is missing from $DEPLOY_DIR/.env. Nothing was restarted."
+
+  local rendered
+  rendered="$(compose config 2>/dev/null | grep -m1 -oE 'DATABASE_URL: .*' || true)"
+  case "$rendered" in
+    *'@'*) : ;;
+    *) die "the rendered compose config has no password in DATABASE_URL:
+     $rendered
+     Editing .env is not enough if a service hardcodes DATABASE_URL under
+     environment:. Nothing was restarted." ;;
+  esac
+  info "rendered compose config carries a credential"
+
   local before after
   before="$(psql_super -tAc 'SELECT count(*) FROM queue_forecast_tasks;')"
   info "restarting services..."
   compose up -d >/dev/null
   sleep 25
+
+  local effective
+  effective="$(compose exec -T collector printenv DATABASE_URL 2>/dev/null || echo MISSING)"
+  case "$effective" in
+    *:*@*) info "collector's effective DATABASE_URL carries a credential" ;;
+    *) db_auth_rollback
+       die "the collector container's effective DATABASE_URL has no credential
+     ($effective). Rolled back." ;;
+  esac
 
   if ! compose ps --status running --quiet | grep -q .; then
     db_auth_rollback; die "no services running after restart; rolled back."

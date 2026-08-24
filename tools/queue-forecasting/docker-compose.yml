@@ -45,7 +45,14 @@ services:
       - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_DB: forecasting
-      POSTGRES_HOST_AUTH_METHOD: trust
+      # NOT trust. Under trust any local connection can claim any identity,
+      # including postgres, which makes the read-only forecast_experiment role
+      # decoration rather than a boundary. These two only take effect when a
+      # volume is INITIALISED - an already-initialised volume keeps its own
+      # pg_hba.conf - but leaving trust here means a future rebuild would
+      # silently drop the boundary.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=trust"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (contents of ~/qf-secrets/postgres.pw)}
       LC_COLLATE: en_US.UTF8
       LC_CTYPE: en_US.UTF8
     volumes:
@@ -78,7 +85,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
     volumes:
       - ./src:/app/tools/queue-forecasting/src
       - ./scripts:/app/tools/queue-forecasting/scripts
@@ -105,7 +112,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
       # V8's default old-space ceiling is ~2GB regardless of the container's
       # mem_limit above -- observed live as repeated "Reached heap limit ...
       # 2040ish MB" crashes at wildly different cumulative row counts (2.44M,
@@ -145,7 +152,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
     volumes:
       - ./src:/app/tools/queue-forecasting/src
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
@@ -186,7 +193,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
     volumes:
       - ./trainer:/app/trainer
     entrypoint: ["uv", "run", "python", "-m", "src.train"]
@@ -209,7 +216,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
     volumes:
       - ./src:/app/tools/queue-forecasting/src
 
@@ -230,7 +237,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
       DASHBOARD_OUTPUT_DIR: /dashboard
       DASHBOARD_INTERVAL_MS: "900000"
     volumes:
@@ -279,7 +286,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
       HEALTH_INTERVAL_SECONDS: "3600"
       HEALTH_LOOKBACK_DAYS: "7"
     volumes:
@@ -302,7 +309,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres@postgres:5432/forecasting
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
       RETENTION_DAYS: "60"
       RETENTION_INTERVAL_SECONDS: "86400"
     volumes:
