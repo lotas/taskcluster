@@ -741,22 +741,29 @@ table inet qf {
   chain output {
     type filter hook output priority 0; policy accept;
 
-    # Only the research uid is constrained; everything else is untouched.
-    meta skuid != ${uid} accept
+    # EVERY rule positively matches the research uid.
+    #
+    # Do NOT write 'meta skuid != <uid> accept' as a first rule. In nftables,
+    # meta skuid on a packet with no owning socket (kernel-generated traffic,
+    # ICMP errors, TCP resets, forwarded packets) does not match at ALL - the
+    # expression fails rather than evaluating true. Such packets therefore skip
+    # that accept, fall through every later rule, and hit the reject. That
+    # broke unrelated host and container traffic.
+    #
+    # Matching positively means anything that is not this uid matches nothing
+    # here and reaches the accept policy untouched.
 
-    # Loopback reaches the filtering proxy on 127.0.0.1:${PROXY_PORT}.
-    oifname "lo" accept
+    # Loopback: reaches the filtering proxy on 127.0.0.1:${PROXY_PORT}.
+    meta skuid ${uid} oifname "lo" accept
 
     # DNS.
-    udp dport 53 accept
-    tcp dport 53 accept
+    meta skuid ${uid} udp dport 53 accept
+    meta skuid ${uid} tcp dport 53 accept
 
-    # Everything else leaving the box from this uid is denied.
-    #
-    # icmpx, NOT icmp. In an inet table, 'reject with icmp' is IPv4-only, and
-    # nft silently narrows the rule with 'meta nfproto ipv4' - leaving IPv6
-    # egress to fall through to the accept policy. icmpx covers both families.
-    counter reject with icmpx type admin-prohibited
+    # Everything else from this uid is denied. icmpx, not icmp: in an inet
+    # table 'reject with icmp' is IPv4-only and nft silently narrows the rule
+    # with 'meta nfproto ipv4', leaving IPv6 to fall through.
+    meta skuid ${uid} counter reject with icmpx type admin-prohibited
   }
 }
 NFT

@@ -70,6 +70,18 @@ Deliberately not in this repo: `pg_hba.conf` (inside the postgres volume,
 backed up as `pg_hba.conf.pre-scram`), `/etc/nftables.conf`, `~/qf-secrets/*.pw`,
 and `/home/research/.config/qf/agent-env`.
 
+## nftables: match the uid positively, never negatively
+
+`meta skuid != <uid> accept` as a leading rule is **wrong**. In nftables,
+`meta skuid` on a packet with no owning socket — kernel-generated traffic, ICMP
+errors, TCP resets, forwarded packets — does not match at all; the expression
+fails rather than evaluating true. Those packets skip the accept, fall through
+every later rule, and hit the reject. Observed effect: the collector started
+timing out on all outbound requests.
+
+Every rule in `inet qf` therefore matches `meta skuid <uid>` positively, so
+anything else matches nothing and reaches the chain's accept policy untouched.
+
 ## Rollback
 
 - Egress table only: `sudo nft delete table inet qf`
