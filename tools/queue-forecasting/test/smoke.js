@@ -1,7 +1,11 @@
 import { createPool, upsertTask, upsertTaskRun, enrichTask, getUnenrichedTaskIds } from '../src/db.js';
 import { normalizeMetadataName, extractImageName } from '../src/utils.js';
+import { assertDisposableDatabaseUrl } from './smoke-guard.js';
 
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
+// No default. See smoke-guard.js — this file issues unqualified DELETEs.
+// It reads SMOKE_DATABASE_URL, never DATABASE_URL, so a shell that already has
+// DATABASE_URL exported for operational work cannot silently arm it.
+const DATABASE_URL = assertDisposableDatabaseUrl(process.env.SMOKE_DATABASE_URL);
 const pool = createPool(DATABASE_URL);
 
 let passed = 0;
