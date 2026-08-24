@@ -656,6 +656,18 @@ cmd_egress() {
     # Installs the nft binary. The distro nftables.service is deliberately NOT
     # enabled - its stock config flushes the whole ruleset, Docker included.
     sudo apt-get install -y -qq tinyproxy nftables
+
+    # Debian ships /etc/nftables.conf starting with `flush ruleset`. If the
+    # package left its service enabled, that runs at every boot and takes
+    # Docker's chains with it. On this host Docker uses the iptables-nft
+    # backend, so those chains are in the same ruleset.
+    if systemctl is-enabled nftables >/dev/null 2>&1; then
+      warn "nftables.service is ENABLED and its config flushes the whole ruleset."
+      warn "That would break Docker networking on the next boot."
+      warn "Disabling it; our rules load from qf-nftables.service instead."
+      sudo systemctl disable nftables >/dev/null 2>&1 || true
+    fi
+    info "nftables.service enabled: $(systemctl is-enabled nftables 2>&1 || true)"
   fi
 
   if would "write the domain allowlist"; then
