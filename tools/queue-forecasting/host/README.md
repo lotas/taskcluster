@@ -72,6 +72,8 @@ and `/home/research/.config/qf/agent-env`.
 
 ## Rollback
 
+- Egress table only: `sudo nft delete table inet qf`
+
 - SCRAM cutover: `./phase0-setup.sh rollback-db-auth`
 - Service identity: `cp .env.pre-app .env && docker compose up -d`
 
@@ -89,6 +91,23 @@ it — quoting and newlines are destroyed. Use `sudo -H -u research bash -lc
 NVM_DIR="$HOME/.nvm"; ...` became a bare `export` that dumped the environment,
 leaving `$NVM_DIR` empty and every later command broken. This also silently
 weakens `nc-suite.sh`, where a command mangled into failure reads as "refused".
+
+## Proxy environment lives in ~/.profile, not ~/.bashrc
+
+Same non-interactive trap as PATH. Verified behaviour:
+
+| invocation | reads `.profile` | reads `.bashrc` |
+|---|---|---|
+| `bash -lc` (sudo, run_research) | yes | no |
+| `bash -c` (cron-like) | no | no |
+
+So `.profile.d-proxy` is sourced from `~/.profile`, and `run_research` sources
+it directly as well. **cron reads neither** — the Phase 4 tick must
+`. /home/research/.profile.d-proxy` itself or the agents will bypass the proxy
+and then be blocked by nftables.
+
+Both upper- and lower-case variables are set: libcurl (curl, git) prefers the
+lower-case names, most Node HTTP stacks read the upper-case ones.
 
 ## PATH gotcha for anything non-interactive (cron included)
 

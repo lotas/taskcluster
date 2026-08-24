@@ -144,7 +144,7 @@ urlencode() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.s
 #    nvm.sh, which non-interactive shells skip (Debian's ~/.bashrc returns
 #    early). Resolve the installed node's bin directory and prepend it to PATH.
 #    Keep this on ONE line - embedded newlines are a needless risk.
-NVM_PRELUDE='export NVM_DIR="$HOME/.nvm"; _nvmbin="$(ls -d "$NVM_DIR"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"; [ -n "$_nvmbin" ] && export PATH="$_nvmbin:$PATH"; true; '
+NVM_PRELUDE='[ -r "$HOME/.profile.d-proxy" ] && . "$HOME/.profile.d-proxy"; export NVM_DIR="$HOME/.nvm"; _nvmbin="$(ls -d "$NVM_DIR"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"; [ -n "$_nvmbin" ] && export PATH="$_nvmbin:$PATH"; true; '
 run_research() {
   sudo -H -u "$RESEARCH_USER" bash -lc "${NVM_PRELUDE}$*"
 }
@@ -778,6 +778,7 @@ UNIT
     sudo systemctl daemon-reload
     sudo systemctl enable --now qf-nftables.service
     sudo nft list table inet qf
+    info "to undo just this table:  sudo nft delete table inet qf"
 
     local docker_after
     docker_after="$(sudo nft list ruleset 2>/dev/null | grep -ciE 'DOCKER|br-[0-9a-f]{12}' || true)"
@@ -788,15 +789,30 @@ UNIT
   fi
 
   if would "set proxy environment for $RESEARCH_USER"; then
+    # Sourced from ~/.profile, NOT ~/.bashrc. Debian's .bashrc returns early
+    # for non-interactive shells, so `bash -lc` (and therefore run_research and
+    # anything scripted) would never see these. Verified: bash -lc reads
+    # .profile and skips .bashrc.
+    #
+    # Lower- AND upper-case: libcurl (curl, git) prefers the lower-case names;
+    # most Node HTTP stacks read the upper-case ones.
     sudo tee "/home/$RESEARCH_USER/.profile.d-proxy" >/dev/null <<ENVV
 export HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT}
 export HTTP_PROXY=http://127.0.0.1:${PROXY_PORT}
+export https_proxy=http://127.0.0.1:${PROXY_PORT}
+export http_proxy=http://127.0.0.1:${PROXY_PORT}
 export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
 ENVV
     sudo chown "$RESEARCH_USER:$RESEARCH_USER" "/home/$RESEARCH_USER/.profile.d-proxy"
-    grep -q 'profile.d-proxy' "/home/$RESEARCH_USER/.bashrc" 2>/dev/null \
+    sudo touch "/home/$RESEARCH_USER/.profile"
+    grep -q 'profile.d-proxy' "/home/$RESEARCH_USER/.profile" 2>/dev/null \
       || echo ". /home/$RESEARCH_USER/.profile.d-proxy" \
-         | sudo tee -a "/home/$RESEARCH_USER/.bashrc" >/dev/null
+         | sudo tee -a "/home/$RESEARCH_USER/.profile" >/dev/null
+    sudo chown "$RESEARCH_USER:$RESEARCH_USER" "/home/$RESEARCH_USER/.profile"
+    # cron gives an even barer environment than `bash -lc` - it reads neither
+    # .profile nor .bashrc. The Phase 4 tick must source this file explicitly.
+    info "proxy env in ~/.profile; cron must source .profile.d-proxy itself"
   fi
 
   [ "$CHECK" = 1 ] && return 0
