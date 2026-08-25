@@ -136,6 +136,11 @@ docker compose --profile full up -d
 
 ## Training workflows
 
+> **`trainer/` here is the frozen production copy.** Research iteration happens
+> in `lotas/qf-research`, which owns this directory's history. Changes here are
+> human-curated ports only — see `trainer/README.md` and
+> `auto-research-phase1-design.md` D2.
+
 There are three nested workflows, each building on the previous:
 
 1. **Single training run** for one config + one as-of-date.

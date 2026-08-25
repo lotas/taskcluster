@@ -27,14 +27,14 @@ Measured on 2026-08-24 in this checkout; each is re-asserted by a step rather th
 
 | Fact | Value |
 |---|---|
-| Commits touching `tools/queue-forecasting/trainer` | 38 |
-| Tracked files under `trainer/` | 68 |
+| Commits touching `tools/queue-forecasting/trainer` | 39 as of 2026-08-25 — **derived at run time**, not asserted |
+| Tracked files under `trainer/` | 68 — likewise derived |
 | Tracked paths containing a space | 0 (so `awk`-based listing comparison is safe) |
 | Anything tracked under `trainer/data/` | none, in the current tree or in history |
 | Largest tracked blob under `trainer/` | 114,012 bytes |
 | `uv sync --locked` in `trainer/` | succeeds (lock agrees with manifest) |
 | `uv run pytest -q` in the monorepo | 226 passed |
-| `uv run pytest -q` in an extracted tree | **1 failed** before Task 1; 225 passed + 1 skipped after |
+| `uv run pytest -q` in an extracted tree | **1 failed** before Task 1; `225 passed, 1 skipped` after. The script asserts "no failures and exactly one skip", not the counts |
 | `filter-repo` output before ref cleanup | `.git` = 194 MB, `origin` remote and its refs survive |
 | `filter-repo` output after ref cleanup | `.git` = 2.4 MB, one ref, 38 commits, 352 objects |
 | Workflows in the monorepo declaring `workflow_dispatch` | none (4 workflows, none dispatchable) |
@@ -710,13 +710,13 @@ Stop. The user commits.
 moment it runs, not what is staged. Two consequences:
 
 1. **Task 1 must be committed first.** Otherwise the extracted tree lacks the
-   serving-parity skip guard and check 3 fails with `1 failed` instead of
+   serving-parity skip guard and check 4 fails with `1 failed` instead of
    `225 passed, 1 skipped`. That failure is correct behaviour — the script is
    telling you the tree is not the one you meant to extract.
 2. **Task 5 must NOT be committed yet.** `trainer/README.md` describes the
-   *production* copy, so it must not appear in `qf-research`. If it is already
-   committed, check 2's file count fails at 69 — see the note at the end of
-   Task 5 for the recovery.
+   *production* copy, so it must not appear in `qf-research`. Check 3 tests for
+   that file by name and refuses with the recovery instructions, so this fails
+   loudly rather than shipping a misleading README.
 
 So the commit order is: Tasks 1-3 (and optionally 6-7, which touch nothing the
 extraction sees) → **run this task** → Task 5.
@@ -731,24 +731,29 @@ Create `tools/queue-forecasting/host/extract-qf-research.sh`:
 ```bash
 #!/usr/bin/env bash
 # Extracts tools/queue-forecasting/trainer/ into a standalone history for
-# qf-research, then verifies the result three ways.
+# qf-research, then verifies the result four ways.
 # Spec: auto-research-phase1-design.md section 5.
 #
 #   ./extract-qf-research.sh            # clone from the remote and extract
 #   SRC=/path/to/checkout ./extract...  # extract from a local checkout instead
 #
-# Run this on a machine with pypi access: check 3 runs `uv sync`.
+# Run this on a machine with pypi access: check 4 runs `uv sync`.
+#
+# Every expectation below is DERIVED FROM THE SOURCE, not hardcoded. An earlier
+# revision asserted "38 commits" and "68 files" as constants and broke the first
+# time a commit touched trainer/ -- and a written-down number is a weaker claim
+# than the property we actually want: that the rewrite preserved exactly the
+# commits and blobs that touched the subtree, whatever their count.
 set -uo pipefail
 
 SRC=${SRC:-git@github.com:lotas/taskcluster.git}
 SRC_BRANCH=${SRC_BRANCH:-feat/queue-forecasting}
 WORK=${WORK:-/tmp/qf-extract}
 SUBDIR=tools/queue-forecasting/trainer
-EXPECT_COMMITS=${EXPECT_COMMITS:-38}
-EXPECT_FILES=${EXPECT_FILES:-68}
 
 die() { echo "extract: $*" >&2; exit 1; }
 step() { echo; echo "== $*"; }
+info() { echo "      $*"; }
 
 command -v git-filter-repo >/dev/null 2>&1 || git filter-repo --version >/dev/null 2>&1 \
   || die "git-filter-repo is not installed (pipx install git-filter-repo)"
@@ -763,13 +768,16 @@ else
   git clone --quiet --single-branch --branch "$SRC_BRANCH" "$SRC" "$WORK" || die "clone failed"
 fi
 
-step "recording the pre-filter listing"
-# Captured from the CLONE, not from any local checkout, so the comparison in
-# check 2 does not depend on what happens to be checked out anywhere else.
+step "measuring the source"
+# Taken from the CLONE, before any rewriting, so the comparisons below do not
+# depend on what happens to be checked out anywhere else.
+SRC_COMMITS=$(git -C "$WORK" rev-list --count "$SRC_BRANCH" -- "$SUBDIR")
+[ "${SRC_COMMITS:-0}" -gt 0 ] || die "no commits touch $SUBDIR on $SRC_BRANCH - wrong path?"
 git -C "$WORK" ls-files -s "$SUBDIR" \
   | awk '{sub("tools/queue-forecasting/","",$4); print $2, $4}' | sort > "$WORK/../qf-before.txt"
-[ "$(wc -l < "$WORK/../qf-before.txt")" -eq "$EXPECT_FILES" ] \
-  || die "expected $EXPECT_FILES tracked files under $SUBDIR, got $(wc -l < "$WORK/../qf-before.txt")"
+SRC_FILES=$(wc -l < "$WORK/../qf-before.txt")
+[ "${SRC_FILES:-0}" -gt 0 ] || die "no tracked files under $SUBDIR - wrong path?"
+info "source has $SRC_COMMITS commits touching $SUBDIR and $SRC_FILES tracked files"
 
 step "rewriting history"
 ( cd "$WORK" && git filter-repo \
@@ -791,24 +799,46 @@ step "removing the source remote and its refs"
 refs=$(git -C "$WORK" for-each-ref --format='%(refname)')
 [ "$refs" = "refs/heads/main" ] || die "expected only refs/heads/main, got: $refs"
 
-step "check 1: commit count"
+step "check 1: the rewrite preserved every subtree commit"
 n=$(git -C "$WORK" rev-list --count main)
-[ "$n" -eq "$EXPECT_COMMITS" ] || die "expected $EXPECT_COMMITS commits, got $n"
-echo "ok    $n commits"
+[ "$n" -eq "$SRC_COMMITS" ] \
+  || die "commit count changed: source had $SRC_COMMITS touching $SUBDIR, extract has $n"
+info "ok    $n commits, matching the source"
 
 step "check 2: every tracked blob is byte-identical (this is the fidelity check)"
 git -C "$WORK" ls-files -s | awk '{print $2, $4}' | sort > "$WORK/../qf-after.txt"
 if ! diff -u "$WORK/../qf-before.txt" "$WORK/../qf-after.txt"; then
   die "tracked object listings differ - the extraction is NOT faithful"
 fi
-echo "ok    $(wc -l < "$WORK/../qf-after.txt") blobs identical, paths rooted at trainer/"
+info "ok    $SRC_FILES blobs identical, paths rooted at trainer/"
 
-step "check 3: the test suite runs in the extracted tree"
-( cd "$WORK/trainer" && uv sync --locked >/dev/null && uv run pytest -q 2>&1 | tail -1 ) \
-  | tee "$WORK/../qf-pytest.txt"
-grep -q '225 passed, 1 skipped' "$WORK/../qf-pytest.txt" \
-  || die "expected '225 passed, 1 skipped' (the skip is the serving-parity guard; see plan Task 1)"
-echo "ok    225 passed, 1 skipped"
+step "check 3: the production freeze notice did not come along"
+# trainer/README.md describes the FROZEN PRODUCTION copy ("research happens
+# elsewhere"). That text is actively wrong inside qf-research, so its presence
+# means this was extracted from a commit that already had plan Task 5 applied.
+if git -C "$WORK" ls-files --error-unmatch trainer/README.md >/dev/null 2>&1; then
+  die "trainer/README.md is in the extract. It describes the production copy and
+     is wrong inside qf-research. Either extract from a commit before plan
+     Task 5, or 'git -C $WORK rm trainer/README.md' before pushing."
+fi
+info "ok    no production-only files carried over"
+
+step "check 4: the test suite runs in the extracted tree"
+out=$( cd "$WORK/trainer" && uv sync --locked >/dev/null 2>&1 \
+       && uv run pytest -q 2>&1 | tail -1 )
+printf '%s\n' "$out" | tee "$WORK/../qf-pytest.txt"
+case "$out" in
+  *failed*) die "tests FAILED in the extracted tree: $out" ;;
+  *passed*) : ;;
+  *)        die "could not read a pytest summary: $out" ;;
+esac
+# Exactly one skip is expected and load-bearing: the serving-parity guard needs
+# src/repo-family.js from the service tree, which this repo does not contain.
+# Zero skips would mean the guard silently vanished; more than one means
+# something else stopped running and nobody noticed.
+printf '%s\n' "$out" | grep -q '1 skipped' \
+  || die "expected exactly '1 skipped' (the serving-parity guard); got: $out"
+info "ok    no failures, exactly one expected skip"
 
 echo
 echo "extraction verified in $WORK -- push it with plan Task 8."
@@ -834,7 +864,21 @@ rm -rf /tmp/qf-extract /tmp/qf-before.txt /tmp/qf-after.txt
 SRC="$(git rev-parse --show-toplevel)" bash host/extract-qf-research.sh
 ```
 
-Expected, in order: `ok    38 commits`; `ok    68 blobs identical, paths rooted at trainer/`; `ok    225 passed, 1 skipped`; then the closing message. Any `die` means stop and diagnose — do not push a repo that failed a check.
+Expected, in order:
+
+```
+      source has N commits touching tools/queue-forecasting/trainer and M tracked files
+      ok    N commits, matching the source
+      ok    M blobs identical, paths rooted at trainer/
+      ok    no production-only files carried over
+225 passed, 1 skipped in ...
+      ok    no failures, exactly one expected skip
+extraction verified in /tmp/qf-extract -- push it with plan Task 8.
+```
+
+`N` and `M` are **derived from the source**, not asserted against constants — on 2026-08-25 they were 39 and 68. An earlier revision hardcoded `EXPECT_COMMITS=38` and broke the moment a commit touched `trainer/`, which is the wrong kind of failure: a written-down number is a weaker claim than "the rewrite preserved exactly what the source had".
+
+Any `die` means stop and diagnose — do not push a repo that failed a check.
 
 - [ ] **Step 4: Confirm the cleanup actually shrank the repository**
 
@@ -942,7 +986,7 @@ Stop. The user commits.
 
 `trainer/README.md` describes the *production* copy — "this is the production trainer, research happens elsewhere". That text is actively wrong inside `qf-research`, so it must **not** appear in the extracted history. Extracting first (68 files) and adding the notice afterwards achieves that with no filtering.
 
-If you ran Task 5 first by accident, the extraction will fail its own file-count check (`expected 68 tracked files ... got 69`), which is the intended outcome — it stops you rather than shipping a misleading README. Either re-run the extraction from a commit before this task, or run it with `EXPECT_FILES=69` and then `git rm trainer/README.md` in `/tmp/qf-extract` before pushing.
+If you commit this task before running Task 4, the extraction's check 3 fails by name — `trainer/README.md is in the extract. It describes the production copy and is wrong inside qf-research` — and tells you the two recoveries: extract from an earlier commit, or `git rm trainer/README.md` in `/tmp/qf-extract` before pushing. That is the intended outcome, not a snag.
 
 ---
 

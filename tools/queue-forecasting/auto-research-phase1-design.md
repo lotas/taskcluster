@@ -263,9 +263,10 @@ git branch -m main
 `--refs` limits rewriting to the one branch, so no other branch or tag survives
 into the new repo.
 
-**Verification, three independent checks.** Check 2 is the one that proves the
-extraction is faithful rather than merely plausible — commit counts and a green
-test run are both satisfiable by a subtly wrong tree:
+**Verification, four independent checks, every expectation derived from the
+source rather than hardcoded.** Check 2 is the one that proves the extraction is
+faithful rather than merely plausible — commit counts and a green test run are
+both satisfiable by a subtly wrong tree:
 
 1. `git rev-list --count main` == **38** (commits touching `trainer/`)
 2. `git ls-files | wc -l` == **68** tracked files, and every tracked blob is
@@ -280,9 +281,15 @@ test run are both satisfiable by a subtly wrong tree:
    ```
 
    Both listings are then rooted at `trainer/…`, so they must be identical.
-3. `pytest` reports **226 passed** — the recorded baseline from this machine on
-   2026-08-24 (226 collected, 27s). `pyproject.toml` lives in `trainer/`, not at
-   the repo root, so the project directory must be explicit:
+3. `trainer/README.md` is **absent**. It describes the frozen production copy,
+   so its presence means the extraction ran from a commit that already had the
+   freeze notice applied.
+4. `pytest` reports **no failures and exactly one skip** — the serving-parity
+   guard, which needs `src/repo-family.js` from the service tree. Asserting the
+   properties rather than the counts keeps the check alive as tests are added;
+   on 2026-08-25 the summary read `225 passed, 1 skipped`. `pyproject.toml`
+   lives in `trainer/`, not at the repo root, so the project directory must be
+   explicit:
 
    ```
    cd /tmp/qf-extract/trainer && uv sync --locked && uv run pytest -q
