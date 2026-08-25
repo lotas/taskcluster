@@ -77,7 +77,7 @@ The guard is real and must keep working where it can. So it skips with a reason 
 **Files:**
 - Modify: `tools/queue-forecasting/trainer/tests/test_data_loader.py:73-82`
 
-- [ ] **Step 1: Reproduce the failure the extraction will hit**
+- [x] **Step 1: Reproduce the failure the extraction will hit**
 
 ```bash
 cd tools/queue-forecasting/trainer
@@ -93,7 +93,7 @@ print('exists:', js.exists())
 
 Expected: it prints a path outside the trainer tree and `exists: False`. That is the failure mode — in `qf-research` there is no `src/repo-family.js`.
 
-- [ ] **Step 2: Write the skip guard**
+- [x] **Step 2: Write the skip guard**
 
 In `trainer/tests/test_data_loader.py`, replace the opening of `test_repo_family_derivation_version_matches_js` (lines 73-82) so that it reads:
 
@@ -121,7 +121,7 @@ def test_repo_family_derivation_version_matches_js():
 
 `pytest` is already imported at module scope (line 3); do not add a second import.
 
-- [ ] **Step 3: Verify the guard still runs in the monorepo**
+- [x] **Step 3: Verify the guard still runs in the monorepo**
 
 ```bash
 cd tools/queue-forecasting/trainer
@@ -130,7 +130,7 @@ uv run pytest -q tests/test_data_loader.py::test_repo_family_derivation_version_
 
 Expected: `1 passed`, **not** skipped. `src/repo-family.js` exists here, so the guard must still assert.
 
-- [ ] **Step 4: Verify the whole suite is unchanged**
+- [x] **Step 4: Verify the whole suite is unchanged**
 
 ```bash
 cd tools/queue-forecasting/trainer && uv run pytest -q 2>&1 | tail -2
@@ -138,7 +138,7 @@ cd tools/queue-forecasting/trainer && uv run pytest -q 2>&1 | tail -2
 
 Expected: `226 passed`. The count must not drop — in this tree nothing should skip.
 
-- [ ] **Step 5: Stage**
+- [x] **Step 5: Stage**
 
 ```bash
 git add tools/queue-forecasting/trainer/tests/test_data_loader.py
@@ -156,7 +156,7 @@ This is the task to be slowest and most careful on. Six rounds of design review 
 - Create: `tools/queue-forecasting/host/nc7-lib.test.sh`
 - Create: `tools/queue-forecasting/host/nc7-lib.sh`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tools/queue-forecasting/host/nc7-lib.test.sh`:
 
@@ -262,7 +262,7 @@ echo "tests=$t failed=$f"
 [ "$f" -eq 0 ] || exit 1
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 cd tools/queue-forecasting && bash host/nc7-lib.test.sh
@@ -270,7 +270,7 @@ cd tools/queue-forecasting && bash host/nc7-lib.test.sh
 
 Expected: failure on the very first line, because `host/nc7-lib.sh` does not exist yet — `. "$here/nc7-lib.sh"` cannot be sourced.
 
-- [ ] **Step 3: Write the library**
+- [x] **Step 3: Write the library**
 
 Create `tools/queue-forecasting/host/nc7-lib.sh`:
 
@@ -367,7 +367,7 @@ secret_leaked() {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 cd tools/queue-forecasting && bash host/nc7-lib.test.sh
@@ -375,7 +375,7 @@ cd tools/queue-forecasting && bash host/nc7-lib.test.sh
 
 Expected, exactly: `tests=38 failed=0`, and every line begins `ok`.
 
-- [ ] **Step 5: Stage**
+- [x] **Step 5: Stage**
 
 ```bash
 git add tools/queue-forecasting/host/nc7-lib.sh tools/queue-forecasting/host/nc7-lib.test.sh
@@ -392,7 +392,7 @@ Glue over the tested library: it performs the requests, classifies with `score_h
 **Files:**
 - Create: `tools/queue-forecasting/host/nc7-suite.sh`
 
-- [ ] **Step 1: Write the suite**
+- [x] **Step 1: Write the suite**
 
 Create `tools/queue-forecasting/host/nc7-suite.sh`:
 
@@ -673,7 +673,7 @@ echo "passed=$pass failed=$fail  evidence=$EVIDENCE"
 [ "$fail" -eq 0 ] || exit 1
 ```
 
-- [ ] **Step 2: Check it parses and that the library tests still pass**
+- [x] **Step 2: Check it parses and that the library tests still pass**
 
 ```bash
 cd tools/queue-forecasting
@@ -683,7 +683,7 @@ bash host/nc7-lib.test.sh | tail -1
 
 Expected: `syntax OK`, then `tests=38 failed=0`.
 
-- [ ] **Step 3: Confirm it refuses to run without a credential**
+- [x] **Step 3: Confirm it refuses to run without a credential**
 
 ```bash
 cd tools/queue-forecasting
@@ -692,7 +692,7 @@ CRED_FILE=/nonexistent bash host/nc7-suite.sh; echo "exit=$?"
 
 Expected: `nc7: no github.com credential in /nonexistent` and `exit=2`. It must fail closed rather than reporting a contained system.
 
-- [ ] **Step 4: Make both executable and stage**
+- [x] **Step 4: Make both executable and stage**
 
 ```bash
 chmod +x tools/queue-forecasting/host/nc7-suite.sh
@@ -713,18 +713,20 @@ moment it runs, not what is staged. Two consequences:
    serving-parity skip guard and check 4 fails with `1 failed` instead of
    `225 passed, 1 skipped`. That failure is correct behaviour — the script is
    telling you the tree is not the one you meant to extract.
-2. **Task 5 must NOT be committed yet.** `trainer/README.md` describes the
-   *production* copy, so it must not appear in `qf-research`. Check 3 tests for
-   that file by name and refuses with the recovery instructions, so this fails
-   loudly rather than shipping a misleading README.
+2. **Task 5's `trainer/README.md` is handled automatically.** It describes the
+   *production* copy, so it must not appear in `qf-research`. A second
+   `filter-repo` pass drops it from the rewritten history, and check 3 asserts
+   it survives neither in the tree nor in any commit. So the extraction is
+   repeatable at any commit, which matters because `/tmp/qf-extract` does not
+   survive a reboot and Task 8 may happen much later.
 
-So the commit order is: Tasks 1-3 (and optionally 6-7, which touch nothing the
-extraction sees) → **run this task** → Task 5.
+So the only hard ordering constraint is that **Task 1 must be committed before
+this task runs**. Task 5 may be committed before or after.
 
 **Files:**
 - Create: `tools/queue-forecasting/host/extract-qf-research.sh`
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 Create `tools/queue-forecasting/host/extract-qf-research.sh`:
 
@@ -751,6 +753,13 @@ SRC_BRANCH=${SRC_BRANCH:-feat/queue-forecasting}
 WORK=${WORK:-/tmp/qf-extract}
 SUBDIR=tools/queue-forecasting/trainer
 
+# Paths deliberately NOT carried into qf-research, as they appear AFTER the
+# path-rename. Single-sourced: the same list drives the history-drop pass and
+# the expected-blob listing, so the two cannot drift apart.
+#   trainer/README.md documents the FROZEN PRODUCTION copy ("research happens
+#   elsewhere"), which is wrong inside the research repo.
+DROP_PATHS="trainer/README.md"
+
 die() { echo "extract: $*" >&2; exit 1; }
 step() { echo; echo "== $*"; }
 info() { echo "      $*"; }
@@ -771,19 +780,50 @@ fi
 step "measuring the source"
 # Taken from the CLONE, before any rewriting, so the comparisons below do not
 # depend on what happens to be checked out anywhere else.
+SRC_FOR_COUNT="$WORK/../qf-src-mirror.git"
+rm -rf "$SRC_FOR_COUNT"
+git clone --quiet --bare --single-branch --branch "$SRC_BRANCH" "$WORK" "$SRC_FOR_COUNT" \
+  || die "could not mirror the source for counting"
 SRC_COMMITS=$(git -C "$WORK" rev-list --count "$SRC_BRANCH" -- "$SUBDIR")
 [ "${SRC_COMMITS:-0}" -gt 0 ] || die "no commits touch $SUBDIR on $SRC_BRANCH - wrong path?"
 git -C "$WORK" ls-files -s "$SUBDIR" \
-  | awk '{sub("tools/queue-forecasting/","",$4); print $2, $4}' | sort > "$WORK/../qf-before.txt"
+  | awk '{sub("tools/queue-forecasting/","",$4); print $2, $4}' | sort > "$WORK/../qf-src.txt"
+# Expected = source minus the deliberate exclusions.
+cp "$WORK/../qf-src.txt" "$WORK/../qf-before.txt"
+for d in $DROP_PATHS; do
+  grep -v " $d\$" "$WORK/../qf-before.txt" > "$WORK/../qf-before.tmp" || true
+  mv "$WORK/../qf-before.tmp" "$WORK/../qf-before.txt"
+done
 SRC_FILES=$(wc -l < "$WORK/../qf-before.txt")
+SRC_FILES_RAW=$(wc -l < "$WORK/../qf-src.txt")
 [ "${SRC_FILES:-0}" -gt 0 ] || die "no tracked files under $SUBDIR - wrong path?"
-info "source has $SRC_COMMITS commits touching $SUBDIR and $SRC_FILES tracked files"
+info "source has $SRC_COMMITS commits touching $SUBDIR and $SRC_FILES_RAW tracked files"
+info "expecting $SRC_FILES after excluding:$(for d in $DROP_PATHS; do printf ' %s' "$d"; done)"
 
 step "rewriting history"
 ( cd "$WORK" && git filter-repo \
     --path "$SUBDIR/" \
     --path-rename "$SUBDIR/:trainer/" \
     --refs "$SRC_BRANCH" ) || die "filter-repo failed"
+
+step "dropping production-only files from the rewritten history"
+# trainer/README.md describes the FROZEN PRODUCTION copy ("research happens
+# elsewhere"), so it is wrong inside qf-research. It lives in the monorepo from
+# commit 05d96b5d52 on, which makes this the normal case rather than an edge
+# case -- so drop it here instead of failing and telling a human to do it.
+# A second filter-repo pass needs --force, the first having already rewritten.
+drop_args=""
+for d in $DROP_PATHS; do
+  git -C "$WORK" ls-files --error-unmatch "$d" >/dev/null 2>&1 && drop_args="$drop_args --path $d"
+done
+if [ -n "$drop_args" ]; then
+  # A second filter-repo pass needs --force, the first having already rewritten.
+  ( cd "$WORK" && git filter-repo --force --invert-paths $drop_args ) \
+    || die "could not drop production-only paths from history"
+  info "dropped:$drop_args"
+else
+  info "no production-only files present"
+fi
 
 step "removing the source remote and its refs"
 # --refs leaves `origin` and its remote-tracking refs in place, and those still
@@ -800,10 +840,21 @@ refs=$(git -C "$WORK" for-each-ref --format='%(refname)')
 [ "$refs" = "refs/heads/main" ] || die "expected only refs/heads/main, got: $refs"
 
 step "check 1: the rewrite preserved every subtree commit"
+# Dropping trainer/README.md can legitimately empty a commit that touched only
+# that file, and filter-repo prunes empty commits -- so allow the count to fall
+# by at most the number of such commits, and never to rise.
 n=$(git -C "$WORK" rev-list --count main)
-[ "$n" -eq "$SRC_COMMITS" ] \
-  || die "commit count changed: source had $SRC_COMMITS touching $SUBDIR, extract has $n"
-info "ok    $n commits, matching the source"
+prunable=0
+for d in $DROP_PATHS; do
+  c=$(git -C "$SRC_FOR_COUNT" rev-list --count "$SRC_BRANCH" \
+        -- "tools/queue-forecasting/$d" 2>/dev/null || echo 0)
+  prunable=$(( prunable + c ))
+done
+lower=$(( SRC_COMMITS - prunable ))
+if [ "$n" -gt "$SRC_COMMITS" ] || [ "$n" -lt "$lower" ]; then
+  die "commit count $n is outside [$lower, $SRC_COMMITS] for $SUBDIR - unexpected rewrite"
+fi
+info "ok    $n commits (source had $SRC_COMMITS; up to $prunable excluded-path-only may prune)"
 
 step "check 2: every tracked blob is byte-identical (this is the fidelity check)"
 git -C "$WORK" ls-files -s | awk '{print $2, $4}' | sort > "$WORK/../qf-after.txt"
@@ -812,16 +863,16 @@ if ! diff -u "$WORK/../qf-before.txt" "$WORK/../qf-after.txt"; then
 fi
 info "ok    $SRC_FILES blobs identical, paths rooted at trainer/"
 
-step "check 3: the production freeze notice did not come along"
-# trainer/README.md describes the FROZEN PRODUCTION copy ("research happens
-# elsewhere"). That text is actively wrong inside qf-research, so its presence
-# means this was extracted from a commit that already had plan Task 5 applied.
-if git -C "$WORK" ls-files --error-unmatch trainer/README.md >/dev/null 2>&1; then
-  die "trainer/README.md is in the extract. It describes the production copy and
-     is wrong inside qf-research. Either extract from a commit before plan
-     Task 5, or 'git -C $WORK rm trainer/README.md' before pushing."
-fi
-info "ok    no production-only files carried over"
+step "check 3: no production-only file survived, in the tree or in history"
+# Asserts the drop above actually worked -- in the working tree AND in every
+# commit, since a file removed from HEAD but left in history would still ship.
+for d in $DROP_PATHS; do
+  git -C "$WORK" ls-files --error-unmatch "$d" >/dev/null 2>&1 \
+    && die "$d is still tracked; the drop pass did not work"
+  [ -n "$(git -C "$WORK" log --all --oneline -- "$d")" ] \
+    && die "$d is gone from the tree but survives in history"
+done
+info "ok    no production-only files, in the tree or in history"
 
 step "check 4: the test suite runs in the extracted tree"
 out=$( cd "$WORK/trainer" && uv sync --locked >/dev/null 2>&1 \
@@ -844,7 +895,7 @@ echo
 echo "extraction verified in $WORK -- push it with plan Task 8."
 ```
 
-- [ ] **Step 2: Install `git-filter-repo` if absent**
+- [x] **Step 2: Install `git-filter-repo` if absent**
 
 ```bash
 command -v git-filter-repo || pipx install git-filter-repo || pip install --user git-filter-repo
@@ -854,7 +905,7 @@ git filter-repo --version
 
 Expected: a version string. It is not preinstalled.
 
-- [ ] **Step 3: Run the extraction against the local checkout**
+- [x] **Step 3: Run the extraction against the local checkout**
 
 Using the local checkout rather than the remote keeps this step offline and makes the comparison exact against the tree Task 1 just modified.
 
@@ -864,23 +915,27 @@ rm -rf /tmp/qf-extract /tmp/qf-before.txt /tmp/qf-after.txt
 SRC="$(git rev-parse --show-toplevel)" bash host/extract-qf-research.sh
 ```
 
-Expected, in order:
+Expected, as measured on 2026-08-25 against `05d96b5d52`:
 
 ```
-      source has N commits touching tools/queue-forecasting/trainer and M tracked files
-      ok    N commits, matching the source
-      ok    M blobs identical, paths rooted at trainer/
-      ok    no production-only files carried over
+      source has 40 commits touching tools/queue-forecasting/trainer and 69 tracked files
+      expecting 68 after excluding: trainer/README.md
+      dropped: --path trainer/README.md
+      ok    39 commits (source had 40; up to 1 excluded-path-only may prune)
+      ok    68 blobs identical, paths rooted at trainer/
+      ok    no production-only files, in the tree or in history
 225 passed, 1 skipped in ...
       ok    no failures, exactly one expected skip
 extraction verified in /tmp/qf-extract -- push it with plan Task 8.
 ```
 
-`N` and `M` are **derived from the source**, not asserted against constants — on 2026-08-25 they were 39 and 68. An earlier revision hardcoded `EXPECT_COMMITS=38` and broke the moment a commit touched `trainer/`, which is the wrong kind of failure: a written-down number is a weaker claim than "the rewrite preserved exactly what the source had".
+Every number is **derived from the source**, not asserted against a constant. Two earlier revisions got this wrong and are worth not repeating: the first hardcoded `EXPECT_COMMITS=38`, which broke the moment a commit touched `trainer/`; the second made `trainer/README.md` a fatal error, which made the whole extraction a one-shot once that file was committed. A written-down number is a weaker claim than "the rewrite preserved exactly what the source had, minus what we deliberately excluded".
+
+The exclusion list is single-sourced in `DROP_PATHS`, which drives the history-drop pass, the expected-blob listing, and the commit-count allowance together, so they cannot drift apart.
 
 Any `die` means stop and diagnose — do not push a repo that failed a check.
 
-- [ ] **Step 4: Confirm the cleanup actually shrank the repository**
+- [x] **Step 4: Confirm the cleanup actually shrank the repository**
 
 ```bash
 du -sh /tmp/qf-extract/.git
@@ -890,7 +945,7 @@ git -C /tmp/qf-extract log --oneline | tail -2
 
 Expected: a few MB (measured 2.4 MB, versus 194 MB before cleanup), exactly `refs/heads/main`, and the oldest commits being the first trainer commits — not monorepo history.
 
-- [ ] **Step 5: Make it executable and stage**
+- [x] **Step 5: Make it executable and stage**
 
 ```bash
 chmod +x tools/queue-forecasting/host/extract-qf-research.sh
@@ -909,7 +964,7 @@ D2: the monorepo copy is retained **indefinitely** and changes only through a hu
 - Create: `tools/queue-forecasting/trainer/README.md`
 - Modify: `tools/queue-forecasting/README.md:137` (immediately after the `## Training workflows` heading)
 
-- [ ] **Step 1: Write the trainer freeze notice**
+- [x] **Step 1: Write the trainer freeze notice**
 
 Create `tools/queue-forecasting/trainer/README.md`:
 
@@ -955,7 +1010,7 @@ copies. Refresh them with an explicit reviewed `uv lock`, then `uv sync
 manifest.
 ```
 
-- [ ] **Step 2: Point the main README's training section at it**
+- [x] **Step 2: Point the main README's training section at it**
 
 In `tools/queue-forecasting/README.md`, insert immediately after the `## Training workflows` heading on line 137 and before the "There are three nested workflows" line:
 
@@ -966,7 +1021,7 @@ In `tools/queue-forecasting/README.md`, insert immediately after the `## Trainin
 > `auto-research-phase1-design.md` D2.
 ```
 
-- [ ] **Step 3: Verify neither file broke anything**
+- [x] **Step 3: Verify neither file broke anything**
 
 ```bash
 cd tools/queue-forecasting/trainer && uv run pytest -q 2>&1 | tail -1
@@ -974,7 +1029,7 @@ cd tools/queue-forecasting/trainer && uv run pytest -q 2>&1 | tail -1
 
 Expected: `226 passed`. A README cannot break tests, but this is the cheap check that Task 1 is still intact before the extraction consumes this tree.
 
-- [ ] **Step 4: Stage**
+- [x] **Step 4: Stage**
 
 ```bash
 git add tools/queue-forecasting/trainer/README.md tools/queue-forecasting/README.md
@@ -999,7 +1054,7 @@ Three edits, each of which is a live control today. Spec §10, Phase 0 table.
 - Modify: `tools/queue-forecasting/host/phase0-setup.sh:696-704`
 - Modify: `tools/queue-forecasting/host/README.md`
 
-- [ ] **Step 1: Retire NC4's dead `/srv/qf-platform` branch**
+- [x] **Step 1: Retire NC4's dead `/srv/qf-platform` branch**
 
 `host/nc-suite.sh:76-80` currently reads:
 
@@ -1022,7 +1077,7 @@ echo "ok    NC4 platform  (controls live in \$DEPLOY_DIR; covered above)"
 pass=$((pass + 1))
 ```
 
-- [ ] **Step 2: Move NC6's denied host off pypi**
+- [x] **Step 2: Move NC6's denied host off pypi**
 
 `host/nc-suite.sh:92` currently reads:
 
@@ -1039,7 +1094,7 @@ pypi becomes an *allowed* host in Step 3, so this probe would invert. Replace wi
 refuse "NC6 denied host"   "curl -sS -o /dev/null --max-time 20 https://huggingface.co"
 ```
 
-- [ ] **Step 3: Widen the allowlist in the generator, not just on the host**
+- [x] **Step 3: Widen the allowlist in the generator, not just on the host**
 
 `host/phase0-setup.sh:696-704` *generates* `/etc/tinyproxy/allowlist.txt`. Editing only the live file means the next `phase0-setup.sh egress` silently reverts it. Add two entries to the heredoc so it reads:
 
@@ -1057,7 +1112,7 @@ refuse "NC6 denied host"   "curl -sS -o /dev/null --max-time 20 https://huggingf
 LIST
 ```
 
-- [ ] **Step 4: Record both changes in the host README**
+- [x] **Step 4: Record both changes in the host README**
 
 Append to `tools/queue-forecasting/host/README.md`, replacing the existing `## Egress exceptions` section body ("None. If a CLI is found not to honour...") with:
 
@@ -1082,7 +1137,7 @@ If a CLI is found not to honour `HTTPS_PROXY` and a direct nftables allowance is
 added for it, record the endpoint, the reason, and the date here.
 ```
 
-- [ ] **Step 5: Move `phase0-setup.sh`'s own denied-host probe too**
+- [x] **Step 5: Move `phase0-setup.sh`'s own denied-host probe too**
 
 `cmd_egress` does not only *generate* the allowlist, it then verifies it. Around line 836:
 
@@ -1104,7 +1159,7 @@ Point it at the same target as NC6:
     && die "denied host was reachable. The allowlist is not being enforced."
 ```
 
-- [ ] **Step 6: Verify the scripts still parse and no denial probe still targets pypi**
+- [x] **Step 6: Verify the scripts still parse and no denial probe still targets pypi**
 
 ```bash
 cd tools/queue-forecasting
@@ -1115,7 +1170,7 @@ grep -n 'pypi' host/nc-suite.sh host/phase0-setup.sh
 
 Expected: `both parse`; `huggingface.co` appears once in each script; and every remaining mention of `pypi` is either the allowlist entry `^pypi\.org$` in the generator or an explanatory comment. **No `run_research`/`refuse` line may still probe `pypi.org`** — that is the check that matters, not the absence of the string.
 
-- [ ] **Step 7: Stage**
+- [x] **Step 7: Stage**
 
 ```bash
 git add tools/queue-forecasting/host/nc-suite.sh \
@@ -1134,7 +1189,7 @@ Spec §10 lists 20 edits to the parent design (plus 5 to the Phase 0 artefacts, 
 **Files:**
 - Modify: `tools/queue-forecasting/auto-research-loop-design.md`
 
-- [ ] **Step 1: Add a superseding pointer at the top of §3.1**
+- [x] **Step 1: Add a superseding pointer at the top of §3.1**
 
 Insert immediately before the repo table at line 71:
 
@@ -1148,7 +1203,7 @@ Insert immediately before the repo table at line 71:
 > the reasoning about why repository boundaries beat path globs is unchanged.
 ```
 
-- [ ] **Step 2: Work the remaining 19 rows of §10's table**
+- [x] **Step 2: Work the remaining 19 rows of §10's table**
 
 For each row, make the substitution the table specifies. The rows are ordered by location, so working top to bottom keeps line numbers meaningful for the rows below. The substantive ones, in order:
 
@@ -1174,7 +1229,7 @@ For each row, make the substitution the table specifies. The rows are ordered by
 | §14 Phase 1 L757-765 | replace the paragraph with a pointer to `auto-research-phase1-design.md` §1-§8 |
 | §15 L827 | add that root executing agent-selected code, build inputs included, is the same failure class |
 
-- [ ] **Step 3: Verify no stale reference survives**
+- [x] **Step 3: Verify no stale reference survives**
 
 ```bash
 cd tools/queue-forecasting
@@ -1183,7 +1238,7 @@ grep -n "qf-service\|qf-platform" auto-research-loop-design.md
 
 Expected: every remaining hit is either inside the Step 1 superseding note, the retained "path to take later" discussion, or `/var/lib/qf-platform` (a filesystem path, deliberately kept). No hit should assert that an agent holds a credential on `qf-service`, or that `/srv/qf-platform` exists.
 
-- [ ] **Step 4: Verify the two designs agree on the token**
+- [x] **Step 4: Verify the two designs agree on the token**
 
 ```bash
 grep -n "Contents: write" auto-research-loop-design.md auto-research-phase1-design.md
@@ -1191,7 +1246,7 @@ grep -n "Contents: write" auto-research-loop-design.md auto-research-phase1-desi
 
 Expected: both name `Contents: write` **and** `Issues: write` on `qf-research`, and neither grants anything on the monorepo.
 
-- [ ] **Step 5: Stage**
+- [x] **Step 5: Stage**
 
 ```bash
 git add tools/queue-forecasting/auto-research-loop-design.md
