@@ -4,7 +4,7 @@
 
 **Goal:** Extract `trainer/` into a private `lotas/qf-research` the research agent owns outright, give it one scoped GitHub token, and prove by negative control that it can write to that repo and nothing else.
 
-**Architecture:** One new repository, one fine-grained PAT (`Contents: write` + `Issues: write` on `qf-research` only), and **no credential of any kind on `lotas/taskcluster`**. The monorepo stays the trusted source for service and platform code, read by root into `/srv/queue-forecasting`. The three-repo split in the parent design is not built — see the spec for why. The live collector and live-predictor are never rebuilt or restarted.
+**Architecture:** One new repository, one fine-grained PAT (`Contents: write` + `Issues: write` on `qf-research` only), and **no credential of any kind on `lotas/taskcluster`**. The monorepo stays the trusted source for service and platform code, read by the agent from a root-owned, secret-free mirror at `/srv/queue-forecasting` — which is *not* the deploy checkout; see the spec's §4.1. The three-repo split in the parent design is not built — see the spec for why. The live collector and live-predictor are never rebuilt or restarted.
 
 **Tech Stack:** `git filter-repo`, bash, `curl`, `jq`, `uv`/pytest, GitHub fine-grained PATs, tinyproxy allowlist.
 
@@ -1264,13 +1264,13 @@ Stop. The user commits.
 
 **Files:** none in this checkout. Creates `lotas/qf-research`.
 
-- [ ] **Step 1: Create the repository — empty**
+- [x] **Step 1: Create the repository — empty**
 
 On GitHub: **New repository**, owner `lotas`, name `qf-research`, **Private**. Do **not** initialise it with a README, `.gitignore`, or licence — the push in Step 3 carries the whole history and an initial commit would collide.
 
 Confirm Issues are enabled (Settings → Features → Issues). They are on by default for a fresh repository, unlike a fork — and the token's `Issues: write` is useless without them.
 
-- [ ] **Step 2: Mint the fine-grained token**
+- [x] **Step 2: Mint the fine-grained token**
 
 Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token.
 
@@ -1282,7 +1282,7 @@ Settings → Developer settings → Personal access tokens → **Fine-grained to
 
 Copy the token once. Do not paste it into a shell command, a file in this repo, or a chat message; Task 10 Step 2 reads it from a prompt that does not echo.
 
-- [ ] **Step 3: Push the verified extraction**
+- [x] **Step 3: Push the verified extraction**
 
 Task 4 left a verified repository in `/tmp/qf-extract`. Push that, not a fresh clone:
 
@@ -1294,7 +1294,7 @@ git push -u origin main
 
 Expected: 38 objects-worth of history, a few MB. If git asks for credentials, authenticate as yourself — the agent's token is not involved in this step.
 
-- [ ] **Step 4: Verify what landed**
+- [x] **Step 4: Verify what landed**
 
 ```bash
 cd /tmp/qf-extract
@@ -1304,7 +1304,7 @@ git log --oneline origin/main | wc -l
 
 Expected: exactly one head, `refs/heads/main`, and `38`. If any other ref appears, the cleanup in Task 4 Step 3 did not run — delete the remote repository and start again rather than pruning refs after the fact.
 
-- [ ] **Step 5: Seed the scaffolding**
+- [x] **Step 5: Seed the scaffolding**
 
 Still in `/tmp/qf-extract`, create three files. Keep it minimal — `ledger.jsonl`, `bus.jsonl`, and `features.yaml` arrive with the Phase 4 code that writes them, and empty scaffolding invites drift.
 
@@ -1395,7 +1395,7 @@ able to act on the description.
 File an issue on this repository pointing at the proposal so it surfaces.
 ```
 
-- [ ] **Step 6: Commit and push the scaffolding**
+- [x] **Step 6: Commit and push the scaffolding**
 
 ```bash
 cd /tmp/qf-extract
@@ -1412,22 +1412,55 @@ This is the one place in this plan where you do commit — it is a different rep
 
 ## Phase 1c — host
 
+### Two paths, and which is which
+
+This host has **two** checkouts of the same repo and branch, and the commands
+below are precise about which one they mean. Getting it backwards VOIDs controls
+rather than failing them, which is the failure mode this plan works hardest to
+avoid.
+
+| Shell variable | What it is | Owner | Used for |
+|---|---|---|---|
+| `$DEPLOY_DIR` | the **running deployment**, inside the deploy user's home | the deploy user | `docker compose`, and `nc-suite.sh`'s probes — `.env` and `trainer/data/models` only exist here |
+| `/srv/queue-forecasting` | a root-owned, secret-free **mirror** (shallow clone of the public fork) | root | everything `research` reads: `host/*.sh`, service source |
+
+`research` cannot traverse the deploy user's home, and must not be able to — see
+`auto-research-phase1-design.md` §4.1 for why a symlink does not help and why
+`chmod o+x` on that home would undercut NC3.
+
+Export the deploy path once, and use it throughout this phase:
+
+```bash
+export DEPLOY_DIR=/home/<deploy-user>/dev/taskcluster/tools/queue-forecasting
+[ -f "$DEPLOY_DIR/.env" ] || echo "wrong DEPLOY_DIR: no .env here"
+```
+
+If the mirror does not exist yet, create it:
+
+```bash
+sudo git clone --depth 1 --single-branch --branch feat/queue-forecasting \
+  https://github.com/lotas/taskcluster /srv/queue-forecasting
+sudo -H -u research test -r /srv/queue-forecasting/tools/queue-forecasting/host/nc7-lib.sh \
+  && echo "research can read the controls"
+```
+
 ### Task 9: Widen the allowlist and re-prove Phase 0
 
 Do this before anything needs pypi. Phase 0's suite must still pass afterwards, or the change broke a control.
 
 **Files:** host state only.
 
-- [ ] **Step 1: Pull the amended controls into the trusted checkout**
+- [x] **Step 1: Pull the amended controls into the trusted checkout**
 
 ```bash
-sudo git -C /srv/queue-forecasting pull --ff-only
+sudo git -C /srv/queue-forecasting fetch --depth 1 origin feat/queue-forecasting
+sudo git -C /srv/queue-forecasting reset --hard FETCH_HEAD
 sudo git -C /srv/queue-forecasting log --oneline -1
 ```
 
-Expected: the commits from Tasks 1-7. If the pull is not fast-forward, stop — the trusted checkout must never be force-updated.
+Expected: the commits from Tasks 1-7. `reset --hard` is correct **for the mirror** and only for the mirror — it is a disposable, root-owned copy with no local state to lose, and a shallow clone cannot fast-forward in the usual way. Never run this against `$DEPLOY_DIR`.
 
-- [ ] **Step 2: Apply the allowlist change**
+- [x] **Step 2: Apply the allowlist change**
 
 ```bash
 cd /srv/queue-forecasting/tools/queue-forecasting
@@ -1438,7 +1471,7 @@ sudo systemctl is-active tinyproxy
 
 Expected: the allowlist has 9 entries, and tinyproxy is `active`. Re-running `egress` is idempotent — it rewrites the allowlist from the generator and restarts the proxy.
 
-- [ ] **Step 3: Verify the new hosts resolve and the denied one does not**
+- [x] **Step 3: Verify the new hosts resolve and the denied one does not**
 
 ```bash
 sudo -H -u research bash -lc 'curl -sS -o /dev/null -w "pypi %{http_code}\n" --max-time 20 https://pypi.org'
@@ -1448,21 +1481,23 @@ sudo -H -u research bash -lc 'curl -sS -o /dev/null -w "hf %{http_code}\n" --max
 
 Expected: a 2xx or 4xx for the first two (reachable), and a failure or `403` for `huggingface.co`.
 
-- [ ] **Step 4: Re-run the Phase 0 negative controls**
+- [x] **Step 4: Re-run the Phase 0 negative controls**
 
 ```bash
-cd /srv/queue-forecasting/tools/queue-forecasting
-sudo DEPLOY_DIR=/srv/queue-forecasting SECRETS_DIR=$HOME/qf-secrets ./host/nc-suite.sh
+sudo DEPLOY_DIR="$DEPLOY_DIR" SECRETS_DIR=$HOME/qf-secrets \
+  /srv/queue-forecasting/tools/queue-forecasting/host/nc-suite.sh
 ```
 
-Expected: every line begins `ok` or `skip`, and the final line reads `passed=17 failed=0` — one higher than Phase 0's 16, because NC4's platform branch now counts instead of skipping. Any `VOID` or `FAIL` line means stop: the allowlist change regressed a control.
+Note the split: the **suite** comes from the mirror (it is a control, so it must be root-owned), while **`DEPLOY_DIR`** is the real deployment. Pointing `DEPLOY_DIR` at the mirror would VOID NC3 and NC5 — their canaries require `.env` and `trainer/data/models` to exist, and a fresh mirror has neither.
 
-- [ ] **Step 5: Refresh the Phase 0 evidence**
+Expected: every line begins `ok` or `skip`, and the final line reads `passed=18 failed=0`. That is two higher than Phase 0's 16: NC4's platform branch now counts instead of skipping, and NC5's directory check is now an explicit `exists` assertion rather than a silent `if`. Any `VOID` or `FAIL` line means stop: the allowlist change regressed a control.
+
+- [x] **Step 5: Refresh the Phase 0 evidence**
 
 ```bash
-cd /srv/queue-forecasting/tools/queue-forecasting
-sudo DEPLOY_DIR=/srv/queue-forecasting SECRETS_DIR=$HOME/qf-secrets ./host/nc-suite.sh \
-  | sudo tee host/nc-evidence-phase0.txt
+sudo DEPLOY_DIR="$DEPLOY_DIR" SECRETS_DIR=$HOME/qf-secrets \
+  /srv/queue-forecasting/tools/queue-forecasting/host/nc-suite.sh \
+  | tee /tmp/nc-evidence-phase0.txt
 ```
 
 Copy that file back into the working checkout and stage it there — the deploy checkout is root-owned and is not where commits come from.
@@ -1473,20 +1508,27 @@ Copy that file back into the working checkout and stage it there — the deploy 
 
 **Files:** host state only. Creates `/home/research/.git-credentials` and `/home/research/qf-research/`.
 
-- [ ] **Step 1: Install `uv` and `jq` system-wide, as root**
+- [x] **Step 1: Install `uv` and `jq` system-wide, as root**
 
 `research` cannot fetch the `uv` installer — `astral.sh` is not allowlisted, and adding it would widen egress for a one-time need. Root's egress is unrestricted, so root installs the *binary* system-wide. Root still never runs `uv` inside the worktree.
 
 ```bash
-sudo apt-get update && sudo apt-get install -y pipx jq
+sudo apt-get update && sudo apt-get install -y pipx jq libgomp1
 sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install uv
 uv --version && jq --version
 sudo -H -u research bash -lc 'uv --version && jq --version'
 ```
 
+`libgomp1` is the OpenMP runtime LightGBM links against. Without it Step 6's
+pytest fails at import with `OSError: libgomp.so.1: cannot open shared object
+file`. `trainer/Dockerfile` already installs it for the container — *"LightGBM
+requires the OpenMP runtime; the -slim base image omits it"* — and running the
+suite natively needs the same package on the host. It is a system library, so
+root installs it; `research` still owns the venv.
+
 Expected: both tools report versions for root and for `research`. `curl | sh` is deliberately avoided: piping a remote script into a root shell is a worse habit than a pinned package install, and `jq` is needed by `nc7-suite.sh`.
 
-- [ ] **Step 2: Write the credential without it reaching argv or shell history**
+- [x] **Step 2: Write the credential without it reaching argv or shell history**
 
 ```bash
 read -rs -p "paste the qf-research PAT: " PAT; echo
@@ -1502,7 +1544,7 @@ Expected: `600 research /home/research/.git-credentials`.
 
 `read -rs` does not echo and does not enter history. `printf` is a bash builtin, so the token never becomes a process argument; it reaches `tee` on stdin only.
 
-- [ ] **Step 3: Configure the helper, with `useHttpPath` set explicitly**
+- [x] **Step 3: Configure the helper, with `useHttpPath` set explicitly**
 
 ```bash
 sudo -H -u research bash -lc '
@@ -1515,7 +1557,7 @@ Expected: `credential.helper store` and `credential.useHttpPath false`.
 
 `useHttpPath=false` is the default, but it is set explicitly because it is load-bearing: with it `true`, git matches by path, the one stored entry would not be offered for the monorepo, and NC7's `R1` would go **VOID** for want of a credential instead of testing the token's scope. It affects `R1` only — the REST probes carry their own `Authorization` header.
 
-- [ ] **Step 4: Verify both URLs resolve to the same credential, without printing it**
+- [x] **Step 4: Verify both URLs resolve to the same credential, without printing it**
 
 ```bash
 sudo -H -u research bash -lc '
@@ -1532,7 +1574,7 @@ Expected: `OK both URLs resolve to the same credential`.
 
 This reuses `cred_fields_digest` from the tested library rather than reimplementing it, which matters: a naive version hashes the empty string on failure, so two *failed* lookups compare equal and the check passes vacuously. `cred_fields_digest` returns non-zero unless it sees exactly one non-empty username and one non-empty password, which is why the `|| { ...; exit 1; }` arms can be trusted.
 
-- [ ] **Step 5: Clone the research repository as `research`**
+- [x] **Step 5: Clone the research repository as `research`**
 
 ```bash
 sudo -H -u research bash -lc 'cd ~ && GIT_TERMINAL_PROMPT=0 git clone https://github.com/lotas/qf-research'
@@ -1561,8 +1603,8 @@ Expected: the sync resolves from pypi; pytest reports `225 passed, 1 skipped`; a
 - [ ] **Step 1: Run the library tests on the host**
 
 ```bash
-cd /srv/queue-forecasting/tools/queue-forecasting
-sudo -H -u research bash -lc 'bash /srv/queue-forecasting/tools/queue-forecasting/host/nc7-lib.test.sh' | tail -1
+sudo -H -u research bash -lc \
+  'bash /srv/queue-forecasting/tools/queue-forecasting/host/nc7-lib.test.sh' | tail -1
 ```
 
 Expected: `tests=38 failed=0`. Run this first every time — the suite's judgement is only as good as this file.
@@ -1646,20 +1688,21 @@ Expected: uptimes spanning the whole phase — hours or days, not minutes. If an
 - [ ] **Step 2: Collection is still ingesting**
 
 ```bash
-sudo docker compose -f /srv/queue-forecasting/tools/queue-forecasting/docker-compose.yml \
+sudo docker compose -f "$DEPLOY_DIR/docker-compose.yml" \
   exec -T postgres psql -U postgres -d forecasting -tAc \
   "select count(*) from queue_forecast_tasks where task_created > now() - interval '1 hour'"
 ```
+
+`$DEPLOY_DIR`, not the mirror: the mirror has no `.env`, so compose could not resolve its variables, and the running containers belong to the deployment anyway.
 
 Expected: a non-zero count in the thousands. fxci ingests ~200-300k rows/day.
 
 - [ ] **Step 3: Production training still runs from the monorepo copy**
 
 ```bash
-sudo git -C /srv/queue-forecasting status --short tools/queue-forecasting/trainer
-ls -d /srv/queue-forecasting/tools/queue-forecasting/trainer/src
-grep -n 'docker compose run --rm --entrypoint uv trainer' \
-  /srv/queue-forecasting/tools/queue-forecasting/scripts/daily_walk_forward.sh
+git -C "$DEPLOY_DIR" status --short trainer
+ls -d "$DEPLOY_DIR/trainer/src"
+grep -n 'docker compose run --rm --entrypoint uv trainer' "$DEPLOY_DIR/scripts/daily_walk_forward.sh"
 ```
 
 Expected: a clean status, the directory present, and the `daily_walk_forward.sh` line intact at ~249. Nothing about the production training path changed in this phase.
@@ -1672,7 +1715,7 @@ Confirm each item of `auto-research-phase1-design.md` §8:
 2. `research` can clone, commit, and push, and `uv sync` succeeded **as `research`** with no root-owned file in the worktree (Task 10 Steps 5-6).
 3. `git credential fill` returns the same credential for both URLs (Task 10 Step 4).
 4. NC7 exits 0, `failed=0`, no `VOID`, evidence carries no secret, durable credential intact (Task 11 Step 3-4).
-5. `nc-suite.sh` reports `passed=17 failed=0` after the NC6 change, and Phase 0 evidence is refreshed (Task 9 Steps 4-5).
+5. `nc-suite.sh` reports `passed=18 failed=0` after the NC6 change, and Phase 0 evidence is refreshed (Task 9 Steps 4-5).
 6. `trainer/` is marked frozen in both places and `daily_walk_forward.sh` is unchanged (Tasks 5, 12 Step 3).
 7. Collector and live-predictor were never rebuilt or restarted (Step 1 above).
 8. The parent design, `nc-suite.sh`, and `phase0-setup.sh` are amended (Tasks 6-7).

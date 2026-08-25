@@ -66,6 +66,41 @@ Run order matters: `research-user` → `agent-cli` → **interactive login** →
 `egress` → `auth-check` → `verify`. Logging in after the egress lock-down
 will fail.
 
+## Two checkouts: the deployment and the trusted mirror
+
+The stack runs from a checkout inside the **deploy user's home** (`$DEPLOY_DIR`).
+`research` cannot traverse that directory, and must not be able to: granting
+traversal would expose everything in that home carrying `o+r`, which is what NC3
+exists to prevent. A symlink does not help either — it is resolved with the
+accessing process's credentials.
+
+So `/srv/queue-forecasting` is a separate **root-owned mirror**, a shallow
+single-branch clone of the public fork, and it is what `research` reads:
+
+```bash
+sudo git clone --depth 1 --single-branch --branch feat/queue-forecasting \
+  https://github.com/lotas/taskcluster /srv/queue-forecasting
+# refresh after deploying:
+sudo git -C /srv/queue-forecasting fetch --depth 1 origin feat/queue-forecasting
+sudo git -C /srv/queue-forecasting reset --hard FETCH_HEAD
+```
+
+It holds no secrets, by construction — a fresh clone has no `.env` and no
+`trainer/data/`. **Refresh it after every deploy**, or an agent reading service
+source reasons about code that is no longer running.
+
+`nc-suite.sh` must still be pointed at the real deployment:
+
+```bash
+sudo DEPLOY_DIR=<the deploy checkout> SECRETS_DIR=$HOME/qf-secrets \
+  /srv/queue-forecasting/tools/queue-forecasting/host/nc-suite.sh
+```
+
+Aiming `DEPLOY_DIR` at the mirror **VOIDs NC3 and NC5** instead of asserting
+them: their canaries require `.env` and `trainer/data/models` to exist. The suite
+itself comes from the mirror because a control must be root-owned; the paths it
+probes are the deployment's.
+
 Deliberately not in this repo: `pg_hba.conf` (inside the postgres volume,
 backed up as `pg_hba.conf.pre-scram`), `/etc/nftables.conf`, `~/qf-secrets/*.pw`,
 and `/home/research/.config/qf/agent-env`.

@@ -235,11 +235,53 @@ provisioned the model-API logins only. Phase 1 therefore does it explicitly:
 | Concern | Repo | Checkout | Unix owner | Agent access |
 |---|---|---|---|---|
 | Research: `trainer/`, experiments, proposals | `qf-research` (private) | `/home/research/qf-research` | `research` | **write**, via one PAT |
-| Service stack: collector, live-predictor, dashboard, retention, `init.sql`, migrations, compose | `lotas/taskcluster` @ `feat/queue-forecasting` | `/srv/queue-forecasting` | root | read-only, filesystem |
-| Platform controls: `host/nc-suite.sh`, phase-0 scripts, future dispatcher/evaluator/contracts | `lotas/taskcluster` @ `feat/queue-forecasting` | same checkout | root | read-only, filesystem |
-| Production trainer (frozen, retained) | `lotas/taskcluster` | `/srv/queue-forecasting/trainer` | root | read-only, filesystem |
+| Service stack: collector, live-predictor, dashboard, retention, `init.sql`, migrations, compose — the **running deployment** | `lotas/taskcluster` @ `feat/queue-forecasting` | the deploy user's own checkout, `$DEPLOY_DIR` | the deploy user | **none** — not reachable, see §4.1 |
+| Platform controls (`host/*.sh`, future dispatcher/evaluator/contracts) and service source to read | `lotas/taskcluster` @ `feat/queue-forecasting` | `/srv/queue-forecasting`, a root-owned mirror | root | read-only, filesystem |
+| Production trainer (frozen, retained) | `lotas/taskcluster` | `$DEPLOY_DIR/trainer` | the deploy user | **none** |
 
 The agent has write authority over exactly one repository and one directory.
+
+### 4.1 Why the deploy checkout and the trusted mirror are separate
+
+Earlier revisions of this document assumed the service stack ran from a
+root-owned `/srv/queue-forecasting`, and that the agent would read both the
+platform controls and the service source from that same checkout. On the real
+host the stack runs from a checkout inside the **deploy user's home
+directory**, which `research` cannot traverse.
+
+The obvious fixes are both wrong. A **symlink** does not help: it is resolved
+with the accessing process's credentials, so `research` would still need execute
+permission on every directory in the target path. And `chmod o+x` on the deploy
+user's home makes the whole tree traversable, so anything in it carrying `o+r`
+becomes readable — which is precisely what NC3 exists to prevent.
+
+So `/srv/queue-forecasting` is a **root-owned mirror**: a shallow, single-branch
+clone of the public fork, refreshed by root. Its decisive property is that it
+**contains no secrets at all** — no `.env`, no `trainer/data/`, no local
+artifacts — because it is a fresh clone rather than a view onto somebody's
+working directory. A bind mount of the deploy checkout would also work and would
+always be current, but it exposes a live working tree and is one stray `chmod`
+away from leaking something.
+
+```
+sudo git clone --depth 1 --single-branch --branch feat/queue-forecasting \
+  https://github.com/lotas/taskcluster /srv/queue-forecasting
+# refresh:
+sudo git -C /srv/queue-forecasting fetch --depth 1 origin feat/queue-forecasting
+sudo git -C /srv/queue-forecasting reset --hard FETCH_HEAD
+```
+
+**`DEPLOY_DIR` must still point at the real deployment, not the mirror.**
+`nc-suite.sh`'s NC3 canary requires `$DEPLOY_DIR/.env` to *exist* and NC5
+requires `$DEPLOY_DIR/trainer/data/models` to exist; a fresh mirror has neither,
+so aiming `DEPLOY_DIR` at it would **VOID** both controls rather than assert
+them. The split is therefore: controls and readable service source come from the
+mirror; `DEPLOY_DIR` is the deploy user's checkout.
+
+The mirror can lag the deployment. That is acceptable for reading controls, whose
+authority is that they are root-owned rather than that they are current, but it
+does mean **root must refresh the mirror after deploying**, or an agent reading
+service source may reason about code that is no longer running.
 
 ## 5. The extraction
 

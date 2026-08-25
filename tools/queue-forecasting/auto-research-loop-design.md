@@ -148,8 +148,8 @@ One host: the existing experimental server. No second VM.
 
 | Concern | Unix user | Checkout | Container runtime | Postgres role |
 |---|---|---|---|---|
-| Service stack (collector, live-predictor, dashboard, health-monitor, retention) | `svc` | `/srv/queue-forecasting` ← `lotas/taskcluster` @ `feat/queue-forecasting` | rootful Docker (existing) | `forecast_app` (read-write) |
-| Trusted dispatcher, runner, evaluator (§3.4) | `root`-owned unit, drops to `svc` | `/srv/queue-forecasting` ← `lotas/taskcluster` @ `feat/queue-forecasting` — the same checkout | rootful Docker | `forecast_migrator` (deploys only) |
+| Service stack (collector, live-predictor, dashboard, health-monitor, retention) | the deploy user | that user's own checkout of `lotas/taskcluster` @ `feat/queue-forecasting`, referred to as `$DEPLOY_DIR` | rootful Docker (existing) | `forecast_app` (read-write) |
+| Trusted dispatcher, runner, evaluator (§3.4); platform controls; service source the agent reads | `root`-owned unit, drops to the deploy user | `/srv/queue-forecasting` — a **root-owned mirror** of the same repo and branch, *not* the deploy checkout (`auto-research-phase1-design.md` §4.1) | rootful Docker | `forecast_migrator` (deploys only) |
 | Agent processes (Claude, Codex) | `research` | `/home/research/qf-research` | **none** | `forecast_experiment` (read-only), via the bounded query interface |
 
 Invariants:
@@ -157,6 +157,11 @@ Invariants:
 - The `research` user has **no** container-runtime access of any kind. A
   Compose *project name* is not a security boundary; access to a shared Docker
   daemon is equivalent to host root. Agents never invoke `docker`.
+- `$DEPLOY_DIR` sits inside the deploy user's home and is **not reachable by
+  `research`** — deliberately, since making it reachable would mean granting
+  traversal of that whole home directory. Anything the agent needs to read comes
+  from the root-owned mirror instead. `nc-suite.sh` still probes `$DEPLOY_DIR`,
+  because that is where `.env` and `trainer/data/models` actually are.
 - The dispatcher's code and unit files are root-owned, sourced from the trusted
   monorepo checkout, and outside every agent-writable path.
 - Experiment output never lands in `trainer/data/models/` — that path is what

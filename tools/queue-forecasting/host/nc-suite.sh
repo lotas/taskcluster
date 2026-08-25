@@ -45,6 +45,26 @@ canary() {   # canary <name> <command...> -> passes when the command SUCCEEDS
   fi
 }
 
+exists() {   # exists <name> <path> -> asserts the TARGET is there, checked AS ROOT
+  # Distinct from canary(), and the distinction is load-bearing. canary() asks
+  # "can research perform this action?", which is right for an action but WRONG
+  # for existence: research frequently cannot even traverse to the target,
+  # because $DEPLOY_DIR lives in the deploy user's home and granting traversal
+  # would expose that whole home -- the thing NC3 exists to prevent.
+  # Unreachability is containment, not a broken control; but it must not be
+  # mistaken for "the file is protected", so root confirms the target is really
+  # there and the refusal that follows therefore means something.
+  local name="$1" path="$2"
+  if [ -e "$path" ]; then
+    echo "ok    $name  (target present; the refusal below is meaningful)"
+    pass=$((pass + 1))
+    return 0
+  fi
+  echo "VOID  $name  ($path missing - the refusal would be vacuous)"
+  fail=$((fail + 1))
+  return 1
+}
+
 echo "== NC1: write to any forecasting table =="
 EXP_URL="postgresql://forecast_experiment:$(cat "$SECRETS_DIR/forecast_experiment.pw")@127.0.0.1:5433/forecasting"
 # Canary first: proves psql exists, the port is reachable, and auth works.
@@ -65,8 +85,9 @@ else
 fi
 
 echo "== NC3: credentials =="
-canary "NC3 env exists"    "test -e $DEPLOY_DIR/.env"
-refuse "NC3 .env"          "cat $DEPLOY_DIR/.env"
+if exists "NC3 env exists" "$DEPLOY_DIR/.env"; then
+  refuse "NC3 .env"        "cat $DEPLOY_DIR/.env"
+fi
 refuse "NC3 secrets dir"   "cat $SECRETS_DIR/forecast_app.pw"
 refuse "NC3 root ssh dir"  "ls /root/.ssh"
 
@@ -81,11 +102,8 @@ echo "ok    NC4 platform  (controls live in \$DEPLOY_DIR; covered above)"
 pass=$((pass + 1))
 
 echo "== NC5: live model directory =="
-if [ -d "$DEPLOY_DIR/trainer/data/models" ]; then
+if exists "NC5 models dir" "$DEPLOY_DIR/trainer/data/models"; then
   refuse "NC5 models write" "touch $DEPLOY_DIR/trainer/data/models/.nc-probe"
-else
-  echo "VOID  NC5 models   (directory missing - control is vacuous)"
-  fail=$((fail + 1))
 fi
 
 echo "== NC6: egress =="
