@@ -8,7 +8,7 @@ ok    NC2 socket write  (refused)
 ok    NC2 docker ps  (refused)
 skip  NC2 podman   (not installed on this host)
 == NC3: credentials ==
-VOID  NC3 env exists  (canary failed - refusals in this group prove nothing)
+ok    NC3 env exists  (target present; the refusal below is meaningful)
 ok    NC3 .env  (refused)
 ok    NC3 secrets dir  (refused)
 ok    NC3 root ssh dir  (refused)
@@ -17,11 +17,11 @@ ok    NC4 deploy write  (refused)
 ok    NC4 unit write  (refused)
 ok    NC4 platform  (controls live in $DEPLOY_DIR; covered above)
 == NC5: live model directory ==
+ok    NC5 models dir  (target present; the refusal below is meaningful)
 ok    NC5 models write  (refused)
 == NC6: egress ==
 ok    NC6 allowed host  (canary: attempt is possible)
 ok    NC6 denied host  (refused)
 ok    NC6 proxy bypass  (refused)
 
-passed=16 failed=1
-
+passed=18 failed=0

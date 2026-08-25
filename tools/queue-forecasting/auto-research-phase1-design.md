@@ -593,9 +593,11 @@ explicit message when no such repo is supplied, rather than silently omitted.
 
 ## 8. Acceptance
 
-1. `qf-research` exists and is private; `trainer/` carries 38 commits of
-   history; its tracked-blob hash listing matches the monorepo's; and `pytest`
-   reports 226 passed.
+1. `qf-research` exists and is private; `trainer/` carries the subtree's full
+   history (39 commits as of 2026-08-25 — **derived from the source at run
+   time**, not asserted against a constant); its tracked-blob hash listing
+   matches the monorepo's minus the deliberate `DROP_PATHS` exclusion; and
+   `pytest` reports no failures with exactly one skip.
 2. As `research`, non-interactively and through the proxy: clone, commit, and
    push to `qf-research` all succeed, and `uv sync` succeeds **as `research`**
    with no root involvement in the worktree.

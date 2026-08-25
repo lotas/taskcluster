@@ -1644,7 +1644,7 @@ Read every line rather than the summary alone:
 - **`FAIL R1b`** — the probe erased `/home/research/.git-credentials`. Restore it via Task 10 Step 2 and report it: it means git took the reject path on a 403.
 - **`VOID`** anywhere — the probe could not be meaningfully attempted. Diagnose before re-running; a VOID is a failure precisely so it cannot be mistaken for containment.
 
-- [ ] **Step 4: Confirm the evidence carries no secret, then stage it**
+- [x] **Step 4: Confirm the evidence carries no secret, then stage it**
 
 ```bash
 sudo -u research grep -c . /tmp/nc7-evidence.txt
@@ -1677,7 +1677,7 @@ Stop. The user commits.
 
 Every item is a command with an expected result, not a judgement call.
 
-- [ ] **Step 1: The live services were never touched**
+- [x] **Step 1: The live services were never touched**
 
 ```bash
 sudo docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'collector|live-predictor|worker-counter|health-monitor'
@@ -1685,7 +1685,7 @@ sudo docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'collector|live-pred
 
 Expected: uptimes spanning the whole phase — hours or days, not minutes. If any of these restarted, find out why before continuing; this phase is defined by not disturbing them.
 
-- [ ] **Step 2: Collection is still ingesting**
+- [x] **Step 2: Collection is still ingesting**
 
 ```bash
 sudo docker compose -f "$DEPLOY_DIR/docker-compose.yml" \
@@ -1697,7 +1697,7 @@ sudo docker compose -f "$DEPLOY_DIR/docker-compose.yml" \
 
 Expected: a non-zero count in the thousands. fxci ingests ~200-300k rows/day.
 
-- [ ] **Step 3: Production training still runs from the monorepo copy**
+- [x] **Step 3: Production training still runs from the monorepo copy**
 
 ```bash
 git -C "$DEPLOY_DIR" status --short trainer
@@ -1707,7 +1707,7 @@ grep -n 'docker compose run --rm --entrypoint uv trainer' "$DEPLOY_DIR/scripts/d
 
 Expected: a clean status, the directory present, and the `daily_walk_forward.sh` line intact at ~249. Nothing about the production training path changed in this phase.
 
-- [ ] **Step 4: Walk the spec's acceptance list**
+- [x] **Step 4: Walk the spec's acceptance list**
 
 Confirm each item of `auto-research-phase1-design.md` §8:
 
