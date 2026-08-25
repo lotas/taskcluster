@@ -1,0 +1,16 @@
+nc7 run=20260825T104016Z-1881145 mono=lotas/taskcluster research=lotas/qf-research check_only=0
+CANARY C1 /user status=200
+CANARY C4 anonymous read of lotas/taskcluster status=200
+CANARY C2 push+delete on lotas/qf-research rc=0
+CANARY C3 issue create=201 close=200 number=4
+preflight deploy-branch sha=01a1f68a5d2d4d97467d8b045d099fb7de7c4bfe
+REFUSE R1 git push rc=128 verdict=refused ref_before=404 ref_after=404 stderr=remote: Permission to lotas/taskcluster.git denied to lotas. fatal: unable to access 'https://github.com/lotas/taskcluster/': The requested URL returned error: 403
+REFUSE R2 create a branch method=POST status=403 verdict=refused body={   "message": "Resource not accessible by personal access token",   "documentation_url": "https://docs.github.com/rest/git/refs#create-a-reference",   "status": "403" }
+REFUSE R3 create a tag method=POST status=403 verdict=refused body={   "message": "Resource not accessible by personal access token",   "documentation_url": "https://docs.github.com/rest/git/refs#create-a-reference",   "status": "403" }
+preflight R4 compare=200 ahead_by=223 pulls=200 open=0
+REFUSE R4 open a PR method=POST status=403 verdict=refused body={   "message": "Resource not accessible by personal access token",   "documentation_url": "https://docs.github.com/rest/pulls/pulls#create-a-pull-request",   "status": "403" }
+REFUSE R5 change repository settings method=PATCH status=403 verdict=refused body={   "message": "Resource not accessible by personal access token",   "documentation_url": "https://docs.github.com/rest/repos/repos#update-a-repository",   "status": "403" }
+REFUSE R6 write a workflow file method=PUT status=403 verdict=refused body={   "message": "Resource not accessible by personal access token",   "documentation_url": "https://docs.github.com/rest/repos/contents#create-or-update-file-contents",   "status": "403" }
+REFUSE R7 credential file mode=600 owner=research
+REFUSE R8 read a private repo outside the token's scope method=GET status=404 verdict=refused body={   "message": "Not Found",   "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository",   "status": "404" }
+INFO issue-filing on lotas/taskcluster status=403 body={   "message": "Resource not accessible by personal access token",   "documentation_url": "https://docs.github.com/rest/issues/issues#create-an-issue",   "status": "403" }

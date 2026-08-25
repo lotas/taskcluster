@@ -1583,7 +1583,7 @@ sudo -H -u research bash -lc 'cd ~/qf-research && git log --oneline | wc -l && g
 
 Expected: `39` commits (38 extracted + the scaffolding commit) and a clean status. The clone goes through the proxy; `github.com` has been allowlisted since Phase 0.
 
-- [ ] **Step 6: Build the venv as `research`, and confirm root is not involved**
+- [x] **Step 6: Build the venv as `research`, and confirm root is not involved**
 
 ```bash
 sudo -H -u research bash -lc 'cd ~/qf-research/trainer && uv sync --locked' 2>&1 | tail -3
@@ -1600,7 +1600,7 @@ Expected: the sync resolves from pypi; pytest reports `225 passed, 1 skipped`; a
 **Files:**
 - Create: `tools/queue-forecasting/host/nc-evidence-phase1.txt`
 
-- [ ] **Step 1: Run the library tests on the host**
+- [x] **Step 1: Run the library tests on the host**
 
 ```bash
 sudo -H -u research bash -lc \
@@ -1609,7 +1609,7 @@ sudo -H -u research bash -lc \
 
 Expected: `tests=38 failed=0`. Run this first every time — the suite's judgement is only as good as this file.
 
-- [ ] **Step 2: Dry-run the canaries**
+- [x] **Step 2: Dry-run the canaries**
 
 ```bash
 sudo -H -u research bash -lc '/srv/queue-forecasting/tools/queue-forecasting/host/nc7-suite.sh --check'
@@ -1619,7 +1619,7 @@ Expected: `ok` for C1 (token authenticates), C2 (push to `qf-research`), C3 (iss
 
 A `VOID` here means the token is wrong before any refusal has been attempted — fix that first, because every refusal would otherwise be vacuous. `VOID C3` specifically means `Issues: write` is missing or Issues are disabled on the repository.
 
-- [ ] **Step 3: Run the full suite**
+- [x] **Step 3: Run the full suite**
 
 ```bash
 sudo -H -u research bash -lc \
@@ -1633,7 +1633,7 @@ If the account has a private repository the token should not see, run it once wi
 
 ```bash
 sudo -H -u research bash -lc \
-  'OUT_OF_SCOPE_REPO=lotas/<some-private-repo> EVIDENCE=/tmp/nc7-evidence.txt \
+  'OUT_OF_SCOPE_REPO=lotas/taskcluster EVIDENCE=/tmp/nc7-evidence.txt \
    /srv/queue-forecasting/tools/queue-forecasting/host/nc7-suite.sh'
 ```
 
