@@ -701,6 +701,8 @@ cmd_egress() {
 ^api\.github\.com$
 ^codeload\.github\.com$
 ^objects\.githubusercontent\.com$
+^pypi\.org$
+^files\.pythonhosted\.org$
 LIST
     [ -f "$here/tinyproxy-allowlist.conf" ] || die "missing $here/tinyproxy-allowlist.conf"
     sudo cp "$here/tinyproxy-allowlist.conf" /etc/tinyproxy/tinyproxy.conf
@@ -831,7 +833,11 @@ ENVV
   run_research 'curl -sS -o /dev/null --max-time 20 https://api.github.com' \
     || die "allowed host unreachable through the proxy. Egress is too tight to run agents."
   info "allowed host reachable"
-  run_research 'curl -sS -o /dev/null --max-time 20 https://pypi.org' 2>/dev/null \
+  # Must match nc-suite.sh's NC6 target. pypi.org was the denied host until
+  # Phase 1 allowlisted it (the agent owns its own venv), at which point this
+  # check would have died claiming the allowlist was unenforced -- immediately
+  # after this same function rewrote and reloaded it.
+  run_research 'curl -sS -o /dev/null --max-time 20 https://huggingface.co' 2>/dev/null \
     && die "denied host was reachable. The allowlist is not being enforced."
   info "denied host blocked"
   run_research "curl -sS -o /dev/null --max-time 20 --noproxy '*' https://api.github.com" 2>/dev/null \

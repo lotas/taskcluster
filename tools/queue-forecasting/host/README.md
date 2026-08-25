@@ -91,8 +91,22 @@ anything else matches nothing and reaches the chain's accept policy untouched.
 
 ## Egress exceptions
 
-None. If a CLI is found not to honour `HTTPS_PROXY` and a direct nftables
-allowance is added for it, record the endpoint, the reason, and the date here.
+`pypi.org` and `files.pythonhosted.org` were added 2026-08-24 for Phase 1. The
+research agent creates and owns its own Python virtualenv, because the
+alternative — root running `uv sync` inside an agent-writable worktree — would
+let a one-line `[build-system]` addition to `pyproject.toml` execute
+agent-authored code as root, and sdist dependencies build as root regardless.
+Nothing root-owned now reads or executes anything from the worktree.
+
+This gives up less than it appears to: `github.com` was already allowlisted, so
+arbitrary code was already fetchable. Dependency review is enforced where it
+matters, at the Phase 2 trusted image build, from a root-owned Dockerfile and
+the human-promoted manifests in the trusted checkout.
+
+NC6's denied-host probe moved from `pypi.org` to `huggingface.co` accordingly.
+
+If a CLI is found not to honour `HTTPS_PROXY` and a direct nftables allowance is
+added for it, record the endpoint, the reason, and the date here.
 
 ## Two invocation traps (both cost real debugging time)
 

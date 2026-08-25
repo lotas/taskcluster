@@ -73,11 +73,12 @@ refuse "NC3 root ssh dir"  "ls /root/.ssh"
 echo "== NC4: trusted checkouts and units =="
 refuse "NC4 deploy write"  "touch $DEPLOY_DIR/.nc-probe"
 refuse "NC4 unit write"    "touch /etc/systemd/system/.nc-probe"
-if [ -d /srv/qf-platform ]; then
-  refuse "NC4 platform write" "touch /srv/qf-platform/.nc-probe"
-else
-  echo "skip  NC4 platform (created in Phase 1; re-run then)"
-fi
+# Platform controls (nc-suite.sh, phase0-setup.sh, and the Phase 2 dispatcher)
+# live in the monorepo checkout, not in a separate /srv/qf-platform. There is
+# no second path to probe: `NC4 deploy write` above already covers them.
+# See auto-research-phase1-design.md D1.
+echo "ok    NC4 platform  (controls live in \$DEPLOY_DIR; covered above)"
+pass=$((pass + 1))
 
 echo "== NC5: live model directory =="
 if [ -d "$DEPLOY_DIR/trainer/data/models" ]; then
@@ -89,7 +90,10 @@ fi
 
 echo "== NC6: egress =="
 canary "NC6 allowed host"  "curl -sS -o /dev/null --max-time 20 https://api.github.com"
-refuse "NC6 denied host"   "curl -sS -o /dev/null --max-time 20 https://pypi.org"
+# pypi.org is allowlisted from Phase 1 on (the agent owns its own venv, so root
+# never runs `uv sync` in an agent-writable worktree -- see the design's section 6).
+# huggingface.co is a plausible model/dataset egress target we deliberately deny.
+refuse "NC6 denied host"   "curl -sS -o /dev/null --max-time 20 https://huggingface.co"
 refuse "NC6 proxy bypass"  "curl -sS -o /dev/null --max-time 20 --noproxy '*' https://api.github.com"
 
 echo

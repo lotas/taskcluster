@@ -1,6 +1,10 @@
 # Auto-Research Loop — Design
 
-Status: design v3 — revised 2026-08-24 after two review rounds. **Unattended execution is
+Status: design v3 — revised 2026-08-24 after two review rounds, and **amended
+2026-08-25 by `auto-research-phase1-design.md` (rev 7)**, which supersedes this
+document's Phase 1: one agent-writable repository and one token, not three
+repositories and two. The amended passages are §3.1, §3.2, §3.3, §3.4, §4.1,
+§4.2, §8.2, §8.5, §11.1, §12, §13.1, §14 and §15. **Unattended execution is
 not approved by this document**; see §14 for the staged gate.
 Supersedes: `experiment-runner.md` (proposal, never implemented) — except for
 its trusted-dispatcher boundary, which is restored here (§3.4).
@@ -57,7 +61,7 @@ The governing principle: **an agent must not be able to weaken the controls
 that constrain it.** Filesystem separation alone does not achieve this, because
 controls are also sourced from agent-writable git history.
 
-### 3.1 Three repositories, not one
+### 3.1 Repository boundaries (Phase 1 superseded — see the note below)
 
 The containment problem is that controls sourced from an agent-writable repo
 can be weakened by the agent. Branch protection is one way to prevent that;
@@ -66,50 +70,68 @@ require a paid plan.** Personal private repositories on the Free plan cannot
 enforce protected branches, required checks, or CODEOWNERS review, so this
 design relies on none of them.
 
+> **Superseded in part by `auto-research-phase1-design.md` (rev 7).** Phase 1
+> creates only `qf-research`; `qf-service` and `qf-platform` remain the
+> monorepo, read from root-owned checkouts, and the agent's single credential
+> is `Contents: write` + `Issues: write` on `qf-research` with **no credential
+> of any kind** on `lotas/taskcluster`. The three-repo split below stays
+> documented as the path to take if the monorepo stops being a suitable home;
+> the reasoning about why repository boundaries beat path globs is unchanged.
+
 | Repo | Contents | Agent credential |
 |---|---|---|
-| `qf-research` | `trainer/src/**`, `trainer/configs/**`, hypotheses, pre-registrations, narrative projection, digests, docs, service-change proposals | `Contents: write` |
-| `qf-service` | collector, `db.js`, `src/live-predictor/**`, `init.sql`, migrations, Dockerfiles, compose files, dependency lockfiles | `Contents: read` + `Issues: write` — **no** Contents write, Pull requests, Workflows, or Administration |
-| `qf-platform` | dispatcher, runner, evaluator, `eval.parquet` builder, contracts, `verdict.py`, `checks.py`, independent derivation, migration linter, negative-control suite | **no credential** |
+| `qf-research` | `trainer/src/**`, `trainer/configs/**`, hypotheses, pre-registrations, narrative projection, digests, docs, service-change proposals | `Contents: write` + `Issues: write` |
+| the monorepo (`lotas/taskcluster` @ `feat/queue-forecasting`) — this split's `qf-service` | collector, `db.js`, `src/live-predictor/**`, `init.sql`, migrations, Dockerfiles, compose files, dependency lockfiles | **no credential** — read from the root-owned checkout at `/srv/queue-forecasting` |
+| the same monorepo checkout — this split's `qf-platform` | dispatcher, runner, evaluator, `eval.parquet` builder, contracts, `verdict.py`, `checks.py`, independent derivation, migration linter, negative-control suite | **no credential** |
 
-The agents need to *read* `qf-service` to write a correct patch and to keep
-serving-parity implementations in step, and they need to file issues there.
-Read and issue-filing are not authority over the code, so they are granted;
-every mutation path is withheld.
+The agents need to *read* the service code to write a correct patch and to keep
+serving-parity implementations in step. Neither reading path needs a credential:
+`lotas/taskcluster` is a fork of a public repository and therefore
+world-readable, and on the host `/srv/queue-forecasting` is root-owned and
+world-readable except `.env` (mode 600) — and always current, so it is the
+better source. Reading is not authority over the code, and every mutation path
+is withheld by the plainest means available: no token names that repository at
+all.
 
-`qf-platform` needs no credential at all: the trusted checkout at
-`/srv/qf-platform` is **world-readable and root-owned**, so agents can read
-contracts and evaluator source directly — reading a control is not weakening
-it — while the dispatcher exposes the operations they need on it (`contract
-show`, `verify`, `independent-derive`) as typed jobs.
+The platform controls need no credential at all: they live in the trusted
+checkout at `/srv/queue-forecasting`, which is **world-readable and
+root-owned**, so agents can read contracts and evaluator source directly —
+reading a control is not weakening it — while the dispatcher exposes the
+operations they need on it (`contract show`, `verify`, `independent-derive`) as
+typed jobs.
 
 This is strictly stronger than the path matrix it replaces. A path glob can
 leave a newly introduced sensitive file unowned — which is why a default-human
-rule is needed there. A repository boundary has no such failure mode: a new
-file in `qf-platform` is unwritable by construction, with no rule to maintain.
+rule is needed there. A repository boundary has no such failure mode: a newly
+introduced control is unwritable by construction, with no rule to maintain.
+Under the Phase 1 design that boundary is realised as **credential absence**
+rather than as a second repository, and the property survives intact: a new file
+in the monorepo is unwritable because the agent holds no credential for that
+repository, which is likewise nothing to maintain.
 
 Consequences, all load-bearing:
 
 - **`qf-research` is untrusted input.** Nothing in it is a control. Trainer
   code from it runs only inside the sandbox, and its outputs are validated by
-  trusted code from `qf-platform` (§8.5). CI on that repo is therefore
-  advisory, and its unenforceability is irrelevant — nothing downstream trusts
-  it.
+  trusted code read from the monorepo checkout (§8.5). CI on that repo is
+  therefore advisory, and its unenforceability is irrelevant — nothing
+  downstream trusts it.
 - **No merge bot.** Agents push directly to `qf-research`. The bot, the path
   matrix, and self-owning CODEOWNERS all disappear.
-- **Trusted checkouts are human-updated.** `/srv/qf-platform` and
-  `/srv/queue-forecasting` are root-owned and pulled with **read-only deploy
-  keys unreadable by `research`**. An agent can neither push to them nor alter
-  what a human pulls.
+- **The trusted checkout is human-updated.** `/srv/queue-forecasting` — which
+  carries the platform controls as well as the service stack, so
+  `/srv/qf-platform` is never created — is root-owned and pulled with a
+  **read-only deploy key unreadable by `research`**. An agent can neither push
+  to it nor alter what a human pulls.
 - **The dispatcher resolves controls only from the trusted checkout.** A
   contract, evaluator, or linter path resolving inside the research worktree is
   refused, not read. This is what stops a research-repo file from
   impersonating a control, and it is the residual risk this split introduces:
   drift, if someone relocates a control into `qf-research` for convenience.
-- **Service changes are proposed as artifacts.** With no write credential on
-  `qf-service`, an agent cannot open a PR there. It commits
-  `proposals/<date>-<slug>.patch` to `qf-research` and files an issue on
-  `qf-service`; the human applies it. Volume is a handful per month.
+- **Service changes are proposed as artifacts.** With no credential of any kind
+  on the monorepo, an agent cannot open a PR there. It commits
+  `research/proposals/<date>-<slug>.patch` to `qf-research` and files an issue
+  on `qf-research`; the human applies it. Volume is a handful per month.
 
 If these repos ever move to an org with Team/Enterprise, add protected
 branches, required checks from a designated App, and CODEOWNERS as defence in
@@ -126,8 +148,8 @@ One host: the existing experimental server. No second VM.
 
 | Concern | Unix user | Checkout | Container runtime | Postgres role |
 |---|---|---|---|---|
-| Service stack (collector, live-predictor, dashboard, health-monitor, retention) | `svc` | `/srv/queue-forecasting` ← `qf-service` | rootful Docker (existing) | `forecast_app` (read-write) |
-| Trusted dispatcher, runner, evaluator (§3.4) | `root`-owned unit, drops to `svc` | `/srv/qf-platform` ← `qf-platform` | rootful Docker | `forecast_migrator` (deploys only) |
+| Service stack (collector, live-predictor, dashboard, health-monitor, retention) | `svc` | `/srv/queue-forecasting` ← `lotas/taskcluster` @ `feat/queue-forecasting` | rootful Docker (existing) | `forecast_app` (read-write) |
+| Trusted dispatcher, runner, evaluator (§3.4) | `root`-owned unit, drops to `svc` | `/srv/queue-forecasting` ← `lotas/taskcluster` @ `feat/queue-forecasting` — the same checkout | rootful Docker | `forecast_migrator` (deploys only) |
 | Agent processes (Claude, Codex) | `research` | `/home/research/qf-research` | **none** | `forecast_experiment` (read-only), via the bounded query interface |
 
 Invariants:
@@ -135,8 +157,8 @@ Invariants:
 - The `research` user has **no** container-runtime access of any kind. A
   Compose *project name* is not a security boundary; access to a shared Docker
   daemon is equivalent to host root. Agents never invoke `docker`.
-- The dispatcher's code and unit files are root-owned, sourced from
-  `qf-platform`, and outside every agent-writable path.
+- The dispatcher's code and unit files are root-owned, sourced from the trusted
+  monorepo checkout, and outside every agent-writable path.
 - Experiment output never lands in `trainer/data/models/` — that path is what
   the live predictor reads.
 
@@ -148,14 +170,17 @@ need their own limits:
 - A systemd slice `qf-research.slice` with `MemoryMax`, `CPUQuota`, `TasksMax`,
   and `IOWeight`, sized so agent activity cannot starve the service stack.
 - **Egress allowlist**, not a blanket deny: the agents are API clients and
-  require `api.anthropic.com`, `api.openai.com`, and `github.com`. Everything
-  else is denied. Experiment containers get **no** egress at all.
+  require `api.anthropic.com`, `api.openai.com`, and `github.com` — plus
+  `pypi.org` and `files.pythonhosted.org`, because the agent creates and owns
+  its own venv. Having root run `uv sync` inside an agent-writable worktree
+  instead would put root's execution under the agent's control, which is the
+  worse trade (`auto-research-phase1-design.md` §6). Everything else is denied.
+  Experiment containers get **no** egress at all.
 - No readable service credentials: `.env`, Pulse/Taskcluster/GCP credentials,
-  SSH keys, and the trusted checkouts' deploy keys are unreadable by
-  `research`. The agents hold only their own model API keys and two
-  fine-grained GitHub tokens (§3.1): one with `Contents: write` on
-  `qf-research`, and one with `Contents: read` + `Issues: write` on
-  `qf-service`. No credential of any kind for `qf-platform`.
+  SSH keys, and the trusted checkout's deploy key are unreadable by
+  `research`. The agents hold only their own model API keys and **one**
+  fine-grained GitHub token (§3.1): `Contents: write` + `Issues: write` on
+  `qf-research`, and **no credential of any kind** on the monorepo.
 - Database access only through the bounded read-only query interface (§3.5),
   never a direct psql session, so query cost is capped and logged.
 
@@ -172,12 +197,34 @@ dispatcher over a unix socket. The dispatcher:
    SHA gives identical immutability with far less machinery.
 3. Runs the trainer in a container: non-root, read-only source mount,
    run-private writable dir, no daemon socket, no egress, no service
-   credentials, CPU/memory/PID/wall-clock limits.
+   credentials, CPU/memory/PID/wall-clock limits. **Where the image and its
+   manifests come from is part of the boundary, not an implementation choice**
+   (`auto-research-phase1-design.md` §6). The **Dockerfile is root-owned and
+   read from the trusted checkout**; the copy of `trainer/Dockerfile` that
+   travels with the research repo is ignored entirely. The **dependency
+   manifests (`pyproject.toml`, `uv.lock`) are the human-promoted copies in the
+   trusted checkout**, never the research repo's, because a pinned lock still
+   lets an sdist run build code — which is why the pins have to be ones a
+   human reviewed. The build runs **`uv sync --locked
+   --no-install-project`**: `--locked` asserts that lock and manifest agree
+   rather than treating the lock as authoritative the way `--frozen` does, and
+   `--no-install-project` keeps a `[build-system]` table from executing even if
+   a research manifest were somehow reached. **Candidate research source is
+   mounted or copied only after the environment image is built**, so nothing
+   from `qf-research` participates in dependency resolution or in any build
+   step.
 4. Holds the **shared** heavy-training lock
    (`/tmp/queue-forecasting-walk-forward.lock`) — the same one
    `daily_walk_forward.sh` uses. A separate lock would allow two trainers to
    run concurrently and exhaust host memory; the hazard trainer already peaks
    at 99.9% of its 22 GB limit on a ~30 GB host.
+
+Under all four sits the corollary of §3's governing principle: **root never
+executes code that lives in, or is selected by, an agent-writable path — build
+inputs included.** A Dockerfile, a `pyproject.toml`, or a lockfile read from the
+research worktree is code selection as surely as an evaluator is, so the
+dispatcher resolves those from the trusted checkout on exactly the same terms as
+contracts, evaluators, and linters.
 
 Job kinds: `screen`, `confirm`, `probe` (restricted to
 `research/experiments/`), `test`, `summarize`, `query`.
@@ -208,6 +255,9 @@ crash recovery, or exactly-once completion.
 ### 4.1 Live state — SQLite, owned by the dispatcher
 
 `/var/lib/qf-platform/state.db` (WAL mode), writable only by the dispatcher.
+The `qf-platform` in that path is a directory name kept for continuity; it no
+longer implies a separate repository, since the dispatcher's own code is read
+from the trusted monorepo checkout (§3.1).
 Holds the job queue, leases, run state transitions, attempt counts, and
 resource high-water marks. Atomic dequeue-with-lease; a crashed run's lease
 expires and is reclaimed. Agents read it through the dispatcher; they never
@@ -228,8 +278,9 @@ At the end of each tick the leader exports a projection into `qf-research`:
 
 This is **not** an audit authority. `qf-research` has no branch protection by
 design (§3.1), so an agent can force-push or rewrite its entire history. That
-does not compromise `qf-platform` or `qf-service` containment, but it does mean
-the projection is a readable narrative that cannot be trusted after the fact.
+does not compromise the monorepo, which holds the service and platform code and
+on which the agent has no credential at all, but it does mean the projection is
+a readable narrative that cannot be trusted after the fact.
 
 **The authoritative record is the dispatcher's SQLite** (§4.1), which agents
 cannot write. It holds, per job and per state transition, with timestamps:
@@ -406,11 +457,11 @@ run a comparison whose members disagree on `extract_cache_key`.
 ### 8.2 Contracts, per target
 
 Separate contracts: `contract.wait_time.yaml`, `contract.run_duration.yaml`.
-(Group ETA has none yet — §14 Phase 7.) They live in `qf-platform`, so agents
-cannot change them at all; a human commit is the only path. The repository
-split also makes the earlier "no commit may edit a contract and record a
-result together" check unnecessary — results live in `qf-research` and
-contracts do not, so the two cannot share a commit.
+(Group ETA has none yet — §14 Phase 7.) They live in the monorepo and are read
+from the trusted checkout, so agents cannot change them at all; a human commit
+is the only path. The repository boundary also makes the earlier "no commit may
+edit a contract and record a result together" check unnecessary — results live
+in `qf-research` and contracts do not, so the two cannot share a commit.
 
 ### 8.3 Closing the p90-inflation hole
 
@@ -577,25 +628,28 @@ untrusted, so an artifact *emitted by the candidate run* proves nothing — two
 implementations agreeing on a corrupted artifact still agree. The candidate run
 therefore emits **only predictions**: `row_id`, `p50`, `p90_raw`.
 
-`eval.parquet` is **constructed by the root-owned evaluator** in `qf-platform`,
-which joins those predictions to the **frozen extract** (§7) and supplies
-everything else itself: `actual`, `baseline_p90`, the guarded p90 (its own copy
-of `compute_guarded_p90`), row membership, and every slice field (`day`,
-`bucket`, `task_queue_id`, `priority`, `reason_resolved`). The candidate cannot
+`eval.parquet` is **constructed by the root-owned evaluator**, which lives in
+the monorepo and is read from the trusted checkout. It joins those predictions
+to the **frozen extract** (§7) and supplies everything else itself: `actual`,
+`baseline_p90`, the guarded p90 (its own copy of `compute_guarded_p90`), row
+membership, and every slice field (`day`, `bucket`, `task_queue_id`,
+`priority`, `reason_resolved`). The candidate cannot
 influence actuals, row membership, or bucketing — only the numbers it is meant
 to be judged on.
 
 The evaluator rejects a prediction set whose `row_id` multiset does not exactly
 match the frozen extract's holdout rows.
 
-The evaluator and its **complete dependency closure** live in `qf-platform`,
-outside agent write access; the dispatcher refuses to execute an evaluator
-resolved from anywhere else.
+The evaluator and its **complete dependency closure** live in the monorepo,
+outside agent write access because the agent holds no credential there; the
+dispatcher refuses to execute an evaluator resolved from anywhere other than the
+trusted checkout.
 
 `verdict.py` computes the official verdict from `eval.parquet`. The copilot
-computes its own using a deliberately separate implementation in
-`qf-platform/eval/independent/`. A mismatch beyond floating-point tolerance is
-an automatic `DEADLOCK`. Running `verdict.py` twice is not verification.
+computes its own using a deliberately separate implementation in the monorepo's
+`eval/independent/`, likewise read from the trusted checkout. A mismatch beyond
+floating-point tolerance is an automatic `DEADLOCK`. Running `verdict.py` twice
+is not verification.
 
 ## 9. Feature availability and coverage
 
@@ -628,17 +682,17 @@ explicitly, retaining the job hash and recording an attempt number.
 
 ### 11.1 Channel
 
-Agents hold no credential on `qf-service`, so they propose rather than submit.
+Agents hold no credential on the monorepo, so they propose rather than submit.
 
 ```
 agents (qf-research)                      human / trusted path
 --------------------                      --------------------
 propose feature needing new data
   |
-  +-- commit proposals/<date>-<slug>.patch
+  +-- commit research/proposals/<date>-<slug>.patch
   |     (migration + collector diff + tests, validated
   |      against a throwaway DB by a `test` job)
-  +-- open an issue on qf-service
+  +-- open an issue on qf-research
   |
   +-- human reviews, applies, merges  --->  deploy step (root-owned)
                                               1. diff policy: allowed paths,
@@ -678,8 +732,9 @@ series on Jun 30 / Jul 1); `IF NOT EXISTS` guards; idempotent and fast.
 
 - **GitHub issues** — interactive. Escalations become issues on `qf-research`
   carrying both positions and the evidence; the human's reply is the tie-break.
-  Service-change proposals become issues on `qf-service` pointing at a patch
-  artifact (§11.1). Agents open no pull requests anywhere.
+  Service-change proposals land there too, as issues on `qf-research` pointing
+  at a patch artifact (§11.1) — the token's `Issues: write` covers that one
+  repository and nothing else. Agents open no pull requests anywhere.
 - **Dashboard research page** — at-a-glance. `dashboard-gen` gains a research
   view: queue, leaderboard, confirmed/refuted hypotheses, open decisions.
 - **`RESEARCH_LOG.md` / `DECISIONS_PENDING.md`** — narrative, regenerated each
@@ -721,17 +776,22 @@ impossible.
 2. Invoke `docker`/`podman` or reach a container-runtime socket.
 3. Read `.env`, Pulse/Taskcluster/GCP credentials, SSH keys, or the read-only
    deploy keys for the trusted checkouts.
-4. Modify `/srv/qf-platform`, `/srv/queue-forecasting`, or any unit file.
+4. Modify `/srv/queue-forecasting` — which holds the platform controls as well
+   as the service stack, so `/srv/qf-platform` is never created — or any unit
+   file.
 5. Write into `trainer/data/models/`.
 6. Reach a network endpoint outside the egress allowlist.
 
 **Phase 1 — credential scoping.** Using the agent's own token:
 
-7. Against `qf-platform` or `qf-service`: push, create or delete a branch or
-   tag, open or merge a pull request, dispatch or edit a workflow, or change
-   repository settings. Filing an **issue** on `qf-service` must succeed —
-   this control asserts the boundary is mutation, not visibility. Reading
-   `qf-service` contents must also succeed.
+7. Against the monorepo (`lotas/taskcluster`): push, create or delete a branch
+   or tag, open or merge a pull request, dispatch or edit a workflow, or change
+   repository settings. The positive control is **not** "filing an issue there
+   succeeds" — with no monorepo credential there is nothing to file it with —
+   but the canary table in `auto-research-phase1-design.md` §7: the token
+   authenticates, a push and an issue on `qf-research` both succeed, and the
+   monorepo reads with no `Authorization` header at all. The boundary is still
+   mutation, not visibility; a refusal means nothing unless the canaries pass.
 
 **Phase 2 — dispatcher integrity.**
 
@@ -754,16 +814,17 @@ autonomy is never enabled.**
 `smoke.js` defanged; `research` user, systemd slice, egress allowlist.
 *Accept:* negative controls 1–6 fail closed.
 
-**Phase 1 — three repositories and credential scoping.** `qf-research`,
-`qf-platform`, `qf-service` split out of `tools/queue-forecasting/` with
-history preserved via `git filter-repo`; trusted checkouts pulled by root with
-read-only deploy keys; two agent tokens issued — `Contents: write` on
-`qf-research`, and `Contents: read` + `Issues: write` on `qf-service` — and
-none for `qf-platform`.
-*Accept:* negative control 7 fails closed on every mutation path while reading
-`qf-service` and filing an issue there both succeed; the agent can push to
-`qf-research`; services keep running from `qf-service`; existing test suites
-pass.
+**Phase 1 — the research repository and credential scoping.** Superseded in
+detail by `auto-research-phase1-design.md` §1–§8, which supplies the
+decisions, the extraction, the Python environment, NC7, and the acceptance
+criteria: one repository, `qf-research`, holding a copy of `trainer/` with its
+history; the monorepo copy frozen and retained as the trusted production
+trainer; one agent token with `Contents: write` + `Issues: write` on
+`qf-research` and **no credential on `lotas/taskcluster`**; the agent's own
+venv, with `pypi.org` and `files.pythonhosted.org` allowlisted.
+*Accept:* per that document's §8 — negative control 7's refusals all fail
+closed with its canaries passing, the agent can push to `qf-research`, the live
+collector and live-predictor are not disrupted, and existing test suites pass.
 
 **Phase 2 — dispatcher, pinning, and the evaluation artifact.** Typed jobs,
 worktree-at-SHA execution, SQLite live state with leases, the root-owned
@@ -771,8 +832,11 @@ evaluator and `eval.parquet`, `verdict.py`, the independent derivation,
 contracts per target.
 *Accept:* negative controls 8–11 fail closed; a known past result
 (`wait_time_residual_throughput_filtered_baseline`) is reproduced end-to-end
-through the dispatcher; the oracle's verdict matches the recorded numbers; and
-the independent derivation agrees to tolerance. **At this point a human submits
+through the dispatcher; the oracle's verdict matches the recorded numbers; the
+independent derivation agrees to tolerance; and the trainer image builds from
+the trusted checkout's Dockerfile and dependency manifests, demonstrated by a
+deliberately poisoned `pyproject.toml` committed to `qf-research` that provably
+does not affect the built image (§3.4 step 3). **At this point a human submits
 experiments with one command and no SSH — the latency problem is solved with
 zero autonomy.**
 
@@ -824,7 +888,7 @@ deployed, health-gated, and appears in `deploys.jsonl` with coverage tracked.
 | Tick overruns the interval | Tick lock | Next tick exits immediately |
 | Runner crash mid-job | SQLite lease expiry | Reclaim, mark failed, preserve logs |
 | Comparison members disagree on extract | Dispatcher pin check | Refuse the job |
-| A control relocated into `qf-research` | Dispatcher path-resolution check | Refuse the job; open an issue |
+| A control relocated into `qf-research` — or, the same failure class, root executing code that an agent-writable path selects, **build inputs included** (§3.4) | Dispatcher path-resolution check, covering the Dockerfile and dependency manifests as well as contracts, evaluators, and linters | Refuse the job; open an issue |
 | Collector deploy degrades collection | Health gate (rate + population + lag) | Auto-revert, restart previous image, issue |
 | Feature used with insufficient coverage | Trainer eligibility check | Hard error; ledger marks `BLOCKED_DATA` |
 | Program-wide false discovery | FDR recomputation on each verdict | Retroactive downgrade to `INCONCLUSIVE` |

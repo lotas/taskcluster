@@ -71,11 +71,20 @@ def test_load_baseline_predictions(tmp_path):
 
 
 def test_repo_family_derivation_version_matches_js():
-    """The Python constant must stay in lockstep with src/repo-family.js."""
+    """The Python constant must stay in lockstep with src/repo-family.js.
+
+    The JS lives in the service tree, which the research repository does not
+    contain (auto-research-phase1-design.md D1/D2). Where it is absent this
+    parity guard cannot run, so the test skips with a reason instead of
+    failing: the guard is enforced in the monorepo, and serving parity is a
+    promotion-time concern there.
+    """
     import re
     from pathlib import Path
 
     js = Path(__file__).resolve().parents[2] / "src" / "repo-family.js"
+    if not js.exists():
+        pytest.skip(f"serving-parity guard needs {js}, absent outside the monorepo")
     text = js.read_text()
     m = re.search(r"REPO_FAMILY_DERIVATION_VERSION\s*=\s*(\d+)", text)
     assert m, "could not find REPO_FAMILY_DERIVATION_VERSION in repo-family.js"
