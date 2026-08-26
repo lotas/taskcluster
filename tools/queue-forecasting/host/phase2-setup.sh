@@ -488,19 +488,42 @@ cmd_builder_probe() {
   step "cancellation timing (5 runs)"
   local i worst=0
   for i in 1 2 3 4 5; do
-    printf 'FROM busybox\nRUN sleep 120\n' > "$tmp/Dockerfile"
+    # A marker unique to this run, because the question is whether THIS build's
+    # step is still running -- not whether anything on the host sleeps.
+    local marker="qfprobe-$$-$i"
+    printf 'FROM busybox\nRUN sleep 120 # %s\n' "$marker" > "$tmp/Dockerfile"
     DOCKER_BUILDKIT=0 docker build --force-rm -t "qf-probe-slow-$i" "$tmp" \
       >/dev/null 2>&1 &
     local client=$!
     sleep 8
+    # POSITIVE CANARY, BEFORE THE KILL. Without it this whole measurement is
+    # vacuous: if the running step cannot be OBSERVED, the wait loop below exits
+    # on its first iteration and reports 0s whether the daemon stopped instantly
+    # or carried on building for two minutes -- a pass that means nothing, on
+    # the one number the D10 builder decision rests on. (`--no-trunc` is part of
+    # this: plain `docker ps` truncates Command to ~20 chars, so the marker --
+    # and even `sleep 120` -- is cut off and never matches.)
+    if ! docker ps --no-trunc --format '{{.Command}}' | grep -q "$marker"; then
+      kill -9 "$client" 2>/dev/null || true
+      docker ps --no-trunc --format '   {{.Command}}' | head -5
+      rm -rf "$tmp"
+      die "run $i: the build step could not be observed while it was RUNNING, so cancellation cannot be measured on this host. Fix the observation before trusting the number: a probe that cannot see the work always reports 0s."
+    fi
     kill -9 "$client" 2>/dev/null || true
-    local t0 elapsed=0
+    local t0 elapsed=0 stopped=0
     t0=$(date +%s)
     while [ "$elapsed" -lt $(( BUILD_SETTLE_S * 3 )) ]; do
-      # Daemon-side work is gone when nothing is running our slow step.
-      docker ps --format '{{.Command}}' | grep -q 'sleep 120' || break
+      docker ps --no-trunc --format '{{.Command}}' | grep -q "$marker" \
+        || { stopped=1; break; }
       sleep 1; elapsed=$(( $(date +%s) - t0 ))
     done
+    if [ "$stopped" != 1 ]; then
+      # Never silently fold a timeout into the worst-case number: it is not a
+      # measurement of ${elapsed}s, it is the absence of one.
+      docker rm -f "$(docker ps -q --filter "ancestor=busybox")" >/dev/null 2>&1 || true
+      rm -rf "$tmp"
+      die "run $i: daemon-side work was STILL running $(( BUILD_SETTLE_S * 3 ))s after the client was killed. Per design D10 the response is to move building out of qfd, not to raise the window."
+    fi
     info "run $i: daemon-side work stopped after ${elapsed}s"
     [ "$elapsed" -gt "$worst" ] && worst="$elapsed"
   done

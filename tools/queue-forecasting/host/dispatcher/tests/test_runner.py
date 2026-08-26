@@ -14,6 +14,7 @@ import types
 import unittest
 
 import qfd
+import source
 import spec
 import store
 
@@ -522,3 +523,50 @@ class TestRunDirLayout(RunnerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSourceFailuresAreRouted(RunnerCase):
+    """An error_class is a ROUTING decision, so one that names the wrong
+    subsystem costs an investigation.
+
+    Only `NotPublished` and `Timeout` were handled; every other git failure --
+    a token that cannot read the remote, DNS, a remote that refuses, a corrupt
+    mirror -- fell through to the generic handler and was reported as
+    `internal`, which sends the operator to read dispatcher tracebacks about a
+    fault in the source or the credential. Seen for real on the first live
+    submit.
+    """
+
+    def run_with_source_error(self, exc):
+        job = self.a_job(state="LEASED")
+        hold = self.hold_for(job)
+        self.addCleanup(lambda: hold.lock.held and hold.lock.release())
+
+        def resolve(sha, deadline=None):
+            raise exc
+
+        self.src.resolve = resolve
+        self.runner.execute(hold)
+        return self.db.call("get", "r1")
+
+    def test_an_unreachable_remote_is_not_called_internal(self):
+        job = self.run_with_source_error(
+            source.SourceError("fatal: could not read Username for"
+                               " 'https://github.com': No such device"))
+        self.assertEqual(job["state"], "FAILED")
+        self.assertEqual(job["error_class"], "source_unavailable")
+
+    def test_an_unpublished_sha_keeps_its_own_class(self):
+        job = self.run_with_source_error(source.NotPublished("nope"))
+        self.assertEqual(job["error_class"], "source_not_published")
+
+    def test_a_hung_fetch_keeps_its_own_class(self):
+        # Subclass ordering: Timeout and NotPublished are both SourceError, so a
+        # base-class handler placed above them would swallow both.
+        job = self.run_with_source_error(source.Timeout("hung"))
+        self.assertEqual(job["error_class"], "source_timeout")
+
+    def test_a_genuine_bug_is_still_internal(self):
+        # The new clause must not widen into "everything is the source's fault".
+        job = self.run_with_source_error(ZeroDivisionError("real bug"))
+        self.assertEqual(job["error_class"], "internal")

@@ -1573,6 +1573,17 @@ class Runner:
         except source_mod.NotPublished as e:
             log.error("%s: %s", run_id, e)
             outcome = ("FAILED", {"error_class": "source_not_published"})
+        except source_mod.SourceError as e:
+            # The BASE class, after its two specific subclasses. Everything else
+            # git can fail at -- a token that cannot read the remote, DNS, a
+            # remote that refuses, a corrupt mirror -- used to fall through to
+            # the generic handler and be reported as `internal`, which points the
+            # operator at a dispatcher bug when the fault is in the source or the
+            # credential. An error class is a routing decision, so a class that
+            # names the wrong subsystem costs an investigation.
+            log.error("%s: source: %s", run_id, e)
+            outcome = ("FAILED", {"error_class": "source_unavailable",
+                                  "finished_at": utcnow()})
         except LockHeld:
             outcome = ("FAILED", {"error_class": "image_build_lock_timeout"})
         except image_mod.ImageError as e:
