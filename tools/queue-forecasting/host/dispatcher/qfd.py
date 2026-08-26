@@ -273,7 +273,48 @@ class Config:
 
         if not os.access(self.runs_dir, os.R_OK | os.X_OK):
             problems.append(f"{self.runs_dir} is not traversable")
+
+        # CAN THIS PROCESS SET A SETGID BIT AT ALL? Asked here, once, because
+        # the answer is a property of the process and not of any job: with
+        # RestrictSUIDSGID=yes in the unit, systemd installs a seccomp filter
+        # that fails every chmod carrying S_ISGID with EPERM, and `out/` is 2770
+        # by design -- so EVERY run died at its first chmod, reported as
+        # `error_class=internal`, which reads as a dispatcher bug and cost a live
+        # investigation to trace back to one line of unit hardening.
+        #
+        # An invariant of the environment belongs in the startup gate, not in
+        # the first job that trips over it. Fail-closed, and NAME THE CAUSE:
+        # a refusal an operator cannot act on is only marginally better than a
+        # crash.
+        problems.extend(self._check_setgid_allowed())
         return problems
+
+    def _check_setgid_allowed(self):
+        """Prove `chmod 2770` works under the state dir, or say why not."""
+        probe = os.path.join(self.state_dir, ".setgid-probe")
+        try:
+            os.makedirs(probe, exist_ok=True)
+            os.chmod(probe, 0o2770)
+            mode = os.stat(probe).st_mode
+        except OSError as e:
+            return [f"cannot set the setgid bit under {self.state_dir}: {e}."
+                    " If the unit carries RestrictSUIDSGID=yes, that seccomp"
+                    " filter is the cause -- it fails every chmod carrying"
+                    " S_ISGID, and each run's out/ directory needs it so the"
+                    " handoff container can read what the sandbox wrote."]
+        finally:
+            try:
+                os.rmdir(probe)
+            except OSError:
+                pass
+        if not (mode & 0o2000):
+            # No error, no bit: the silent-clear path. POSIX drops S_ISGID
+            # without complaint when the caller is not in the file's group, so
+            # an unchecked chmod would leave `out/` looking correct.
+            return [f"the setgid bit did not stick under {self.state_dir};"
+                    " artifacts written by the sandbox would not be readable by"
+                    " the handoff container"]
+        return []
 
 
 # --- the DB owner thread -------------------------------------------------

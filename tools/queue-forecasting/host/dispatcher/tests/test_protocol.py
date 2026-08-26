@@ -11,6 +11,7 @@ import socket
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import qfd
 import spec
@@ -682,6 +683,38 @@ class TestStartupPreconditions(unittest.TestCase):
         problems = self.check(runs_dir="")
         self.assertTrue(any("runs_dir is unset" in p for p in problems),
                         problems)
+
+    def test_a_host_that_forbids_setgid_is_fatal_at_startup(self):
+        # The live failure this was written for: RestrictSUIDSGID=yes in the unit
+        # made every `chmod 2770` on a run's out/ raise EPERM, so every job died
+        # as `error_class=internal` -- a per-job symptom for a per-PROCESS fault.
+        # An invariant of the environment belongs in the startup gate.
+        def refuse(path, mode):
+            raise PermissionError(1, "Operation not permitted")
+
+        with mock.patch("qfd.os.chmod", refuse):
+            problems = self.check()
+        self.assertTrue(any("setgid bit" in p for p in problems), problems)
+        self.assertTrue(any("RestrictSUIDSGID" in p for p in problems),
+                        "the refusal must NAME the cause; an operator cannot act"
+                        " on 'Operation not permitted'")
+
+    def test_a_setgid_bit_that_silently_does_not_stick_is_fatal(self):
+        # POSIX drops S_ISGID without an error when the caller is not in the
+        # file's group, so a chmod that "succeeded" proves nothing on its own.
+        real = os.chmod
+
+        def drop(path, mode):
+            return real(path, mode & ~0o2000)
+
+        with mock.patch("qfd.os.chmod", drop):
+            problems = self.check()
+        self.assertTrue(any("did not stick" in p for p in problems), problems)
+
+    def test_the_probe_leaves_nothing_behind(self):
+        self.assertEqual(self.check(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.root,
+                                                     ".setgid-probe")))
 
 
 class TestTrustedPathResolution(unittest.TestCase):

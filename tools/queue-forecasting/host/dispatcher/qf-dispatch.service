@@ -66,7 +66,22 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=no
 PrivateDevices=yes
-RestrictSUIDSGID=yes
+# NO, and this is a deliberate exception rather than an oversight.
+# RestrictSUIDSGID installs a seccomp filter that fails ANY chmod carrying
+# S_ISUID or S_ISGID with EPERM -- including the setgid bit on a directory,
+# which Runner.prepare_run_dir needs on each run's out/. That bit is
+# load-bearing: without it, files the sandbox writes take the creating process's
+# group, and the handoff container (uid 10001, group qfrun) cannot read the
+# artifacts it exists to collect. There is no directories-only variant of the
+# restriction, so every run failed at its first chmod.
+#
+# The residual: qfd runs as the unprivileged qfd user, which can only set a
+# setuid bit on a file it already owns -- so this buys an attacker who is
+# ALREADY qfd a persistence trick, not an escalation. Against an artifact path
+# that cannot work at all, that is the smaller cost. Revisit if the sandbox ever
+# runs with qfrun as its primary gid, which would make the setgid bit redundant
+# and let this come back.
+RestrictSUIDSGID=no
 ReadWritePaths=/var/lib/qf-platform /var/lib/qf-runs /var/lib/qf-locks
 # Leave nothing behind on a clean stop: an orphaned heavy container would keep
 # 22g while its flock died with the process (design 4.2). Both roles carry
