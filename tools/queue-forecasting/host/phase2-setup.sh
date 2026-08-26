@@ -86,6 +86,23 @@ deploy_user() {
   stat -c '%U' "$TRUSTED" 2>/dev/null || echo deploy
 }
 
+# Drop to a user for ONE probe. Deliberately not `sg`: `sg` re-executes the
+# target's LOGIN SHELL, and qfd's shell is /usr/sbin/nologin by design (see
+# cmd_dispatch_user), so every probe below failed with "This account is
+# currently not available." -- a false negative indistinguishable from a
+# permission fault, on the one account these checks exist for. `runuser -u`
+# execs the command directly and calls initgroups(), which reads /etc/group
+# fresh, so a membership added a moment ago is already in effect and no `sg`
+# context is needed at all.
+as_user() {  # as_user <user> <shell string>
+  local u="$1"; shift
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$u" -- /bin/sh -c "$*"
+  else
+    sudo -u "$u" /bin/sh -c "$*"
+  fi
+}
+
 require_group() {
   getent group "$1" >/dev/null \
     || die "group $1 does not exist; run dispatch-user and locks first"
@@ -297,19 +314,17 @@ cmd_locks() {
   info "intent: $(stat -c '%A %U:%G' "$INTENT_DIR")"
 
   step "verify as BOTH users"
-  # Group membership does not apply to existing sessions, so each check runs in
-  # a fresh `sg` context.
   local u
   for u in qfd "$du"; do
-    sudo -u "$u" sg qfheavy -c "exec 9>$LOCK_FILE" \
+    as_user "$u" "exec 9>$LOCK_FILE" \
       || die "$u cannot open the lock for WRITE; the nightly script's exec 9> would fail fatally"
     info "$u can open the lock for write"
   done
   # A flock held by one side must be SEEN by the other.
-  sudo -u qfd sg qfheavy -c "flock -n $LOCK_FILE -c 'sleep 5'" &
+  as_user qfd "flock -n $LOCK_FILE -c 'sleep 5'" &
   local holder=$!
   sleep 1
-  if sudo -u "$du" sg qfheavy -c "flock -n $LOCK_FILE -c true" 2>/dev/null; then
+  if as_user "$du" "flock -n $LOCK_FILE -c true" 2>/dev/null; then
     kill "$holder" 2>/dev/null || true
     die "a lock held by qfd was NOT seen by $du; this is not a mutex"
   fi
@@ -318,18 +333,32 @@ cmd_locks() {
 
   # The deploy user creates markers; qfd unlinks stale ones; research does neither.
   local probe="$INTENT_DIR/nightly.$$.$(date +%s).intent"
-  sudo -u "$du" sg qfheavy -c "printf 'pid=%d\ndeadline=1\n' $$ > $probe" \
+  as_user "$du" "printf 'pid=%d\ndeadline=1\n' $$ > $probe" \
     || die "$du cannot create an intent marker"
   info "$du can create a marker"
-  sudo -u qfd sg qfheavy -c "cat $probe > /dev/null" || die "qfd cannot read the marker"
-  sudo -u qfd sg qfheavy -c "rm -f $probe" || die "qfd cannot unlink a stale marker"
+  as_user qfd "cat $probe > /dev/null" || die "qfd cannot read the marker"
+  as_user qfd "rm -f $probe" || die "qfd cannot unlink a stale marker"
   info "qfd can read and unlink a marker"
-  if sudo -u "$RESEARCH_USER" bash -lc "touch $INTENT_DIR/nightly.1.1.intent" 2>/dev/null; then
+
+  # POSITIVE CANARY FIRST. The two refusals below are the point of this step,
+  # and a refusal proves nothing unless the same invocation can succeed at
+  # something: a nologin shell, a missing user or a broken `sudo` rule would
+  # make both of them "pass" while proving the opposite of what they claim.
+  # This is the same trap as the `sg` false negative above, in the direction
+  # that fails OPEN instead of closed.
+  local canary; canary="$(mktemp -d)"
+  chmod 0777 "$canary"
+  as_user "$RESEARCH_USER" "exec 9>$canary/probe" \
+    || die "cannot run anything as $RESEARCH_USER, so the two refusals below would prove nothing"
+  rm -rf "$canary"
+  info "$RESEARCH_USER probes actually execute (canary)"
+
+  if as_user "$RESEARCH_USER" "touch $INTENT_DIR/nightly.1.1.intent" 2>/dev/null; then
     rm -f "$INTENT_DIR/nightly.1.1.intent"
     die "$RESEARCH_USER can create an intent marker; it could stop the dispatcher indefinitely"
   fi
   info "$RESEARCH_USER can neither create nor delete a marker"
-  if sudo -u "$RESEARCH_USER" bash -lc "exec 9>$LOCK_FILE" 2>/dev/null; then
+  if as_user "$RESEARCH_USER" "exec 9>$LOCK_FILE" 2>/dev/null; then
     die "$RESEARCH_USER can open the lock for write"
   fi
   info "$RESEARCH_USER cannot open the lock"
