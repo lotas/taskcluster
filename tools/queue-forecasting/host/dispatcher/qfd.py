@@ -611,6 +611,13 @@ class BoundedWriter:
         return False
 
 
+def _one_line(text, limit=300):
+    """Collapse a subprocess's stderr to a single bounded log line. Journald
+    treats each line as a record, so an untrimmed multi-line error is
+    interleaved with everything else and reads as several unrelated events."""
+    return " ".join((text or "").split())[:limit]
+
+
 # --- docker ---------------------------------------------------------------
 class Docker:
     """Every call under its own subprocess timeout, so a hung daemon cannot
@@ -618,6 +625,26 @@ class Docker:
 
     def __init__(self, runner=None):
         self._runner = runner or self._subprocess_runner
+        # One log line per (container, reason), not one per probe. The
+        # confirmation loops poll every couple of seconds for up to
+        # KILL_CONFIRM_S, so logging each unknown unconditionally buries the one
+        # fact an operator needs; logging none at all is worse, and was: a
+        # 300-second stall reported "state unknown" 150 times without once
+        # saying what Docker actually said.
+        self._unknown_seen = set()
+        self._unknown_lock = threading.Lock()
+
+    def _log_unknown(self, container_id, reason):
+        """Say WHY the answer was unknown, once. An operator who cannot see the
+        exit status and stderr has to reproduce the probe by hand to learn
+        anything, and the probe is the part that is failing."""
+        key = (container_id, reason)
+        with self._unknown_lock:
+            if key in self._unknown_seen:
+                return
+            self._unknown_seen.add(key)
+        log.warning("docker: cannot determine the state of %s: %s",
+                    container_id, reason)
 
     @staticmethod
     def _subprocess_runner(argv, env, timeout):
@@ -650,17 +677,27 @@ class Docker:
             p = self.run(["docker", "inspect", "-f", "{{.State.Status}}",
                           container_id], timeout=timeout)
         except subprocess.TimeoutExpired:
+            self._log_unknown(container_id,
+                              f"docker inspect did not answer in {timeout}s")
             return None
         out = (p.stdout or "").strip()
         if p.returncode != 0:
             # "No such object" IS a positive answer: the container is gone.
             if "No such object" in (p.stderr or ""):
                 return False
+            self._log_unknown(
+                container_id,
+                f"docker inspect exited {p.returncode} with a message this"
+                f" probe does not recognise as a positive absence:"
+                f" {_one_line(p.stderr)!r}")
             return None
         if out in self.LIVE_STATUSES:
             return True
         if out in self.STOPPED_STATUSES:
             return False
+        self._log_unknown(container_id,
+                          f"docker inspect exited 0 but reported the"
+                          f" unrecognised status {out!r}")
         return None
 
 

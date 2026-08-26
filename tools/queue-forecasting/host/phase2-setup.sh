@@ -456,8 +456,12 @@ cmd_builder_probe() {
   # (2) --memory is HONOURED. Classic honours the build-time resource flags
   #     BuildKit ignores, which is the whole reason for choosing it.
   printf 'FROM busybox\nRUN dd if=/dev/zero of=/tmp/big bs=1M count=200\n' > "$tmp/Dockerfile"
-  if DOCKER_BUILDKIT=0 docker build --memory 64m -q -t qf-probe-mem "$tmp" \
-      >/dev/null 2>&1; then
+  # --force-rm because this build is EXPECTED to fail: without it the classic
+  # builder keeps the killed intermediate container, and probe (2) leaks one
+  # ~65MiB container per invocation onto a host whose disk floor gates
+  # admissions. Three runs of `builder-probe` left three of them.
+  if DOCKER_BUILDKIT=0 docker build --force-rm --memory 64m -q -t qf-probe-mem \
+      "$tmp" >/dev/null 2>&1; then
     # FAILS, not warns. This probe is the whole reason design D10 chose the
     # classic builder over buildx -- classic honours the build-time resource
     # flags BuildKit ignores. If the cap is not enforced, every `RUN` step is
@@ -520,7 +524,9 @@ cmd_builder_probe() {
     if [ "$stopped" != 1 ]; then
       # Never silently fold a timeout into the worst-case number: it is not a
       # measurement of ${elapsed}s, it is the absence of one.
-      docker rm -f "$(docker ps -q --filter "ancestor=busybox")" >/dev/null 2>&1 || true
+      # -aq, not -q: the container to clean up here is a build intermediate,
+      # which may already have exited.
+      docker ps -aq --filter "ancestor=busybox" | xargs -r docker rm -f >/dev/null 2>&1 || true
       rm -rf "$tmp"
       die "run $i: daemon-side work was STILL running $(( BUILD_SETTLE_S * 3 ))s after the client was killed. Per design D10 the response is to move building out of qfd, not to raise the window."
     fi
