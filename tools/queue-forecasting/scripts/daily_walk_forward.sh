@@ -14,7 +14,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 DEFAULT_CONFIGS="configs/wait_time_residual_throughput_filtered_baseline.yaml,configs/run_duration_residual.yaml"
 
-LOCK_FILE="${LOCK_FILE:-/tmp/queue-forecasting-walk-forward.lock}"
+LOCK_FILE="${LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}"
+INTENT_DIR="${INTENT_DIR:-/var/lib/qf-locks/intent.d}"
+# Must exceed QFD_JOB_HOLD_DEADLINE_S + QFD_KILL_CONFIRM_S: the dispatcher
+# holds the lock past its deadline rather than release it over a kill it
+# could not confirm, so this run can still skip a night. See
+# host/README.md and auto-research-phase2-design.md D10a.
+LOCK_WAIT_S="${LOCK_WAIT_S:-9000}"
 AS_OF_DATE="${AS_OF_DATE:-}"
 FROM_DATE="${FROM_DATE:-}"
 TO_DATE="${TO_DATE:-}"
@@ -50,7 +56,9 @@ Options:
   -h, --help                  Show this help.
 
 Environment overrides:
-  LOCK_FILE                   flock path for cron non-overlap.
+  LOCK_FILE                   flock path for the shared training mutex.
+  INTENT_DIR                  Directory for this run's intent marker.
+  LOCK_WAIT_S                 Bounded wait for the mutex, in seconds.
   AS_OF_DATE                  Same as --as-of.
   FROM_DATE, TO_DATE          Same as --from/--to.
   STEP_DAYS                   Same as --step-days.
@@ -209,14 +217,60 @@ if [[ "$DRY_RUN" != 1 ]]; then
   require_command docker
 fi
 
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    echo "ERROR: another walk-forward run is already active; lock file: $LOCK_FILE" >&2
-    exit 1
-  fi
-else
-  echo "WARN: flock not found; running without a cron overlap lock." >&2
+# flock is REQUIRED. The previous branch warned and trained anyway, so the whole
+# mutex -- and every memory guarantee that rests on it -- was bypassable by a
+# PATH missing one binary. Two 22g trainers on a ~29g host froze this box twice
+# in 2026-07; that is what the warn-and-continue branch was risking.
+require_command flock
+
+# Declare intent BEFORE waiting, as a marker file rather than a lock. Shared
+# flocks barge past a queued exclusive waiter -- verified on this host: a second
+# LOCK_SH was granted while an EX waiter sat in the queue, and the waiter
+# entered only after every shared holder left. A lock-based gate inherits that
+# same defect; a file's existence does not, because nothing contends for it.
+# The dispatcher reads this marker and admits no new work while it is live.
+# See auto-research-phase2-design.md D10a.
+# Per-invocation name, published ATOMICALLY. Writing a fixed nightly.intent in
+# place let qfd read it half-written, let two invocations overwrite each other,
+# and let either EXIT trap delete the other's declaration. This trap removes
+# only THIS invocation's file.
+# Preflight, so the new defaults fail with a REMEDY rather than a bare `exec`
+# error. This script's LOCK_FILE default moved from /tmp to the provisioned
+# inode (the legacy /tmp name is retired, not aliased: any name in a 1777
+# directory is plantable while it does not exist), so between this change
+# landing and `phase2-setup.sh locks` running there is a window where neither
+# object exists. Failing closed is right; failing cryptically is not.
+if [[ ! -w "$LOCK_FILE" ]]; then
+  echo "ERROR: lock file $LOCK_FILE is missing or not writable by $(id -un)." >&2
+  echo "       Provision it with: sudo ./host/phase2-setup.sh locks" >&2
+  echo "       It must be 0660 root:qfheavy and this user must be in qfheavy." >&2
+  exit 1
+fi
+if [[ ! -d "$INTENT_DIR" || ! -w "$INTENT_DIR" ]]; then
+  echo "ERROR: intent directory $INTENT_DIR is missing or not writable." >&2
+  echo "       Provision it with: sudo ./host/phase2-setup.sh locks" >&2
+  echo "       It must be 2770 root:qfheavy -- the setgid bit is load-bearing." >&2
+  exit 1
+fi
+
+INTENT_FILE="$INTENT_DIR/nightly.$$.$(date +%s).intent"
+tmp="$INTENT_FILE.tmp"
+( umask 027; printf 'pid=%d\ndeadline=%d\n' "$$" "$(( $(date +%s) + LOCK_WAIT_S ))" > "$tmp" ) \
+  || { echo "ERROR: cannot write $tmp" >&2; exit 1; }
+chmod 0640 "$tmp" && mv -f "$tmp" "$INTENT_FILE" \
+  || { echo "ERROR: cannot publish $INTENT_FILE" >&2; rm -f "$tmp"; exit 1; }
+trap 'rm -f "$INTENT_FILE" "$tmp"' EXIT
+
+exec 9>"$LOCK_FILE"
+# Bounded wait, not -n: light experiments hold this lock SHARED for their
+# lifetime, so -n would skip the night whenever one was in flight. The bound
+# must exceed QFD_JOB_HOLD_DEADLINE_S plus QFD_KILL_CONFIRM_S: the dispatcher
+# holds the lock past its deadline rather than release it over a kill it could
+# not confirm, so this run can still skip a night. Deliberate -- a released lock
+# over live work is the failure the mutex exists to prevent.
+if ! flock -w "$LOCK_WAIT_S" 9; then
+  echo "ERROR: walk-forward lock not acquired within ${LOCK_WAIT_S}s; lock file: $LOCK_FILE" >&2
+  exit 1
 fi
 
 section "Daily walk-forward configuration"
@@ -231,6 +285,8 @@ summary_to:        ${SUMMARY_TO}
 summary_configs:   ${SUMMARY_CONFIGS}
 summary_output:    ${SUMMARY_OUTPUT}
 lock_file:         ${LOCK_FILE}
+intent_dir:        ${INTENT_DIR}
+lock_wait_s:       ${LOCK_WAIT_S}
 dry_run:           ${DRY_RUN}
 CONFIG
 

@@ -18,7 +18,13 @@ PG_SERVICE="${PG_SERVICE:-postgres}"
 PGUSER="${PGUSER:-postgres}"
 PGDATABASE="${PGDATABASE:-forecasting}"
 DUMP_COMPRESSION="${DUMP_COMPRESSION:-6}"
-LOCK_FILE="${LOCK_FILE:-/tmp/queue-forecasting-backup.lock}"
+# NAMESPACED deliberately. `daily_walk_forward.sh` also reads a lock path, and
+# the Phase 2a setup instructs the operator to put one on the crontab -- where a
+# bare `LOCK_FILE=` assignment applies to EVERY entry below it. A shared name
+# would make this script flock the heavy-training mutex and exit 1 whenever a
+# training job held it: backups would die silently, and backups would become a
+# contender on a mutex they have no business in.
+BACKUP_LOCK_FILE="${BACKUP_LOCK_FILE:-/tmp/queue-forecasting-backup.lock}"
 KEEP_DAILY="${KEEP_DAILY:-7}"
 KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
 KEEP_MONTHLY="${KEEP_MONTHLY:-3}"
@@ -67,7 +73,10 @@ Environment:
   PGUSER                          Postgres user (default: postgres).
   PGDATABASE                      Postgres database (default: forecasting).
   DUMP_COMPRESSION                pg_dump -Z compression level (default: 6).
-  LOCK_FILE                       flock path for cron non-overlap.
+  BACKUP_LOCK_FILE                flock path for cron non-overlap. Namespaced
+                                  so a crontab-wide LOCK_FILE= (which the
+                                  Phase 2a setup adds for the nightly
+                                  trainer) cannot capture it.
   KEEP_DAILY                      GFS: newest dump per day, last N (default: 7).
   KEEP_WEEKLY                     GFS: newest dump per ISO week, last N (default: 4).
   KEEP_MONTHLY                    GFS: newest dump per month, last N (default: 3).
@@ -251,9 +260,9 @@ require_command docker
 require_command gcloud
 
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"$LOCK_FILE"
+  exec 9>"$BACKUP_LOCK_FILE"
   if ! flock -n 9; then
-    echo "ERROR: another backup is already running; lock file: $LOCK_FILE" >&2
+    echo "ERROR: another backup is already running; lock file: $BACKUP_LOCK_FILE" >&2
     exit 1
   fi
 fi

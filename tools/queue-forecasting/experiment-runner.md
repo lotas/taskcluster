@@ -369,7 +369,19 @@ concurrent trainers exhausted memory and froze the VM.
 
 The experiment runner and `daily_walk_forward.sh` must share one global
 training lock. It is not sufficient for agent jobs to use a new lock while cron
-continues using `/tmp/queue-forecasting-walk-forward.lock`.
+continues using a different one.
+
+**Done as of Phase 2a** (`auto-research-phase2a-plan.md` Task 7b): the shared
+mutex is one provisioned `0660 root:qfheavy` inode at
+`/var/lib/qf-locks/heavy-training.lock`. The old
+`/tmp/queue-forecasting-walk-forward.lock` name is **retired, not aliased** —
+any name in a 1777 directory is plantable while it does not exist, so the
+untrusted user could create it before `systemd-tmpfiles` ran and own the
+nightly run's lock. `flock` is per inode, so migrating cron is a dispatcher
+**start-up prerequisite** rather than a follow-up: two provisioned paths are two
+mutexes and both sides would run. Holds are shared/exclusive, with a separate
+intent-marker gate, because shared holders barge past a queued exclusive waiter
+(design D10a).
 
 Recommended queue policy:
 

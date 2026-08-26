@@ -200,9 +200,26 @@ dispatcher over a unix socket. The dispatcher:
    patches, no bundles. The bundle format from `experiment-runner.md` existed
    only to carry uncommitted laptop work; with agents owning a repo, a pinned
    SHA gives identical immutability with far less machinery.
+   **Where the objects come from is part of the boundary**
+   (`auto-research-phase2-design.md` D3): the worktree is cut from a
+   **dispatcher-owned bare mirror** fetched from GitHub with a dispatcher-only
+   `Contents: read` token, and the SHA must be **reachable from a
+   remote-tracking ref** — `git cat-file -e` would accept a force-dropped commit
+   no human can read at a URL, so a verdict about it would have no source behind
+   it. A local `file://` fetch from the agent's own clone is **rejected**: it
+   would run `git upload-pack` against an agent-writable repository whose
+   configuration selects the code that runs. The mirror sets
+   `core.hooksPath=/dev/null`, because the objects landing in it are
+   agent-authored.
 3. Runs the trainer in a container: non-root, read-only source mount,
    run-private writable dir, no daemon socket, no egress, no service
-   credentials, CPU/memory/PID/wall-clock limits. **Where the image and its
+   credentials, CPU/memory/PID/wall-clock limits. "No service credentials" is
+   a **requirement the trainer does not meet today** — `trainer/src/data_loader.py`
+   reads `os.environ["DATABASE_URL"]` and extracts from Postgres itself — so
+   `auto-research-phase2-design.md` D4 changes the data plane rather than
+   restating the rule: **candidate code never holds a DB credential.** Trusted
+   code extracts a wide superset per window into Parquet, and the sandbox runs
+   `--network none` with no `DATABASE_URL` to find. **Where the image and its
    manifests come from is part of the boundary, not an implementation choice**
    (`auto-research-phase1-design.md` §6). The **Dockerfile is root-owned and
    read from the trusted checkout**; the copy of `trainer/Dockerfile` that
@@ -218,11 +235,28 @@ dispatcher over a unix socket. The dispatcher:
    mounted or copied only after the environment image is built**, so nothing
    from `qf-research` participates in dependency resolution or in any build
    step.
-4. Holds the **shared** heavy-training lock
-   (`/tmp/queue-forecasting-walk-forward.lock`) — the same one
+4. Holds the **shared** heavy-training lock — the same one
    `daily_walk_forward.sh` uses. A separate lock would allow two trainers to
    run concurrently and exhaust host memory; the hazard trainer already peaks
    at 99.9% of its 22 GB limit on a ~30 GB host.
+   Naming it by path is not enough, and the path has **moved**
+   (`auto-research-phase2-design.md` D5): it is one provisioned
+   `0660 root:qfheavy` inode at `/var/lib/qf-locks/heavy-training.lock`, with
+   cron migration as a **start-up prerequisite** rather than a follow-up. Three
+   things make that necessary. `flock` is **per inode**, so two provisioned
+   paths are two mutexes and an unmigrated cron entry would lock the other one
+   while the dispatcher locked this one — both would then run.
+   `daily_walk_forward.sh:213` acquires it with a **write** open (`exec 9>`), so
+   whichever side creates the file first owns it and the other side's open fails
+   — fatally, on the nightly side; hence a group-writable inode rather than
+   merely a shared namespace. And the group cannot be `qfclient`, because
+   `research` is in that group and a group-writable lock would let the untrusted
+   agent hold the mutex indefinitely and stop nightly training, with no job
+   involved and therefore no timeout to save it. The legacy `/tmp` name is
+   **retired, not aliased**: any name in a 1777 directory is plantable while it
+   does not exist. Admission is also **shared/exclusive** rather than
+   all-or-nothing, with a separate intent gate, because shared holders barge
+   past a queued exclusive waiter (D10a).
 
 Under all four sits the corollary of §3's governing principle: **root never
 executes code that lives in, or is selected by, an agent-writable path — build
@@ -231,16 +265,67 @@ research worktree is code selection as surely as an evaluator is, so the
 dispatcher resolves those from the trusted checkout on exactly the same terms as
 contracts, evaluators, and linters.
 
-Job kinds: `screen`, `confirm`, `probe` (restricted to
-`research/experiments/`), `test`, `summarize`, `query`.
+Job kinds, annotated with the sub-phase that introduces each (§2 of
+`auto-research-phase2-design.md`) — Phase 2 is **four sub-phases**, not one
+step, and a kind that has not arrived yet is refused by name:
+
+| Kind | Sub-phase | Notes |
+|---|---|---|
+| `test` | **2a** | the trainer's own suite at a pinned SHA |
+| `selftest` | **2a** | NC13 from inside the sandbox that actually ran |
+| `extract` | 2b | trusted, holds the only DB credential |
+| `probe` | 2b | restricted to `research/experiments/` |
+| `query` | 2b | closed-world typed request, never `_build_query` reuse (D4) |
+| `evaluate` | 2c | trusted evaluator, trusted contracts |
+| `screen` | 2d | |
+| `confirm` | 2d | |
+| `summarize` | 2d | |
 
 Whether the container runtime becomes rootless Podman for experiments is an
 implementation choice (§16); the dispatcher boundary is required either way.
 
+#### Design note: simpler isolation and read-only CI inputs
+
+The amount of dispatcher machinery here is driven less by “running an
+experiment” than by running agent-authored code **on the same host as the
+nightly production workload**. Shared resource admission, the common training
+mutex, crash reconstruction, and confirm-before-release are consequences of
+that co-location. If experiments can move to a disposable VM or separate
+worker, prefer that boundary: an interrupted experiment can simply fail, and a
+substantial part of the adoption and recovery protocol can disappear. Until
+then, removing those controls from the shared host would remove properties, not
+just complexity.
+
+`--network none` should remain the default for experiment containers, but “no
+general Internet” need not mean “no useful public CI data.” A future extension
+may expose a **typed, host-side, read-only Taskcluster broker** for the FirefoxCI
+and Community deployments rather than giving candidate code direct egress. Its
+closed-world operations would be limited to resolving an index route, reading a
+task or task-group status, listing public artifacts, and fetching an explicitly
+named `public/` artifact. Public artifact inspection and downloads require no
+Taskcluster credentials; see the
+[Taskcluster artifact API tutorial](https://docs.taskcluster.net/docs/tutorial/download-task-artifacts)
+and the [FirefoxCI API documentation](https://firefox-ci-tc.services.mozilla.com/docs/manual/using/api).
+
+The broker must carry **no Taskcluster credentials** and accept no arbitrary
+URL. It hard-codes the FirefoxCI and Community root URLs, permits no task
+creation, hooks, secrets, uploads, or private artifacts, and applies response
+size, artifact size, time, and rate limits. Redirects are validated at every
+hop rather than turning an allowlisted API call into arbitrary S3/CDN access;
+requests and resulting digests are logged and may be cached. The sandbox talks
+only to this typed local interface (for example, `qf ci task`, `qf ci index`,
+and `qf ci artifact`), never to a general HTTP or CONNECT proxy. This treats CI
+data as another bounded input channel, on the same model as the typed database
+interface, rather than weakening the sandbox into “limited Internet access.”
+
 ### 3.5 Database roles
 
 - `forecast_app` — existing service identity (read-write).
-- `forecast_experiment` — `CONNECT`, schema `USAGE`, `SELECT` only.
+- `forecast_experiment` — `CONNECT`, schema `USAGE`, `SELECT` only. **Only the
+  trusted extractor connects as this role**, from the dispatcher side, and
+  **never from inside a sandbox** (`auto-research-phase2-design.md` D4). A
+  read-only role reachable from candidate code would still be a credential in
+  an agent-selected process.
   `default_transaction_read_only=on`, plus `statement_timeout`,
   `idle_in_transaction_session_timeout`, `lock_timeout`, `temp_file_limit`,
   and a connection limit.
@@ -271,7 +356,19 @@ write it directly.
 It also holds the **bus itself**. The dispatcher exposes one append-only
 operation, `note`, through which the leader submits each bus entry (and the
 verbatim consult transcript it references). Entries are hash-chained on
-arrival. Bodies are small text, so the storage cost is negligible next to run
+arrival.
+
+**One chain, not two** (`auto-research-phase2-design.md` D7). Earlier wording
+here described hash-chaining as something the bus did, separately from job
+state; that would leave the job records — the things a verdict is argued from —
+outside the tamper-evident structure. Instead there is a single append-only
+chain in `events`, and **`jobs` is a projection of it**, maintained in the same
+transaction. `verify-chain` therefore does two things: it recomputes the chain,
+and it **replays the chain into a projection and compares that against `jobs`**.
+Checking only the first would let a direct `UPDATE` on `jobs` pass. Every
+projected column is compared, not just `state`, because an edit to `spec_json`,
+`image_digest`, `exit_code`, a lease field or an artifact digest is exactly what
+a forged verdict would need. Bodies are small text, so the storage cost is negligible next to run
 artifacts — and persisting them here is what makes the reasoning record
 survive a rewrite of `qf-research`.
 
@@ -315,6 +412,13 @@ and consult transcripts. Artifacts are retained 90 days, then pruned to
 manifests plus the evaluation artifact (§8.5), whose retention is set by the
 size estimate in §16.7 — reproducing a verdict depends on it, so it outlives
 every other artifact.
+
+Unchanged by Phase 2a, with one clarification: **in 2a there is nothing
+longer-lived to keep.** A `test` or `selftest` run produces logs and a
+`result.json`, not an evaluation artifact, so the 90-day timer
+(`qf-runs-prune.timer`, design D13) is the whole retention policy at that point.
+§16.7's longer horizon is **2c's** question, arriving with the evaluation
+artifact it applies to.
 
 ### 4.4 `features.yaml` — the deliverable
 
@@ -434,10 +538,16 @@ A tick pulls a mutable branch and the runner executes later, so every job
 record pins its inputs. Without this, candidate and control can silently
 differ in code or data.
 
-Each job pins: `source_sha`, `image_digest`, `contract_hash`,
-`resolved_config_hash`, `data_watermark` (max `pending_at` / resolution
-timestamp included in the extract), `excluded_dates_hash` (the anomalous-day
-set), `baseline_artifact_id`, and `extract_cache_key`.
+Each job pins: `source_sha`, **`source_ref`**, `image_digest`,
+`contract_hash`, `resolved_config_hash`, `data_watermark` (max `pending_at` /
+resolution timestamp included in the extract), `excluded_dates_hash` (the
+anomalous-day set), `baseline_artifact_id`, and `extract_cache_key`.
+
+`source_ref` is the remote-tracking ref the SHA was reachable from (§3.4 step 2,
+D3): without it a verdict records a commit id but no URL at which a human can
+read it. `pins` is a **key/value table** keyed `(run_id, key)`, so the pins that
+arrive with 2b and 2c need **no migration** — which is why the list above can
+grow without a schema version.
 
 The trainer already has a content-hashed Parquet extract cache
 (`trainer/src/data_loader.py:90,184`), but its key does not include a data
@@ -798,17 +908,40 @@ impossible.
    monorepo reads with no `Authorization` header at all. The boundary is still
    mutation, not visibility; a refusal means nothing unless the canaries pass.
 
-**Phase 2 — dispatcher integrity.**
+**Phase 2 — dispatcher integrity.** Phase 2 is four sub-phases (§2 of
+`auto-research-phase2-design.md`), and the controls split across them: **six in
+2a** and **two in 2c**, per D14. NC12–NC15 are written out here rather than left
+implicit in an acceptance bullet, because the Phase 4 gate counts this list.
 
-8. Start a second concurrent heavy training job.
-9. Submit a job whose `contract_hash` disagrees with the trusted checkout.
+*2a — the spine:*
+
+8. Start a second concurrent heavy training job. (Seventeen clauses: the mutex
+   has that many ways to be wrong, and thirteen were found by review rather
+   than by design. Includes that `flock` actually excludes on this filesystem —
+   a vacuous mutex reads exactly like a working one.)
 10. Cause a contract, evaluator, or linter to resolve from the research
     worktree instead of the trusted checkout.
+12. **Build provenance:** make a research-repo `pyproject.toml`/`uv.lock`
+    participate in the image build. The build context is exactly three files
+    copied out of the trusted checkout, and `image.py` asserts the resulting
+    directory holds nothing else.
+13. **Sandbox isolation,** asserted from *inside* the sandbox that actually ran
+    (the `selftest` kind), not from a hand-rolled `docker run` in the suite —
+    which would test a copy of the flags rather than the flags.
+14. **The dispatcher's own token cannot write:** one canary plus three
+    separately-named refusals, each with a *valid* payload, so a 422 cannot
+    masquerade as containment.
+15. **Disk containment:** log cap, output quota, admission floor, and hostile
+    artifact modes and file types.
+
+*2c — evaluation integrity:*
+
+9. Submit a job whose `contract_hash` disagrees with the trusted checkout.
 11. Submit a prediction set whose `row_id` multiset does not match the frozen
     extract.
 
-**Gate:** the full eleven must pass as a single run before Phase 4 begins, and
-be re-run immediately before Phase 5.
+**Gate:** the full **fifteen** must pass as a single run before Phase 4 begins,
+and be re-run immediately before Phase 5.
 
 ## 14. Rollout
 
@@ -831,17 +964,35 @@ venv, with `pypi.org` and `files.pythonhosted.org` allowlisted.
 closed with its canaries passing, the agent can push to `qf-research`, the live
 collector and live-predictor are not disrupted, and existing test suites pass.
 
-**Phase 2 — dispatcher, pinning, and the evaluation artifact.** Typed jobs,
-worktree-at-SHA execution, SQLite live state with leases, the root-owned
-evaluator and `eval.parquet`, `verdict.py`, the independent derivation,
-contracts per target.
-*Accept:* negative controls 8–11 fail closed; a known past result
-(`wait_time_residual_throughput_filtered_baseline`) is reproduced end-to-end
-through the dispatcher; the oracle's verdict matches the recorded numbers; the
-independent derivation agrees to tolerance; and the trainer image builds from
-the trusted checkout's Dockerfile and dependency manifests, demonstrated by a
-deliberately poisoned `pyproject.toml` committed to `qf-research` that provably
-does not affect the built image (§3.4 step 3). **At this point a human submits
+**Phase 2 — dispatcher, pinning, and the evaluation artifact. Four sub-phases,
+not one step** (`auto-research-phase2-design.md` §2). The trainer's real
+execution path — five orchestration steps in `scripts/run_training.sh`, `.env`
+handed wholesale to the container, the trainer extracting from Postgres itself
+and writing back into a mounted worktree — means that as one step the trust
+boundary, the data plane and the evaluator would all land together, unverified.
+
+- **2a — the spine.** `qfd`, the unix-socket protocol, closed-world typed job
+  specs, SQLite live state with a hash chain and leases, bare mirror plus
+  worktree-at-SHA, the content-keyed trusted image build, the sandbox itself,
+  run-directory layout and retention, the `qf` client. Kinds: `test`,
+  `selftest`.
+  *Accept:* negative controls **8, 10, 12, 13, 14, 15** fail closed, and anyone
+  can run the trainer's test suite at an exact published SHA in a sandbox,
+  reproducibly, without SSH.
+- **2b — the data plane.** The trusted extractor, the frozen wide extract, and
+  the typed `extract`/`probe`/`query` kinds. Candidate code never holds a DB
+  credential (D4).
+- **2c — evaluation.** The root-owned evaluator, `eval.parquet`, `verdict.py`,
+  the independent derivation, contracts per target.
+  *Accept:* negative controls **9 and 11** fail closed; a known past result
+  (`wait_time_residual_throughput_filtered_baseline`) is reproduced end-to-end
+  through the dispatcher; the oracle's verdict matches the recorded numbers; and
+  the independent derivation agrees to tolerance.
+- **2d — ergonomics.** The remaining kinds (`screen`, `confirm`, `summarize`),
+  the historical-reproduction acceptance, and **the full suite as one run**.
+
+The poisoned-`pyproject.toml` demonstration (§3.4 step 3) is **NC12**, and it
+lands in 2a with the build it tests. **From the end of 2a a human submits
 experiments with one command and no SSH — the latency problem is solved with
 zero autonomy.**
 
@@ -889,7 +1040,8 @@ deployed, health-gated, and appears in `deploys.jsonl` with coverage tracked.
 |---|---|---|
 | Bus corruption | `bus doctor` at tick start | Refuse the tick; open an issue |
 | Verdict derivations disagree | Independent recomputation from `eval.parquet` | Automatic `DEADLOCK`; escalate |
-| Trainer OOM | Dispatcher resource watch | Infrastructure class; one retry; record high-water mark |
+| Trainer OOM | Dispatcher resource watch | Infrastructure class; one retry; record high-water mark. Per-container caps are **not** sufficient: admission is an **aggregate memory budget** over everything admitted, image builds included, since two 22 GB jobs each honouring their own cap is still 44 GB on a ~29 GB host (D10) |
+| Run directory fills the filesystem | Log cap, output-quota sampling, and a free-space admission floor | Disk is a **separate** containment boundary with its own control (NC15), not a corollary of the memory cap (`auto-research-phase2-design.md` §4.5) |
 | Tick overruns the interval | Tick lock | Next tick exits immediately |
 | Runner crash mid-job | SQLite lease expiry | Reclaim, mark failed, preserve logs |
 | Comparison members disagree on extract | Dispatcher pin check | Refuse the job |
@@ -905,9 +1057,15 @@ deployed, health-gated, and appears in `deploys.jsonl` with coverage tracked.
 
 ## 16. Open decisions
 
-1. Rootless Podman for experiment containers versus rootful Docker behind the
-   dispatcher. The dispatcher boundary is required either way; rootless would
-   additionally shrink the blast radius of a dispatcher bug.
+1. ~~Rootless Podman for experiment containers versus rootful Docker behind the
+   dispatcher.~~ **CLOSED by `auto-research-phase2-design.md` D2: rootful Docker
+   behind the dispatcher.** The dispatcher boundary is required either way, and
+   rootless would additionally shrink the blast radius of a dispatcher bug — but
+   the live stack already runs on rootful Docker, and running experiments on a
+   second runtime would mean two container stacks to reason about for a benefit
+   that only pays out if `qfd` itself is compromised. *Revisit condition:* at
+   Phase 5, or earlier if `qfd` grows any parser more complex than the
+   closed-world spec validator.
 2. Cron cadence (3 hours is the starting assumption).
 3. Screen cohort set and subsample rate — must be fixed in the contract before
    the first screen and calibrated for both error directions.
@@ -924,3 +1082,12 @@ deployed, health-gated, and appears in `deploys.jsonl` with coverage tracked.
 9. Whether the block-length rule should be `ceil(n^(1/3))` or the ACF
    zero-crossing. Decide empirically against the existing 17-cohort history
    during Phase 3, then freeze it.
+10. **Base-image pinning cadence.** `trainer-env.Dockerfile` pins its base by
+   digest, so security updates to the base are a deliberate act with a diff.
+   Who re-runs `phase2-setup.sh pin-base`, and how often, is unset — a pin that
+   is never refreshed is a frozen CVE, and one refreshed automatically is not a
+   pin. (`auto-research-phase2-design.md` §8.)
+11. **Token rotation owner.** The dispatcher's `Contents: read` token at
+   `/etc/qf-dispatch/github-token` has no rotation schedule and no named owner.
+   NC14 proves it cannot write; nothing yet proves it is current.
+   (`auto-research-phase2-design.md` §8.)

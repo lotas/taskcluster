@@ -1,0 +1,18 @@
+[Unit]
+Description=Prune queue-forecasting run directories older than 90 days
+Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/auto-research-phase2-design.md
+
+[Service]
+Type=oneshot
+User=qfd
+Group=qfd
+SupplementaryGroups=qfrun qfclient
+StateDirectory=qf-runs
+ReadWritePaths=/var/lib/qf-runs
+# -mindepth 1 -maxdepth 1: prune whole run directories, never walk into one and
+# delete parts of it. A half-pruned run reads as a run whose artifacts vanished.
+ExecStart=/usr/bin/find /var/lib/qf-runs -mindepth 1 -maxdepth 1 -type d -mtime +90 -exec rm -rf {} +
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes

@@ -1211,6 +1211,10 @@ Test cases:
 The D2 flag set is a control, so it is built by a pure function and asserted by
 tests rather than typed into a shell string.
 
+*(As shipped this function is `docker_create_argv`, paired with
+`docker_start_argv`; see the amendment after the flag list for why the single
+`docker run` verb had to be split.)*
+
 ```python
 def docker_run_argv(*, image_ref, run_id, spec_hash, kind, src_mount, out_mount,
                     entrypoint_argv, mem_limit, cpus, uid_gid="10001:10001",
@@ -1227,7 +1231,7 @@ def docker_run_argv(*, image_ref, run_id, spec_hash, kind, src_mount, out_mount,
 tag: a tag can be re-pointed between `ensure_image` and `docker run`, and the
 recorded `image_digest` would then describe something other than what ran.
 
-It emits, in order: `docker run --rm`, `--name qf-<run_id>-<role>`, `--label
+It emits, in order: `docker create --rm`, `--name qf-<run_id>-<role>`, `--label
 qf.run_id=`, **`--label qf.role=candidate|handoff`**, `--label qf.spec_hash=`,
 `--label qf.kind=`, `--log-driver none`,
 `--network none`,
@@ -1236,6 +1240,129 @@ qf.run_id=`, **`--label qf.role=candidate|handoff`**, `--label qf.spec_hash=`,
 `--cpus <c>`, `--oom-score-adj 500`, `--tmpfs /tmp:rw,nosuid,nodev,size=<s>`,
 `-v <src>:/app/trainer:ro`, `-v <out>:/out:rw`, each `extra_ro_mounts` as
 `-v <src>:<dst>:ro`, then `image_ref` and `entrypoint_argv`.
+
+**Amended after review (round 6): `create`, not `run`.** The plan said `docker
+run`, and one command that creates and starts cannot tell the dispatcher when
+the container began to exist — `Popen` returning says the local CLI was spawned.
+Until the daemon binds the name, `docker inspect` answers "No such object",
+which every confirmation path treats as a positive absence, so a sweep in that
+window releases the resource row and the training mutex over a container that is
+about to start. The builder therefore emits a `docker create` argv (all the flags
+above, unchanged) and `docker_start_argv(run_id, role)` emits `docker start
+--attach qf-<run_id>-<role>`; the create is synchronous, so its exit status is
+the acknowledgement, and it is the last thing the phase gate does. See
+`host/README.md` for the two consequences (`{{.State.Status}}` as the probe, and
+`docker rm -f` closing the kill escalation) and NC16 for the live check.
+
+Two `error_class` values come with it, and they differ in what the operator is
+told rather than in what is held: `container_start_failed` (the create was
+refused and the name reads absent) and `start_unconfirmed` (anything else).
+Neither releases its resource row, because **a row may be released without
+confirmation only when Docker was never asked about that name** — a daemon can
+complete a submitted request after the client that submitted it has died, so an
+absence read back after a failed create is a reading, not a proof.
+
+Nor is confirmation itself allowed to believe the first absence, which is only a
+reading for the same reason: `KILL_CONFIRM_S` bounds how long it polls, not how
+long absence must hold. So the ambiguity is persisted *before* the create is
+issued (`store.absence_settles_pin`, one pin per role) and taken down only by
+Docker's answer; `Runner._account_for` — now the only place a row is
+released on an inspection — keeps removing as well as probing and requires the
+absence to hold for `BUILD_SETTLE_S`, with any sighting pushing the instant
+forward; and `Store.reclaim` counts an unsettled absence as unknown. The window
+takes `BUILD_SETTLE_S` because this is the same question as an abandoned build —
+daemon-side work whose client is gone — and inherits the same documented D10
+residual rather than pretending to a proof.
+
+The create being synchronous also means it *spends the hold*: expiry is
+re-checked between the create and the `docker start`, and every wait budget is
+measured after the create rather than before it (the handoff has no deadline
+watcher, so an over-granted wait there just runs past the hold).
+
+Two rules follow from the same fix and are worth stating separately, because
+they are about recovery rather than about the create: **startup recovery hands
+back a hold only when something must keep asking** (a recorded inventory means
+forced cleanup, whatever the state — nothing in a restarted process can resume a
+run whose `docker start --attach` client died with the old one, and an undriven
+hold is renewed for ever by `reclaim`), and **the persisted hold deadline
+outranks every probe outcome** (past `hold_deadline_at`, a job with a recorded
+inventory goes to CLEANUP_BLOCKED whether Docker said alive, unknown, or
+absent-but-unsettled; only a settled absence keeps its cleaner
+release-and-fail). Checking that inside the *alive* branch alone left the unknown
+case RUNNING, which is a stall with no escape: `resolve_blocked` lists
+CLEANUP_BLOCKED only and `force-release` refuses anything else, so neither the
+automatic path nor the operator could act. Whether the container is `running` or
+merely `created` does not matter to either rule: the kill escalation ends in
+`docker rm -f`, so both confirm.
+
+`add_resource` also refuses outside `PHASE_ACTIVE_STATES` (= `RUNNING`).
+`reclaim` can move a run out from under a phase that already holds its gate: to
+FAILED when the inventory was momentarily and legitimately empty (the candidate
+exited and `--rm` took its container), or to CLEANUP_BLOCKED when it never had
+one. A row inserted after either means a real container attached to a job whose
+reservation and lane are freed and which nothing looks at again — `expired`
+covers lease-active states only, `resolve_blocked` covers CLEANUP_BLOCKED only,
+and in the CLEANUP_BLOCKED case the confirmation already running releases the new
+row as "gone" because the name is not bound yet. `not terminal` is the wrong test;
+CLEANUP_BLOCKED is not terminal and is precisely where no new workload may
+appear. Refusing the record makes it unreachable, because containers are recorded
+before they can exist. The phase takes the revoked path.
+
+The ambiguity is pinned by `_record_container`, before the row, for the same
+reason: a recorded name whose container does not exist yet reads exactly like one
+whose container was removed, and a confirmation pass holds no guard. What it pins
+there is `ABSENCE_NOT_YET_ISSUED`, not an instant — an instant is a bet that a
+request in flight completes within a window, and before the request is issued
+there is nothing to bet on. Otherwise a phase stalled past BUILD_SETTLE_S (with
+its renewer stalled too) becomes a "settled absence" and has its row released
+just before it issues the create.
+
+The pin comes down on the **answer**, not on the asking. Writing the instant
+"immediately before the request goes out" is still before it, so a thread
+descheduled between the two statements reproduces the same defect in a narrower
+window — and a window is not a fix. Exit 0 clears it; a non-zero exit or a
+timeout replaces it with `now + BUILD_SETTLE_S`, because those mean the request
+*was* issued.
+
+Because the sentinel is immune to elapsed time, it needs an OWNER, and losing
+one is a permanent stall: it would refuse every absence for ever — cleanup could
+never confirm, the job would sit in CLEANUP_BLOCKED, and the lock, lane and
+reservation would stay held until an operator ran `force-release`. Three ways to
+lose it, so three owners, all converting to `now + BUILD_SETTLE_S` through
+`Store.settle_unissued_creates`:
+
+- **the phase abandons the create.** `Runner._unacked_create` wraps the record
+  *and* the create in both phases. A finalizer rather than more `except` clauses:
+  `subprocess.run` raises `OSError` when a fork or exec never reached the daemon,
+  a DB call can raise, and the next exception this code meets has not been
+  written yet — enumerating them means the next one is a stall. It must not
+  raise, since it runs with the real diagnosis in flight.
+- **the conversion fails.** `Runner.retry_unsettled`, drained by the reaper each
+  pass ahead of `resolve_blocked`. Swallowing the failure is not accepting it:
+  nothing forces a restart, so a DB failure that clears a second later would
+  leave the pin ownerless for the life of the daemon. The queue is in memory
+  because the store is what failed; it empties only on success, which includes
+  "nothing left to convert".
+- **the process dies with the pin up.** `Recovery._settle_unissued`, before the
+  run's first confirmation: a restart is the one moment when "no phase can issue
+  this create" is true of every role at once.
+
+An instant rather than a clear (no owner can tell "never asked" from "asked,
+and the answer died with the client", and the daemon may still bind the name);
+starting *now* (the time qfd spent down is not time anything was watching); and
+never touching an instant already running, or a retry or crash loop would extend
+the window for ever.
+
+Relatedly: `resolve_blocked` no longer overwrites `error_class` with
+`reclaimed_after_block`. The terminal CAUSE survives and the resolution is a pin
+(`unblocked_at`).
+
+`force-release` gained a second pass. A positive "live" from Docker refuses
+always; an **unknown** is refused on the first call, which revokes the hold and
+freezes the inventory, and accepted on the second — the flag can override
+Docker's silence, but not against an inventory that could still have grown while
+nobody could see it. With no registered hold there is no phase gate to win, so
+one call is enough.
 
 Test cases:
 

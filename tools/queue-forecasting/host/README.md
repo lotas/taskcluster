@@ -203,3 +203,533 @@ Worth reconsidering at Phase 4: for a cron-driven loop, a system-wide
 `/usr/bin/node` (apt/NodeSource) is more robust than a per-user version
 manager. The only cost of switching is reinstalling the two CLIs; their
 credentials live in `~/.claude` and `~/.codex` and would survive.
+
+---
+
+# Phase 2a — the trusted dispatcher
+
+Plan: `auto-research-phase2a-plan.md`. Design: `auto-research-phase2-design.md`.
+
+The deliverable is a root-owned dispatcher (`qfd`) that runs a pinned, sandboxed
+job on request from the `research` user, with append-only hash-chained state.
+No data plane, no contracts, no evaluator, no autonomy.
+
+## Identity: one user, three groups
+
+| Name | Kind | Why it exists |
+|---|---|---|
+| `qfd` | user | runs the dispatcher; in `docker`, `qfrun`, `qfclient`, `qfheavy` |
+| `qfrun` | group, **gid 10001 fixed** | the in-container group the trusted image bakes in, so `out/` is handed over by group |
+| `qfclient` | group | who may talk to the client socket and read `artifacts/`: `research`, the deploy user, `qfd` |
+| `qfheavy` | group | who may hold the training mutex: `qfd` and the deploy user, **never `research`** |
+
+`qfrun`'s gid is not negotiable — `trainer-env.Dockerfile` creates gid 10001
+inside the image, and `phase2-setup.sh dispatch-user` dies if the host's group
+already exists with a different gid.
+
+`qfheavy` excludes `research` deliberately. `qfclient` contains `research`, so a
+mutex group-writable by `qfclient` would let the untrusted agent hold the lock
+indefinitely and stop nightly training — with no job involved, and therefore no
+timeout to save it.
+
+## Two state directories
+
+- `/var/lib/qf-platform` — `qfd`-private (0750 `qfd:qfd`): `state.db` (SQLite,
+  WAL), `mirror.git` (the bare trusted mirror), `build.lock`.
+- `/var/lib/qf-runs` — `0750 qfd:qfclient` so clients can *traverse* to the run
+  directories they are meant to read. `StateDirectory=` creates it `qfd:qfd`, so
+  `phase2-setup.sh runs-dir` fixes the group; without that step every `qf logs`
+  fails with a permission error and nothing says why.
+
+Per run, and **every one of these is owned deliberately** — `qfd`'s primary
+group is `qfd`, so anything left unchowned is invisible to both identities that
+need it:
+
+| Path | Owner | Mode | Who needs it |
+|---|---|---|---|
+| the run directory | `qfd:qfclient` | 0750 | clients must *traverse* it to reach `artifacts/` and `logs/` |
+| `src/` | `qfd:qfrun` | 0750 | the container (uid/gid 10001) reads the worktree here |
+| `out/` | `qfd:qfrun` | **2770** | the container writes here; setgid keeps the group |
+| `artifacts/` | `qfd:qfclient` | 0750, files 0640 | the only thing a client reads |
+| `logs/` | `qfd:qfclient` | 0750 | `qf logs` reads the file directly (D9) |
+
+`Runner.OWNERSHIP` is the single declaration of that table, and a test asserts
+every created directory appears in it. Chowning only `out/` and `artifacts/`
+left `src/` untraversable by the container and `logs/` unreadable by every
+`qfclient` member — a failure that shows up as a job that cannot see its own
+source, and a `qf logs` that always denies permission.
+
+`chown` clears the setgid bit on Linux, so each `chmod` runs *after* its
+`chown`; otherwise `out/` loses 2770 and artifacts the sandbox creates drift out
+of the `qfrun` group.
+
+## Two sockets, and why
+
+- `/run/qf-dispatch/client/sock` — 0660 `qfd:qfclient`. `ping`, `submit`,
+  `status`, `list`, `cancel`, `verify-chain`, `trusted-paths`.
+- `/run/qf-dispatch/admin/sock` — 0660 `qfd:qfheavy`. `force-release`, and
+  nothing else.
+
+The split is the access-control boundary, not ergonomics. `force-release` lets a
+caller assert "I have verified nothing is running" and release the training
+mutex; on the client socket, whose group contains `research`, that is an escape
+hatch reachable by the untrusted agent. `SO_PEERCRED` records *who* called — it
+does not authorise them, so the admin socket also refuses any peer uid outside
+{root, deploy}.
+
+**The parent runtime directory is 0711**: traversable but not listable. Chowning
+a socket does not grant traversal of its directory, so a tighter mode here makes
+*both* sockets unreachable and every negative control that assumes a reachable
+socket passes vacuously.
+
+## The lock, and `PrivateTmp=no`
+
+One provisioned inode: `/var/lib/qf-locks/heavy-training.lock`, 0660
+`root:qfheavy`. Plus `/var/lib/qf-locks/intent.d`, **2770** — the setgid bit is
+load-bearing, because without it a nightly marker's group comes from the deploy
+user's primary group and its mode from that user's umask, so under `umask 077`
+`qfd` cannot read the declaration and admits straight through it.
+
+`PrivateTmp=no` is defence in depth *only*. The lock no longer lives in `/tmp`,
+so a private `/tmp` would not break it; the setting stays off so that a future
+reader who moves the lock back to `/tmp` does not silently get two private
+inodes and no mutex. That mistake cost two host freezes in 2026-07.
+
+The real requirements are checked at startup, and `qfd` refuses to start if any
+fails: one inode shared with the deploy user's cron entry (hence the root-owned
+marker `/etc/qf-dispatch/lock-migrated`), group-write permission on it (the
+nightly script opens it with `exec 9>`, a *write* open), and a readable,
+writable, setgid `intent.d`.
+
+**Invariant, stated because it ties every timeout together:**
+
+```
+TIMEOUT_MAX + BUILD_TIMEOUT_S + BUILD_LOCK_WAIT_S + HANDOFF_TIMEOUT_S
+  + SETUP_TEARDOWN_ALLOWANCE_S  <  JOB_HOLD_DEADLINE_S
+JOB_HOLD_DEADLINE_S + KILL_CONFIRM_S  <  LOCK_WAIT_S
+```
+
+Shipped: `3600 + 1800 + 900 + 120 + 600 = 7020 < 7800`, and `7800 + 300 = 8100
+< 9000`. These numbers move together or not at all. `qfd` refuses to start if
+the chain inverts, `phase2-setup.sh discover` **fails** rather than warns, and
+`Config.check_deadline_chain` is unit-tested — because the failure mode is a
+silently skipped or starved nightly run.
+
+**A phase start is a critical section, not a check.** Each `Hold` carries a
+`guard` (an `RLock`) and `Hold.phase_gate(what)`. Starting the candidate or the
+handoff happens *inside* the gate; revoking a hold (`Reaper.release_hold`,
+`qfadmin force-release`) takes the *same* guard. That ordering is the only thing
+that makes two properties true at once:
+
+- **no container starts after the mutex is freed** — a revocation that arrives
+  first sets `revoked` under the guard, so the phase refuses;
+- **the mutex is never freed while a container is recorded live** — a phase that
+  wins the race records its row under the guard, and `release_hold` then sees it
+  and *vetoes*, leaving the hold registered for the next sweep.
+
+The gate covers **decision, record AND start** for *both* phases. Covering only
+decision-and-record was the same defect one level down: `docker.run` after the
+guard was released let `force-release` close the descriptor and only then would
+the handoff container start.
+
+**`Popen` is not proof that a container exists**, which is why the containers
+are run as `docker create` + `docker start --attach` rather than `docker run`.
+Spawning the CLI says the local process started, not that the daemon bound the
+name — and until it is bound, `docker inspect` answers *"No such object"*, which
+every confirmation path here reads as a POSITIVE absence. A sweep landing in
+that window would release the resource row *and* the training descriptor, and
+only afterwards would the CLI create and start the container: live work, no
+mutex. `docker create` is synchronous, so its exit status is the
+acknowledgement, and it is the last thing the gate does. Afterwards the name is
+bound, so a sweep is harmless either way — it sees the container and refuses to
+release, or it removes it and `docker start` then has nothing to start.
+
+Two consequences worth stating, because both are load-bearing:
+
+- the container-state probe asks `{{.State.Status}}`, not `{{.State.Running}}`.
+  A **created** container is not running, and the old probe answered `false` for
+  it — "has not started yet" read as "has finished".
+- the kill escalation ends in `docker rm -f`. A created container never dies, so
+  `--rm` never fires and `docker stop` changes nothing; without a removal such a
+  container could never be confirmed stopped and the job would hold admissions
+  shut forever.
+
+`create` is the only Docker call made while the guard is held, bounded by
+`min(Runner.create_timeout_s, time left on the hold)`, and `wait` still happens
+*outside* the gate — `subprocess.run` inside would have held the guard for the
+whole handoff and stalled the reaper for up to `HANDOFF_TIMEOUT_S`.
+
+**Because the create is synchronous, it spends the hold**, which has two
+consequences that are easy to miss:
+
+- expiry is re-checked between the create and the `docker start`. The create is
+  bounded by what was left, so it can return exactly *on* the deadline, and
+  starting then is work admitted past it.
+- every wait budget is measured **after** the create, not before. The candidate
+  would eventually be caught by its deadline watcher; the handoff has none, so
+  an over-granted wait there simply runs past the hold. Under a second left is
+  no grant at all: the container is already up, so it comes straight back down.
+
+**A resource row may be released without confirmation only when Docker was never
+asked about that name.** Once a create has been issued, an absence read back is
+a *reading*, not a proof — a daemon can complete a submitted request after the
+client that submitted it has died, so a non-zero exit covers both "the daemon
+answered no" and "the connection broke after the request went out". Both failure
+paths therefore retain the row. The probe is kept only to *classify*:
+`container_start_failed` when the name reads absent, `start_unconfirmed`
+otherwise.
+
+**Retaining the row is necessary and not sufficient**, because confirmation
+would then convert the *first* absence into a release — the same mistake one
+layer down. `KILL_CONFIRM_S` is a maximum polling period; it does not require
+absence to be *stable*. So the ambiguity is **persisted before the create is
+issued** (`store.absence_settles_pin`, one pin per role), taken down only by
+Docker's answer, and every path that would release a row on an
+inspection consults it:
+
+- `Runner._account_for` — the single place a row is released on an inspection,
+  which is why the rule lives there and not in each of the two confirmation
+  loops. For an unacknowledged name it keeps `docker rm -f`-ing as well as
+  probing (a window that only samples cannot destroy what lands between two
+  samples), and requires the absence to hold for `BUILD_SETTLE_S`. Any sighting
+  pushes the instant forward, so what is tested is stability, not a lucky
+  sample. It observes *before* it removes: `docker rm -f` exiting zero does not
+  reliably distinguish "removed it" from "there was nothing there", and that is
+  not a distinction to bet a mutex on.
+- `Store.reclaim` — an unsettled absence joins the *unknowns*. That method holds
+  a probe, not a Docker client, so it can only wait; it re-runs every reap
+  interval and the instant is fixed, so it terminates.
+
+`BUILD_SETTLE_S` (30s) does double duty here, and deliberately: this is the same
+question as an abandoned `docker build` — daemon-side work whose client is gone
+— so it takes the same knob and inherits the same documented residual. A daemon
+that completed a create *more* than `BUILD_SETTLE_S` after its client died would
+still slip through. It rests on documented behaviour, not on a proof, exactly as
+design D10 already accepts for the build. With `BUILD_SETTLE_S` well under
+`KILL_CONFIRM_S` the settle finishes inside a single confirmation call; if it
+does not, the job sits in `CLEANUP_BLOCKED` — holding, not releasing — and a
+later reaper pass finishes it.
+
+The handoff child is spawned on `DEVNULL`, not pipes: nothing reads them, so a
+handoff writing more than one pipe buffer would block on the write until its own
+timeout killed it, and buffering instead would mean an unbounded stream from a
+container whose `/bin/sh` comes out of the candidate's own image. Its exit code
+is its diagnostic channel (2–5 map to `error_class`), which is why it has one.
+Either way the client is **reaped** after the container is stopped, not
+abandoned.
+
+Both phases also re-check expiry **after** their synchronous record, because the
+record is a round-trip to the DB-owner thread and takes time; if the budget went
+meanwhile, the row is marked released, since nothing started under it.
+
+`if hold.revoked.is_set(): ...` followed by starting the phase is a
+time-of-check/time-of-use race, and no number of extra checks closes it. The
+same reasoning applies to the deadline: the candidate's expiry is re-checked
+inside the gate immediately before `spawn`, and if the budget went while the
+container was being recorded, the row is marked released — because nothing ever
+started under it.
+
+**New work may only appear in `PHASE_ACTIVE_STATES` — which is `RUNNING`, and
+nothing else.** `add_resource` refuses anywhere else, and that refusal is
+load-bearing rather than defensive. `reclaim` can move a run out from under a
+phase that already holds its gate, and each exclusion in that set is a rule:
+`LEASED` and `BUILDING` own no container of ours (the classic builder is not
+recorded), and by `CLEANUP_BLOCKED` cleanup has already *begun*. Every mutation
+is serialised through the DB-owner thread, so the two cannot interleave inside a
+statement — but they can *arrive* in that order, and a row inserted afterwards is
+the worst available shape:
+
+- **`FAILED`** (reclaim settled a momentarily-empty inventory — the candidate
+  exited and `--rm` took its container): the reservation and the lane are already
+  freed, the phase then starts a real container, and a terminal job is invisible
+  to `expired` (lease-active states only) and to `resolve_blocked`
+  (`CLEANUP_BLOCKED` only), so nothing looks at it again.
+- **`CLEANUP_BLOCKED`** (reclaim moved a RUNNING job with an empty inventory):
+  `resolve_blocked` is already confirming this run's absence, so it finds the new
+  row, sees the deterministic name not yet bound, releases it as gone and
+  finishes the job.
+
+Both end the same way: the descriptor veto in `release_hold` fires correctly and
+too late, over live work. `not terminal` is therefore the wrong test.
+
+Refusing the *record* is what makes that unreachable rather than unlikely:
+containers are recorded before they can exist, so a refused record means no
+container is ever created. The phase takes the revoked path, which already means
+"do not start, collect nothing". The check and the insert are one transaction in
+the single writer thread, which is the only place this ordering can be decided.
+
+For the same reason, the ambiguity is pinned by `_record_container`, before the
+row it protects — not at create time. From the moment a row exists, that name's
+absence must not be read as proof: the container does not exist *yet*, and a
+confirmation pass holds no guard, so it would release the row as gone while the
+phase is still inside its gate on its way to creating it. A pin with no row is
+harmless; a row with no pin is the window.
+
+**And what it pins is not an instant.** `_record_container` writes
+`ABSENCE_NOT_YET_ISSUED`, and it stays up until Docker *answers*. The
+distinction is the difference between two claims:
+
+- *a request is in flight and may complete late* — a bet on a window, which is the
+  residual design D10 already accepts;
+- *nothing has been asked yet* — not a bet at all. The phase holding the gate is
+  still going to ask, so no amount of elapsed time makes the absence mean
+  anything. A phase stalled past any window (with its renewer stalled too, so the
+  lease lapses) must not become a settled absence and have its row released just
+  before it issues the create.
+
+**An answer is what starts the clock — not the asking.** Converting the sentinel
+"immediately before the request goes out" is still *before* it: a thread
+descheduled between those two statements leaves an instant expiring while
+nothing has been asked, which is the same defect in a narrower window, and a
+window is not a fix. So the answer moves the pin: cleared on exit 0, replaced by
+`now + BUILD_SETTLE_S` on a non-zero exit or a timeout (the request *was*
+issued, so a late create is the bounded residual). The sentinel is deliberately
+not shaped like an instant, and `absence_believable` refuses it explicitly
+rather than relying on string ordering to do it by accident.
+
+**A sentinel is immune to elapsed time, so it needs an owner — and it has
+three, one per way of losing the last one.** Its meaning is "a phase holds this run's gate and has not asked
+yet", which is true while that phase exists and a lie the moment nothing can
+ask any more. Left standing it refuses *every* absence for ever: cleanup could
+never confirm, the job would sit in `CLEANUP_BLOCKED`, and the lock, the lane and
+the reservation would stay held until an operator ran `force-release`. So every
+way of losing the owner is covered, and all three convert to
+`now + BUILD_SETTLE_S` via `Store.settle_unissued_creates`:
+
+- **the phase abandons the create** — `Runner._unacked_create`, a context manager
+  wrapping the record *and* the create in both phases. A **finalizer, not a
+  longer list of `except` clauses**: `subprocess.run` raises `OSError` when a
+  fork or exec never got as far as a Docker request, a DB call can raise, and the
+  next exception this code learns about has not been written yet. Enumerating
+  them means the next one is a stall. It converts the sentinel only, so an
+  acknowledged create passes through cleared and an answered-ambiguous one keeps
+  the instant its answer justified.
+- **the conversion itself fails** — `Runner.retry_unsettled`, drained by the
+  reaper each pass, before `resolve_blocked` (while the sentinel stands every
+  absence is unbelievable, so a confirmation pass ahead of the conversion is a
+  wasted pass). The finalizer must not raise — it runs in a `finally` with the
+  real diagnosis in flight — but **swallowed is not abandoned**: nothing forces a
+  restart, so a DB failure that clears a second later would otherwise leave the
+  pin ownerless for the life of the daemon, and the pin is immune to time. The
+  queue is in memory because the store is what just failed; the pin it refers to
+  is durable, and a process that dies before a retry lands hands it to the owner
+  below. A pair leaves the queue only on success — including the store reporting
+  nothing left to convert, since another owner getting there first is the same
+  outcome.
+- **the process dies with the pin up** — `Recovery._settle_unissued`, before the
+  first confirmation of each re-adopted run. A restart is the one moment when "no
+  phase can issue this create" is true of every role at once.
+
+Three details of the conversion are load-bearing:
+
+- **an instant, not a clear.** A crash cannot distinguish "never asked" from
+  "asked, and the answer died with the client", and in the second case the
+  daemon may still bind the name. The ambiguity is kept, in the bounded form
+  that repeated `docker rm -f` terminates, rather than resolved by assumption in
+  the direction that frees a mutex.
+- **the window starts at the restart.** The instant is a bet about a request that
+  may be in flight *now*; the time qfd spent down is not time anything was
+  watching.
+- **an instant already running is left alone.** It was written by an answer, so
+  its window is already elapsing; rewriting it on every pass would mean a crash
+  loop, or a retry, never settles anything.
+
+**A resolution does not overwrite a cause.** `resolve_blocked` used to set
+`error_class=reclaimed_after_block`, which says how a job got unstuck and throws
+away why it died (`hold_deadline_expired`, `kill_unconfirmed`, `mutex_lost`) —
+the half triage actually needs. The cause now survives and the resolution is
+recorded as an `unblocked_at` pin, which is what pins are for.
+
+**Startup recovery hands back a hold only when something must keep asking.** A
+recorded inventory means *forced cleanup*, not adoption, whatever state the job
+was in — because nothing in a restarted process can resume one of these runs: the
+`docker start --attach` client died with the old process, so the exit status is
+gone, the logs are no longer pumped, the watchers are not sampling and the
+handoff will never run. A hold handed back there would be driven by **nobody**,
+and an undriven hold is not merely useless — the lease lapses, `reclaim` finds a
+live container and renews it, and every later sweep does the same while the
+mutex, the lane and the reservation stay held. `finish` still releases only on
+confirmed shutdown, so a hold does come back when the job ends
+`CLEANUP_BLOCKED`; the retained descriptor is the witness to which happened.
+
+Whether that container is `running` or merely `created` — the crash window
+between `docker create` and `docker start` — makes no difference here, which is
+why recovery does not need to tell them apart: the kill escalation ends in
+`docker rm -f`, so both become a positive absence and both confirm.
+
+**The persisted hold deadline outranks every probe outcome.** In `Store.reclaim`
+the deadline is checked *above* the probe branches, not inside one: past
+`hold_deadline_at`, a job with a recorded inventory goes to `CLEANUP_BLOCKED`
+(`error_class=hold_deadline_expired`) whether Docker said *alive*, *unknown*, or
+*absent-but-not-yet-settled*. A lapsed lease means nothing is driving the run, and
+renewing it for ever and re-asking about it for ever are the same stall.
+
+The unknown case is the one that makes the placement matter. Leaving such a job
+`RUNNING` was a stall **with no escape**: `resolve_blocked` lists
+`CLEANUP_BLOCKED` only, so the automatic path never saw it, and `force-release`
+refuses anything that is not `CLEANUP_BLOCKED`, so the operator could not act
+either. `CLEANUP_BLOCKED` is the state that keeps the lock, the lane and the
+reservation held *and* is visible to both paths — fail-closed and reachable, which
+is the combination that matters. The reaper's `resolve_blocked` has a Docker
+client (unlike `reclaim`) and kills and confirms in the same sweep when the daemon
+answers; when it does not, the two-pass `force-release` is the way out.
+
+One exemption: a *settled* absence still releases and fails cleanly, because it
+has a better answer available than "blocked".
+
+`force-release` **revokes first, then re-verifies, and may take two passes.**
+The long flag is an assertion about the past: the operator checked, then typed,
+and the request may then have waited on the phase guard — which is long enough
+for a phase that had already won the gate to create and start a container. So
+revocation comes first (nothing further can start), and the recorded inventory
+is then re-read under the guard and put to Docker:
+
+- **positive "live"** — refused, every time. Evidence beats an assertion, and no
+  amount of re-asserting launders it. The run stays `CLEANUP_BLOCKED` with its
+  descriptor held, and ordinary confirmation resolves it without anyone's help.
+- **unknown** — this is what the flag exists to override, but it cannot be
+  overridden against an inventory that could still have grown, because Docker's
+  silence is exactly when nobody can see that it did. So the **first** call
+  freezes (that is the revoke) and refuses with the names to check; the
+  **second** answers from an inventory nothing could have changed. With no
+  registered hold there is no phase gate to win, so the inventory is already
+  frozen and one call is enough.
+- **positively absent** — released; no assertion was needed.
+
+The event still records who said so.
+
+**Every phase is bounded by an instant, not a duration.** The hold deadline is
+persisted (`hold_deadline_at`), and each phase derives its own budget by
+subtracting the clock:
+
+- source work gets ONE absolute deadline — `min(hold deadline, now +
+  SETUP_TEARDOWN_ALLOWANCE_S)` — passed as an argument to `resolve` and
+  `add_worktree`, so every git command inside them takes
+  `min(per-command ceiling, time left)`. A per-command ceiling alone is not a
+  bound: `resolve` runs several commands, and five of them each honouring 300s
+  is 1500s of held mutex. The deadline is never instance state, because two
+  light workers share one `Source` and would overwrite each other's budget.
+- every Docker call in the build phase takes `min(cap, time left)`. Watch for
+  falsy zero here: `timeout or 60` silently promoted a correctly-computed budget
+  of 0 back to a full minute.
+- the candidate, the build and the handoff each REFUSE a spent budget rather
+  than flooring it to one second. A one-second grant past an expired deadline is
+  the same overrun, just smaller.
+
+`LOCK_WAIT_S` must exceed the deadline *plus* the kill-confirmation window
+because the dispatcher **holds the lock past its deadline** rather than release
+it over a kill it could not confirm. So the nightly run can still skip a night.
+That is deliberate: a skipped nightly run is recoverable, a released lock over
+live work is not.
+
+## The token, and who rotates it
+
+`/etc/qf-dispatch/github-token`, 0400 `qfd:qfd`, a `Contents: read`-only fine
+grained token for `lotas/qf-research`. Installed by `phase2-setup.sh token
+<file>`, which verifies read works **and write does not** before accepting it.
+
+It never appears in argv, in a URL, or in a log: `source.py` hands git a
+credential helper that reads the file at the moment git asks for the password.
+
+**Rotation has no owner yet** — see open decision 11 in
+`auto-research-loop-design.md` §16. NC14 proves the token cannot write; nothing
+yet proves it is current.
+
+## Updating the dispatcher requires a restart
+
+`qfd` **executes from the trusted checkout**, so new code is not picked up by a
+`git pull` alone:
+
+```sh
+sudo ./host/phase2-setup.sh mirror-refresh   # fetch + hard reset + restart
+```
+
+Two consequences worth remembering: predictions and events already written are
+immutable (the chain would stop verifying otherwise), and a restart re-runs
+startup reconciliation, which re-acquires the training lock for every
+non-terminal job **before** any cleanup.
+
+## Refreshing the promoted `env/` manifests
+
+`host/dispatcher/env/pyproject.toml` and `env/uv.lock` are **human-promoted
+copies** of the trainer's manifests. A pinned lock still lets an sdist run build
+code, so the pins have to be ones a human reviewed.
+
+Refreshing them is a **reviewed act with a diff, never a sync**:
+
+```sh
+diff -u host/dispatcher/env/pyproject.toml trainer/pyproject.toml
+diff -u host/dispatcher/env/uv.lock        trainer/uv.lock
+# read the diff, then, deliberately:
+cp trainer/pyproject.toml trainer/uv.lock host/dispatcher/env/
+```
+
+`test_image.py::TestPromotedManifestsMatchTheTrainer` fails when they diverge.
+That test is a **tripwire saying a review is due** — it does not copy anything.
+Changing either file changes the image content key, so the next job rebuilds.
+
+## Order of operations (the parts that are not interchangeable)
+
+```sh
+sudo ./host/phase2-setup.sh discover        # fails, not warns, on a bad invariant
+sudo ./host/phase2-setup.sh dispatch-user
+sudo ./host/phase2-setup.sh locks
+sudo ./host/phase2-setup.sh cron-lock-path  # writes the migration marker
+sudo ./host/phase2-setup.sh builder-probe   # measures cancellation timing
+sudo ./host/phase2-setup.sh runs-dir
+sudo ./host/phase2-setup.sh pin-base        # prints a FROM line to commit
+sudo ./host/phase2-setup.sh token /path/to/token
+sudo ./host/phase2-setup.sh install
+sudo ./host/phase2-setup.sh verify
+```
+
+`locks` and `cron-lock-path` come **before** `install`: `qfd` refuses to start
+without the migration marker, and an unmigrated nightly script (`flock -n`) plus
+a dispatcher holding `LOCK_SH` means silently skipped nightly runs.
+
+`builder-probe` **fails** if daemon-side build cancellation exceeds
+`QFD_BUILD_SETTLE_S`. The documented response is to move building out of `qfd`
+(design D10) — *not* to raise the window.
+
+## Two instruments that do NOT detect a leaked file handle
+
+Both were tried here and both reported success over a live leak:
+
+- **`-W error::ResourceWarning`.** A ResourceWarning raised while a file object
+  is being *finalised* becomes an "Exception ignored" **unraisable** exception,
+  not a test failure. 354 warning-strict tests passed while two log handles
+  leaked on every gated refusal path.
+- **Scanning `/proc/self/fd`.** Under CPython refcounting the writer becomes
+  unreachable as the exception unwinds the frame, so the fd is already gone by
+  the time the assertion runs. The leak is still real — a retained traceback,
+  which both `unittest` and `log.exception` keep, extends the window
+  arbitrarily — but this check cannot see it.
+
+What works: hold a reference to every writer (`TrackingWriter` in
+`tests/test_review_fixes.py`) and assert each was **closed**. Removing the
+refcounting rescue turns "was it closed" into a question with a deterministic
+answer.
+
+## Running the tests
+
+The dispatcher's own suite needs no host, no privileges, no Docker and no
+network:
+
+```sh
+cd tools/queue-forecasting/host/dispatcher
+PYTHONPATH=. python3 -m unittest discover -s tests
+```
+
+`PYTHONPATH=.` is required: the tests import `spec`, `store` and friends as
+top-level modules, and `unittest discover` only puts the *start* directory on
+`sys.path`.
+
+**Two things the unit suite cannot answer**, because they are properties of the
+Docker CLI rather than of this code, so `nc-suite-phase2.sh` NC16 asks a real
+daemon on the host:
+
+- `docker start --attach` must relay the *container's* exit status. If it did
+  not, every failing candidate would read as `SUCCEEDED` — a silent regression,
+  which is the only kind worth building a gate for.
+- `--rm` is now set at create time, so removal must still happen; a surviving
+  name would collide with the next incarnation of it.

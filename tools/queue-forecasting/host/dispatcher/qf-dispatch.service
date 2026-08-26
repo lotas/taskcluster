@@ -1,0 +1,93 @@
+[Unit]
+Description=Queue-forecasting trusted experiment dispatcher
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=qfd
+Group=qfd
+# qfheavy is listed explicitly, not left to initgroups: qfd MUST be able to open
+# the 0660 root:qfheavy lock inode for WRITE and to unlink a stale marker in the
+# 2770 root:qfheavy intent directory. Both are startup preconditions, so a
+# missing membership is a refusal to start rather than a silent loss of the
+# mutex -- but naming it here means the unit states its own requirement.
+SupplementaryGroups=docker qfrun qfclient qfheavy
+ExecStart=/usr/bin/python3 /srv/queue-forecasting/tools/queue-forecasting/host/dispatcher/qfd.py
+Environment=QFD_TRUSTED_DIR=/srv/queue-forecasting/tools/queue-forecasting/host/dispatcher
+Environment=QFD_STATE_DIR=/var/lib/qf-platform
+Environment=QFD_RUNS_DIR=/var/lib/qf-runs
+Environment=QFD_REMOTE=https://github.com/lotas/qf-research
+Environment=QFD_TOKEN_FILE=/etc/qf-dispatch/github-token
+Environment=QFD_LOCK_FILE=/var/lib/qf-locks/heavy-training.lock
+Environment=QFD_INTENT_DIR=/var/lib/qf-locks/intent.d
+Environment=QFD_BUILD_LOCK=/var/lib/qf-platform/build.lock
+Environment=QFD_BUILD_TIMEOUT_S=1800
+Environment=QFD_BUILD_LOCK_WAIT_S=900
+Environment=QFD_BUILD_SETTLE_S=30
+Environment=QFD_JOB_HOLD_DEADLINE_S=7800
+Environment=QFD_KILL_CONFIRM_S=300
+Environment=QFD_STOP_TIMEOUT_S=10
+# One QFD_SOCKET only. The plan's revision 12 text set it twice -- first
+# /run/qf-dispatch/sock, then /run/qf-dispatch/client/sock -- and systemd keeps
+# the last, so the first was dead but read as if it were the value.
+Environment=QFD_SOCKET=/run/qf-dispatch/client/sock
+Environment=QFD_ADMIN_SOCKET=/run/qf-dispatch/admin/sock
+Environment=QFD_ADMIN_UID=%%DEPLOY_UID%%
+Environment=QFD_REAP_INTERVAL_S=60
+Environment=QFD_SETUP_TEARDOWN_ALLOWANCE_S=600
+Environment=QFD_MARKER_STALE_MARGIN_S=900
+Environment=QFD_LOCK_MIGRATED_MARKER=/etc/qf-dispatch/lock-migrated
+Environment=QFD_ADMITTED_MEM_BUDGET_MB=22528
+Environment=QFD_TIMEOUT_MAX_S=3600
+Environment=QFD_LOCK_WAIT_S=9000
+Environment=QFD_IMAGE_BUILD_MEM_MB=2048
+Environment=QFD_LIGHT_WORKERS=2
+Environment=QFD_LOG_CAP_MB=16
+Environment=QFD_ARTIFACT_CAP_MB=2048
+Environment=QFD_HANDOFF_TIMEOUT_S=120
+Environment=QFD_DISK_FLOOR_GB=20
+Environment=QFD_QUEUED_CAP_PER_UID=20
+# The lease is much shorter than a job may run (TIMEOUT_MAX is 3600), so the
+# runner renews at a third of it; without renewal the reclaimer eats live work.
+Environment=QFD_LEASE_S=300
+RuntimeDirectory=qf-dispatch qf-dispatch/client qf-dispatch/admin
+# 0711 on the parent: TRAVERSABLE but not listable. Revision 9 had 0750 qfd:qfd,
+# which made BOTH sockets unreachable -- research, deploy, qfclient and qfheavy
+# alike -- because chowning a socket does not grant traversal of its directory.
+# The whole control plane was unusable and nothing in the acceptance list would
+# have caught it, since every check assumed a reachable socket.
+RuntimeDirectoryMode=0711
+StateDirectory=qf-platform qf-runs
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=no
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/qf-platform /var/lib/qf-runs /var/lib/qf-locks
+# Leave nothing behind on a clean stop: an orphaned heavy container would keep
+# 22g while its flock died with the process (design 4.2). Both roles carry
+# qf.run_id, so this covers the handoff as well as the candidate.
+ExecStopPost=/usr/bin/env bash -c 'docker ps -q --filter label=qf.run_id | xargs -r docker stop -t 10'
+# PrivateTmp is off for defence in depth only: the lock now lives under
+# /var/lib, so a private /tmp would not break it. It stays off because a future
+# reader who moves the lock back to /tmp would otherwise get two private inodes
+# and no mutex, silently -- which is what two 22g trainers on a ~29g host cost
+# in 2026-07, twice.
+#
+# The real requirements are elsewhere and are checked at startup:
+#   - ONE inode. flock is per inode, so `LOCK_FILE` must name the same file the
+#     deploy user's cron entry names -- hence QFD_LOCK_MIGRATED_MARKER.
+#   - Shared PERMISSION, not just a shared namespace: daily_walk_forward.sh:213
+#     opens the lock for WRITE (`exec 9>`), so the inode is 0660 root:qfheavy.
+#   - qfheavy contains qfd and the deploy user, NEVER research: qfclient does
+#     contain research, which would let the agent hold the mutex indefinitely.
+PrivateTmp=no
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

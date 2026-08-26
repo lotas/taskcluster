@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily prune of queue-forecasting run directories (design D13)
+
+[Timer]
+OnCalendar=daily
+# Away from the nightly walk-forward window, and randomised so a restart storm
+# does not align every host.
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
