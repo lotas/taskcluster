@@ -538,17 +538,25 @@ nc13() {
   assert_eq "NC13 the selftest job succeeded" "SUCCEEDED" "$final"
 
   # An exit code alone must not certify it: grep the run's own output.
-  out="$(as "$RESEARCH_USER" "qf logs $rid" 2>/dev/null)"
+  #
+  # stderr is NOT discarded. It was, and that hid the reason `qf logs` could
+  # return nothing: runs_dir was not traversable by the client, so the read
+  # failed and the client reported it as a missing file. The message is the only
+  # thing that distinguishes "the suite was clean" from "we never read it".
+  out="$(as "$RESEARCH_USER" "qf logs $rid")"
+  # THE SUMMARY FIRST, and the FAIL/VOID grep only after it. In the other order
+  # an EMPTY read reports "no FAIL or VOID line" -- the comfortable answer --
+  # before anything establishes that there was output to grep at all.
+  if ! printf '%s' "$out" | grep -q '== NC13: pass='; then
+    void "NC13 no summary line -- the suite may not have run, and the FAIL/VOID scan below would have passed vacuously"
+    return
+  fi
+  ok "NC13 the in-sandbox suite actually ran to its summary"
   if printf '%s' "$out" | grep -qE '^(FAIL|VOID) '; then
     bad "NC13 the in-sandbox suite reported FAIL/VOID lines"
     printf '%s\n' "$out" | grep -E '^(FAIL|VOID) ' | sed 's/^/    /'
   else
     ok "NC13 no FAIL or VOID line in the in-sandbox output"
-  fi
-  if printf '%s' "$out" | grep -q '== NC13: pass='; then
-    ok "NC13 the in-sandbox suite actually ran to its summary"
-  else
-    void "NC13 no summary line -- the suite may not have run"
   fi
 }
 

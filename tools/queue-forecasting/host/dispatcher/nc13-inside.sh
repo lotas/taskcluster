@@ -35,13 +35,26 @@ PY
 [ -d /run ] && ok "canary: /run exists" || void "canary: /run exists"
 [ -S /var/run/docker.sock ] && bad "docker socket present" || ok "no docker socket"
 
-# Source mount is read-only, and writable output exists
-[ -r /app/trainer/pyproject.toml ] \
+# Source mount is read-only, and writable output exists.
+#
+# The canary asks whether the MOUNT is there and readable, not whether some
+# particular file is. Naming `pyproject.toml` made this canary a statement about
+# qf-research's directory layout: the repository keeps it elsewhere, so the
+# canary voided on a sandbox that was in fact working perfectly, and the void
+# read as a containment failure.
+[ -d /app/trainer ] && [ -n "$(ls -A /app/trainer 2>/dev/null)" ] \
   && ok "canary: source mount readable" || void "canary: source mount readable"
 ( : > /app/trainer/.nc13 ) 2>/dev/null \
   && bad "source mount is writable" || ok "source mount is read-only"
-( : > /app/trainer/data/.nc13 ) 2>/dev/null \
-  && bad "trainer/data is writable" || ok "trainer/data is not writable"
+# There WAS a second write here, to /app/trainer/data. It is gone rather than
+# canaried, because it is an assertion that cannot fail. `:ro` applies to the
+# whole subtree, so the write at the mount root above already tests the mount
+# flag; the only way `data/` could differ is a separate rw bind mount over it,
+# and `sandbox._check_extra_dest` allows extra destinations ONLY at /artifacts
+# or under /trusted/ -- so that configuration cannot be built. What the check
+# actually did was pass for whichever reason applied, EROFS or ENOENT, and count
+# as evidence either way. The allowlist is where this property is really
+# enforced, and `tests/test_sandbox.py` is where it is really tested.
 ( : > /out/.nc13 ) 2>/dev/null \
   && ok "canary: /out is writable" || void "canary: /out is writable"
 
