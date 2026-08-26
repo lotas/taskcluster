@@ -704,32 +704,39 @@ nc15() {
   echo "== NC15: disk containment =="
   local sha; sha="$(head_sha)"
 
-  # Canary: a well-behaved job's artifacts land at 0640 qfd:qfclient and are
-  # readable as research. Without this the refusals could be measuring a handoff
-  # that never produced anything.
-  local good; good="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha")"
-  wait_terminal "$good" 1800 >/dev/null
-  local art="$RUNS_DIR/$good/artifacts"
-  if [ -d "$art" ] && [ -n "$(ls -A "$art" 2>/dev/null)" ]; then
-    local mode owner group
-    mode="$(stat -c '%a' "$art"/* | head -1)"
-    owner="$(stat -c '%U' "$art"/* | head -1)"
-    group="$(stat -c '%G' "$art"/* | head -1)"
-    assert_eq "NC15 canary: artifact mode" "640" "$mode"
-    assert_eq "NC15 canary: artifact owner" "qfd" "$owner"
-    assert_eq "NC15 canary: artifact group" "qfclient" "$group"
-    canary_as "$RESEARCH_USER" "NC15 canary: research can read an artifact" \
-      "cat $art/* > /dev/null"
-  else
-    void "NC15 canary: no artifacts were produced"
-  fi
-
-  # The hostile-job clauses need the Task 13 fixture branch.
+  # The CANARY needs the fixture branch too, and that is a correction rather
+  # than a tidy-up. It used to submit a plain `test` job and ask whether
+  # artifacts appeared -- but an ordinary pytest run writes nothing to /out, and
+  # the 2a allowlist is `result.json` and nothing else, so the canary voided on a
+  # perfectly working handoff. Producing an artifact takes a fixture that writes
+  # one.
   if [ ! -f "$NC12_SHA_FILE" ]; then
-    void "NC15 hostile-job clauses need the Task 13 fixture branch"
+    void "NC15 needs the Task 13 fixture branch ($NC12_SHA_FILE); missing is VOID, not skip"
   else
     local fx; fx="$(tr -d '[:space:]' < "$NC12_SHA_FILE")"
-    local rid final
+    local rid final art
+
+    # Canary: a well-behaved job's artifact lands at 0640 qfd:qfclient and is
+    # readable as research -- only true if the pre-create / --group-add / chmod
+    # sequence of Task 6 is right. Without it every refusal below could be
+    # measuring a handoff that never produced anything.
+    local good; good="$(submit_as "$RESEARCH_USER" --kind test --sha "$fx" \
+      --path research/experiments/artifact_good.py)"
+    wait_terminal "$good" 1800 >/dev/null
+    art="$RUNS_DIR/$good/artifacts"
+    if [ -d "$art" ] && [ -n "$(ls -A "$art" 2>/dev/null)" ]; then
+      local mode owner group
+      mode="$(stat -c '%a' "$art"/* | head -1)"
+      owner="$(stat -c '%U' "$art"/* | head -1)"
+      group="$(stat -c '%G' "$art"/* | head -1)"
+      assert_eq "NC15 canary: artifact mode" "640" "$mode"
+      assert_eq "NC15 canary: artifact owner" "qfd" "$owner"
+      assert_eq "NC15 canary: artifact group" "qfclient" "$group"
+      canary_as "$RESEARCH_USER" "NC15 canary: research can read an artifact" \
+        "cat $art/* > /dev/null"
+    else
+      void "NC15 canary: no artifacts were produced"
+    fi
 
     rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$fx" \
       --path research/experiments/log_flood.py)"
@@ -756,6 +763,57 @@ nc15() {
     else
       bad "NC15 the run directory grew past its bound (${used}MiB)"
     fi
+    # Reclaim the flood FILE only, after the assertion has read its size. The
+    # prune timer is 90 days, and leaving ~2GiB of deliberate garbage on a host
+    # whose disk floor gates admissions would mean this suite degrades the thing
+    # it just measured. Logs, artifacts and the event record all stay.
+    rm -f "$RUNS_DIR/$rid/out/nc15-flood.bin"
+
+    # HOSTILE MODES. A candidate can leave its artifact 0600, which qfd -- owner
+    # of the directory but not of the file -- can neither read nor chmod. The
+    # handoff runs as the candidate's own uid precisely so it always can
+    # (design D9), so this must still yield a readable 0640 copy.
+    rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$fx" \
+      --path research/experiments/artifact_mode_0600.py)"
+    final="$(wait_terminal "$rid" 1800)"
+    assert_eq "NC15 a 0600 artifact still SUCCEEDS" "SUCCEEDED" "$final"
+    art="$RUNS_DIR/$rid/artifacts/result.json"
+    if [ -s "$art" ]; then
+      assert_eq "NC15 the 0600 artifact was normalised to 0640" "640" \
+        "$(stat -c '%a' "$art")"
+      canary_as "$RESEARCH_USER" "NC15 research can read the 0600 artifact" \
+        "cat $art > /dev/null"
+    else
+      bad "NC15 a 0600 artifact produced no readable copy"
+    fi
+
+    # HOSTILE FILE TYPES. Both must be refused, and -- the part worth measuring
+    # -- refused by the TYPE GUARD rather than by the timeout. `wc -c` and `cat`
+    # on a FIFO both block for ever, so if the guard were removed these would
+    # wedge until HANDOFF_TIMEOUT_S. Asserting the class AND the elapsed time
+    # separately is what distinguishes "the guard worked" from "the backstop
+    # caught it": the plan's text expected the FIFO case to terminate AT the
+    # timeout, which would mean the guard had not run.
+    for fixture in artifact_symlink artifact_fifo; do
+      rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$fx" \
+        --path "research/experiments/$fixture.py")"
+      final="$(wait_terminal "$rid" 1800)"
+      assert_eq "NC15 $fixture is FAILED" "FAILED" "$final"
+      assert_eq "NC15 $fixture is refused as a bad type" "handoff_bad_type" \
+        "$(field_of "$rid" error_class)"
+      local wall; wall="$(field_of "$rid" wall_s)"
+      # Integer compare on a float field: cut at the point.
+      if [ -n "$wall" ] && [ "${wall%%.*}" -lt "$HANDOFF_TIMEOUT_S" ]; then
+        ok "NC15 $fixture was refused by the type guard, not the timeout (${wall%%.*}s < ${HANDOFF_TIMEOUT_S}s)"
+      else
+        bad "NC15 $fixture took ${wall}s, at or past HANDOFF_TIMEOUT_S; the type guard did not do the refusing"
+      fi
+      if [ -s "$RUNS_DIR/$rid/artifacts/result.json" ]; then
+        bad "NC15 $fixture still produced artifact CONTENT"
+      else
+        ok "NC15 $fixture copied nothing into artifacts/"
+      fi
+    done
   fi
 
   # Admission floor: with the floor above actual free space, nothing is admitted.

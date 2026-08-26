@@ -736,6 +736,50 @@ daemon on the host:
 - **What the CLI *says* about a container that is gone.** This one bit us for
   real on 2026-08-26 (Docker 29.7.2), which is why the third bullet exists.
 
+## The `nc12-poisoned-manifest` branch is a FIXTURE, not litter
+
+`qf-research` carries a permanent branch called `nc12-poisoned-manifest`, and
+`host/nc12-sha.txt` pins the exact commit the suite runs. **Do not delete either
+as stale.** Without them NC12 and every hostile-job clause of NC15 report VOID —
+by design, so that a missing fixture is visible rather than silently dropping two
+negative controls.
+
+The branch deliberately contains a `trainer/pyproject.toml` that cannot be built:
+a `build-backend` that does not exist and two requirements that do not exist.
+That is the control. NC12 asserts the trainer image is built from the promoted
+manifests in `dispatcher/env/` and never from the research tree, so poisoning the
+research manifest must change nothing — the image content key stays
+byte-identical and neither package reaches the image. It fails loudly rather than
+harmlessly on purpose: a backend that resolved to something benign would let the
+real regression pass unnoticed.
+
+It also carries six fixtures under `research/experiments/`, each a pytest module
+with one `test_*` function (the suite runs them through the ordinary `test`
+path, and pytest collects an explicitly named file but still needs a matching
+function name). Regenerate them with `./nc-fixtures-phase2.sh <qf-research
+checkout>`, which is idempotent and never commits or pushes.
+
+Three corrections to the plan's NC15 text came out of writing them, and the code
+is right in each case:
+
+- The plan says **two** scripts; there are **six**. NC15's canary asserts that a
+  well-behaved job's artifact lands at 0640 `qfd:qfclient` — but an ordinary
+  pytest run writes nothing to `/out`, so the canary voided on a working handoff
+  and every refusal it guards proved nothing. `artifact_good.py` is that canary.
+  The other two additions are the symlink and FIFO cases, which Task 13's own
+  text does ask for.
+- The plan names `predictions.parquet`. The 2a allowlist is **`result.json` and
+  nothing else** (`Runner._artifact_allowlist`; 2b widens it with typed
+  contracts). A fixture writing `predictions.parquet` would produce no artifact
+  at all, and the run would read as a handoff failure for the wrong reason.
+- The plan expects the FIFO case to terminate **at** `QFD_HANDOFF_TIMEOUT_S`. It
+  should not: `handoff-inside.sh` tests the file type before it reads, so a FIFO
+  is refused as `handoff_bad_type` in milliseconds. The timeout is the backstop
+  for a world where that guard is gone. The suite therefore asserts the class
+  *and* that the elapsed time is well inside the timeout — otherwise "it
+  terminated" cannot distinguish the guard doing its job from the backstop
+  catching a hang.
+
 ## Findings for `qf-research` (Task 12 output)
 
 Recorded here rather than fixed in the platform, per the plan: a trainer test
