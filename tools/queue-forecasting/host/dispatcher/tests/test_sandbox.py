@@ -216,7 +216,7 @@ class TestEntrypoint(unittest.TestCase):
         self.assertEqual(
             sandbox.entrypoint_for(eff),
             ["/opt/qfenv/bin/python", "-m", "pytest", "-p", "no:cacheprovider",
-             "-q", "tests"])
+             "-q", "trainer/tests"])
 
     def test_the_only_dash_p_comes_from_trusted_code(self):
         # -p loads plugins from the untrusted tree, so it is absent from the

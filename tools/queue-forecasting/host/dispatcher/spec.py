@@ -99,6 +99,10 @@ def _check_paths(paths):
     return list(paths)
 
 
+# Relative to the worktree root, which is the mount point.
+DEFAULT_TEST_PATHS = ["trainer/tests"]
+
+
 def _check_test_args(args):
     if not isinstance(args, dict):
         _err("args must be an object")
@@ -106,7 +110,13 @@ def _check_test_args(args):
     if unknown:
         _err(f"unknown args key(s) for kind test: {sorted(unknown)}")
 
-    paths = _check_paths(args.get("paths", ["tests"]))
+    # `trainer/tests`, not `tests`: the worktree ROOT is what gets mounted (at
+    # /app/trainer), and qf-research keeps its suite one level down. The old
+    # default resolved to a directory that does not exist, so an omitted --path
+    # produced pytest exit 4 -- a usage error that used to be reported as a
+    # failing experiment. A default that is wrong for the only repository this
+    # dispatcher can run is worse than no default.
+    paths = _check_paths(args.get("paths", DEFAULT_TEST_PATHS))
 
     k = args.get("k")
     if k is not None:

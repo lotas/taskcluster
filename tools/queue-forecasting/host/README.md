@@ -736,6 +736,42 @@ daemon on the host:
 - **What the CLI *says* about a container that is gone.** This one bit us for
   real on 2026-08-26 (Docker 29.7.2), which is why the third bullet exists.
 
+## Findings for `qf-research` (Task 12 output)
+
+Recorded here rather than fixed in the platform, per the plan: a trainer test
+that fails inside the sandbox is a finding, and the fix belongs in
+`qf-research`, not in a looser sandbox.
+
+First full `--kind test` run: **220 passed, 5 failed, 1 skipped** in 197s.
+
+All five failures are one bug, and it is a real one rather than a sandbox
+artefact. `trainer/tests/test_ablation_configs.py` and
+`trainer/tests/test_config_qctx.py` call `load_config(Path("configs/..."))` with
+a **relative** path, so they resolve against the process CWD. That makes them
+pass only when pytest is invoked from whichever directory happens to sit above
+`configs/`; run from the repository root -- which is what the dispatcher mounts
+and what `pytest trainer/tests` implies -- every one of them raises
+`FileNotFoundError`.
+
+The fix is to anchor the paths to the test file rather than to the caller's CWD:
+
+```python
+CONFIGS = Path(__file__).resolve().parents[1] / "configs"
+c = load_config(CONFIGS / "wait_qctx_a_capacity.yaml")
+```
+
+That is correct wherever `configs/` actually lives and from whatever directory
+pytest is invoked, which is the property the current code lacks. Nothing about
+the sandbox is involved: there is no network call, no write, and no missing
+credential in any of the five.
+
+**One platform change did come out of this run**, and it is not a workaround:
+`spec.DEFAULT_TEST_PATHS` was `["tests"]`, which does not exist in the only
+repository this dispatcher can run -- the worktree ROOT is the mount point and
+the suite is a level down. It is now `["trainer/tests"]`. A default that is wrong
+for the sole consumer is worse than no default, because the failure it produces
+(pytest exit 4) looks like a broken experiment rather than a missing argument.
+
 ## A probe must ask a question whose ANSWER is positive
 
 `is_running` used to establish absence by finding the string `No such object` in

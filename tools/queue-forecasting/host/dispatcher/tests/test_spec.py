@@ -22,7 +22,11 @@ class TestTopLevel(unittest.TestCase):
         self.assertEqual(eff["timeout_s"], 1800)
         self.assertEqual(eff["mem_limit"], "4g")
         self.assertEqual(eff["cpus"], 4.0)
-        self.assertEqual(eff["args"]["paths"], ["tests"])
+        # `trainer/tests`, because the worktree ROOT is the mount point and
+        # qf-research keeps its suite one level down. The first live `--kind
+        # test` submission without --path came back pytest exit 4 on the old
+        # default.
+        self.assertEqual(eff["args"]["paths"], ["trainer/tests"])
         self.assertEqual(eff["lane"], "light")   # derived, not supplied
 
     def test_unknown_top_level_key_is_refused(self):
@@ -168,7 +172,8 @@ class TestHash(unittest.TestCase):
         a = spec.spec_hash(spec.normalize(base()))
         b = spec.spec_hash(spec.normalize(base(timeout_s=1800,
                                                mem_limit="4g", cpus=4.0,
-                                               args={"paths": ["tests"]})))
+                                               args={"paths":
+                                                     ["trainer/tests"]})))
         self.assertEqual(a, b)
 
     def test_key_order_does_not_change_the_hash(self):
