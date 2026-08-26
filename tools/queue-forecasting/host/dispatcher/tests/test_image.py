@@ -111,16 +111,22 @@ class TestBasePinning(ImageCase):
         with self.assertRaises(image.ImageError):
             self.key()
 
-    def test_the_shipped_dockerfile_is_wellformed_but_unpinned_until_setup(self):
-        # The committed file carries REPLACE_ME on purpose; Task 11 pastes the
-        # real digest. This asserts the placeholder is detected rather than
-        # silently building something.
+    def test_the_shipped_dockerfile_is_pinned_by_digest(self):
+        # This assertion INVERTED when Task 11 was performed: `pin-base` printed
+        # a real digest, it was committed, and the shipped file is now pinned.
+        # Keeping the old expectation would have meant a test asserting the
+        # deployment had not happened.
+        #
+        # Still worth a test, in the new direction: it catches a revert to the
+        # placeholder and a hand-edit back to a floating tag, either of which
+        # would move the base out from under the content key. The refusal path
+        # does not depend on what the repo ships -- the four cases above cover it
+        # with synthetic input.
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(here, "trainer-env.Dockerfile"), "rb") as fh:
             shipped = fh.read()
-        self.assertIn(b"@sha256:", shipped)
-        with self.assertRaises(image.UnpinnedBase):
-            image.base_digest(shipped)
+        digest = image.base_digest(shipped)
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
 
 class TestBuildContext(ImageCase):

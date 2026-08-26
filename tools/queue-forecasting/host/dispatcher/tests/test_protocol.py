@@ -862,3 +862,91 @@ class TestRunId(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCheckoutCommit(unittest.TestCase):
+    """Provenance has to be read from the checkout, not stamped at install time.
+
+    A stamped value goes stale the moment someone pulls and restarts by hand,
+    and a stale sha ends the question "is this the reviewed code?" with a wrong
+    answer, where "unknown" at least prompts it.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = self.dir.name
+        self.git = os.path.join(self.root, ".git")
+        os.makedirs(os.path.join(self.git, "refs", "heads"))
+        self.sha = "b" * 40
+
+    def head(self, text):
+        with open(os.path.join(self.git, "HEAD"), "w") as fh:
+            fh.write(text)
+
+    def branch(self, name, sha):
+        path = os.path.join(self.git, "refs", "heads", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(sha + "\n")
+
+    def test_a_loose_ref_is_resolved(self):
+        self.head("ref: refs/heads/main\n")
+        self.branch("main", self.sha)
+        self.assertEqual(qfd.checkout_commit(self.root), self.sha)
+
+    def test_it_searches_upwards_from_a_subdirectory(self):
+        # qfd is given the DISPATCHER directory, several levels down.
+        self.head("ref: refs/heads/main\n")
+        self.branch("main", self.sha)
+        deep = os.path.join(self.root, "tools", "qf", "host", "dispatcher")
+        os.makedirs(deep)
+        self.assertEqual(qfd.checkout_commit(deep), self.sha)
+
+    def test_a_packed_ref_is_resolved(self):
+        # A gc'd checkout has no loose ref for its own branch.
+        self.head("ref: refs/heads/main\n")
+        with open(os.path.join(self.git, "packed-refs"), "w") as fh:
+            fh.write("# pack-refs with: peeled fully-peeled sorted\n")
+            fh.write(f"{'c' * 40} refs/heads/other\n")
+            fh.write(f"{self.sha} refs/heads/main\n")
+            fh.write(f"^{'d' * 40}\n")
+        self.assertEqual(qfd.checkout_commit(self.root), self.sha)
+
+    def test_a_detached_head_is_the_sha_itself(self):
+        self.head(self.sha + "\n")
+        self.assertEqual(qfd.checkout_commit(self.root), self.sha)
+
+    def test_a_gitdir_file_is_followed(self):
+        # A worktree's `.git` is a file pointing at the real directory.
+        real = os.path.join(self.dir.name, "real.git")
+        os.makedirs(real)
+        with open(os.path.join(real, "HEAD"), "w") as fh:
+            fh.write(self.sha + "\n")
+        work = os.path.join(self.dir.name, "work")
+        os.makedirs(work)
+        with open(os.path.join(work, ".git"), "w") as fh:
+            fh.write(f"gitdir: {real}\n")
+        self.assertEqual(qfd.checkout_commit(work), self.sha)
+
+    def test_anything_unreadable_or_odd_is_unknown_not_an_exception(self):
+        # It runs during start-up: a diagnostic must never be why qfd refuses to
+        # come up. Every one of these is a shape seen in the wild.
+        self.head("ref: refs/heads/main\n")            # ref with no file
+        # Not "" -- an empty path means the CWD, which in a checkout resolves to
+        # a real commit. That is correct behaviour, not a failure case.
+        cases = {
+            "missing ref": self.root,
+            "no repository": tempfile.mkdtemp(dir=self.dir.name),
+            "a path that does not exist": "/nonexistent/deeper/still",
+        }
+        for label, path in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(qfd.checkout_commit(path), "unknown")
+        self.branch("main", "not-a-sha")
+        self.assertEqual(qfd.checkout_commit(self.root), "unknown",
+                         "a non-sha was reported as a commit")
+
+    def test_the_environment_still_wins(self):
+        # For tests, and for a deployment with no checkout at all.
+        self.assertEqual(qfd.checkout_commit("/nonexistent"), "unknown")

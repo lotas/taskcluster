@@ -657,6 +657,69 @@ def free_disk_mb(path):
     return (st.f_bavail * st.f_frsize) // (1024 * 1024)
 
 
+def checkout_commit(start, _depth=8):
+    """The commit HEAD points at in the checkout containing `start`, or
+    "unknown".
+
+    Reads `.git` DIRECTLY rather than shelling out to git, for two reasons that
+    are both about who qfd is. It runs as a nologin system user against a
+    checkout owned by someone else, and modern git REFUSES such a repository
+    ("detected dubious ownership") unless it is listed in safe.directory -- so
+    the subprocess would report "unknown" on a perfectly good checkout. And this
+    runs during start-up, where a subprocess against a wedged filesystem is a
+    hang rather than an answer.
+
+    Total by construction: anything unreadable, unexpected or not a hex sha is
+    "unknown", because this is a diagnostic and must never be the reason the
+    daemon fails to start.
+    """
+    path = os.path.realpath(start or ".")
+    for _ in range(_depth):
+        git = os.path.join(path, ".git")
+        if os.path.exists(git):
+            break
+        parent = os.path.dirname(path)
+        if parent == path:
+            return "unknown"
+        path = parent
+    else:
+        return "unknown"
+    try:
+        if os.path.isfile(git):
+            # A worktree or submodule: `.git` is a file naming the real dir.
+            with open(git) as fh:
+                line = fh.read().strip()
+            if not line.startswith("gitdir:"):
+                return "unknown"
+            git = os.path.realpath(
+                os.path.join(path, line.split(":", 1)[1].strip()))
+        with open(os.path.join(git, "HEAD")) as fh:
+            head = fh.read().strip()
+        if not head.startswith("ref:"):
+            return head if _is_sha(head) else "unknown"
+        ref = head.split(":", 1)[1].strip()
+        loose = os.path.join(git, ref)
+        if os.path.isfile(loose):
+            with open(loose) as fh:
+                sha = fh.read().strip()
+            return sha if _is_sha(sha) else "unknown"
+        # Packed: a checkout that has been gc'd has no loose ref for its branch.
+        with open(os.path.join(git, "packed-refs")) as fh:
+            for row in fh:
+                if row.startswith("#") or row.startswith("^"):
+                    continue
+                parts = row.split()
+                if len(parts) == 2 and parts[1] == ref and _is_sha(parts[0]):
+                    return parts[0]
+    except OSError:
+        return "unknown"
+    return "unknown"
+
+
+def _is_sha(value):
+    return len(value) == 40 and all(c in "0123456789abcdef" for c in value)
+
+
 def _gid(name):
     """The gid of a host group, or None when it does not exist.
 
@@ -723,7 +786,17 @@ class Dispatcher:
                                stale_margin_s=cfg.marker_stale_margin_s)
         self._id_lock = threading.Lock()
         self.started_at = utcnow()
-        self.commit = os.environ.get("QFD_COMMIT", "unknown")
+        # Provenance, and the one field that answers "is the process running the
+        # code that was reviewed?" (design §7 risk 4: qfd EXECUTES from the
+        # trusted checkout, so the code and the process must move together).
+        # READ FROM THE CHECKOUT, not from the unit or a file written at install
+        # time: a value stamped by the installer goes stale the moment anyone
+        # runs `git pull` and `systemctl restart` by hand, and a stale commit is
+        # worse than no commit -- "unknown" prompts a question, a wrong sha ends
+        # one. The env var still wins, for tests and for a deployment that has no
+        # checkout at all.
+        self.commit = (os.environ.get("QFD_COMMIT")
+                       or checkout_commit(self.cfg.trusted_dir))
         # run_id -> Hold, for every job whose lock this process is holding.
         # Without it, `cancel` and `force-release` could only edit the database:
         # a RUNNING job would be marked CANCELLED while its container kept its
