@@ -251,6 +251,27 @@ class TestFinishRetainsTheDescriptor(RunnerCase):
         self.assertEqual(self.db.call("admitted_mem_mb"), 0)
         self.assertIn(os.path.join(self.runs, "r1", "src"), self.src.removed)
 
+    def test_a_terminal_run_says_so_in_the_journal(self):
+        """A healthy run used to log NOTHING at all.
+
+        The event store is the audit trail, but an operator reads `journalctl`,
+        and there silence meant either "it worked" or "nothing was ever picked
+        up" -- indistinguishable. A subsystem that only speaks when it is unhappy
+        cannot be watched, and this was noticed on the host by someone asking why
+        a run that plainly executed left no trace.
+        """
+        job = self.a_job()
+        self.db.call("add_resource", "r1", role="candidate", container_id="c1",
+                     now="2026-08-25T10:00:03Z")
+        self.docker.states = {"c1": [False]}
+        with self.assertLogs(qfd.log, level="INFO") as caught:
+            self.runner.finish(self.hold_for(job), "FAILED",
+                               {"exit_code": 1, "error_class": "nonzero_exit",
+                                "finished_at": qfd.utcnow()})
+        line = "\n".join(caught.output)
+        for expected in ("r1", "FAILED", "exit_code=1", "nonzero_exit"):
+            self.assertIn(expected, line)
+
     def test_the_chain_still_verifies_after_either_path(self):
         for cid, answer in (("c1", [False]), ("c2", [None])):
             with self.subTest(answer=answer):

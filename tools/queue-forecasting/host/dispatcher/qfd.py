@@ -1634,6 +1634,15 @@ class Runner:
         # Registered before any work: `cancel` and `force-release` must be able
         # to find this hold for as long as it exists.
         self.disp.register_hold(hold)
+        # TWO lines per run in the journal, here and in `finish`. The event store
+        # is the audit trail and always was, but an operator reads `journalctl`,
+        # and a healthy run used to log NOTHING there -- so silence meant either
+        # "it worked" or "nothing was even picked up", with no way to tell them
+        # apart. A subsystem that only speaks when it is unhappy cannot be
+        # watched.
+        log.info("%s: starting in lane %s: kind=%s sha=%s mem=%s",
+                 run_id, hold.lock.lane, hold.job["kind"],
+                 effective["source_sha"][:12], effective.get("mem_limit"))
         renewer = self._start_renewer(hold)
         outcome = ("FAILED", {"error_class": "internal"})
         try:
@@ -2632,6 +2641,9 @@ class Runner:
             if state in store_mod.ALLOWED.get(job["state"], set()):
                 self.db.call("transition", run_id, state, now=utcnow(),
                              fields=fields)
+                log.info("%s: %s exit_code=%s error_class=%s", run_id, state,
+                         fields.get("exit_code"),
+                         fields.get("error_class") or "-")
             else:
                 log.error("%s: cannot move %s -> %s", run_id, job["state"],
                           state)
