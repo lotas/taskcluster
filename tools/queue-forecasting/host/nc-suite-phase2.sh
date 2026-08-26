@@ -132,7 +132,27 @@ require_state_for() {  # require_state_for <run_id> <state> <seconds>
   return 0
 }
 
-head_sha() { as "$DEPLOY_USER" "git -C $STATE_DIR/mirror.git rev-parse refs/remotes/origin/main" 2>/dev/null; }
+# `-c safe.directory=` is load-bearing, not defensive. The mirror is owned by
+# qfd and this runs as the deploy user, and modern git REFUSES a repository
+# owned by someone else ("detected dubious ownership") -- with stderr discarded,
+# that came back as an empty string, and an empty string here VOIDs NC13 and
+# NC15 with "no mirror HEAD" on a perfectly healthy host. A blanket
+# `--global safe.directory` would fix it too and is worse: it would leave the
+# exception behind for everything the deploy user ever touches.
+head_sha() { as "$DEPLOY_USER" \
+  "git -c safe.directory=$STATE_DIR/mirror.git -C $STATE_DIR/mirror.git rev-parse refs/remotes/origin/main" \
+  2>/dev/null; }
+
+# The Task 13 fixture sha, validated as a sha before anything is submitted with
+# it. A truncated or comment-laden nc12-sha.txt would otherwise reach `qf submit`
+# and be refused for a reason that reads like containment.
+fixture_sha() {
+  [ -f "$NC12_SHA_FILE" ] || return 1
+  local s; s="$(tr -d '[:space:]' < "$NC12_SHA_FILE")"
+  [ "${#s}" -eq 40 ] || return 1
+  case "$s" in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s' "$s"
+}
 
 standin_nightly() {  # standin_nightly <wait_s> -> background PID that waits then holds
   ( exec 9>"$LOCK"; flock -w "$1" 9 && sleep 60 ) &
@@ -480,12 +500,11 @@ sys.exit(0 if r.get('ok') else 1)\""
 nc12() {
   echo
   echo "== NC12: build provenance =="
-  if [ ! -f "$NC12_SHA_FILE" ]; then
-    void "NC12 requires $NC12_SHA_FILE (Task 13); missing is VOID, not skip"
+  local poisoned key_before key_after rid
+  if ! poisoned="$(fixture_sha)"; then
+    void "NC12 requires a 40-hex sha in $NC12_SHA_FILE (Task 13); missing or malformed is VOID, not skip"
     return
   fi
-  local poisoned key_before key_after rid
-  poisoned="$(tr -d '[:space:]' < "$NC12_SHA_FILE")"
   key_before="$(as "$DEPLOY_USER" \
     "cd $DISPATCHER && python3 -c 'import image; print(image.content_key(\".\"))'" 2>/dev/null)"
   if [ -z "$key_before" ]; then
@@ -497,6 +516,14 @@ nc12() {
   rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$poisoned")"
   local final; final="$(wait_terminal "$rid" 1800)"
   echo "  the poisoned-SHA job finished $final"
+  # A fixture branch that was written but never PUSHED is the likely first
+  # mistake, and without naming it here the operator gets a cascade of failed
+  # containment clauses instead of "publish the branch". Every clause below and
+  # all of NC15's hostile jobs run at this same sha.
+  if [ "$(field_of "$rid" error_class)" = "source_not_published" ]; then
+    void "NC12 the fixture sha $poisoned is not on the research remote: push the nc12-poisoned-manifest branch (NC12 and NC15's hostile clauses all run at it)"
+    return
+  fi
   key_after="$(as "$DEPLOY_USER" \
     "cd $DISPATCHER && python3 -c 'import image; print(image.content_key(\".\"))'" 2>/dev/null)"
   assert_eq "NC12 the image content key is unchanged by a poisoned manifest" \
@@ -710,10 +737,10 @@ nc15() {
   # the 2a allowlist is `result.json` and nothing else, so the canary voided on a
   # perfectly working handoff. Producing an artifact takes a fixture that writes
   # one.
-  if [ ! -f "$NC12_SHA_FILE" ]; then
-    void "NC15 needs the Task 13 fixture branch ($NC12_SHA_FILE); missing is VOID, not skip"
+  local fx
+  if ! fx="$(fixture_sha)"; then
+    void "NC15 needs the Task 13 fixture branch: a 40-hex sha in $NC12_SHA_FILE; missing or malformed is VOID, not skip"
   else
-    local fx; fx="$(tr -d '[:space:]' < "$NC12_SHA_FILE")"
     local rid final art
 
     # Canary: a well-behaved job's artifact lands at 0640 qfd:qfclient and is
