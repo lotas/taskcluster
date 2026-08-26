@@ -167,10 +167,17 @@ def cmd_trusted_paths(args):
 def cmd_logs(args):
     # Read the file directly; the socket is control-only (D9).
     path = os.path.join(RUNS_DIR, args.run_id, "logs", args.stream + ".log")
-    if not os.path.exists(path):
+    try:
+        with open(path, "rb") as fh:
+            sys.stdout.buffer.write(fh.read())
+    except FileNotFoundError:
         die(f"no {args.stream} log at {path}")
-    with open(path, "rb") as fh:
-        sys.stdout.buffer.write(fh.read())
+    except OSError as e:
+        # `os.path.exists` answers False for a path it cannot REACH, so the
+        # previous version reported a missing log file for what was a permission
+        # fault two directories up -- and sent the reader looking in the wrong
+        # place entirely. Distinguish "not there" from "not allowed".
+        die(f"cannot read {path}: {e}")
 
 
 def cmd_force_release(args):

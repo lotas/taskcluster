@@ -646,7 +646,11 @@ class TestStartupPreconditions(unittest.TestCase):
         for k, v in over.items():
             setattr(self.cfg, k, v)
         gid = os.stat(self.lock).st_gid
-        return self.cfg.check_startup(my_groups=[gid, os.stat(self.intent).st_gid])
+        # `client_gid` is injected because there is no qfclient group in a test
+        # environment; the daemon resolves it by name.
+        return self.cfg.check_startup(
+            my_groups=[gid, os.stat(self.intent).st_gid],
+            client_gid=os.stat(self.root).st_gid)
 
     def test_a_wellformed_host_passes(self):
         self.assertEqual(self.check(), [])
@@ -711,6 +715,30 @@ class TestStartupPreconditions(unittest.TestCase):
         with mock.patch("qfd.os.chmod", drop):
             problems = self.check()
         self.assertTrue(any("did not stick" in p for p in problems), problems)
+
+    def test_the_runs_dir_is_made_reachable_by_clients(self):
+        # The live failure: systemd's StateDirectory creates runs_dir as
+        # qfd:qfd 0750, so `research` could not TRAVERSE it -- and every per-run
+        # directory underneath was correctly grouped qfclient beneath a parent
+        # nobody in qfclient could enter. `qf logs` could never work for the one
+        # account it exists for.
+        os.chmod(self.root, 0o700)
+        self.assertEqual(self.check(), [])
+        st = os.stat(self.root)
+        self.assertEqual(st.st_gid, os.stat(self.root).st_gid)
+        self.assertTrue(st.st_mode & 0o010,
+                        "clients must be able to traverse the runs dir")
+
+    def test_a_runs_dir_that_cannot_be_made_reachable_is_fatal(self):
+        # Silence here is the worst outcome: the client's own error for an
+        # unreachable path is "no such file", so nothing would name the cause.
+        def refuse(path, gid_or_mode, *rest):
+            raise PermissionError(1, "Operation not permitted")
+
+        with mock.patch("qfd.os.chown", refuse):
+            problems = self.check()
+        self.assertTrue(any("reachable by qfclient" in p for p in problems),
+                        problems)
 
     def test_the_probe_leaves_nothing_behind(self):
         self.assertEqual(self.check(), [])

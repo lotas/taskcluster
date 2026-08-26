@@ -204,7 +204,8 @@ class Config:
                 f" trusted directory {root}")
         return real
 
-    def check_startup(self, *, group_of=None, my_groups=None, stat=os.stat):
+    def check_startup(self, *, group_of=None, my_groups=None, stat=os.stat,
+                      client_gid=None):
         """Every precondition, fail-closed. Revision 5 validated only the
         training lock, so a missing or mis-permissioned intent directory would
         have silently restored starvation."""
@@ -287,7 +288,49 @@ class Config:
         # a refusal an operator cannot act on is only marginally better than a
         # crash.
         problems.extend(self._check_setgid_allowed())
+        problems.extend(self._ensure_runs_dir_reachable(client_gid))
         return problems
+
+    def _ensure_runs_dir_reachable(self, client_gid=None):
+        """`qf logs` and artifact reads are FILE reads -- design D9 keeps the
+        socket control-only -- so `runs_dir` ITSELF has to be traversable by
+        qfclient.
+
+        systemd's `StateDirectory` creates it as User:Group, i.e. qfd:qfd 0750,
+        which excludes `research` outright. Every per-run directory underneath was
+        correctly grouped qfclient, under a parent nobody in qfclient could
+        enter, so `qf logs` could never work for the one account it exists for --
+        and it did not FAIL loudly either: `os.path.exists` answers False for a
+        path it cannot reach, so the client blamed a missing log file.
+
+        Fixed rather than merely reported, for the same reason `prepare_run_dir`
+        sets its own modes: the daemon owns this directory and belongs to the
+        group, so it needs no privilege, and refusing to start over something
+        nothing else is going to fix would be a self-inflicted outage. Verified
+        afterwards, because a chown that silently did not take is worse than one
+        that failed -- and only then reported as a problem.
+        """
+        gid = client_gid
+        if gid is None:
+            try:
+                gid = grp.getgrnam("qfclient").gr_gid
+            except KeyError:
+                return ["the qfclient group does not exist, so no client can"
+                        " ever read a log or an artifact; run"
+                        " `phase2-setup.sh dispatch-user`."]
+        try:
+            os.chown(self.runs_dir, -1, gid)
+            os.chmod(self.runs_dir, 0o750)
+            st = os.stat(self.runs_dir)
+        except OSError as e:
+            return [f"cannot make {self.runs_dir} reachable by qfclient: {e}."
+                    " Until it is, `qf logs` and artifact reads fail for every"
+                    " client, and they fail as 'no such file'."]
+        if st.st_gid != gid or not st.st_mode & 0o010:
+            return [f"{self.runs_dir} is still not traversable by qfclient"
+                    f" (gid={st.st_gid}, mode={oct(st.st_mode & 0o7777)});"
+                    " `qf logs` and artifact reads cannot work."]
+        return []
 
     def _check_setgid_allowed(self):
         """Prove `chmod 2770` works under the state dir, or say why not."""
@@ -1043,6 +1086,13 @@ class Dispatcher:
         if job is None:
             raise Refused(f"no such run {run_id!r}")
         job["spec"] = json.loads(job["spec_json"])
+        # The PINS, because that is where several things a reader looks for
+        # actually live. `source_ref` is the clearest case: it is written as a pin
+        # mid-run, so the same-named `jobs` column stays null for every job, and
+        # a status that showed only the row reported "source_ref": null while the
+        # ref -- the whole point of which is that a human can open it at a URL --
+        # sat one table away.
+        job["pins"] = self.db.call("pins_for", run_id)
         return {"job": job, "stall": self.cleanup_stall()}
 
     def _op_list(self, payload, uid):
