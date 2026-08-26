@@ -3,7 +3,7 @@
 # (auto-research-phase1-design.md §6).
 #
 # Base pinned by digest: `phase2-setup.sh pin-base` prints the line to paste.
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:REPLACE_ME
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca
 
 # LightGBM needs the OpenMP runtime; the -slim base omits it.
 RUN apt-get update \
