@@ -546,6 +546,30 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestExitCodeClassification(RunnerCase):
+    """An error_class is a ROUTING decision (same rule as the source classes).
+
+    The live case: `--kind test` against a repository whose tests are not at the
+    default path exited 4 -- pytest's "usage error" -- and was reported as
+    `nonzero_exit`, i.e. "the experiment failed". Nothing in the record said the
+    experiment never ran, so the next step is to go and debug code that was never
+    executed. On a loop that will make this mistake repeatedly, that is the
+    difference between a one-line fix to the submission and a wild goose chase.
+    """
+
+    def test_a_pytest_usage_error_is_not_a_failed_experiment(self):
+        self.assertEqual(self.runner._exit_class(4), "bad_invocation")
+
+    def test_collecting_nothing_is_its_own_class(self):
+        self.assertEqual(self.runner._exit_class(5), "no_tests_collected")
+
+    def test_a_real_test_failure_is_still_nonzero_exit(self):
+        # 1 is pytest's "tests ran and failed", which IS a failed experiment.
+        for code in (1, 2, 3, 127):
+            with self.subTest(code=code):
+                self.assertEqual(self.runner._exit_class(code), "nonzero_exit")
+
+
 class TestSourceFailuresAreRouted(RunnerCase):
     """An error_class is a ROUTING decision, so one that names the wrong
     subsystem costs an investigation.

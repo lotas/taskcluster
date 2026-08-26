@@ -2026,7 +2026,25 @@ class Runner:
             return "FAILED", {**base, "error_class": handoff_class}
         state = "SUCCEEDED" if exit_code == 0 else "FAILED"
         return state, {**base,
-                       "error_class": None if exit_code == 0 else "nonzero_exit"}
+                       "error_class": None if exit_code == 0
+                       else self._exit_class(exit_code)}
+
+    # pytest's own exit codes for "you asked for the wrong thing". The
+    # entrypoint IS pytest -- the runner builds `pytest -q <paths>` itself -- so
+    # reading its exit table is making an existing coupling explicit, not adding
+    # one.
+    #
+    # The distinction is a ROUTING decision, which is why it is worth the two
+    # lines. `nonzero_exit` says "the experiment failed", and an auto-research
+    # loop reading that will go looking at the code. 4 and 5 mean the JOB was
+    # misconfigured -- a path that does not exist in the worktree, a `-k` that
+    # selects nothing -- and the fix is the submission, not the repository. On a
+    # loop that will make this mistake repeatedly, conflating them sends every
+    # layout mistake off to debug an experiment that never ran.
+    EXIT_CLASSES = {4: "bad_invocation", 5: "no_tests_collected"}
+
+    def _exit_class(self, exit_code):
+        return self.EXIT_CLASSES.get(exit_code, "nonzero_exit")
 
     def _start_watchers(self, hold, paths, container_id, out_w, err_w):
         """The containment monitoring design §4.5 and parent §15 require.
