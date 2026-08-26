@@ -8,6 +8,7 @@
 import json
 import os
 import socket
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -829,6 +830,78 @@ class TestDockerConfirmation(unittest.TestCase):
 
     def test_an_unparseable_answer_is_unknown(self):
         self.assertIsNone(self.probe(0, "maybe\n").is_running("c"))
+
+
+class TestAbsenceDoesNotDependOnDockersWording(unittest.TestCase):
+    """The live failure of 2026-08-26: every run froze admissions on its way out.
+
+    `is_running` established absence by matching the string "No such object" in
+    `docker inspect`'s stderr. Docker 29 words it differently, so a container
+    that `--rm` had already removed came back as UNKNOWN -- and unknown is
+    deliberately immune to time, so the confirmation loop polled it for
+    KILL_CONFIRM_S, gave up, and left the job CLEANUP_BLOCKED with admissions
+    shut. A restart re-adopted the cleanup and hit the same wall.
+
+    The rule these tests pin down is that absence must come from an ANSWER, not
+    from a sentence: a zero exit from `docker ps -a` is a complete enumeration.
+    """
+
+    def docker(self, inspect, ps):
+        """`inspect` and `ps` are (returncode, stdout, stderr), or an exception."""
+        def runner(argv, env, timeout):
+            spec = ps if "ps" in argv else inspect
+            if isinstance(spec, BaseException):
+                raise spec
+            rc, out, err = spec
+            return type("P", (), {"returncode": rc, "stdout": out,
+                                  "stderr": err})()
+        return qfd.Docker(runner=runner)
+
+    UNRECOGNISED = (1, "", "Error response from daemon: No such container: c")
+
+    def test_a_removed_container_is_absent_whatever_the_message_says(self):
+        # Deliberately NOT only the Docker 29 wording: the point is that the
+        # decision no longer depends on any wording at all.
+        for stderr in ("Error response from daemon: No such container: c",
+                       "some wording nobody has shipped yet"):
+            with self.subTest(stderr=stderr):
+                d = self.docker((1, "", stderr), (0, "abc123\tother\n", ""))
+                self.assertIs(d.is_running("c"), False)
+
+    def test_a_container_still_listed_is_unknown_not_absent(self):
+        # The dangerous direction. inspect failed, but the container IS there --
+        # releasing the mutex here is the one failure the subsystem exists to
+        # prevent, so this must stay unknown rather than become absent.
+        d = self.docker(self.UNRECOGNISED,
+                        (0, "abc123\tc\ndef456\tother\n", ""))
+        self.assertIsNone(d.is_running("c"))
+
+    def test_an_unobtainable_list_is_unknown_not_absent(self):
+        # "The list I could not get did not contain it" is exactly the inference
+        # that would release the mutex when the docker socket is missing.
+        d = self.docker(self.UNRECOGNISED,
+                        (1, "", "Cannot connect to the Docker daemon"))
+        self.assertIsNone(d.is_running("c"))
+
+    def test_a_hung_list_is_unknown_not_absent(self):
+        d = self.docker(self.UNRECOGNISED,
+                        subprocess.TimeoutExpired("docker ps", 1))
+        self.assertIsNone(d.is_running("c"))
+
+    def test_a_full_id_matches_by_prefix(self):
+        # Callers pass the full id from `docker create` OR the name; a listing
+        # must not read as an absence just because it was matched the other way.
+        full = "a" * 64
+        d = self.docker(self.UNRECOGNISED, (0, full + "\tqf-x-candidate\n", ""))
+        self.assertIsNone(d.is_running(full))
+
+    def test_a_recognised_message_still_short_circuits(self):
+        # The old fast path stays: on a daemon that words it the old way there is
+        # no reason to pay a second subprocess. `ps` is made to fail loudly so
+        # this proves it was not consulted.
+        d = self.docker((1, "", "Error: No such object: c"),
+                        (1, "", "ps should not have been called"))
+        self.assertIs(d.is_running("c"), False)
 
 
 class TestTrainingLock(unittest.TestCase):

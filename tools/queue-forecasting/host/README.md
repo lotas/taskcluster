@@ -733,3 +733,38 @@ daemon on the host:
   which is the only kind worth building a gate for.
 - `--rm` is now set at create time, so removal must still happen; a surviving
   name would collide with the next incarnation of it.
+- **What the CLI *says* about a container that is gone.** This one bit us for
+  real on 2026-08-26 (Docker 29.7.2), which is why the third bullet exists.
+
+## A probe must ask a question whose ANSWER is positive
+
+`is_running` used to establish absence by finding the string `No such object` in
+`docker inspect`'s stderr. Docker 29 words it differently, and the consequence
+was total: every run's `--rm` container had already been removed by the time
+cleanup looked, the removal read as **unknown**, and unknown is deliberately
+immune to time — so the confirmation loop polled for `KILL_CONFIRM_S`, gave up,
+and left the job `CLEANUP_BLOCKED` with admissions shut. A restart correctly
+re-adopted the orphaned cleanup and hit the same wall. Every job froze the loop
+on its way *out*, with nothing wrong with the job.
+
+Two things were wrong, and they are separable:
+
+1. **The evidence was a sentence.** A daemon's error prose is the weakest thing
+   in the system to bet a mutex on, and broadening the match is not the fix:
+   a loose `no such` test would match `stat /var/run/docker.sock: no such file or
+   directory` and turn "the daemon is unreachable" into "the container is
+   positively gone". Absence now comes from `Docker._exists`, where a **zero
+   exit from `docker ps -a` is a complete enumeration** — a name absent from it
+   is absent from the daemon. A non-zero exit stays unknown, because "the list I
+   could not obtain did not contain it" is exactly the unsafe inference.
+2. **The unknown did not say why.** 150 log lines over 300 seconds read
+   `state unknown; not treating as stopped` without once printing the exit
+   status or the stderr, so the diagnosis needed the probe reproduced by hand.
+   `is_running` now reports the reason once per (container, reason) — once, not
+   once per poll, or the one fact an operator needs is buried by the polling.
+
+The recovery path itself behaved correctly throughout, which is worth recording
+because it is the part that was designed for this: `qfadmin force-release`
+refused on the first call (revoking the hold and freezing the inventory),
+released on the second, and the reservation came back by itself because
+`admitted_mem_mb` is derived from job state rather than tracked separately.

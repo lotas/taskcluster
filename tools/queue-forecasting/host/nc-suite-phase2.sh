@@ -572,7 +572,20 @@ nc13() {
 nc16() {
   echo
   echo "== NC16: create-then-start relays the exit status =="
-  local sha rid final code klass leftover live
+  local sha rid final code klass leftover live absent
+  # FIRST, the probe itself, against a name that certainly does not exist.
+  # On 2026-08-26 this was the whole failure: `is_running` read absence out of
+  # the WORDING of docker inspect's stderr, Docker 29 words it differently, and
+  # every run ended CLEANUP_BLOCKED with admissions frozen. The row-release
+  # assertion at the end of this function would have caught it -- but only via a
+  # run that could no longer complete, so the suite would have reported a
+  # confusing downstream failure instead of the one-line cause. Asking the
+  # primitive directly costs nothing and names the real thing.
+  absent="$(PYTHONPATH="$DISPATCHER" python3 -c \
+    'import qfd; print(qfd.Docker().is_running("qf-nc16-certainly-absent"))' \
+    2>/dev/null)"
+  assert_eq "NC16 the probe reads a nonexistent container as positively absent" \
+    "False" "${absent:-unknown}"
   sha="$(head_sha)"
   if [ -z "$sha" ]; then void "NC16 canary: no mirror HEAD"; return; fi
   rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" \

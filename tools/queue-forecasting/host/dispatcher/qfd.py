@@ -670,6 +670,45 @@ class Docker:
                                "removing"})
     STOPPED_STATUSES = frozenset({"exited", "dead"})
 
+    def _exists(self, container_id, timeout=15):
+        """Is this container in the daemon's COMPLETE container list? Tri-state,
+        same convention as `is_running`.
+
+        This exists because `is_running` establishes absence by matching a
+        SENTENCE, and a sentence is the weakest evidence in the system. Docker
+        29 answers a missing container with wording that does not contain "No
+        such object", so every `--rm` container that had already been removed
+        read as unknown -- for ever, since the sentinel logic correctly refuses
+        to age an unknown into a stop. Every job froze admissions on its way
+        out.
+
+        The fix is not a longer list of sentences to match. `docker ps -a` with
+        a zero exit is a COMPLETE enumeration, so a name absent from it is
+        absent from the daemon -- a positive answer rather than a reading of
+        prose. Anything else is unknown: a non-zero exit is the daemon failing
+        to answer, and "the list I could not obtain did not contain it" is
+        exactly the inference that would release a mutex over live work when the
+        socket is missing.
+
+        Prefix matching on the id is deliberate and one-sided: a false PRESENCE
+        only costs another poll, while a false ABSENCE releases the mutex.
+        """
+        try:
+            p = self.run(["docker", "ps", "-a", "--no-trunc", "--format",
+                          "{{.ID}}\t{{.Names}}"], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        if p.returncode != 0:
+            return None
+        for line in (p.stdout or "").splitlines():
+            cid, _, names = line.partition("\t")
+            cid = cid.strip()
+            if cid and len(container_id) >= 12 and cid.startswith(container_id):
+                return True
+            if container_id in (n.strip() for n in names.split(",")):
+                return True
+        return False
+
     def is_running(self, container_id, timeout=15):
         """POSITIVE confirmation only. An error, a timeout or an unparseable
         answer is 'unknown', and unknown is never treated as stopped."""
@@ -685,10 +724,15 @@ class Docker:
             # "No such object" IS a positive answer: the container is gone.
             if "No such object" in (p.stderr or ""):
                 return False
+            # The wording did not match, which says nothing about whether the
+            # container is there. Ask a question with a positive answer instead
+            # of matching more prose -- see `_exists`.
+            if self._exists(container_id, timeout=timeout) is False:
+                return False
             self._log_unknown(
                 container_id,
-                f"docker inspect exited {p.returncode} with a message this"
-                f" probe does not recognise as a positive absence:"
+                f"docker inspect exited {p.returncode} and the container is"
+                f" still listed (or the list was unavailable); inspect said:"
                 f" {_one_line(p.stderr)!r}")
             return None
         if out in self.LIVE_STATUSES:
