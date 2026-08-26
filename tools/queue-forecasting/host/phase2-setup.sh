@@ -28,12 +28,20 @@
 #
 # ENVIRONMENT:
 #   TRUSTED       trusted checkout (default /srv/queue-forecasting)
-#   DEPLOY_USER   the deploy account (default: owner of $TRUSTED)
+#   TRUSTED_REF   what mirror-refresh resets to (default origin/main)
+#   DEPLOY_USER   the NIGHTLY/OPERATOR account -- whose crontab runs
+#                 daily_walk_forward.sh, who joins qfheavy, whose uid the admin
+#                 socket authorises (default: owner of $TRUSTED). NOT the
+#                 checkout's owner, which is who fetches into it.
 #   RESEARCH_USER the untrusted agent account (default: research)
 
 set -euo pipefail
 
 TRUSTED="${TRUSTED:-/srv/queue-forecasting}"
+# What `mirror-refresh` hard-resets the trusted checkout to. Defaults to
+# origin/main because that is the reviewed line; overriding it is legitimate
+# during a phase rollout, and is announced when it happens.
+TRUSTED_REF="${TRUSTED_REF:-origin/main}"
 DISPATCHER="$TRUSTED/tools/queue-forecasting/host/dispatcher"
 RESEARCH_USER="${RESEARCH_USER:-research}"
 CHECK=0
@@ -81,9 +89,19 @@ would() {  # would <description> ; returns 0 if we should actually act
   return 0
 }
 
+# TWO PRINCIPALS, not one, and conflating them broke `mirror-refresh` on the
+# first host where they differed. `DEPLOY_USER` is the NIGHTLY/OPERATOR
+# identity: whose crontab runs daily_walk_forward.sh, who joins qfheavy, who
+# writes intent markers, whose uid the admin socket authorises. The trusted
+# checkout can be owned by someone else entirely -- and only its owner can fetch
+# into it, because git writes .git/FETCH_HEAD and the remote refs.
 deploy_user() {
   if [ -n "${DEPLOY_USER:-}" ]; then printf '%s' "$DEPLOY_USER"; return; fi
   stat -c '%U' "$TRUSTED" 2>/dev/null || echo deploy
+}
+
+trusted_owner() {
+  stat -c '%U' "$TRUSTED" 2>/dev/null || die "$TRUSTED does not exist"
 }
 
 # Drop to a user for ONE probe. Deliberately not `sg`: `sg` re-executes the
@@ -623,10 +641,25 @@ cmd_mirror_refresh() {
   step "refresh the trusted checkout and restart"
   # The dispatcher EXECUTES from this checkout (design §7 risk 4), so the code
   # and the running process must move together.
-  local du; du="$(deploy_user)"
-  if would "fetch and hard-reset $TRUSTED"; then
-    sudo -u "$du" git -C "$TRUSTED" fetch --prune origin
-    sudo -u "$du" git -C "$TRUSTED" reset --hard origin/main
+  #
+  # As the checkout's OWNER, not as $DEPLOY_USER: `git fetch` writes
+  # .git/FETCH_HEAD and the remote refs, so a non-owner fails with a bare
+  # "Permission denied" naming a file rather than the reason. These are two
+  # different identities on any host where the nightly cron does not own /srv.
+  local owner; owner="$(trusted_owner)"
+  info "checkout owner: $owner"
+  if [ "$TRUSTED_REF" != "origin/main" ]; then
+    warn "resetting to $TRUSTED_REF, not origin/main: the daemon will run code from a branch"
+  fi
+  if would "fetch and hard-reset $TRUSTED to $TRUSTED_REF"; then
+    # A stray root-owned .git artifact from a manual `sudo git fetch` breaks
+    # every later fetch by the owner, and git reports it as a missing file. Say
+    # what it is instead of leaving the operator to guess.
+    sudo -u "$owner" test -w "$TRUSTED/.git" \
+      || die "$owner cannot write $TRUSTED/.git -- a manual 'sudo git' probably left root-owned files there. Remedy: sudo chown -R $owner: $TRUSTED/.git"
+    sudo -u "$owner" git -C "$TRUSTED" fetch --prune origin \
+      || die "fetch failed as $owner; if a manual 'sudo git' ran in $TRUSTED, chown .git back to $owner"
+    sudo -u "$owner" git -C "$TRUSTED" reset --hard "$TRUSTED_REF"
     info "now at $(git -C "$TRUSTED" rev-parse --short HEAD)"
   fi
   if would "restart qf-dispatch"; then
