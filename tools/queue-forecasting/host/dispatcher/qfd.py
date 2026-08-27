@@ -3025,7 +3025,60 @@ class Reaper(threading.Thread):
         # Converting first means one sweep can both settle and confirm.
         self.runner.retry_unsettled()
         self.resolve_blocked()
+        self.sweep_worktrees()
         return decided
+
+    # How many worktrees one sweep may reclaim. Bounded so a backlog is worked
+    # off over several sweeps rather than making one of them long.
+    WORKTREE_SWEEP_LIMIT = 50
+
+    def sweep_worktrees(self):
+        """Remove the `src/` worktree of every job that has reached a terminal
+        state, whatever path took it there.
+
+        `Runner.finish` already does this -- and for a long time it was the ONLY
+        place that did, which meant the worktree was cleaned on the happy path
+        and leaked on every other one: a lease reclaimed by this thread, a
+        CLEANUP_BLOCKED job resolved by `resolve_blocked`, an operator
+        force-release, a startup recovery that goes straight to FAILED. Those are
+        precisely the paths the fault gates exercise, so a gate run left one full
+        checkout of qf-research per hard kill, and `qf-runs-prune` does not touch
+        them for ninety days. On a host whose admission floor is 20 GiB of the
+        same filesystem, that is not housekeeping -- it is the loop stopping
+        itself.
+
+        A SWEEP rather than a call added to each terminal transition, for the
+        reason the sentinel needed the same treatment: enumerating the ways a job
+        can end is a list that goes stale, while "terminal and still has a
+        worktree" is a condition. Driven from the filesystem, so a run directory
+        whose job row is gone entirely is covered too.
+        """
+        try:
+            entries = sorted(os.listdir(self.cfg.runs_dir))
+        except OSError as e:
+            log.warning("worktree sweep: cannot list %s: %s",
+                        self.cfg.runs_dir, e)
+            return 0
+        swept = 0
+        for run_id in entries:
+            if swept >= self.WORKTREE_SWEEP_LIMIT:
+                break
+            src = os.path.join(self.cfg.runs_dir, run_id, "src")
+            if not os.path.isdir(src):
+                continue
+            job = self.db.call("get", run_id)
+            if job is not None and job["state"] not in store_mod.TERMINAL:
+                continue
+            try:
+                self.runner.src.remove_worktree(src)
+            except Exception:                          # noqa: BLE001
+                log.exception("worktree sweep: %s", run_id)
+                continue
+            swept += 1
+        if swept:
+            log.info("worktree sweep: reclaimed %d worktree(s) from terminal"
+                     " runs", swept)
+        return swept
 
     def release_hold(self, run_id, why):
         """Close and unregister a hold this process still owns, if any.

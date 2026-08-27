@@ -546,6 +546,71 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestWorktreesAreReclaimedHoweverAJobEnds(RunnerCase):
+    """`finish` was the ONLY place a worktree was removed.
+
+    So it was cleaned on the happy path and leaked on every other one -- a lease
+    reclaimed by the reaper, a CLEANUP_BLOCKED job resolved by `resolve_blocked`,
+    an operator force-release, a startup recovery that goes straight to FAILED.
+    Those are exactly the paths the fault gates exercise, so a gate run left one
+    full checkout of qf-research per hard kill, and `qf-runs-prune` ignores them
+    for ninety days -- on a host whose admission floor is 20 GiB of the same
+    filesystem.
+
+    A sweep rather than a call bolted onto each terminal transition: enumerating
+    the ways a job can end is a list that goes stale, while "terminal and still
+    has a worktree" is a condition.
+    """
+
+    def reaper(self):
+        return qfd.Reaper(self.cfg, self.db, self.runner, self.disp,
+                          self.docker)
+
+    def plant(self, run_id, state):
+        self.a_job(run_id=run_id, state="QUEUED")
+        if state != "QUEUED":
+            self.db.call("dequeue", "light", owner="qfd",
+                         now="2026-08-25T10:00:01Z",
+                         lease_expires_at="2026-08-25T10:05:00Z",
+                         hold_deadline_at="2036-08-25T12:00:00Z", max_running=2)
+            for step in ("BUILDING", "RUNNING", state):
+                if step == "RUNNING" and state == "BUILDING":
+                    break
+                self.db.call("transition", run_id, step,
+                             now="2026-08-25T10:00:02Z")
+                if step == state:
+                    break
+        src = os.path.join(self.runs, run_id, "src")
+        os.makedirs(src)
+        return src
+
+    def test_a_worktree_left_by_a_reclaimed_job_is_reclaimed(self):
+        src = self.plant("gone", "FAILED")
+        self.assertEqual(self.reaper().sweep_worktrees(), 1)
+        self.assertIn(src, self.src.removed)
+
+    def test_a_live_jobs_worktree_is_left_alone(self):
+        # The dangerous direction: removing the source tree out from under a
+        # running container.
+        src = self.plant("live", "RUNNING")
+        self.assertEqual(self.reaper().sweep_worktrees(), 0)
+        self.assertNotIn(src, self.src.removed)
+
+    def test_a_run_directory_with_no_job_row_is_still_swept(self):
+        # Driven from the filesystem on purpose, so a directory whose row is gone
+        # entirely has an owner too.
+        src = os.path.join(self.runs, "orphan-dir", "src")
+        os.makedirs(src)
+        self.assertEqual(self.reaper().sweep_worktrees(), 1)
+        self.assertIn(src, self.src.removed)
+
+    def test_the_sweep_is_bounded(self):
+        for i in range(qfd.Reaper.WORKTREE_SWEEP_LIMIT + 5):
+            os.makedirs(os.path.join(self.runs, f"r{i:03d}", "src"))
+        self.assertEqual(self.reaper().sweep_worktrees(),
+                         qfd.Reaper.WORKTREE_SWEEP_LIMIT)
+
+
 class TestAnUnusableMutexIsNotContention(RunnerCase):
     """The live failure of 2026-08-26 22:05.
 

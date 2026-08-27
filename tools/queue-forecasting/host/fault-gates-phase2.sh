@@ -66,6 +66,38 @@ build_clients() { pgrep -fa 'docker[- ]build' | grep -v fault-gates | wc -l; }
 # means from the outside.
 lock_holders() { fuser "$LOCK" 2>/dev/null | tr -s ' '; }
 
+# READINESS, not a fixed sleep. Gate B waited `sleep 10` after each restart and
+# then asserted -- but startup recovery runs the build-settle procedure for every
+# retained BUILDING job, up to QFD_BUILD_SETTLE_S each, so after Gate A had left
+# two of them a restart took far longer than ten seconds. The socket was not
+# there yet, verify-chain came back rc=2, and every LATER iteration then failed
+# to submit for want of the same socket: one slow start, ten reports.
+wait_ready() {  # wait_ready [seconds] -> 0 when the daemon answers
+  local limit="${1:-180}" waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    if sudo -H -u "$RESEARCH_USER" bash -lc 'qf ping' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
+  return 1
+}
+
+# A daemon that never comes back invalidates every remaining iteration, so this
+# stops the gate instead of letting it emit one void per iteration for a
+# condition that will not change.
+require_ready() {
+  local what="$1"
+  if ! wait_ready; then
+    echo
+    echo "ABORTING: the dispatcher did not become ready after $what." >&2
+    echo "Nothing below could be measured against a daemon that is not running," >&2
+    echo "and each iteration would report its own unrelated failure." >&2
+    systemctl status qf-dispatch --no-pager -n 20 >&2 || true
+    exit 2
+  fi
+}
+
 set_dropin() {
   mkdir -p "$DROPIN_DIR"
   printf '[Service]\n%s\n' "$1" > "$DROPIN"
@@ -108,7 +140,7 @@ gate_a() {
     echo
     echo "-- iteration: $method --"
     systemctl restart qf-dispatch
-    sleep 5
+    require_ready "the restart at the top of iteration $method"
     local before_clients; before_clients="$(build_clients)"
 
     case "$method" in
@@ -219,7 +251,21 @@ gate_a() {
       ok "$method: state after restart is $state"
     fi
 
+    # Wait for the cancelled job to actually LEAVE its non-terminal state. A
+    # BUILDING job that is merely asked to cancel keeps its lock and reservation
+    # until the settle procedure finishes, and every later daemon start re-adopts
+    # it and re-runs that procedure -- which is what made Gate B's restarts take
+    # longer than its fixed sleep. Leaving work behind for the next stage is how
+    # one gate breaks another.
     as "$RESEARCH_USER" "qf cancel $rid" >/dev/null 2>&1
+    local settle=0
+    while [ "$settle" -lt 120 ]; do
+      case "$(sql "SELECT state FROM jobs WHERE run_id='$rid';")" in
+        SUCCEEDED|FAILED|TIMEOUT|CANCELLED|REFUSED) break ;;
+      esac
+      sleep 3; settle=$((settle + 3))
+    done
+    [ "$settle" -ge 120 ] && note "$method: $rid did not settle in 120s (state $(sql "SELECT state FROM jobs WHERE run_id='$rid';"))"
     [ "$method" = build_timeout ] && clear_dropin
   done
 
@@ -275,10 +321,11 @@ Environment=QFD_FAULT_AFTER=$phase"
       sleep 8
       note "dispatcher exited at phase $phase (active=$(systemctl is-active qf-dispatch))"
 
-      # Now a clean restart, and the assertion.
+      # Now a clean restart, and the assertion -- but only once the daemon is
+      # actually answering. See `wait_ready`.
       rm -f "$DROPIN"; systemctl daemon-reload
       systemctl restart qf-dispatch
-      sleep 10
+      require_ready "the clean restart in $phase/$orphan_alive"
 
       local state live_after holders
       state="$(sql "SELECT state FROM jobs WHERE run_id='$rid';")"
