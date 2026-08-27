@@ -2238,9 +2238,24 @@ class Runner:
 
     def _pump(self, proc, out_w, err_w):
         def pump(stream, writer):
+            # NEVER BREAK, however far past the cap this goes. The writer stops
+            # WRITING at the cap (`write` returns 0 immediately once
+            # `overflowed`), but this loop must keep READING to EOF.
+            #
+            # It used to `break` on overflow, and that turned a bounded log into
+            # a wedged job: `docker start --attach` streams the container's
+            # output into this pipe, so a full pipe with no reader blocks the
+            # CLI in write() -- and then `proc.wait(timeout=budget)` cannot
+            # return no matter how promptly the watcher kills the container.
+            # NC15's log-flooding job sat there for its whole 1800s timeout and
+            # was reported with a NULL error_class instead of `log_overflow`
+            # within a sampling interval. The disk-flood twin passed throughout,
+            # because it writes to /out and leaves its pipe drained.
+            #
+            # Killing a process does not help when what it is blocked on is a
+            # pipe nobody is reading.
             for chunk in iter(lambda: stream.read(65536), b""):
-                if writer.write(chunk) == 0 and writer.overflowed:
-                    break
+                writer.write(chunk)
 
         threads = []
         for stream, writer in ((proc.stdout, out_w), (proc.stderr, err_w)):

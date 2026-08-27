@@ -1365,3 +1365,63 @@ class TestTheStandInNightlyIsWaitableAndDoesNotBlockItsCaller(unittest.TestCase)
         c = c[:c.index("# (f)")]
         self.assertIn("standin_acquired", c)
         self.assertIn("released another's shared lock", c)
+
+
+class TestTheAdminCanaryDoesNotDependOnPath(unittest.TestCase):
+    """`(g4) deploy reaches the admin socket` VOIDed with "qfadmin: command not
+    found": qfadmin is installed in /usr/local/sbin, which is not on a non-root
+    user's PATH. That is a report about $PATH wearing the costume of a report
+    about the admin socket."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+
+    def test_the_canary_uses_an_absolute_path(self):
+        self.assertRegex(self.suite, r'QFADMIN="\$\{QFADMIN:-/usr/local/sbin/qfadmin\}"')
+        g4 = self.suite[self.suite.index("# (g4) force-release authorisation"):]
+        g4 = g4[:g4.index("# (g6)")]
+        code = "\n".join(l for l in g4.splitlines()
+                         if not l.lstrip().startswith("#"))
+        self.assertIn("$QFADMIN --help", code)
+        self.assertNotIn('"qfadmin --help"', code)
+
+    def test_the_path_matches_where_setup_installs_it(self):
+        # A suite that hardcodes a location the installer does not use fails for
+        # a reason that has nothing to do with the control.
+        with open(os.path.join(self.host, "phase2-setup.sh")) as fh:
+            setup = fh.read()
+        self.assertIn("/usr/local/sbin/qfadmin", setup)
+
+    def test_the_admin_socket_refusals_do_not_invoke_a_binary(self):
+        # A missing binary exits 127, and refuse_as would score that as a
+        # refusal it had not earned. These clauses must talk to the socket.
+        g4 = self.suite[self.suite.index("# (g4) force-release authorisation"):]
+        g4 = g4[:g4.index("# (g6)")]
+        for name in ("research cannot reach the admin socket",
+                     "force-release does not exist on the client socket"):
+            i = g4.index(name)
+            self.assertIn("python3 -c", g4[i:i + 400], name)
+
+
+class TestNc16AssertsTheClassTheClassifierActuallyProduces(unittest.TestCase):
+    """NC16's probe names a path that does not exist -- pytest's usage error,
+    exit 4 -- and the clause asserted `nonzero_exit` after exit 4 was split out
+    as `bad_invocation`. It was asserting the previous behaviour of the very
+    thing it tests."""
+
+    def test_the_clause_expects_bad_invocation(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            suite = fh.read()
+        nc16 = suite[suite.index("NC16 the probe is FAILED"):]
+        nc16 = nc16[:nc16.index("exit status was relayed")]
+        self.assertIn('"bad_invocation"', nc16)
+        self.assertNotIn('"nonzero_exit" "$klass"', nc16)
+
+    def test_and_the_classifier_agrees_with_it(self):
+        # Pinned together so the two cannot drift again in either direction.
+        self.assertEqual(qfd.Runner.EXIT_CLASSES.get(4), "bad_invocation")

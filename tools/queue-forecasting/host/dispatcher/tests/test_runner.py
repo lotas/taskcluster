@@ -8,8 +8,10 @@
 # mutex to the nightly run while live work continues.
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import threading
 import types
 import unittest
 
@@ -779,3 +781,91 @@ class TestSourceFailuresAreRouted(RunnerCase):
         # The new clause must not widen into "everything is the source's fault".
         job = self.run_with_source_error(ZeroDivisionError("real bug"))
         self.assertEqual(job["error_class"], "internal")
+
+
+class TestTheLogPumpKeepsDrainingAfterTheCap(unittest.TestCase):
+    """A log-flooding job was never killed for `log_overflow`. It sat in
+    `proc.wait()` for its full 1800s timeout and NC15 read it as
+    TIMEOUT_WAITING with error_class NULL.
+
+    The watcher was fine and the cap was fine -- the file stopped at exactly
+    cap+len(MARKER). The pump was the problem: it BROKE out of its read loop on
+    overflow, and `docker start --attach` streams the container's output into
+    that pipe. A full pipe with no reader blocks the CLI in write(), so the
+    process could not exit however hard the watcher killed the container. The
+    disk-flood twin passed because it writes to /out and leaves its pipe drained.
+
+    Killing a process does not help if what it is blocked on is a pipe nobody is
+    reading."""
+
+    def _run_pump(self, cap, payload_bytes, join_timeout=20):
+        """Drive Runner._pump against real pipes. Returns (writer, produced_ok).
+
+        `produced_ok` is False if a producer thread was still blocked writing --
+        which is the deadlock, reproduced.
+        """
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        producers, files, writers = [], [], []
+        streams = {}
+        for name in ("stdout", "stderr"):
+            r, w = os.pipe()
+            streams[name] = os.fdopen(r, "rb")
+            writer = qfd.BoundedWriter(os.path.join(tmp, name + ".log"), cap)
+            writers.append(writer)
+            files.append(os.path.join(tmp, name + ".log"))
+
+            def produce(fd=w):
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(b"x" * payload_bytes)
+                except BrokenPipeError:
+                    pass
+
+            t = threading.Thread(target=produce, daemon=True)
+            producers.append(t)
+
+        proc = types.SimpleNamespace(stdout=streams["stdout"],
+                                     stderr=streams["stderr"])
+        for t in producers:
+            t.start()
+        # self is unused by _pump.
+        pump_threads = qfd.Runner._pump(None, proc, writers[0], writers[1])
+        produced_ok = True
+        for t in producers:
+            t.join(timeout=join_timeout)
+            if t.is_alive():
+                produced_ok = False
+        for t in pump_threads:
+            t.join(timeout=5)
+        for w_ in writers:
+            w_.close()
+        for s in streams.values():
+            s.close()
+        return writers, files, produced_ok
+
+    def test_a_producer_far_past_the_cap_is_not_blocked(self):
+        # 4 MiB through a 4 KiB cap: ~64 pipe-buffers' worth. If the pump stops
+        # reading at the cap, the producer blocks for ever and this fails.
+        cap = 4096
+        writers, files, produced_ok = self._run_pump(cap, 4 << 20)
+        self.assertTrue(produced_ok,
+                        "a producer was still blocked writing: the pump stopped"
+                        " draining, which is what wedged proc.wait() for 1800s")
+        self.assertTrue(writers[0].overflowed)
+
+    def test_the_file_is_still_bounded_at_the_cap(self):
+        # Draining must not mean writing: the bound is the whole point of the
+        # BoundedWriter, and NC15 asserts it independently on the host.
+        cap = 4096
+        writers, files, _ = self._run_pump(cap, 4 << 20)
+        for path in files:
+            size = os.path.getsize(path)
+            self.assertEqual(size, cap + len(qfd.BoundedWriter.MARKER),
+                             f"{path} is {size}B, cap is {cap}B")
+
+    def test_a_producer_under_the_cap_still_reaches_eof_normally(self):
+        writers, files, produced_ok = self._run_pump(1 << 20, 1024)
+        self.assertTrue(produced_ok)
+        self.assertFalse(writers[0].overflowed)
+        self.assertEqual(os.path.getsize(files[0]), 1024)

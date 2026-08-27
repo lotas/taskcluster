@@ -1019,3 +1019,67 @@ exists to detect. It now asserts alive **and not acquired**.
 
 Covered by six clauses in `test-nc-instrument.sh` (real `flock`, real background
 processes, no dispatcher) and `TestTheStandInNightlyIsWaitableAndDoesNotBlockItsCaller`.
+
+## Task 14 second run: 78/8, and one real dispatcher defect (2026-08-27)
+
+Four of the eight were `standin_nightly` (above), fixed after that run started.
+The other four:
+
+### `log_overflow` never fired: the pump stopped draining
+
+NC15's log-flooding job was reported `TIMEOUT_WAITING` with a NULL
+`error_class`, while `no log file exceeded 16MiB (largest 16777262B)` passed —
+exactly `cap + len(MARKER)`, so the cap worked perfectly. The watcher was fine
+too; its disk-flood twin killed correctly with `out_quota_exceeded` on the same
+1800s window.
+
+The pump was the defect:
+
+```python
+for chunk in iter(lambda: stream.read(65536), b""):
+    if writer.write(chunk) == 0 and writer.overflowed:
+        break                      # <-- stops READING, not just writing
+```
+
+`docker start --attach` streams the container's output *into that pipe*. A full
+pipe with no reader blocks the CLI in `write()`, so `proc.wait(timeout=budget)`
+cannot return however promptly `watch_disk` kills the container. The job sat in
+`proc.wait` for its whole 1800s timeout — which is precisely the window NC15
+allows, so it read as a timeout rather than as the wedge it was. The disk flood
+was immune because it writes to `/out` and leaves its pipe drained.
+
+**Killing a process does not help when what it is blocked on is a pipe nobody is
+reading.** The pump now never breaks: `write` returns 0 immediately once
+`overflowed`, so the file stays bounded while the stream is drained to EOF.
+
+Reproduced before fixing, in `TestTheLogPumpKeepsDrainingAfterTheCap`: 4 MiB
+through a 4 KiB cap over real pipes, asserting the producer is not still blocked.
+That test took 80s (blocked) before the fix and 0.005s after.
+
+### `(g4) deploy reaches the admin socket`: a $PATH report in disguise
+
+`qfadmin: command not found` — it lives in `/usr/local/sbin`, which is not on a
+non-root user's PATH. The canary now uses `$QFADMIN`, pinned by test to the path
+`phase2-setup.sh` installs. The two refusal clauses beside it connect to the
+socket with `python3` rather than invoking a binary, which is what kept *them*
+honest: a missing binary exits 127, and `refuse_as` would have scored that as a
+refusal it had not earned.
+
+This VOID was only actionable because `canary_as` had just started printing the
+captured reason. The identical failure in the previous run said only
+`VOID (g4) deploy reaches the admin socket`.
+
+### `NC16 it is classified nonzero_exit`
+
+Stale expectation. The probe names a path that does not exist — pytest's usage
+error, exit 4 — and exit 4 now routes to `bad_invocation`, because "the
+experiment ran and failed" and "the experiment never ran" send an operator to
+different places. The clause was asserting the previous behaviour of the thing it
+tests. Now pinned to the classifier in both directions.
+
+### What went right
+
+`NC15 artifact_symlink was refused by the type guard, not the timeout (1s <
+120s)` and the FIFO at `0s`. Those clauses were written to distinguish the
+file-type guard from the `HANDOFF_TIMEOUT_S` backstop, and they show the guard
+doing the work — the strongest result in the run.

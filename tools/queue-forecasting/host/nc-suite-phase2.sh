@@ -51,6 +51,7 @@ DEPLOY_USER="${DEPLOY_USER:-$(detect_nightly_user || true)}"
 LOCK="${QFD_LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}"
 INTENT_DIR="${QFD_INTENT_DIR:-/var/lib/qf-locks/intent.d}"
 MIGRATED_MARKER="${QFD_LOCK_MIGRATED_MARKER:-/etc/qf-dispatch/lock-migrated}"
+QFADMIN="${QFADMIN:-/usr/local/sbin/qfadmin}"
 CLIENT_SOCK="${QFD_SOCKET:-/run/qf-dispatch/client/sock}"
 ADMIN_SOCK="${QFD_ADMIN_SOCKET:-/run/qf-dispatch/admin/sock}"
 RUNS_DIR="${QFD_RUNS_DIR:-/var/lib/qf-runs}"
@@ -880,8 +881,14 @@ nc8_protocol() {
   # proves nothing if nothing can connect at all. Revision 9's 0750 qfd:qfd
   # runtime directory made both sockets unreachable.
   canary_as "$RESEARCH_USER" "(g4) research reaches the client socket" "qf ping"
+  # ABSOLUTE PATH. qfadmin is installed in /usr/local/sbin (phase2-setup.sh),
+  # and sbin is not on a non-root user's PATH, so by name this canary VOIDed with
+  # "qfadmin: command not found" -- a report about $PATH dressed up as a report
+  # about the admin socket. The two refusal clauses below connect to the socket
+  # directly with python3 for the same reason: a missing binary exits 127, and
+  # `refuse_as` would have scored that as a refusal it had not earned.
   canary_as "$DEPLOY_USER" "(g4) deploy reaches the admin socket" \
-    "qfadmin --help"
+    "$QFADMIN --help"
   refuse_as "$RESEARCH_USER" "(g4) research cannot reach the admin socket" \
     "python3 -c \"import socket;s=socket.socket(socket.AF_UNIX);s.connect('$ADMIN_SOCK')\""
   refuse_as "$RESEARCH_USER" "(g4) force-release does not exist on the client socket" \
@@ -1094,7 +1101,19 @@ nc16() {
   code="$(field_of "$rid" exit_code)"
   klass="$(field_of "$rid" error_class)"
   assert_eq "NC16 the probe is FAILED" "FAILED" "$final"
-  assert_eq "NC16 it is classified nonzero_exit" "nonzero_exit" "$klass"
+  # bad_invocation, NOT nonzero_exit. The probe deliberately names a path that
+  # does not exist, which is pytest's USAGE ERROR (exit 4) -- and exit 4 now
+  # routes to `bad_invocation`, because "the experiment ran and failed" and "the
+  # experiment never ran" send an operator to different places. This clause read
+  # `nonzero_exit` until the classifier gained that distinction, so it was
+  # asserting the old behaviour of the thing it tests.
+  #
+  # The exit-1 route (tests ran and failed -> nonzero_exit) is covered by
+  # TestExitCodeClassification rather than here: producing a genuinely failing
+  # test on the host would need another qf-research fixture, and the mapping is
+  # pure arithmetic on the exit code.
+  assert_eq "NC16 a usage error is classified bad_invocation" \
+    "bad_invocation" "$klass"
   # The whole point: a status was relayed, and it was not zero. "None" here
   # means the client never reported one, which is exactly the failure mode
   # `docker start --attach` would introduce if it did not wait properly.
