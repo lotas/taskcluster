@@ -879,3 +879,81 @@ because it is the part that was designed for this: `qfadmin force-release`
 refused on the first call (revoking the hold and freezing the inventory),
 released on the second, and the reservation came back by itself because
 `admitted_mem_mb` is derived from job state rather than tracked separately.
+
+## The NC suite's `pass=49 fail=24` run was not a result (2026-08-27)
+
+A full run of `nc-suite-phase2.sh` on a healthy host reported 24 failures, almost
+all of them `TIMEOUT_WAITING` or an empty state, while the *same clause's*
+filesystem assertion passed: NC13 "ran to its summary", the log cap held at
+16MiB, the 0600 artifact "was normalised to 0640", and nothing was copied for the
+symlink and FIFO fixtures. **The jobs ran and behaved correctly.** What failed was
+the suite's ability to read their state:
+
+```bash
+state_of() { as "$RESEARCH_USER" "qf status $1 --json" 2>/dev/null \
+  | python3 -c '...print(json.load(sys.stdin)["job"]["state"])' 2>/dev/null; }
+```
+
+Two discarded error streams, and one empty-string outcome covering *no socket*,
+*refused*, *unparseable payload*, *no such job* and *the job has no state*.
+`require_state_for` proves it fired on the very first poll: `(left QUEUED for
+after 0s)`.
+
+**The 24 failures were the harmless half.** These three lines printed `ok`:
+
+```
+ok  (refusal) it starts once the lock is released
+ok  (exclusion) two heavy jobs are never both RUNNING
+ok  (budget) a 22g heavy and a 4g light never run concurrently
+```
+
+The first is `wait_state ... || [ "$(state_of ...)" != "QUEUED" ]`, and an empty
+string is not "QUEUED". The other two are `while ...; do if [ "$(state_of A)" =
+RUNNING ] && [ "$(state_of B)" = RUNNING ]`, and an empty string is never
+RUNNING. **NC8's mutual-exclusion and memory-budget properties — the two things
+NC8 exists to prove — passed having observed nothing at all.** A vacuous mutex
+reads exactly like a working one, which is the first paragraph of this suite's own
+header; the code had never implemented it.
+
+Fixed in four places:
+
+1. `state_of`/`field_of` return `UNREADABLE` and record *why* in `$BLIND_FILE`.
+   The counter is a FILE because these run inside `$(...)`, and a subshell's
+   increment to a shell variable is discarded on exit.
+2. `never_concurrent` replaces both hand-rolled concurrency loops and requires
+   **positive** evidence: each job observed RUNNING *separately*. Never observed
+   is VOID, not a pass. It is correct even against the old blind helper, so the
+   two fixes are independent.
+3. `preflight_instrument` submits a probe job and reads its state back through
+   the same helper the clauses use, and **exits 2** if that round trip fails.
+   `qf ping` answering proves the socket, sudo, the login shell and qfclient
+   membership; it does *not* prove `qf status <run_id>` answers, which is what
+   every state assertion is built on. Thirty seconds instead of forty minutes.
+4. A run that was blind even once prints `THE INSTRUMENT WAS BLIND n TIME(S);
+   THESE TOTALS DO NOT STAND`, writes `VOID RUN:` into the evidence file, and
+   exits nonzero **even if every clause passed**.
+
+`refuse_as`, `canary_as` and NC10's canary now print the captured reason on the
+unexpected outcome. Every VOID in that run arrived with no reason attached.
+
+Guarded by `test-nc-instrument.sh` (extracts the instrument, drives it against a
+stubbed `qf`, 10 assertions) and by
+`TestTheNcSuiteCanTellBlindnessFromAnAnswer` in `dispatcher/tests/test_protocol.py`,
+which runs that harness and statically rejects the vacuous comparison. The suite
+cannot test this itself: reaching the bad path needs a dispatcher that will not
+answer, and on a healthy host that path never runs.
+
+### Why `fault-gates-phase2.sh` 32/0 is unaffected
+
+The gates never call `qf status`. They read `state.db` directly with `sqlite3`,
+and their blind path is *loud*: an empty state matches neither arm of
+
+```bash
+case "$state" in
+  LEASED|BUILDING|RUNNING|CLEANUP_BLOCKED) [ -n "$holders" ] && outcome_held=1 ;;
+  SUCCEEDED|FAILED|TIMEOUT|CANCELLED)      [ "$live_after" -eq 0 ] && outcome_clean=1 ;;
+esac
+```
+
+so both flags stay 0 and the clause falls through to `bad`. That is the shape to
+copy: enumerate the states that PERMIT a pass, and let everything else fail.

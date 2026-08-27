@@ -76,10 +76,21 @@ void() { echo "VOID  $1  (canary failed - refusals in this group prove nothing)"
 # and `refuse` reads that as a pass.
 as() { sudo -H -u "$1" bash -lc "${*:2}"; }
 
+# Both of these keep the command's output and print it on the UNEXPECTED
+# outcome only. Every VOID in one full run of this suite arrived with no reason
+# attached -- "canary: the attempt is possible" is a fine thing to print when a
+# canary works, but "VOID (g4) deploy reaches the admin socket" with the reason
+# thrown away is a line an operator can do nothing with.
 refuse_as() {  # refuse_as <user> <name> <command...> -> passes when it FAILS
   local user="$1" name="$2"; shift 2
-  if as "$user" "$*" >/dev/null 2>&1; then
+  # rc captured explicitly: `local out="$(cmd)"` would make $? the status of
+  # `local` (always 0), which turns every refusal clause into a PERMITTED.
+  local out rc
+  out="$(as "$user" "$*" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
     bad "$name  (action was PERMITTED)"
+    [ -n "$out" ] && printf '        it said: %s\n' \
+      "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
   else
     ok "$name  (refused)"
   fi
@@ -87,10 +98,12 @@ refuse_as() {  # refuse_as <user> <name> <command...> -> passes when it FAILS
 
 canary_as() {  # canary_as <user> <name> <command...> -> passes when it SUCCEEDS
   local user="$1" name="$2"; shift 2
-  if as "$user" "$*" >/dev/null 2>&1; then
+  local out rc
+  out="$(as "$user" "$*" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
     ok "$name  (canary: the attempt is possible)"
   else
-    void "$name"
+    void "$name  (rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160))"
   fi
 }
 
@@ -115,20 +128,149 @@ assert_eq() {
 # --- dispatcher helpers ---------------------------------------------------
 qf_as() { as "$1" "qf ${*:2}"; }
 
-submit_as() {  # submit_as <user> <args...> -> prints the run id
-  as "$1" "qf submit ${*:2}" 2>/dev/null | tail -1
+# --- THE INSTRUMENT -------------------------------------------------------
+#
+# WHY THIS IS THE MOST DEFENSIVE CODE IN THE SUITE. Every state observation used
+# to be `qf status ... 2>/dev/null | python3 -c ... 2>/dev/null`, which has three
+# possible outcomes collapsed into two: a state name, or an empty string that
+# meant EITHER "the job has no state" (impossible) OR "I could not ask". A run of
+# this suite reported pass=49 fail=24 where all 24 failures and at least three of
+# the PASSES came from that empty string -- including
+#
+#   ok  (exclusion) two heavy jobs are never both RUNNING
+#   ok  (budget) a 22g heavy and a 4g light never run concurrently
+#
+# both of which are `while ...; do if [ "$(state_of A)" = RUNNING ] && ...`. An
+# empty string never equals RUNNING, so the two properties NC8 exists to prove
+# passed because nothing whatsoever was observed. The failures were noisy and
+# honest; the vacuous passes were the dangerous half.
+#
+# So state is now read through one function that can say "I could not ask", the
+# reason is recorded, and no clause is allowed to draw a conclusion from it.
+#
+# THE COUNTER LIVES IN A FILE, not a variable. state_of is called almost
+# exclusively inside `$(...)`, and a subshell's increment to a shell variable is
+# discarded when it exits -- a counter kept in a variable here would read 0 no
+# matter how blind the run had been.
+BLIND_FILE="$(mktemp -t nc-blind.XXXXXX)"
+trap 'rm -f "$BLIND_FILE"' EXIT
+
+note_blind() {  # note_blind <reason>
+  printf '%s\n' "$1" >> "$BLIND_FILE"
+  # Once per distinct reason, like the daemon's transition logging: a poll loop
+  # would otherwise print the same line 30 times and bury the first occurrence.
+  if [ "$(grep -c -x -F "$1" "$BLIND_FILE" 2>/dev/null || echo 1)" = 1 ]; then
+    echo "BLIND cannot read job state: $1" >&2
+  fi
 }
 
-state_of() { as "$RESEARCH_USER" "qf status $1 --json" 2>/dev/null \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["job"]["state"])' 2>/dev/null; }
+blind_count() { wc -l < "$BLIND_FILE" 2>/dev/null | tr -d ' '; }
 
-field_of() { as "$RESEARCH_USER" "qf status $1 --json" 2>/dev/null \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['job'].get('$2'))" 2>/dev/null; }
+# UNREADABLE, not "". A sentinel that is obviously not a state, so a clause that
+# compares it against RUNNING and moves on is at least comparing something a
+# reader can find in the output.
+UNREADABLE=UNREADABLE
+
+status_json() {  # status_json <run_id> -> payload on stdout, reason on stderr
+  local rid="$1" out rc
+  if [ -z "$rid" ]; then
+    echo "no run id was ever produced (the submit failed)" >&2; return 1
+  fi
+  out="$(as "$RESEARCH_USER" "qf status $rid --json" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'qf status exited %s: %s\n' "$rc" \
+      "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# Extraction is a separate step from transport so the two failures do not share a
+# message: "the dispatcher would not answer" and "the answer had no job in it"
+# have completely different remedies.
+_extract() {  # _extract <run_id> <jq-ish key> -- reads payload on stdin
+  python3 -c '
+import json, sys
+key = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception as e:
+    sys.exit("payload is not JSON (%s): %.120s" % (e, raw))
+if not d.get("ok", True):
+    sys.exit("the dispatcher refused: %s" % d.get("error"))
+job = d.get("job")
+if job is None:
+    sys.exit("the reply has no job key: %.120s" % raw)
+value = job.get(key, "__MISSING__")
+if value == "__MISSING__":
+    sys.exit("the job has no %s field" % key)
+print(value)
+' "$1"
+}
+
+# Both streams are MERGED and the exit code does the discriminating, because
+# status_json writes a payload on success and a reason on failure and never both.
+# The first version routed stderr to a temp file, which worked and read as though
+# something were being thrown away -- and a helper whose whole purpose is not
+# throwing errors away should not have a `2>/dev/null` anywhere in it.
+state_of() {  # state_of <run_id> -> a state name, or UNREADABLE
+  local rid="$1" out st
+  if ! out="$(status_json "$rid" 2>&1)"; then
+    note_blind "$out"; printf '%s' "$UNREADABLE"; return 1
+  fi
+  if ! st="$(printf '%s' "$out" | _extract state 2>&1)"; then
+    note_blind "$st"; printf '%s' "$UNREADABLE"; return 1
+  fi
+  printf '%s' "$st"
+}
+
+field_of() {  # field_of <run_id> <field> -> the value, or UNREADABLE
+  local rid="$1" out value
+  if ! out="$(status_json "$rid" 2>&1)"; then
+    note_blind "$out"; printf '%s' "$UNREADABLE"; return 1
+  fi
+  if ! value="$(printf '%s' "$out" | _extract "$2" 2>&1)"; then
+    note_blind "$value"; printf '%s' "$UNREADABLE"; return 1
+  fi
+  printf '%s' "$value"
+}
+
+# THE GATE. Called at the top of every clause that is about to conclude
+# something from a job's state. It runs in the MAIN shell (not a substitution),
+# so unlike note_blind it can actually stop the run.
+#
+# A conclusion drawn while the instrument is broken is not a weaker conclusion,
+# it is a false one, and it is indistinguishable in the output from a real pass.
+readable() {  # readable <run_id> <clause-name> -> 0 if state is observable
+  local st; st="$(state_of "$1")"
+  if [ "$st" = "$UNREADABLE" ]; then
+    void "$2  (state unreadable: $(tail -1 "$BLIND_FILE" 2>/dev/null))"
+    return 1
+  fi
+  return 0
+}
+
+submit_as() {  # submit_as <user> <args...> -> prints the run id
+  local out rc
+  out="$(as "$1" "qf submit ${*:2}" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Not silent, and not fatal: the caller checks for an empty id. But the
+    # REASON is what turns "no run id" into something actionable -- nine of those
+    # in one gate run cost an afternoon because the message was thrown away.
+    echo "  submit failed (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" >&2
+    return 1
+  fi
+  printf '%s' "$out" | tail -1
+}
 
 wait_state() {  # wait_state <run_id> <state> <timeout_s>
-  local rid="$1" want="$2" limit="$3" waited=0
+  local rid="$1" want="$2" limit="$3" waited=0 st
   while [ "$waited" -lt "$limit" ]; do
-    [ "$(state_of "$rid")" = "$want" ] && return 0
+    st="$(state_of "$rid")"
+    [ "$st" = "$want" ] && return 0
+    # No point burning a 300s window polling an instrument that cannot answer.
+    [ "$st" = "$UNREADABLE" ] && return 2
     sleep 2; waited=$((waited + 2))
   done
   return 1
@@ -140,6 +282,7 @@ wait_terminal() {
     st="$(state_of "$rid")"
     case "$st" in
       SUCCEEDED|FAILED|TIMEOUT|CANCELLED|REFUSED) echo "$st"; return 0 ;;
+      "$UNREADABLE") echo "$UNREADABLE"; return 2 ;;
     esac
     sleep 2; waited=$((waited + 2))
   done
@@ -150,6 +293,10 @@ require_state_for() {  # require_state_for <run_id> <state> <seconds>
   local rid="$1" want="$2" secs="$3" waited=0 st
   while [ "$waited" -lt "$secs" ]; do
     st="$(state_of "$rid")"
+    if [ "$st" = "$UNREADABLE" ]; then
+      echo "  (could not watch $rid: instrument blind)" >&2
+      return 2
+    fi
     if [ "$st" != "$want" ]; then
       echo "  (left $want for $st after ${waited}s)" >&2
       return 1
@@ -157,6 +304,54 @@ require_state_for() {  # require_state_for <run_id> <state> <seconds>
     sleep 3; waited=$((waited + 3))
   done
   return 0
+}
+
+terminal_state() {
+  case "$1" in SUCCEEDED|FAILED|TIMEOUT|CANCELLED|REFUSED) return 0 ;;
+                *) return 1 ;; esac
+}
+
+# never_concurrent <name> <rid_a> <rid_b> <window_s> <overlap-message>
+#
+# "They were never both RUNNING" is a claim satisfied by two very different
+# worlds: one where a mutex serialised them, and one where the observer was blind
+# or the jobs never started. The first is the property NC8 exists to prove. The
+# second is how this clause printed `ok` while state_of returned "" sixty times.
+#
+# So a pass now requires POSITIVE evidence -- each job observed RUNNING on its
+# own -- and an unobserved run is VOID rather than a pass. This is the same rule
+# the refusal groups already follow (a refusal means nothing unless the action
+# was possible); it just had never been applied to the concurrency clauses,
+# which are the ones where a vacuous pass is most expensive.
+never_concurrent() {
+  local name="$1" a="$2" b="$3" window="$4" overlap_msg="$5"
+  local i=0 both=0 seen_a=0 seen_b=0 sa sb
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    void "$name  (one of the two jobs was never submitted)"; return
+  fi
+  while [ "$i" -lt "$window" ]; do
+    sa="$(state_of "$a")"; sb="$(state_of "$b")"
+    if [ "$sa" = "$UNREADABLE" ] || [ "$sb" = "$UNREADABLE" ]; then
+      void "$name  (state unreadable: $(tail -1 "$BLIND_FILE" 2>/dev/null))"; return
+    fi
+    [ "$sa" = RUNNING ] && seen_a=1
+    [ "$sb" = RUNNING ] && seen_b=1
+    if [ "$sa" = RUNNING ] && [ "$sb" = RUNNING ]; then both=1; break; fi
+    # Stop as soon as the answer cannot change: both seen separately (property
+    # established) or both terminal (nothing further can happen). The old loop
+    # always burned its full window, which is why it was set to a window too
+    # short for two serialised test jobs to both start in.
+    [ "$seen_a" = 1 ] && [ "$seen_b" = 1 ] && break
+    terminal_state "$sa" && terminal_state "$sb" && break
+    sleep 2; i=$((i + 2))
+  done
+  if [ "$both" = 1 ]; then
+    bad "$overlap_msg"
+  elif [ "$seen_a" = 1 ] && [ "$seen_b" = 1 ]; then
+    ok "$name  (each was observed RUNNING separately)"
+  else
+    void "$name  (never observed either job RUNNING: a=$seen_a b=$seen_b; exclusion unproven)"
+  fi
 }
 
 # `-c safe.directory=` is load-bearing, not defensive. The mirror is owned by
@@ -250,6 +445,47 @@ preflight() {
     exit 2
   fi
   echo "preflight: admitting, mutex free, ${queued} queued (cap ${cap}), ${free_mb}MiB free"
+  preflight_instrument
+}
+
+# THE INSTRUMENT CANARY, and the single most valuable check in this file.
+#
+# `qf ping` answering proves the socket, the client, sudo, the login shell and
+# qfclient membership all work. It does NOT prove that `qf status <run_id>`
+# answers, and that is the one call every state assertion in this suite is built
+# on. A run where status was broken and ping was fine produced 73 clauses of
+# output, 24 noisy failures and at least three PASSES that had observed nothing
+# -- and it took about forty minutes to produce.
+#
+# So: submit a real job, read its state back through the same helper the clauses
+# use, and refuse to continue if that round trip does not work. Thirty seconds
+# instead of forty minutes, and no misleading evidence file.
+preflight_instrument() {
+  local rid st
+  rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$(head_sha)" --mem 2g)" || true
+  if [ -z "$rid" ]; then
+    echo "PREFLIGHT: could not submit a probe job, so no state assertion in this" >&2
+    echo "suite could mean anything. The reason is printed above." >&2
+    exit 2
+  fi
+  st="$(state_of "$rid")"
+  as "$RESEARCH_USER" "qf cancel $rid" >/dev/null 2>&1 || true
+  if [ "$st" = "$UNREADABLE" ]; then
+    echo >&2
+    echo "PREFLIGHT: submitted $rid but CANNOT READ ITS STATE:" >&2
+    echo "  $(tail -1 "$BLIND_FILE" 2>/dev/null)" >&2
+    echo >&2
+    echo "Refusing to run the suite. 'qf ping' works, so this is not the socket" >&2
+    echo "or group membership -- it is the status op specifically. Reproduce it" >&2
+    echo "with the error visible:" >&2
+    echo "  sudo -H -u $RESEARCH_USER qf status $rid --json" >&2
+    echo "  sudo journalctl -u qf-dispatch -n 50 --no-pager" >&2
+    echo >&2
+    echo "Every state clause below would report TIMEOUT_WAITING, and the" >&2
+    echo "concurrency clauses would report PASS having observed nothing." >&2
+    exit 2
+  fi
+  echo "preflight: the status round trip works (probe $rid read back as $st)"
 }
 
 nc8() {
@@ -402,51 +638,44 @@ nc8() {
   local holder=$!
   sleep 2
   rid_a="$(submit_as "$RESEARCH_USER" --kind test --sha "$(head_sha)" --mem 8g)"
-  if require_state_for "$rid_a" QUEUED 15; then
-    ok "(refusal) a heavy job stays QUEUED while the lock is held elsewhere"
-  else
-    bad "(refusal) a heavy job left QUEUED while the lock was held"
-  fi
+  # Three outcomes, because require_state_for now has three: it held (0), it
+  # moved (1), or the suite could not watch it (2). Folding 2 into "it moved"
+  # printed FAIL on a healthy host; folding it into "it held" would be worse.
+  require_state_for "$rid_a" QUEUED 15
+  case $? in
+    0) ok  "(refusal) a heavy job stays QUEUED while the lock is held elsewhere" ;;
+    1) bad "(refusal) a heavy job left QUEUED while the lock was held" ;;
+    *) void "(refusal) a heavy job stays QUEUED  (could not watch it)" ;;
+  esac
   wait "$holder" 2>/dev/null
-  if wait_state "$rid_a" RUNNING 120 || [ "$(state_of "$rid_a")" != "QUEUED" ]; then
-    ok "(refusal) it starts once the lock is released"
-  else
-    bad "(refusal) it never started after the lock was released"
-  fi
+  # POSITIVELY observed RUNNING. The old form was
+  #   wait_state ... RUNNING 120 || [ "$(state_of ...)" != "QUEUED" ]
+  # whose right-hand side is true for UNREADABLE, so a blind suite reported that
+  # the mutex handed the job through. "Not still queued" is not "it started".
+  wait_state "$rid_a" RUNNING 120
+  case $? in
+    0) ok  "(refusal) it starts once the lock is released" ;;
+    2) void "(refusal) it starts once the lock is released  (state unreadable)" ;;
+    *) if terminal_state "$(state_of "$rid_a")"; then
+         ok "(refusal) it starts once the lock is released  (already terminal)"
+       else
+         bad "(refusal) it never started after the lock was released"
+       fi ;;
+  esac
   wait_terminal "$rid_a" 900 >/dev/null
 
   # --- exclusion: two heavy jobs are never both RUNNING -------------------
   rid_a="$(submit_as "$RESEARCH_USER" --kind test --sha "$(head_sha)" --mem 8g)"
   rid_b="$(submit_as "$RESEARCH_USER" --kind test --sha "$(head_sha)" --mem 8g)"
-  local both=0 i=0
-  while [ "$i" -lt 60 ]; do
-    if [ "$(state_of "$rid_a")" = RUNNING ] && [ "$(state_of "$rid_b")" = RUNNING ]; then
-      both=1; break
-    fi
-    sleep 2; i=$((i + 2))
-  done
-  if [ "$both" -eq 0 ]; then
-    ok "(exclusion) two heavy jobs are never both RUNNING"
-  else
-    bad "(exclusion) two heavy jobs ran concurrently"
-  fi
+  never_concurrent "(exclusion) two heavy jobs are never both RUNNING" \
+    "$rid_a" "$rid_b" 1200 "(exclusion) two heavy jobs ran concurrently"
 
   # --- budget: a 22g heavy and a 4g light never overlap -------------------
   local big small
   big="$(submit_as "$RESEARCH_USER" --kind test --sha "$(head_sha)" --mem 22g)"
   small="$(submit_as "$RESEARCH_USER" --kind test --sha "$(head_sha)" --mem 4g)"
-  both=0; i=0
-  while [ "$i" -lt 60 ]; do
-    if [ "$(state_of "$big")" = RUNNING ] && [ "$(state_of "$small")" = RUNNING ]; then
-      both=1; break
-    fi
-    sleep 2; i=$((i + 2))
-  done
-  if [ "$both" -eq 0 ]; then
-    ok "(budget) a 22g heavy and a 4g light never run concurrently"
-  else
-    bad "(budget) 26g of admitted memory ran at once on a ~29g host"
-  fi
+  never_concurrent "(budget) a 22g heavy and a 4g light never run concurrently" \
+    "$big" "$small" 1200 "(budget) 26g of admitted memory ran at once on a ~29g host"
   for r in "$rid_a" "$rid_b" "$big" "$small"; do
     as "$RESEARCH_USER" "qf cancel $r" >/dev/null 2>&1
   done
@@ -607,9 +836,14 @@ nc10() {
   echo
   echo "== NC10: trusted paths resolve only from the trusted checkout =="
   local json
-  json="$(as "$RESEARCH_USER" "qf trusted-paths --json" 2>/dev/null)"
+  # stderr KEPT. This canary voided with "returned nothing" on a host where the
+  # client was printing a perfectly good explanation to stderr, and the suite
+  # threw it away -- which is the same defect as the old state_of.
+  local why
+  json="$(as "$RESEARCH_USER" "qf trusted-paths --json" 2>/tmp/nc10.$$)"
+  why="$(cat /tmp/nc10.$$ 2>/dev/null)"; rm -f /tmp/nc10.$$
   if [ -z "$json" ]; then
-    void "NC10 canary: qf trusted-paths returned nothing"
+    void "NC10 canary: qf trusted-paths returned nothing${why:+ ($why)}"
     return
   fi
   ok "NC10 canary: qf trusted-paths responded"
@@ -1042,10 +1276,29 @@ main() {
     printf 'failed: %s\n' "${FAILED_NAMES[@]}"
   fi
 
+  # A PARTLY BLIND RUN HAS NO TOTALS. If the instrument failed even once, the
+  # pass count is not a weaker result than a clean one -- it is a different kind
+  # of thing, because a clause that could not observe its subject reports `ok`
+  # for every negative property it was asked about. Saying so here, and in the
+  # evidence file, is the difference between a result and a misleading artifact.
+  local blind; blind="$(blind_count)"
+  if [ -n "$blind" ] && [ "$blind" -gt 0 ]; then
+    echo
+    echo "== THE INSTRUMENT WAS BLIND $blind TIME(S); THESE TOTALS DO NOT STAND ==" >&2
+    echo "distinct reasons:" >&2
+    sort -u "$BLIND_FILE" | sed 's/^/  /' >&2
+    echo "Fix the reason above and re-run. Do not record this as evidence." >&2
+  fi
+
   {
     echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) nc-suite-phase2.sh ==="
     echo "host=$(hostname) trusted=$TRUSTED"
     echo "dispatcher commit: $(as "$RESEARCH_USER" 'qf ping' 2>/dev/null | grep -i commit || echo unknown)"
+    if [ -n "$blind" ] && [ "$blind" -gt 0 ]; then
+      echo "VOID RUN: the state instrument failed $blind time(s); totals below are"
+      echo "  not evidence. Distinct reasons:"
+      sort -u "$BLIND_FILE" | sed 's/^/    /'
+    fi
     echo "pass=$pass fail=$fail"
     [ "$fail" -gt 0 ] && printf 'failed: %s\n' "${FAILED_NAMES[@]}"
     echo
@@ -1057,7 +1310,8 @@ main() {
     exit 3
   fi
 
-  [ "$fail" -eq 0 ]
+  # Blindness is a failure of the run even if every clause happened to pass.
+  [ "$fail" -eq 0 ] && [ "${blind:-0}" -eq 0 ]
 }
 
 main "$@"

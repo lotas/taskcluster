@@ -1171,3 +1171,82 @@ class TestCheckoutCommit(unittest.TestCase):
     def test_the_environment_still_wins(self):
         # For tests, and for a deployment with no checkout at all.
         self.assertEqual(qfd.checkout_commit("/nonexistent"), "unknown")
+
+
+class TestTheNcSuiteCanTellBlindnessFromAnAnswer(unittest.TestCase):
+    """The NC suite's own instrument, guarded here because the suite cannot
+    guard it: reaching the bad path needs a dispatcher that will not answer, and
+    on a healthy host that path never runs.
+
+    A run reported pass=49 fail=24 where `state_of` returned "" for every job.
+    The 24 failures were noise; the danger was that three clauses printed `ok`
+    having observed nothing -- including NC8's mutual-exclusion and memory-budget
+    properties, which are the whole reason NC8 exists."""
+
+    def setUp(self):
+        # tests/ -> dispatcher/ -> host/. The suite is a sibling of the
+        # dispatcher directory, not of this file.
+        host = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+        self.host = host
+        with open(os.path.join(host, "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+
+    def test_state_of_does_not_discard_the_reason_it_could_not_ask(self):
+        # The original: `qf status ... 2>/dev/null | python3 -c ... 2>/dev/null`
+        # -- two discarded error streams and a single empty-string outcome
+        # covering "no socket", "refused", "unparseable" and "no such job".
+        body = self.suite[self.suite.index("state_of() {"):]
+        body = body[:body.index("\nfield_of() {")]
+        self.assertNotIn("2>/dev/null", body,
+                         "state_of is discarding the reason again:\n" + body)
+        self.assertIn("UNREADABLE", body)
+        self.assertIn("note_blind", body)
+
+    def test_the_blindness_counter_is_not_a_shell_variable(self):
+        # state_of is called almost only inside $(...), and a subshell's
+        # increment to a shell variable is discarded when it exits -- so a
+        # counter kept in a variable reads 0 however blind the run was.
+        self.assertRegex(self.suite, r'BLIND_FILE="\$\(mktemp')
+
+    def test_the_concurrency_clauses_require_positive_observation(self):
+        # "They were never both RUNNING" is satisfied both by a working mutex and
+        # by an observer that sees nothing. Only the first is evidence.
+        self.assertNotRegex(
+            self.suite,
+            r'\[ "\$\(state_of "\$\w+"\)" = RUNNING \] && \[ "\$\(state_of',
+            "a concurrency clause is comparing raw state_of output again; use"
+            " never_concurrent, which demands each job be seen RUNNING")
+        self.assertIn("never_concurrent ", self.suite)
+        block = self.suite[self.suite.index("never_concurrent() {"):]
+        block = block[:block.index("\n}\n")]
+        self.assertIn("seen_a", block)
+        self.assertIn("exclusion unproven", block)
+
+    def test_the_preflight_proves_the_status_round_trip_not_just_ping(self):
+        # `qf ping` answering proves the socket, sudo, the login shell and group
+        # membership. It does not prove `qf status <run_id>` answers, which is
+        # what every state assertion in the suite is built on.
+        self.assertIn("preflight_instrument", self.suite)
+        pf = self.suite[self.suite.index("preflight_instrument() {"):]
+        pf = pf[:pf.index("\n}\n")]
+        self.assertIn("qf submit", pf.replace("submit_as", "qf submit"))
+        self.assertIn("state_of", pf)
+        self.assertIn("exit 2", pf)
+
+    def test_a_blind_run_does_not_report_totals_as_a_result(self):
+        self.assertIn("THE INSTRUMENT WAS BLIND", self.suite)
+        self.assertIn("VOID RUN:", self.suite)
+        # Blindness fails the run even if every clause happened to pass.
+        self.assertRegex(self.suite,
+                         r'\[ "\$fail" -eq 0 \] && \[ "\$\{blind:-0\}" -eq 0 \]')
+
+    def test_the_instrument_harness_passes(self):
+        script = os.path.join(self.host, "test-nc-instrument.sh")
+        self.assertTrue(os.path.isfile(script), script)
+        self.assertTrue(os.stat(script).st_mode & 0o111, "not executable")
+        p = subprocess.run([script], capture_output=True, text=True,
+                           timeout=180)
+        self.assertEqual(p.returncode, 0,
+                         f"harness failed:\n{p.stdout}\n{p.stderr}")
+        self.assertIn("harness: pass=10 fail=0", p.stdout)
