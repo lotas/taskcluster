@@ -193,6 +193,65 @@ standin_nightly() {  # standin_nightly <wait_s> -> background PID that waits the
 # =========================================================================
 # NC8 -- the mutex, seventeen clauses, thirteen of them found by review.
 # =========================================================================
+# PRECONDITION, once, before any clause. This suite submits dozens of jobs, so
+# one upstream condition -- admissions stopped, the nightly holding the mutex, a
+# full per-uid queue, or a co-tenant Postgres spilling temp files into the disk
+# floor -- turns into a screenful of unrelated VOIDs that each look like a
+# containment failure. The fault gates learned this the expensive way: eleven
+# reports from a single stuck queue.
+#
+# It REFUSES rather than warns. An evidence file is the output of this script, and
+# evidence gathered against a host that could not run jobs is worse than no
+# evidence, because it reads as coverage.
+preflight() {
+  local ping admit mutex queued free_mb cap floor_mb need_mb
+  ping="$(as "$RESEARCH_USER" 'qf ping' 2>/dev/null)" || true
+  if [ -z "$ping" ]; then
+    echo "PREFLIGHT: cannot reach the dispatcher as $RESEARCH_USER." >&2
+    exit 2
+  fi
+  admit="$(printf '%s\n' "$ping" | awk -F': ' '/^admit:/{print $2}')"
+  mutex="$(printf '%s\n' "$ping" | awk -F': ' '/^mutex:/{print $2}')"
+  queued="$(printf '%s\n' "$ping" | awk -F': ' '/^queued:/{print $2}')"
+  free_mb="$(printf '%s\n' "$ping" | awk -F': ' '/^free_disk_mb:/{print $2}')"
+  cap="${QFD_QUEUED_CAP_PER_UID:-20}"
+  floor_mb=$(( ${QFD_DISK_FLOOR_GB:-20} * 1024 ))
+  # NC15's disk-flood fixture writes up to OUT_QUOTA, and every other clause
+  # needs the floor satisfied on top of that.
+  need_mb=$(( floor_mb + ${QFD_ARTIFACT_CAP_MB:-2048} + 4096 ))
+
+  if [ -z "$admit" ]; then
+    echo "PREFLIGHT: this dispatcher predates the admit/mutex fields in ping;" >&2
+    echo "refresh the trusted checkout before gathering evidence." >&2
+    exit 2
+  fi
+  if [ "$admit" != "ok" ]; then
+    echo "PREFLIGHT: not admitting ($admit). Clear it first." >&2
+    exit 2
+  fi
+  if [ "$mutex" != "free" ]; then
+    echo "PREFLIGHT: the training mutex reads '$mutex'. The nightly" >&2
+    echo "walk-forward runs at 01:00 for roughly a quarter of an hour and holds" >&2
+    echo "it exclusively; no light job is admitted while it does." >&2
+    echo "holders: $(fuser "$LOCK" 2>/dev/null | tr -s ' ')" >&2
+    exit 2
+  fi
+  if [ -n "$queued" ] && [ "$queued" -ge $(( cap / 2 )) ]; then
+    echo "PREFLIGHT: $queued jobs already QUEUED against a per-uid cap of" >&2
+    echo "$cap; submits would start being refused part-way through." >&2
+    exit 2
+  fi
+  if [ -n "$free_mb" ] && [ "$free_mb" -lt "$need_mb" ]; then
+    echo "PREFLIGHT: ${free_mb}MiB free, and this suite needs about" >&2
+    echo "${need_mb}MiB (the ${floor_mb}MiB admission floor, NC15's output" >&2
+    echo "quota, and headroom). Note that queue-forecasting_pgdata spills temp" >&2
+    echo "files during large queries and can double transiently -- if that is" >&2
+    echo "what you are seeing, wait for it rather than lowering the floor." >&2
+    exit 2
+  fi
+  echo "preflight: admitting, mutex free, ${queued} queued (cap ${cap}), ${free_mb}MiB free"
+}
+
 nc8() {
   echo
   echo "== NC8: no second heavy job, and the mutex protocol from both sides =="
@@ -966,6 +1025,7 @@ main() {
     exit 2
   fi
   echo "trusted=$TRUSTED deploy=$DEPLOY_USER research=$RESEARCH_USER"
+  preflight
   echo "lock=$LOCK intent=$INTENT_DIR"
 
   nc8
