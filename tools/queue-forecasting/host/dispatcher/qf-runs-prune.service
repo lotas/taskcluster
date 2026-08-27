@@ -1,5 +1,5 @@
 [Unit]
-Description=Prune queue-forecasting run directories older than 90 days
+Description=Prune queue-forecasting run directories (tiered, with a size cap)
 Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/auto-research-phase2-design.md
 
 [Service]
@@ -9,9 +9,23 @@ Group=qfd
 SupplementaryGroups=qfrun qfclient
 StateDirectory=qf-runs
 ReadWritePaths=/var/lib/qf-runs
-# -mindepth 1 -maxdepth 1: prune whole run directories, never walk into one and
-# delete parts of it. A half-pruned run reads as a run whose artifacts vanished.
-ExecStart=/usr/bin/find /var/lib/qf-runs -mindepth 1 -maxdepth 1 -type d -mtime +90 -exec rm -rf {} +
+# A SCRIPT, not a `find` one-liner, and the reasoning is in its header. The
+# short version: age-only retention assumes a steady rate, one day of fault-gate
+# and NC-suite work put 5.6GiB here, and the dispatcher's own admission floor
+# reserves the last 20GiB of the same filesystem. The script keeps two tiers by
+# age plus a size cap, drops out/logs/src before artifacts (kilobytes of
+# scientific record versus megabytes of transcript), leaves a PRUNED file so a
+# partially pruned run reads as pruned rather than as damaged, and exits non-zero
+# if it could not get under its budget.
+#
+# Nothing younger than QF_PRUNE_MIN_AGE_HOURS is touched, which is what keeps a
+# LIVE run safe without this unit needing to open the dispatcher's database.
+ExecStart=/srv/queue-forecasting/tools/queue-forecasting/host/dispatcher/qf-runs-prune.sh
+Environment=QFD_RUNS_DIR=/var/lib/qf-runs
+Environment=QF_PRUNE_MIN_AGE_HOURS=6
+Environment=QF_PRUNE_LOG_DAYS=14
+Environment=QF_PRUNE_RUN_DAYS=90
+Environment=QF_PRUNE_MAX_TOTAL_MB=8192
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -7,6 +7,7 @@
 # connection defect the DB-owner thread exists to prevent.
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -930,6 +931,42 @@ class TestAbsenceDoesNotDependOnDockersWording(unittest.TestCase):
         d = self.docker((1, "", "Error: No such object: c"),
                         (1, "", "ps should not have been called"))
         self.assertIs(d.is_running("c"), False)
+
+
+class TestThePruneUnitAndItsScriptAgree(unittest.TestCase):
+    """The unit ExecStarts a script in the trusted checkout, and nothing else
+    checks that the two still match. A timer that fails at every firing does so
+    quietly."""
+
+    def setUp(self):
+        self.here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(self.here, "qf-runs-prune.service")) as fh:
+            self.unit = fh.read()
+
+    def test_the_execstart_names_a_file_that_exists(self):
+        line = [l for l in self.unit.splitlines() if l.startswith("ExecStart=")]
+        self.assertEqual(len(line), 1, self.unit)
+        path = line[0].split("=", 1)[1].split()[0]
+        self.assertEqual(os.path.basename(path), "qf-runs-prune.sh")
+        self.assertTrue(os.path.isfile(os.path.join(self.here,
+                                                    "qf-runs-prune.sh")))
+
+    def test_the_script_is_executable(self):
+        # 0644 here means the timer fails at every firing with "Permission
+        # denied", in a unit nobody is watching.
+        mode = os.stat(os.path.join(self.here, "qf-runs-prune.sh")).st_mode
+        self.assertTrue(mode & 0o111, oct(mode))
+
+    def test_every_knob_the_script_reads_is_set_by_the_unit(self):
+        # A default that only exists in the script is a default nobody reviewing
+        # the unit can see.
+        with open(os.path.join(self.here, "qf-runs-prune.sh")) as fh:
+            script = fh.read()
+        knobs = set(re.findall(r"\$\{(QF_PRUNE_[A-Z_]+):-", script))
+        knobs.discard("QF_PRUNE_DRY_RUN")     # operator-only, never in the unit
+        for knob in sorted(knobs):
+            with self.subTest(knob=knob):
+                self.assertIn(f"Environment={knob}=", self.unit)
 
 
 class TestMutexProbe(unittest.TestCase):

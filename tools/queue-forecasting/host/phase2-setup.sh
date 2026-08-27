@@ -649,6 +649,10 @@ cmd_install() {
     if grep -q '%%DEPLOY_UID%%' /etc/systemd/system/qf-dispatch.service; then
       die "the DEPLOY_UID placeholder was not substituted; the admin socket would authorise nobody"
     fi
+    # The unit ExecStarts a script in the TRUSTED checkout, so it needs the
+    # executable bit there -- a 0644 script is a unit that fails at every firing
+    # with nothing but "Permission denied" in a timer nobody is watching.
+    chmod 0755 "$DISPATCHER/qf-runs-prune.sh"
     install -m 0644 "$DISPATCHER/qf-runs-prune.service" /etc/systemd/system/
     install -m 0644 "$DISPATCHER/qf-runs-prune.timer" /etc/systemd/system/
   fi
