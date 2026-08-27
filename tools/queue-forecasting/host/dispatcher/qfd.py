@@ -567,6 +567,39 @@ class LockHeld(Exception):
     that blocks while holding anything turns a momentary hold into a long one."""
 
 
+def probe_mutex(path):
+    """"free", "held_exclusive", or "unknown". A DIAGNOSTIC, never a decision.
+
+    Admission already answers this per lane inside `Runner.try_one`, where a
+    failed `LOCK_SH` is logged and the job stays QUEUED. What was missing was any
+    way to ASK: `may_admit` covers the cleanup stall and the nightly intent gate
+    but not the mutex, so a queue frozen by an incumbent heavy run -- the
+    nightly, most often -- looked identical to an idle one from outside. The
+    fault gates then submitted sixteen jobs into it and reported sixteen
+    unrelated voids.
+
+    A shared, non-blocking probe: it succeeds unless something holds the lock
+    EXCLUSIVELY, which is exactly the condition that stops the light lane. It
+    holds the shared lock for microseconds, and the nightly waits with a timeout
+    rather than `-n`, so the probe cannot cost it the lock.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return "held_exclusive"
+        return "free"
+    except OSError:
+        # No lock file, or unreadable. `check_startup` refuses to start without
+        # one, so this is "cannot tell", not "free".
+        return "unknown"
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 class TrainingLock:
     """One open file description per job.
 
@@ -1053,6 +1086,7 @@ class Dispatcher:
         may, reason = self.may_admit()
         return {
             "admit": "ok" if may else reason,
+            "mutex": probe_mutex(self.cfg.lock_file),
             "queued": len(self.db.call("list", state="QUEUED", limit=500)),
             "commit": self.commit,
             "schema": SCHEMA_VERSION,

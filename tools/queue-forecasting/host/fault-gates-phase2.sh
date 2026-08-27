@@ -29,6 +29,9 @@ TRUSTED="${TRUSTED:-/srv/queue-forecasting}"
 DISPATCHER="$TRUSTED/tools/queue-forecasting/host/dispatcher"
 RESEARCH_USER="${RESEARCH_USER:-research}"
 STATE_DIR="${QFD_STATE_DIR:-/var/lib/qf-platform}"
+# Named once here rather than repeated inline: `lock_holders` had its own copy of
+# this default, and the preflight below needs the same inode.
+LOCK="${QFD_LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}"
 BUILD_SETTLE_S="${QFD_BUILD_SETTLE_S:-30}"
 # ONE definition, used both for the drop-in the gate installs and for the instant
 # the gate starts its clock at. Two copies of this number drifting apart is how
@@ -61,7 +64,7 @@ build_clients() { pgrep -fa 'docker[- ]build' | grep -v fault-gates | wc -l; }
 # A job holds the training lock exactly while a descriptor on it is open. `fuser`
 # tells us whether ANY process holds it, which is what "the lock was retained"
 # means from the outside.
-lock_holders() { fuser "${QFD_LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}" 2>/dev/null | tr -s ' '; }
+lock_holders() { fuser "$LOCK" 2>/dev/null | tr -s ' '; }
 
 set_dropin() {
   mkdir -p "$DROPIN_DIR"
@@ -348,13 +351,25 @@ preflight() {
     echo "or every iteration below will VOID for this one reason." >&2
     exit 2
   fi
+  # THE MUTEX, which `admit` does not cover: `may_admit` answers about the
+  # cleanup stall and the intent gate, while the lock is taken per lane inside
+  # try_one. A nightly run holding LOCK_EX freezes the light lane while every
+  # other indicator reads healthy -- which is precisely what happened, and the
+  # gate blamed the jobs.
+  if ! ( exec 9>"$LOCK"; flock -s -n 9 ); then
+    echo "REFUSING TO RUN: something holds the training mutex EXCLUSIVELY --" >&2
+    echo "the nightly walk-forward, most likely. Light jobs cannot be admitted" >&2
+    echo "while it does, so every iteration below would VOID on a healthy host." >&2
+    echo "holders: $(lock_holders)" >&2
+    exit 2
+  fi
   if [ -n "$queued" ] && [ "$queued" -ge $(( cap / 2 )) ]; then
     echo "REFUSING TO RUN: $queued jobs are already QUEUED and the per-uid cap" >&2
     echo "is $cap, so submits will start being refused mid-run and report as" >&2
     echo "'no run id'. Drain the queue first (qf list --state QUEUED)." >&2
     exit 2
   fi
-  echo "preflight: admitting, ${queued} queued (cap ${cap})"
+  echo "preflight: admitting, mutex free, ${queued} queued (cap ${cap})"
 }
 
 

@@ -932,6 +932,56 @@ class TestAbsenceDoesNotDependOnDockersWording(unittest.TestCase):
         self.assertIs(d.is_running("c"), False)
 
 
+class TestMutexProbe(unittest.TestCase):
+    """The gap that made a frozen queue indistinguishable from an idle one.
+
+    `may_admit` covers the cleanup stall and the nightly intent gate; it does NOT
+    cover the mutex, because that is decided per lane inside `try_one`. From
+    outside, a light lane blocked by an incumbent heavy holder looked exactly
+    like an idle host -- and the fault gates submitted sixteen jobs into one and
+    reported sixteen unrelated voids.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lock = os.path.join(self.tmp.name, "heavy.lock")
+        open(self.lock, "wb").close()
+
+    def test_an_unheld_lock_reads_free(self):
+        self.assertEqual(qfd.probe_mutex(self.lock), "free")
+
+    def test_a_shared_holder_still_reads_free(self):
+        # The probe answers the question the LIGHT lane asks. A shared holder is
+        # another light job, which does not block one.
+        import fcntl as f
+        fd = os.open(self.lock, os.O_WRONLY)
+        self.addCleanup(os.close, fd)
+        f.flock(fd, f.LOCK_SH)
+        self.assertEqual(qfd.probe_mutex(self.lock), "free")
+
+    def test_an_exclusive_holder_reads_held(self):
+        import fcntl as f
+        fd = os.open(self.lock, os.O_WRONLY)
+        self.addCleanup(os.close, fd)
+        f.flock(fd, f.LOCK_EX)
+        self.assertEqual(qfd.probe_mutex(self.lock), "held_exclusive")
+
+    def test_a_missing_lock_is_unknown_not_free(self):
+        # "Cannot tell" must not read as "nothing is holding it".
+        self.assertEqual(qfd.probe_mutex(self.lock + ".absent"), "unknown")
+
+    def test_the_probe_does_not_keep_the_lock(self):
+        # It holds a shared lock for microseconds; if it leaked one, an exclusive
+        # acquire afterwards would fail and the probe would have cost the nightly
+        # its mutex.
+        import fcntl as f
+        qfd.probe_mutex(self.lock)
+        fd = os.open(self.lock, os.O_WRONLY)
+        self.addCleanup(os.close, fd)
+        f.flock(fd, f.LOCK_EX | f.LOCK_NB)   # raises if the probe leaked
+
+
 class TestTrainingLock(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

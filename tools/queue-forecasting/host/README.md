@@ -736,6 +736,37 @@ daemon on the host:
 - **What the CLI *says* about a container that is gone.** This one bit us for
   real on 2026-08-26 (Docker 29.7.2), which is why the third bullet exists.
 
+## Do not run the suites while the nightly holds the mutex
+
+`fault-gates-phase2.sh` and `nc-suite-phase2.sh` both submit jobs, and a job
+cannot be admitted into the light lane while anything holds the training lock
+EXCLUSIVELY. The nightly walk-forward does exactly that, for as long as it runs.
+
+This is not a theoretical caution. A gate run on 2026-08-27 produced eleven
+failures from it: three iterations voided with "the job never reached BUILDING
+(state QUEUED)", and the nine after that voided with "no run id" because each
+voided iteration left its job QUEUED until `research` hit
+`QFD_QUEUED_CAP_PER_UID`. Every indicator an operator would think to check read
+healthy — `stall: None`, `admitted_mem_mb: 0`, both lanes idle — because
+`may_admit` covers the cleanup stall and the intent gate but *not* the mutex,
+which is taken per lane inside `Runner.try_one`.
+
+Three fixes came out of it, and the first is the one to remember:
+
+- **`qf ping` now answers it.** `admit`, `mutex` (`free` / `held_exclusive` /
+  `unknown`) and `queued`. A queue that is not moving is the likeliest question
+  to ask that endpoint and it could not answer any part of it; the reasons
+  existed only as INFO lines repeated once per poll in journald.
+- **The gate has a preflight** that refuses to start when the dispatcher is not
+  admitting, when the mutex is held exclusively, or when the queue is already at
+  half the per-uid cap. Sixteen iterations against a queue that cannot move is
+  worse than one refusal naming the cause.
+- **A voided iteration cancels its own job**, instead of leaving it to fill the
+  cap and convert one upstream condition into a second, unrelated failure mode.
+
+`unknown` from the mutex probe means "cannot tell", not "free" — the lock file
+was missing or unreadable, which `check_startup` already refuses to start over.
+
 ## The `nc12-poisoned-manifest` branch is a FIXTURE, not litter
 
 `qf-research` carries a permanent branch called `nc12-poisoned-manifest`, and
