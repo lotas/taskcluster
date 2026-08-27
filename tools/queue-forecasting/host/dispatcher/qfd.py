@@ -1044,7 +1044,16 @@ class Dispatcher:
 
     def _op_ping(self, payload, uid):
         stall = self.cleanup_stall()
+        # `admit` and `queued`, because "why is my job still QUEUED" was
+        # unanswerable from here. The reasons were logged at INFO once per poll,
+        # so they sit in journald surrounded by hundreds of copies of themselves,
+        # and `stall` alone covers only one of the several ways admission stops.
+        # A queue that is not moving is the likeliest question to ask this
+        # endpoint, and it could not answer it.
+        may, reason = self.may_admit()
         return {
+            "admit": "ok" if may else reason,
+            "queued": len(self.db.call("list", state="QUEUED", limit=500)),
             "commit": self.commit,
             "schema": SCHEMA_VERSION,
             "started_at": self.started_at,

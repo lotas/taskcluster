@@ -118,7 +118,18 @@ gate_a() {
     if [ -z "$rid" ]; then void "$method: submit produced no run id"; continue; fi
 
     if ! wait_for_state "$rid" BUILDING 180; then
+      # WHY, not just "it did not". A job that sits QUEUED is the daemon
+      # refusing to admit, and the reason is a fact it already knows -- printing
+      # only the state sent the reader looking at the job instead of at the
+      # queue. Every iteration of this gate then voided for the same upstream
+      # cause with nothing naming it.
       void "$method: the job never reached BUILDING (state $(sql "SELECT state FROM jobs WHERE run_id='$rid';"))"
+      as "$RESEARCH_USER" "qf ping" 2>/dev/null \
+        | grep -E '^(admit|queued|stall|admitted_mem_mb|free_disk_mb):' \
+        | sed 's/^/      /'
+      journalctl -u qf-dispatch --since '-3 min' 2>/dev/null \
+        | grep -E 'not admitt|lane .*:' | tail -3 | sed 's/^/      /'
+      as "$RESEARCH_USER" "qf cancel $rid" >/dev/null 2>&1
       continue
     fi
     ok "$method: canary -- the job reached BUILDING and a build is in flight"
@@ -294,11 +305,20 @@ Environment=QFD_FAULT_AFTER=$phase"
         bad "$phase/$orphan_alive: INTERMEDIATE state -- state=$state live=$live_after holders='$holders'"
       fi
 
-      # The chain must still verify either way.
-      if as "$RESEARCH_USER" "qf verify-chain" >/dev/null 2>&1; then
+      # The chain must still verify either way -- and "does not verify" must not
+      # also mean "could not ask". `qf verify-chain` exits 1 for a chain with
+      # problems and 2 for a transport failure, and this used to discard both
+      # along with the output, so a daemon whose socket was not up yet reported
+      # as CORRUPTION on the one signal that says the audit record is intact.
+      local vc_out vc_rc
+      vc_out="$(as "$RESEARCH_USER" "qf verify-chain" 2>&1)"; vc_rc=$?
+      if [ "$vc_rc" -eq 0 ]; then
         ok "$phase/$orphan_alive: the event chain still verifies"
+      elif [ "$vc_rc" -eq 1 ]; then
+        bad "$phase/$orphan_alive: THE EVENT CHAIN HAS PROBLEMS after the crash"
+        printf '%s\n' "$vc_out" | sed 's/^/      /'
       else
-        bad "$phase/$orphan_alive: the event chain does not verify after the crash"
+        void "$phase/$orphan_alive: could not ask the daemon to verify the chain (rc=$vc_rc): $(printf '%s' "$vc_out" | head -1)"
       fi
 
       as "$RESEARCH_USER" "qf cancel $rid" >/dev/null 2>&1
@@ -308,12 +328,44 @@ Environment=QFD_FAULT_AFTER=$phase"
   clear_dropin
 }
 
+# PRECONDITION, checked once. Every iteration of both gates submits a job, and a
+# host whose admissions are already stopped -- or whose per-uid queue is already
+# full -- turns one upstream condition into a screenful of unrelated VOIDs. The
+# first real run produced eleven failures from a single stuck queue.
+preflight() {
+  local ping admit queued cap
+  ping="$(sudo -H -u "$RESEARCH_USER" bash -lc 'qf ping' 2>/dev/null)" || true
+  admit="$(printf '%s\n' "$ping" | awk -F': ' '/^admit:/{print $2}')"
+  queued="$(printf '%s\n' "$ping" | awk -F': ' '/^queued:/{print $2}')"
+  cap="${QFD_QUEUED_CAP_PER_UID:-20}"
+  if [ -z "$admit" ]; then
+    echo "cannot reach the dispatcher as $RESEARCH_USER; nothing below would mean anything" >&2
+    exit 2
+  fi
+  if [ "$admit" != "ok" ]; then
+    echo "REFUSING TO RUN: the dispatcher is not admitting ($admit)." >&2
+    echo "Clear that first -- e.g. resolve or force-release the blocked run --" >&2
+    echo "or every iteration below will VOID for this one reason." >&2
+    exit 2
+  fi
+  if [ -n "$queued" ] && [ "$queued" -ge $(( cap / 2 )) ]; then
+    echo "REFUSING TO RUN: $queued jobs are already QUEUED and the per-uid cap" >&2
+    echo "is $cap, so submits will start being refused mid-run and report as" >&2
+    echo "'no run id'. Drain the queue first (qf list --state QUEUED)." >&2
+    exit 2
+  fi
+  echo "preflight: admitting, ${queued} queued (cap ${cap})"
+}
+
+
 main() {
   [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 2; }
   command -v sqlite3 >/dev/null || { echo "sqlite3 is required" >&2; exit 2; }
   trap 'rm -f "$DROPIN"; systemctl daemon-reload; systemctl restart qf-dispatch' EXIT
 
   echo "== Phase 2a fault gates =="
+
+  preflight
   echo "settle window: ${BUILD_SETTLE_S}s"
 
   gate_a
