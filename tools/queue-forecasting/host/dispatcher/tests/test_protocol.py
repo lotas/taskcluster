@@ -1245,11 +1245,13 @@ class TestTheNcSuiteCanTellBlindnessFromAnAnswer(unittest.TestCase):
         script = os.path.join(self.host, "test-nc-instrument.sh")
         self.assertTrue(os.path.isfile(script), script)
         self.assertTrue(os.stat(script).st_mode & 0o111, "not executable")
+        # The stand-in clauses use real flock against real background processes,
+        # so this takes ~25s of wall clock rather than being instant.
         p = subprocess.run([script], capture_output=True, text=True,
-                           timeout=180)
+                           timeout=300)
         self.assertEqual(p.returncode, 0,
                          f"harness failed:\n{p.stdout}\n{p.stderr}")
-        self.assertIn("harness: pass=10 fail=0", p.stdout)
+        self.assertIn("harness: pass=16 fail=0", p.stdout)
 
 
 class TestJsonIsAcceptedOnEitherSideOfTheSubcommand(unittest.TestCase):
@@ -1319,3 +1321,47 @@ class TestJsonIsAcceptedOnEitherSideOfTheSubcommand(unittest.TestCase):
             bad = re.findall(r"qf(?:admin)? (?!--json)[a-z-]+[^\"'\n]*--json",
                              text)
             self.assertEqual(bad, [], f"{name} uses the trailing form: {bad}")
+
+
+class TestTheStandInNightlyIsWaitableAndDoesNotBlockItsCaller(unittest.TestCase):
+    """`standin_nightly` used to be `( ... ) & echo $!`, read through a command
+    substitution. That made it both unreturnable and unwaitable, and produced
+    four of NC8's protocol FAILs on a correctly behaving host."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+
+    def test_it_does_not_echo_its_pid(self):
+        # Echoing the pid forces a command substitution at the call site, and the
+        # backgrounded subshell inherits that pipe as stdout -- so `$(...)` waits
+        # for the stand-in to die instead of for the function to return.
+        body = self.suite[self.suite.index("standin_nightly() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertNotIn("echo $!", body, body)
+        self.assertIn("STANDIN_PID=$!", body)
+
+    def test_its_output_cannot_hold_a_callers_pipe_open(self):
+        body = self.suite[self.suite.index("standin_nightly() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn(">/dev/null 2>&1 &", body)
+
+    def test_no_call_site_uses_a_command_substitution(self):
+        # Comments stripped: the fixed helper documents the broken call form, and
+        # matching that is how this test first failed against a correct script.
+        # Second time in one sitting -- a static scan over source must decide
+        # what counts as code before it decides what counts as wrong.
+        code = "\n".join(l for l in self.suite.splitlines()
+                         if not l.lstrip().startswith("#"))
+        self.assertNotRegex(code, r'\w+="\$\(standin_nightly')
+
+    def test_acquisition_is_observed_not_inferred_from_liveness(self):
+        # A stand-in that WRONGLY acquired the mutex is also alive, holding it,
+        # for its whole hold window -- so `kill -0` alone reports `ok` for the
+        # failure clause (c) exists to detect.
+        c = self.suite[self.suite.index("# (c) PER-DESCRIPTOR ownership"):]
+        c = c[:c.index("# (f)")]
+        self.assertIn("standin_acquired", c)
+        self.assertIn("released another's shared lock", c)

@@ -29,9 +29,14 @@ SUITE="$HERE/nc-suite-phase2.sh"
 # Extract the instrument block rather than sourcing the suite, which would run
 # main() against the live host.
 BLOCK="$(mktemp)"; trap 'rm -f "$BLOCK"' EXIT
+# Two ranges: the instrument, and the stand-in nightly helpers further down.
+# Sourcing the whole suite would run main() against the live host.
 awk '/^# --- THE INSTRUMENT/{f=1} /^# .-c safe.directory=/{f=0} f' "$SUITE" > "$BLOCK"
+awk '/^# A stand-in for the nightly:/{f=1} /^# NC8 -- the mutex/{f=0} f' \
+  "$SUITE" >> "$BLOCK"
 for fn in state_of field_of submit_as wait_state wait_terminal \
-          require_state_for never_concurrent terminal_state note_blind; do
+          require_state_for never_concurrent terminal_state note_blind \
+          standin_nightly standin_acquired wait_standin_acquired; do
   grep -q "^$fn()" "$BLOCK" || { echo "extraction missed $fn()" >&2; exit 2; }
 done
 
@@ -152,6 +157,67 @@ fi
 restore
 eval "$state_of_orig"
 rm -f "$SEQ"
+
+# =========================================================================
+# THE STAND-IN NIGHTLY. Real flock, real background processes, no dispatcher.
+# =========================================================================
+#
+# The original was `( exec 9>"$LOCK"; flock -w "$1" 9 && sleep 60 ) & echo $!`,
+# read as `sp="$(standin_nightly 300)"`, and it had two bugs feeding four FAILs:
+#
+#   1. Command substitution reads its pipe to EOF and the backgrounded subshell
+#      inherits that pipe as stdout, so `$(...)` blocked until the stand-in had
+#      waited for the lock, slept 60s and exited -- measured at 67s in a local
+#      reproduction. By the time `sp` was assigned the process was gone.
+#   2. It was a GRANDCHILD, so `wait "$sp"` returned 127 ("not a child of this
+#      shell") without waiting, printing "it never acquired the lock".
+#
+# Whether clause (a) then said "waits rather than exiting" or "exited instead of
+# waiting" was a RACE: at that moment the process is a zombie, and `kill -0`
+# succeeds for a zombie until init reaps it. Two hosts disagreed for that reason.
+echo "== the stand-in nightly, against real flock =="
+SLOCK="$(mktemp)"
+LOCK="$SLOCK"          # the helpers read $LOCK
+
+( exec 8>"$SLOCK"; flock -s 8; sleep 12 ) &   # a shared holder, like a light job
+holder=$!
+sleep 1
+t0=$(date +%s); standin_nightly 60 3; t1=$(date +%s)
+[ $((t1 - t0)) -le 1 ]   && HOK "standin_nightly returns immediately ($((t1 - t0))s)"   || HBAD "standin_nightly blocked for $((t1 - t0))s -- the substitution bug is back"
+
+kill -0 "$STANDIN_PID" 2>/dev/null   && HOK "it is a direct child, visible as pid $STANDIN_PID"   || HBAD "the stand-in is not visible to kill -0"
+
+sleep 3
+if kill -0 "$STANDIN_PID" 2>/dev/null && ! standin_acquired; then
+  HOK "while a shared holder exists it WAITS and has not acquired"
+else
+  HBAD "it did not wait behind the shared holder"
+fi
+
+wait "$holder" 2>/dev/null
+if wait_standin_acquired 60; then
+  HOK "it acquires once the holder drains, and the marker records when"
+else
+  HBAD "it never acquired after the holder drained"
+fi
+if wait "$STANDIN_PID" 2>/dev/null; then
+  HOK "wait reaps it (a grandchild would return 127 immediately)"
+else
+  HBAD "wait failed -- it is not a child of this shell"
+fi
+rm -f "$STANDIN_ACQUIRED"
+
+( exec 8>"$SLOCK"; flock -x 8; sleep 20 ) &   # EXCLUSIVE: it must never get in
+blocker=$!
+sleep 1
+standin_nightly 3 2
+if wait_standin_acquired 12; then
+  HBAD "it claimed acquisition through an exclusive holder"
+else
+  HOK "a flock timeout reports 'never acquired', not success"
+fi
+kill "$blocker" 2>/dev/null; wait "$blocker" 2>/dev/null
+rm -f "$STANDIN_ACQUIRED" "$SLOCK"
 
 echo
 echo "harness: pass=$hpass fail=$hfail"

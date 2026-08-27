@@ -385,9 +385,48 @@ fixture_sha() {
   printf '%s' "$s"
 }
 
-standin_nightly() {  # standin_nightly <wait_s> -> background PID that waits then holds
-  ( exec 9>"$LOCK"; flock -w "$1" 9 && sleep 60 ) &
-  echo $!
+# A stand-in for the nightly: opens the mutex, waits up to <wait_s> for it, then
+# holds it for <hold_s>.
+#
+# SETS TWO VARIABLES rather than echoing the pid, and both reasons are defects
+# this replaced. It used to be `( ... ) & echo $!`, read as
+# `sp="$(standin_nightly 300)"`:
+#
+#   1. Command substitution reads the pipe to EOF, and the backgrounded subshell
+#      INHERITS that pipe as its stdout. So `$(...)` did not return when the
+#      function returned -- it blocked until the stand-in had waited for the
+#      lock, slept, and exited. By the time `sp` was assigned the process was
+#      already dead, and `kill -0` reported "exited instead of waiting".
+#   2. Forked inside a substitution subshell, it was a GRANDCHILD of the suite,
+#      and `wait` on a non-child returns 127 immediately -- so "(a) it never
+#      acquired the lock" was printed without anything being waited for.
+#
+# Acquisition is reported through a MARKER FILE, not through the exit status, so
+# the clause can time the wait itself instead of the wait plus the hold.
+standin_nightly() {  # standin_nightly <wait_s> [hold_s]; sets STANDIN_PID/_ACQUIRED
+  STANDIN_ACQUIRED="$(mktemp -u -t nc-standin.XXXXXX)"
+  # stdout and stderr go to /dev/null so this can never hold a caller's pipe
+  # open, whatever the call site looks like.
+  ( exec 9>"$LOCK"
+    flock -w "$1" 9 || exit 1
+    date +%s > "$STANDIN_ACQUIRED"
+    sleep "${2:-5}"
+  ) >/dev/null 2>&1 &
+  STANDIN_PID=$!
+}
+
+standin_acquired() { [ -s "$STANDIN_ACQUIRED" ]; }
+
+# Waits for the stand-in to acquire, up to <limit>s. Distinguishes acquisition
+# from exit: the process exiting without the marker means flock timed out.
+wait_standin_acquired() {  # wait_standin_acquired <limit_s>
+  local waited=0
+  while [ "$waited" -lt "$1" ]; do
+    standin_acquired && return 0
+    kill -0 "$STANDIN_PID" 2>/dev/null || return 1   # exited without acquiring
+    sleep 2; waited=$((waited + 2))
+  done
+  return 1
 }
 
 # =========================================================================
@@ -695,19 +734,33 @@ nc8_protocol() {
 
   # (a) a stand-in nightly WAITS behind a light job's LOCK_SH, and proceeds.
   local light; light="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" --mem 2g)"
-  wait_state "$light" RUNNING 300
-  local t0 t1 sp
+  if ! wait_state "$light" RUNNING 300; then
+    void "(a) the light job never reached RUNNING, so there is nothing for the stand-in to wait behind"
+    return
+  fi
+  local t0 t1
   t0=$(date +%s)
-  sp="$(standin_nightly 300)"
+  standin_nightly 300
   sleep 5
-  if kill -0 "$sp" 2>/dev/null; then
+  # Still alive AND has not acquired: that is what waiting looks like. Alive
+  # alone would also be true of a stand-in that took the lock immediately,
+  # which would mean the light job was not holding it.
+  if kill -0 "$STANDIN_PID" 2>/dev/null && ! standin_acquired; then
     ok "(a) a stand-in nightly waits rather than exiting"
+  elif standin_acquired; then
+    bad "(a) the stand-in took the mutex while a light job was RUNNING"
   else
     bad "(a) the stand-in nightly exited instead of waiting"
   fi
   wait_terminal "$light" 900 >/dev/null
-  if wait "$sp" 2>/dev/null; then t1=$(date +%s); ok "(a) it proceeded after $((t1 - t0))s"; else
-    bad "(a) it never acquired the lock"; fi
+  if wait_standin_acquired 300; then
+    t1="$(cat "$STANDIN_ACQUIRED")"
+    ok "(a) it proceeded after $((t1 - t0))s"
+  else
+    bad "(a) it never acquired the lock"
+  fi
+  wait "$STANDIN_PID" 2>/dev/null
+  rm -f "$STANDIN_ACQUIRED"
 
   # (b) STARVATION, tested by actively trying to barge while the waiter is queued.
   light="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" --mem 2g)"
@@ -715,7 +768,7 @@ nc8_protocol() {
   local marker="$INTENT_DIR/nightly.$$.$(date +%s).intent"
   printf 'pid=%d\ndeadline=%d\n' "$$" "$(( $(date +%s) + 600 ))" > "$marker"
   chmod 0640 "$marker"
-  sp="$(standin_nightly 600)"
+  standin_nightly 600
   local barged=0 j=0
   while [ "$j" -lt 5 ]; do
     local probe; probe="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" --mem 2g)"
@@ -731,8 +784,13 @@ nc8_protocol() {
   fi
   wait_terminal "$light" 900 >/dev/null
   rm -f "$marker"
-  if wait "$sp" 2>/dev/null; then ok "(b) nightly entered once the running job drained"; else
-    bad "(b) nightly never entered"; fi
+  if wait_standin_acquired 300; then
+    ok "(b) nightly entered once the running job drained"
+  else
+    bad "(b) nightly never entered"
+  fi
+  wait "$STANDIN_PID" 2>/dev/null
+  rm -f "$STANDIN_ACQUIRED"
 
   # (b2) stale markers: dead PID, and expired deadline.
   local stale_dead="$INTENT_DIR/nightly.999999.$(date +%s).intent"
@@ -782,17 +840,29 @@ nc8_protocol() {
   local l1 l2
   l1="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" --mem 2g)"
   l2="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" --mem 2g --timeout 600)"
-  wait_state "$l1" RUNNING 300; wait_state "$l2" RUNNING 300
-  sp="$(standin_nightly 600)"
-  wait_terminal "$l1" 900 >/dev/null
-  sleep 10
-  if kill -0 "$sp" 2>/dev/null; then
-    ok "(c) the second light job's LOCK_SH survived the first's exit"
+  if ! wait_state "$l1" RUNNING 300 || ! wait_state "$l2" RUNNING 300; then
+    void "(c) both light jobs never ran together, so nothing held two shared locks"
   else
-    bad "(c) one job's exit released another's shared lock"
+    standin_nightly 600
+    wait_terminal "$l1" 900 >/dev/null
+    sleep 10
+    # NOT ACQUIRED is the assertion; alive is only the precondition. The old
+    # clause tested `kill -0` alone -- and a stand-in that HAD taken the mutex
+    # (that is, l1's exit having released l2's LOCK_SH: precisely the bug this
+    # clause exists to catch) is also alive, holding it, for the whole hold
+    # window. The failure it was written to detect would have printed `ok`.
+    if ! kill -0 "$STANDIN_PID" 2>/dev/null; then
+      bad "(c) the stand-in exited early; the clause could not observe the lock"
+    elif standin_acquired; then
+      bad "(c) one job's exit released another's shared lock"
+    else
+      ok "(c) the second light job's LOCK_SH survived the first's exit"
+    fi
+    wait_terminal "$l2" 900 >/dev/null
+    wait_standin_acquired 300 >/dev/null || true
+    wait "$STANDIN_PID" 2>/dev/null
+    rm -f "$STANDIN_ACQUIRED"
   fi
-  wait_terminal "$l2" 900 >/dev/null
-  wait "$sp" 2>/dev/null
 
   # (f) the nightly wrapper fails CLOSED without flock.
   local script="$TRUSTED/tools/queue-forecasting/scripts/daily_walk_forward.sh"

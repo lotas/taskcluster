@@ -978,3 +978,44 @@ esac
 
 so both flags stay 0 and the clause falls through to `bad`. That is the shape to
 copy: enumerate the states that PERMIT a pass, and let everything else fail.
+
+### `standin_nightly`: unreturnable and unwaitable (2026-08-27)
+
+Four of NC8's protocol FAILs on a correct host came from one helper:
+
+```bash
+standin_nightly() {                                    # the original
+  ( exec 9>"$LOCK"; flock -w "$1" 9 && sleep 60 ) &
+  echo $!
+}
+```
+
+read as `sp="$(standin_nightly 300)"`. Two bugs:
+
+1. **The call did not return.** Command substitution reads its pipe to EOF, and
+   the backgrounded subshell inherits that pipe as stdout — so `$(...)` blocked
+   until the stand-in had waited for the lock, slept its 60s and exited. Measured
+   at **67s** in a local reproduction. By the time `sp` was assigned the process
+   was already dead, so `kill -0` reported `(a) the stand-in nightly exited
+   instead of waiting`.
+2. **`wait` could not reap it.** Forked inside a substitution subshell it was a
+   *grandchild*, and `wait` on a non-child returns **127** immediately without
+   waiting: `(a) it never acquired the lock`, `(b) nightly never entered`.
+
+Whether clause (a) reported "waits rather than exiting" or "exited instead of
+waiting" was a **race**: at that instant the process is a zombie, and `kill -0`
+succeeds for a zombie until init reaps it. Two hosts disagreed for that reason.
+
+Now the helper sets `STANDIN_PID` (a direct child, so `kill -0` and `wait` both
+work) and reports acquisition through a marker file, so a clause can time the
+*wait* rather than the wait plus the hold, and can distinguish "still waiting"
+from "acquired" from "timed out".
+
+**Clause (c) had an independent defect.** It asserted only `kill -0` — but a
+stand-in that had *wrongly* acquired the mutex (which is exactly the bug: one
+light job's exit releasing another's `LOCK_SH`) is also alive, holding it, for
+its whole hold window. The clause would have printed `ok` for the failure it
+exists to detect. It now asserts alive **and not acquired**.
+
+Covered by six clauses in `test-nc-instrument.sh` (real `flock`, real background
+processes, no dispatcher) and `TestTheStandInNightlyIsWaitableAndDoesNotBlockItsCaller`.
