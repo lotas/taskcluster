@@ -611,6 +611,45 @@ class TestWorktreesAreReclaimedHoweverAJobEnds(RunnerCase):
                          qfd.Reaper.WORKTREE_SWEEP_LIMIT)
 
 
+class TestAdmissionRefusalsAreLoggedAtTransitions(RunnerCase):
+    """One line when it starts, one when it clears -- not one per poll.
+
+    The 2026-08-27 journal carried two identical `disk floor: 12043m free is
+    below 20480m` lines every two seconds. The number moves, so keying the
+    de-duplication on the whole message would log every poll anyway; the KIND is
+    what changes rarely, and it is what an operator is reading for.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A floor nothing can satisfy, so step 4 refuses deterministically.
+        self.db.stop()
+        self.db = qfd.DbOwner(os.path.join(self.root, "state2.db"),
+                              mem_budget_mb=self.cfg.mem_budget_mb,
+                              disk_floor_mb=1 << 30, out_quota_mb=0,
+                              artifact_cap_mb=0).start()
+        self.addCleanup(self.db.stop)
+        self.disp = qfd.Dispatcher(self.cfg, self.db, docker=self.docker,
+                                   src=self.src)
+        self.runner = qfd.Runner(self.cfg, self.db, self.disp,
+                                 docker=self.docker, src=self.src)
+
+    def test_a_persistent_refusal_is_logged_once(self):
+        self.a_job(state="QUEUED")
+        with self.assertLogs(qfd.log, level="INFO") as caught:
+            for _ in range(6):
+                self.assertFalse(self.runner.try_one("light"))
+        lines = [line for line in caught.output if "not admitting" in line]
+        self.assertEqual(len(lines), 1, caught.output)
+        self.assertIn("disk floor", lines[0])
+
+    def test_the_detail_still_carries_the_numbers(self):
+        self.a_job(state="QUEUED")
+        with self.assertLogs(qfd.log, level="INFO") as caught:
+            self.runner.try_one("light")
+        self.assertRegex("\n".join(caught.output), r"\d+m")
+
+
 class TestAnUnusableMutexIsNotContention(RunnerCase):
     """The live failure of 2026-08-26 22:05.
 

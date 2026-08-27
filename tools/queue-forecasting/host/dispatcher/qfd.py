@@ -1649,6 +1649,7 @@ class Runner:
         # instead of something to be reconstructed by counting lines.
         self._lock_wait = {}
         self._mutex_fault = set()
+        self._refusals = {}
         self._lock_state_lock = threading.Lock()
         self.qfrun_gid = _gid("qfrun")
         self.qfclient_gid = _gid("qfclient")
@@ -1656,6 +1657,27 @@ class Runner:
         # binary. It was a bare `subprocess.Popen` call, which is a large part of
         # why this path shipped both unwired and with a None image reference.
         self.spawn = subprocess.Popen
+
+    def _note_refusal(self, lane, kind, detail):
+        """Log an admission refusal when its KIND changes, not once per poll.
+
+        Two light workers polling every two seconds produce ~3600 lines an hour,
+        and the ones that matter -- it started, it stopped -- are indistinguishable
+        from the ones that do not. The kind is the key rather than the whole
+        message because the message carries a moving number ("12043m free"), and
+        keying on that would log every poll again.
+        """
+        with self._lock_state_lock:
+            changed = self._refusals.get(lane) != kind
+            self._refusals[lane] = kind
+        if changed:
+            log.info("lane %s: not admitting (%s): %s", lane, kind, detail)
+
+    def _note_admitted(self, lane):
+        with self._lock_state_lock:
+            previous = self._refusals.pop(lane, None)
+        if previous is not None:
+            log.info("lane %s: admitting again; %s cleared", lane, previous)
 
     def _note_mutex_contended(self, lane):
         """Log the START of a wait, not each poll of it."""
@@ -1691,7 +1713,7 @@ class Runner:
 
         ok, reason = self.disp.may_admit()                      # 2
         if not ok:
-            log.info("not admitting into %s: %s", lane, reason)
+            self._note_refusal(lane, reason, reason)
             return False
 
         try:                                                    # 3
@@ -1716,9 +1738,12 @@ class Runner:
                 "admit", effective["mem_limit"],
                 free_disk_mb=free_disk_mb(self.cfg.runs_dir))
             if not ok:
-                log.info("lane %s not admitted: %s", lane, why)
+                # The kind is the text before the colon ("disk floor", "memory
+                # budget"); the detail carries the numbers.
+                self._note_refusal(lane, why.split(":", 1)[0], why)
                 lock.release()
                 return False
+            self._note_admitted(lane)
 
             # 5 is deliberately empty: the gate was READ, not held.
             now_epoch = time.time()
