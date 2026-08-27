@@ -239,7 +239,9 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
       DASHBOARD_OUTPUT_DIR: /dashboard
-      DASHBOARD_INTERVAL_MS: "900000"
+      # Generation itself can take many minutes at production volume. The loop
+      # waits for it to finish, then waits another hour before refreshing.
+      DASHBOARD_INTERVAL_MS: "3600000"
     volumes:
       - ./src:/app/tools/queue-forecasting/src
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
