@@ -1250,3 +1250,72 @@ class TestTheNcSuiteCanTellBlindnessFromAnAnswer(unittest.TestCase):
         self.assertEqual(p.returncode, 0,
                          f"harness failed:\n{p.stdout}\n{p.stderr}")
         self.assertIn("harness: pass=10 fail=0", p.stdout)
+
+
+class TestJsonIsAcceptedOnEitherSideOfTheSubcommand(unittest.TestCase):
+    """`--json` was defined on the top-level parser only, so
+    `qf status <run_id> --json` -- the order everyone types -- exited 2 with
+    "unrecognized arguments: --json".
+
+    Nothing noticed for the length of a phase, because the one caller that used
+    that order discarded stderr: every state read in the NC suite came back
+    empty, and NC8's mutual-exclusion and memory-budget clauses passed having
+    observed nothing. The invocation was never valid; it only looked like a host
+    problem."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        self.mod = {}
+        with open(os.path.join(here, "qf")) as fh:
+            exec(compile(fh.read(), "qf", "exec"), self.mod)  # noqa: S102
+
+    def _json(self, argv, admin=False):
+        return self.mod["build_parser"](admin).parse_args(argv).json
+
+    def test_the_global_form_still_works(self):
+        # The form the README and existing scripts use. A fix that broke this
+        # would trade one silent failure for another.
+        for argv in (["--json", "status", "r1"], ["--json", "ping"],
+                     ["--json", "list", "--limit", "5"],
+                     ["--json", "trusted-paths"]):
+            self.assertTrue(self._json(argv), argv)
+
+    def test_the_trailing_form_now_works(self):
+        for argv in (["status", "r1", "--json"], ["ping", "--json"],
+                     ["list", "--limit", "5", "--json"],
+                     ["trusted-paths", "--json"]):
+            self.assertTrue(self._json(argv), argv)
+
+    def test_the_subparser_flag_does_not_clobber_the_global_one(self):
+        # store_true's default of False would OVERWRITE the namespace, so
+        # `qf --json status x` would come back json=False -- a fix that silently
+        # disables JSON output everywhere. argparse.SUPPRESS is what prevents it.
+        self.assertTrue(self._json(["--json", "status", "r1"]))
+
+    def test_absent_means_absent(self):
+        for argv in (["status", "r1"], ["ping"]):
+            self.assertFalse(self._json(argv), argv)
+
+    def test_the_admin_client_agrees(self):
+        self.assertTrue(self._json(["force-release", "r1", "--json"], admin=True))
+        self.assertTrue(self._json(["--json", "force-release", "r1"], admin=True))
+
+    def test_no_caller_uses_a_form_that_only_works_on_the_new_client(self):
+        # The trailing form is accepted now, but a script in the trusted checkout
+        # may run against a client that predates this fix. The global form works
+        # against both, so that is the one the callers use.
+        for name in ("nc-suite-phase2.sh", "fault-gates-phase2.sh",
+                     "phase2-setup.sh"):
+            path = os.path.join(self.host, name)
+            if not os.path.isfile(path):
+                continue
+            # Comment lines are skipped: the fixed call site carries a comment
+            # naming the broken form, and matching that is how this test first
+            # failed against a correct script.
+            with open(path) as fh:
+                text = "\n".join(l for l in fh.read().splitlines()
+                                 if not l.lstrip().startswith("#"))
+            bad = re.findall(r"qf(?:admin)? (?!--json)[a-z-]+[^\"'\n]*--json",
+                             text)
+            self.assertEqual(bad, [], f"{name} uses the trailing form: {bad}")

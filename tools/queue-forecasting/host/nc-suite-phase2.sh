@@ -176,7 +176,12 @@ status_json() {  # status_json <run_id> -> payload on stdout, reason on stderr
   if [ -z "$rid" ]; then
     echo "no run id was ever produced (the submit failed)" >&2; return 1
   fi
-  out="$(as "$RESEARCH_USER" "qf status $rid --json" 2>&1)"; rc=$?
+  # `qf --json status`, NOT `qf status ... --json`. The flag is defined on the
+  # top-level parser; the trailing form exited 2 with "unrecognized arguments:
+  # --json" and this helper's discarded stderr turned that into an empty state
+  # for every job in the suite. The client now accepts both orders, but the
+  # global form is the one that also works against an older deployed client.
+  out="$(as "$RESEARCH_USER" "qf --json status $rid" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     printf 'qf status exited %s: %s\n' "$rc" \
       "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" >&2
@@ -478,7 +483,7 @@ preflight_instrument() {
     echo "Refusing to run the suite. 'qf ping' works, so this is not the socket" >&2
     echo "or group membership -- it is the status op specifically. Reproduce it" >&2
     echo "with the error visible:" >&2
-    echo "  sudo -H -u $RESEARCH_USER qf status $rid --json" >&2
+    echo "  sudo -H -u $RESEARCH_USER qf --json status $rid" >&2
     echo "  sudo journalctl -u qf-dispatch -n 50 --no-pager" >&2
     echo >&2
     echo "Every state clause below would report TIMEOUT_WAITING, and the" >&2
@@ -840,7 +845,7 @@ nc10() {
   # client was printing a perfectly good explanation to stderr, and the suite
   # threw it away -- which is the same defect as the old state_of.
   local why
-  json="$(as "$RESEARCH_USER" "qf trusted-paths --json" 2>/tmp/nc10.$$)"
+  json="$(as "$RESEARCH_USER" "qf --json trusted-paths" 2>/tmp/nc10.$$)"
   why="$(cat /tmp/nc10.$$ 2>/dev/null)"; rm -f /tmp/nc10.$$
   if [ -z "$json" ]; then
     void "NC10 canary: qf trusted-paths returned nothing${why:+ ($why)}"

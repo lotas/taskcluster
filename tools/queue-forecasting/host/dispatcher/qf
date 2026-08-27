@@ -189,6 +189,25 @@ def cmd_force_release(args):
               admin=True), args.json)
 
 
+def _allow_json_after_the_subcommand(sub):
+    """Accept `--json` on EITHER side of the subcommand.
+
+    It used to be global only, so `qf status <run_id> --json` -- the order
+    everyone types, and the order every state read in the NC suite used -- exited
+    2 with "unrecognized arguments: --json". The suite discarded that stderr, so
+    the read returned an empty string, and NC8's mutual-exclusion and
+    memory-budget clauses passed having observed nothing at all.
+
+    default=SUPPRESS is load-bearing rather than tidy: with store_true's normal
+    default of False, a subparser flag OVERWRITES the namespace, so
+    `qf --json status x` would come back with json=False.
+    """
+    for parser in sub.choices.values():
+        parser.add_argument("--json", action="store_true",
+                            default=argparse.SUPPRESS,
+                            help="raw JSON output")
+
+
 def build_parser(admin_mode):
     p = argparse.ArgumentParser(
         prog="qfadmin" if admin_mode else "qf",
@@ -211,6 +230,7 @@ def build_parser(admin_mode):
                              " so re-check those containers and run the same"
                              " command again")
         fr.set_defaults(func=cmd_force_release)
+        _allow_json_after_the_subcommand(sub)
         return p
 
     sub.add_parser("ping").set_defaults(func=cmd_ping)
@@ -251,6 +271,7 @@ def build_parser(admin_mode):
     lg.add_argument("--stream", default="stdout",
                     choices=("stdout", "stderr"))
     lg.set_defaults(func=cmd_logs)
+    _allow_json_after_the_subcommand(sub)
     return p
 
 

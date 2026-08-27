@@ -899,6 +899,27 @@ Two discarded error streams, and one empty-string outcome covering *no socket*,
 `require_state_for` proves it fired on the very first poll: `(left QUEUED for
 after 0s)`.
 
+**The root cause was the invocation, not the host.** `--json` is defined on the
+top-level parser, so `qf status <run_id> --json` was never valid:
+
+```
+$ sudo -H -u research qf status <rid> --json
+usage: qf [-h] [--json] {ping,submit,status,list,cancel,verify-chain,trusted-paths,logs} ...
+qf: error: unrecognized arguments: --json
+```
+
+argparse exits 2 and prints that to stderr, which the helper discarded. It had
+never worked. `ping`, `submit`, `verify-chain` and `qf logs` were fine because
+none of them pass `--json`; NC10's `qf trusted-paths --json` failed identically.
+An hour went into suspecting the daemon -- serialization in `_reply`, `pins_for`
+dispatch, `cleanup_stall` blocking, response size -- because the one line that
+said what was wrong was thrown away at the call site.
+
+Two fixes, deliberately both: the client now accepts `--json` on either side of
+the subcommand (`default=argparse.SUPPRESS` on the subparser flag, or store_true
+would overwrite `qf --json status x` back to False), and the callers use the
+global form, which also works against a client that predates the fix.
+
 **The 24 failures were the harmless half.** These three lines printed `ok`:
 
 ```

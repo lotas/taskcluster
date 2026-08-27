@@ -54,20 +54,27 @@ declare -A STATES=()
 as() {
   local cmd="${*:2}"
   case "$cmd" in
-    "qf status "*)
+    "qf --json status "*)
       case "$MODE" in
         die)     echo "qf: no dispatcher socket at /run/qf-dispatch/client/sock" >&2
                  return 2 ;;
         refused) echo '{"ok": false, "error": "no such run '\''x'\''"}' ;;
         nojob)   echo '{"ok": true, "stall": null}' ;;
         garbage) echo 'Traceback (most recent call last): boom' ;;
-        good)    local rid="${cmd##qf status }"; rid="${rid%% *}"
+        good)    local rid="${cmd##qf --json status }"; rid="${rid%% *}"
                  echo "{\"ok\": true, \"job\": {\"state\": \"${STATES[$rid]:-QUEUED}\"}}" ;;
       esac ;;
     "qf submit "*)
       if [ "${SUBMIT_OK:-1}" = 1 ]; then echo "test-20260827T000000Z-abc-1"
       else echo "qf: submit refused: bad sha" >&2; return 2; fi ;;
     "qf cancel "*) : ;;
+    "qf status "*)
+      # argparse's actual behaviour for the trailing form, reproduced so that a
+      # caller regressing to `qf status <rid> --json` fails here rather than
+      # returning an empty state on a live host.
+      echo "usage: qf [-h] [--json] {ping,submit,status,list,cancel,verify-chain,trusted-paths,logs} ..." >&2
+      echo "qf: error: unrecognized arguments: --json" >&2
+      return 2 ;;
   esac
 }
 
