@@ -30,6 +30,10 @@ DISPATCHER="$TRUSTED/tools/queue-forecasting/host/dispatcher"
 RESEARCH_USER="${RESEARCH_USER:-research}"
 STATE_DIR="${QFD_STATE_DIR:-/var/lib/qf-platform}"
 BUILD_SETTLE_S="${QFD_BUILD_SETTLE_S:-30}"
+# ONE definition, used both for the drop-in the gate installs and for the instant
+# the gate starts its clock at. Two copies of this number drifting apart is how
+# the clock ends up measuring the wrong interval.
+FG_BUILD_TIMEOUT_S="${FG_BUILD_TIMEOUT_S:-45}"
 DROPIN_DIR=/etc/systemd/system/qf-dispatch.service.d
 DROPIN="$DROPIN_DIR/fault-gate.conf"
 EVIDENCE="$HERE/fault-evidence-phase2a.txt"
@@ -105,7 +109,7 @@ gate_a() {
     local before_clients; before_clients="$(build_clients)"
 
     case "$method" in
-      build_timeout) set_dropin "Environment=QFD_BUILD_TIMEOUT_S=45"
+      build_timeout) set_dropin "Environment=QFD_BUILD_TIMEOUT_S=$FG_BUILD_TIMEOUT_S"
                      systemctl restart qf-dispatch; sleep 5 ;;
     esac
 
@@ -118,14 +122,37 @@ gate_a() {
       continue
     fi
     ok "$method: canary -- the job reached BUILDING and a build is in flight"
+    local t_building; t_building=$(date +%s)
     sleep 10
 
+    # THE CLOCK STARTS AT THE EVENT, NOT BEFORE THE WAIT FOR IT.
+    #
+    # `t0` used to be set before a fixed `sleep 60` that waited for a 45s
+    # timeout to fire, so 60 seconds of the gate's own sleeping were counted as
+    # cancellation latency -- and the gate then failed design D10's rule on that
+    # number, reporting "cancellation took 60s > 30s" on a host where the build
+    # client had in fact died promptly. A measurement that includes the wait for
+    # the thing it measures is not a measurement of it.
+    #
+    # For the timeout method the event is the daemon's own kill, which fires
+    # BUILD_TIMEOUT_S after the build started. BUILDING is observed within a poll
+    # of the build starting, so `t_building + BUILD_TIMEOUT_S` is the fire
+    # instant to within that poll -- and the residual bias is stated rather than
+    # hidden: it makes the window very slightly generous, so a PASS here is
+    # weaker than a pass on the other two methods by up to one poll interval.
     local t0 t1 elapsed
-    t0=$(date +%s)
     case "$method" in
-      build_timeout)  note "letting QFD_BUILD_TIMEOUT_S=45 fire"; sleep 60 ;;
-      sigkill)        kill -9 "$(systemctl show -p MainPID --value qf-dispatch)" ;;
-      systemctl_stop) systemctl stop qf-dispatch ;;
+      build_timeout)
+        note "letting QFD_BUILD_TIMEOUT_S=$FG_BUILD_TIMEOUT_S fire"
+        local fires_at=$(( t_building + FG_BUILD_TIMEOUT_S ))
+        while [ "$(date +%s)" -lt "$fires_at" ]; do sleep 1; done
+        t0="$fires_at" ;;
+      sigkill)
+        t0=$(date +%s)
+        kill -9 "$(systemctl show -p MainPID --value qf-dispatch)" ;;
+      systemctl_stop)
+        t0=$(date +%s)
+        systemctl stop qf-dispatch ;;
     esac
 
     # 1. No docker build client survives.

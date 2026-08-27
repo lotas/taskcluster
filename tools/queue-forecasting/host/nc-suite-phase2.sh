@@ -20,7 +20,34 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRUSTED="${TRUSTED:-/srv/queue-forecasting}"
 DISPATCHER="$TRUSTED/tools/queue-forecasting/host/dispatcher"
 RESEARCH_USER="${RESEARCH_USER:-research}"
-DEPLOY_USER="${DEPLOY_USER:-$(stat -c '%U' "$TRUSTED" 2>/dev/null || echo deploy)}"
+# THE NIGHTLY IDENTITY, and deliberately NOT `stat -c %U "$TRUSTED"`. The
+# trusted checkout is owned by root here, so deriving it that way made
+# DEPLOY_USER=root -- and then `crontab -l -u root` held no nightly entry (both
+# one-inode clauses VOIDed on a correctly configured host) and
+# `refuse_as root "rm -f $LOCK"` SUCCEEDED, because root is exempt from DAC.
+# That last one destroyed the mutex inode mid-run and every lock clause after it
+# was measuring a host the suite had broken. `phase2-setup.sh` already carries
+# this distinction; the suite did not.
+#
+# Detected from whichever crontab actually schedules the nightly, because that
+# is the definition. Undetectable is a hard stop, not a guess: the whole of NC8
+# is about the protocol between qfd and that user.
+detect_nightly_user() {
+  local f u
+  for f in /var/spool/cron/crontabs/* /var/spool/cron/*; do
+    [ -f "$f" ] || continue
+    if grep -q 'daily_walk_forward' "$f" 2>/dev/null; then
+      basename "$f"; return 0
+    fi
+  done
+  for f in /etc/cron.d/*; do
+    [ -f "$f" ] || continue
+    u="$(awk '$1 !~ /^#/ && /daily_walk_forward/ {print $6; exit}' "$f")"
+    if [ -n "$u" ]; then printf '%s' "$u"; return 0; fi
+  done
+  return 1
+}
+DEPLOY_USER="${DEPLOY_USER:-$(detect_nightly_user || true)}"
 LOCK="${QFD_LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}"
 INTENT_DIR="${QFD_INTENT_DIR:-/var/lib/qf-locks/intent.d}"
 MIGRATED_MARKER="${QFD_LOCK_MIGRATED_MARKER:-/etc/qf-dispatch/lock-migrated}"
@@ -139,9 +166,13 @@ require_state_for() {  # require_state_for <run_id> <state> <seconds>
 # NC15 with "no mirror HEAD" on a perfectly healthy host. A blanket
 # `--global safe.directory` would fix it too and is worse: it would leave the
 # exception behind for everything the deploy user ever touches.
-head_sha() { as "$DEPLOY_USER" \
-  "git -c safe.directory=$STATE_DIR/mirror.git -C $STATE_DIR/mirror.git rev-parse refs/remotes/origin/main" \
-  2>/dev/null; }
+# Run as root (the suite already is), not as the nightly user: reading the mirror
+# is not a property of that identity, and coupling it there meant a suite that
+# could not identify the nightly user could not even find a sha to submit.
+head_sha() {
+  git -c "safe.directory=$STATE_DIR/mirror.git" -C "$STATE_DIR/mirror.git" \
+    rev-parse refs/remotes/origin/main 2>/dev/null
+}
 
 # The Task 13 fixture sha, validated as a sha before anything is submitted with
 # it. A truncated or comment-laden nc12-sha.txt would otherwise reach `qf submit`
@@ -201,12 +232,47 @@ nc8() {
   fi
 
   # --- permission and immutability ----------------------------------------
-  # The lock's directory is 0755 root:root, so neither runtime user can unlink
-  # or recreate the inode, and qfd refuses to start when it is missing.
+  # The property is that the lock's DIRECTORY is 0755 root:root, so neither
+  # runtime user can unlink or recreate the inode -- and qfd refuses to start
+  # when it is missing.
+  #
+  # Asserted against the directory first, and the live `rm` only for users who
+  # are actually subject to it. Two reasons, both learned the hard way:
+  #
+  #   * root is exempt from DAC, so "root cannot unlink the lock" is a claim
+  #     that can only ever fail. Asserting it is not a strict test, it is a
+  #     broken one.
+  #   * the attempt is DESTRUCTIVE. When it succeeded it removed the mutex
+  #     inode, so the qfd canary below then failed to open a file that no longer
+  #     existed, the nightly script's `exec 9>` would have failed fatally, and
+  #     the daemon would refuse to start. A gate that can destroy the thing it
+  #     guards has to check afterwards and put it back.
+  local lock_dir; lock_dir="$(dirname "$LOCK")"
+  assert_eq "(perm) the lock directory is 0755" "755" "$(stat -c '%a' "$lock_dir")"
+  assert_eq "(perm) the lock directory is owned by root:root" "root:root" \
+    "$(stat -c '%U:%G' "$lock_dir")"
+
+  local lock_id_before; lock_id_before="$(stat -c '%d:%i' "$LOCK")"
   for u in "$DEPLOY_USER" qfd; do
+    [ -n "$u" ] || continue
     canary_as "$u" "(perm) $u can open the lock for write" "exec 9>$LOCK"
-    refuse_as "$u" "(perm) $u cannot unlink the lock" "rm -f $LOCK"
+    if [ "$(id -u "$u" 2>/dev/null)" = "0" ]; then
+      # Stated rather than skipped silently: an omitted clause reads as coverage.
+      echo "      (perm) $u is uid 0 and exempt from DAC; the directory"\
+           "assertions above are what constrain it"
+    else
+      # `rm`, NOT `rm -f`: -f exits 0 for a file that is not there, so once the
+      # inode had been destroyed this clause reported PERMITTED for every user
+      # regardless of permissions -- three of the four NC8 failures on the first
+      # real run were that one deletion echoing forward.
+      refuse_as "$u" "(perm) $u cannot unlink the lock" "rm $LOCK"
+    fi
   done
+  if [ ! -e "$LOCK" ] || [ "$(stat -c '%d:%i' "$LOCK")" != "$lock_id_before" ]; then
+    bad "(perm) THE LOCK INODE WAS REPLACED OR DESTROYED by this gate; restoring it"
+    systemd-tmpfiles --create /etc/tmpfiles.d/qf-locks.conf >/dev/null 2>&1 \
+      || install -m 0660 -o root -g qfheavy /dev/null "$LOCK"
+  fi
   # --- group: research must not be able to touch the mutex at all ----------
   if id -nG "$RESEARCH_USER" 2>/dev/null | tr ' ' '\n' | grep -qx qfheavy; then
     bad "(group) $RESEARCH_USER is in qfheavy -- it could stop nightly training at will"
@@ -227,15 +293,40 @@ nc8() {
   rm -f "$victim"
 
   # --- (h) marker readability under a hostile umask -----------------------
-  # The directory's setgid bit is what makes this work.
-  local umask_marker="$INTENT_DIR/nightly.4321.$(date +%s).intent"
-  as "$DEPLOY_USER" "umask 077; printf 'pid=4321\ndeadline=%d\n' $(( $(date +%s) + 60 )) > $umask_marker"
-  if as qfd "cat $umask_marker" >/dev/null 2>&1; then
-    ok "(h) a marker written under umask 077 is still readable by qfd"
+  # TWO clauses, because the mechanism has two halves and only one of them is
+  # the directory's setgid bit.
+  #
+  # The old single clause wrote a marker with a bare `>` under umask 077 and
+  # asserted qfd could read it, on the reasoning that setgid made it so. It
+  # cannot: setgid sets the GROUP, never the mode, so that marker is 0600 and qfd
+  # genuinely cannot read it. The clause failed on a correctly configured host
+  # and the comment it was written from (in qf-locks.conf) claimed more for
+  # setgid than setgid does.
+  #
+  # What actually makes this safe is the publisher: daily_walk_forward.sh writes
+  # a temp file, `chmod 0640`s it, and `mv`s it into place. So (h1) tests that
+  # sequence -- the one that ships -- and (h2) is its negative control, proving
+  # the chmod is what does the work rather than the umask happening to be lax.
+  local now_s; now_s="$(date +%s)"
+  local m_good="$INTENT_DIR/nightly.4321.$now_s.intent"
+  as "$DEPLOY_USER" "umask 077; t=$m_good.tmp; printf 'pid=4321\ndeadline=%d\n' $(( now_s + 60 )) > \$t && chmod 0640 \$t && mv -f \$t $m_good"
+  if as qfd "cat $m_good" >/dev/null 2>&1; then
+    ok "(h1) the nightly's publish sequence yields a marker qfd can read under umask 077"
   else
-    bad "(h) qfd cannot read a umask-077 marker -- it would admit straight through it"
+    bad "(h1) qfd cannot read a marker published the way the nightly publishes it -- it would admit straight through the declaration"
   fi
-  rm -f "$umask_marker"
+  assert_eq "(h1) the published marker's group is qfheavy" "qfheavy" \
+    "$(stat -c '%G' "$m_good" 2>/dev/null)"
+  rm -f "$m_good"
+
+  local m_bare="$INTENT_DIR/nightly.4322.$now_s.intent"
+  as "$DEPLOY_USER" "umask 077; printf 'pid=4322\ndeadline=%d\n' $(( now_s + 60 )) > $m_bare"
+  if as qfd "cat $m_bare" >/dev/null 2>&1; then
+    bad "(h2) a marker written WITHOUT the chmod was readable anyway, so (h1) proves nothing about the chmod -- check the deploy user's umask"
+  else
+    ok "(h2) the same write without the chmod is unreadable, so the chmod is what makes (h1) work"
+  fi
+  rm -f "$m_bare"
 
   # --- canary: a heavy job runs at all with the lock free -----------------
   local heavy rid_a rid_b
@@ -866,6 +957,14 @@ nc15() {
 main() {
   [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 2; }
   echo "== Phase 2a negative controls =="
+  if [ -z "$DEPLOY_USER" ]; then
+    echo "cannot identify the nightly user: no crontab schedules" >&2
+    echo "daily_walk_forward.sh. NC8 is entirely about the protocol between qfd" >&2
+    echo "and that account, so guessing one would produce clauses that pass or" >&2
+    echo "fail for reasons unrelated to the mutex. Set DEPLOY_USER=<user> and" >&2
+    echo "re-run." >&2
+    exit 2
+  fi
   echo "trusted=$TRUSTED deploy=$DEPLOY_USER research=$RESEARCH_USER"
   echo "lock=$LOCK intent=$INTENT_DIR"
 
