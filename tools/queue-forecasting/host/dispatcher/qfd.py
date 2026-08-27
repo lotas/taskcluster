@@ -562,6 +562,17 @@ class StartUnconfirmed(Exception):
     error_class = "start_unconfirmed"
 
 
+class MutexUnusable(Exception):
+    """The training lock file cannot be OPENED -- not "someone else has it".
+
+    Deliberately not a subclass of `LockHeld`. Contention is normal, transient
+    and self-clearing; an inode qfd cannot open is a configuration fault that
+    clears only when a human fixes it, and the two need different words and
+    different log levels. Conflating them would have the daemon report a broken
+    mutex as ordinary contention and wait for it forever.
+    """
+
+
 class LockHeld(Exception):
     """The lock could not be taken without blocking. Never waited on: a worker
     that blocks while holding anything turns a momentary hold into a long one."""
@@ -616,7 +627,23 @@ class TrainingLock:
     def acquire(self):
         # Opened for WRITE, matching daily_walk_forward.sh:213's `exec 9>`, so
         # both sides contend on the same inode with the same access.
-        fd = os.open(self.path, os.O_WRONLY)
+        #
+        # The open is guarded because it CAN fail, and did: on 2026-08-26 the NC8
+        # suite deleted this inode, something recreated it, and the heavy worker
+        # then raised a bare PermissionError out of here every two seconds. The
+        # worker loop caught it and carried on -- so the lane was not lost -- but
+        # what an operator saw was a traceback storm, with the one actionable
+        # fact (the mutex inode is unusable, and the remedy is one command) buried
+        # in a stack trace instead of stated.
+        try:
+            fd = os.open(self.path, os.O_WRONLY)
+        except OSError as e:
+            raise MutexUnusable(
+                f"cannot open the training mutex {self.path} for write: {e}."
+                " Nothing can be admitted without it. If the inode was replaced,"
+                " restore it with `systemd-tmpfiles --create"
+                " /etc/tmpfiles.d/qf-locks.conf` (0660 root:qfheavy) and check"
+                " that qfd is still in qfheavy.") from None
         mode = fcntl.LOCK_SH if self.lane == "light" else fcntl.LOCK_EX
         try:
             fcntl.flock(fd, mode | fcntl.LOCK_NB)
@@ -1614,12 +1641,41 @@ class Runner:
         # ALIVE through a transient DB failure. See `_settle_if_unissued`.
         self.unsettled = set()
         self.unsettled_lock = threading.Lock()
+        # Mutex state, logged at TRANSITIONS rather than per poll. Two light
+        # workers polling every 2s produced 900 identical "light lock
+        # unavailable" lines across a 15-minute nightly run -- which is both
+        # unreadable and, worse, hides the one thing worth knowing: HOW LONG.
+        # Logging the start and the end makes the duration a fact in the journal
+        # instead of something to be reconstructed by counting lines.
+        self._lock_wait = {}
+        self._mutex_fault = set()
+        self._lock_state_lock = threading.Lock()
         self.qfrun_gid = _gid("qfrun")
         self.qfclient_gid = _gid("qfclient")
         # Injectable so the whole execute path is testable without a docker
         # binary. It was a bare `subprocess.Popen` call, which is a large part of
         # why this path shipped both unwired and with a None image reference.
         self.spawn = subprocess.Popen
+
+    def _note_mutex_contended(self, lane):
+        """Log the START of a wait, not each poll of it."""
+        with self._lock_state_lock:
+            first = lane not in self._lock_wait
+            if first:
+                self._lock_wait[lane] = time.monotonic()
+        if first:
+            log.info("lane %s: waiting for the training mutex; it is held"
+                     " elsewhere (the nightly walk-forward, most often). No job"
+                     " in this lane is admitted until it is free.", lane)
+
+    def _note_mutex_acquired(self, lane):
+        """Log the END of a wait, with its duration."""
+        with self._lock_state_lock:
+            started = self._lock_wait.pop(lane, None)
+            self._mutex_fault.discard(lane)
+        if started is not None:
+            log.info("lane %s: training mutex acquired after %ds of waiting",
+                     lane, int(time.monotonic() - started))
 
     # --- the admission sequence ------------------------------------------
     def try_one(self, lane):
@@ -1640,9 +1696,19 @@ class Runner:
 
         try:                                                    # 3
             lock = TrainingLock(self.cfg.lock_file, lane).acquire()
-        except LockHeld as e:
-            log.info("lane %s: %s", lane, e)
+        except MutexUnusable as e:
+            # ERROR, and once: this does not clear on its own, and repeating it
+            # every two seconds would bury it in itself.
+            with self._lock_state_lock:
+                first = lane not in self._mutex_fault
+                self._mutex_fault.add(lane)
+            if first:
+                log.error("lane %s: %s", lane, e)
             return False
+        except LockHeld:
+            self._note_mutex_contended(lane)
+            return False
+        self._note_mutex_acquired(lane)
 
         effective = json.loads(head["spec_json"])
         try:

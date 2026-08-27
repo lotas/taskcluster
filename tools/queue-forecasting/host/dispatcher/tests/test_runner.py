@@ -546,6 +546,66 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestAnUnusableMutexIsNotContention(RunnerCase):
+    """The live failure of 2026-08-26 22:05.
+
+    NC8 deleted the training lock inode; the heavy worker then raised a bare
+    `PermissionError` out of `os.open` every two seconds. The worker loop caught
+    it and carried on, so the lane was never lost -- but the journal filled with
+    tracebacks and the one actionable fact (the mutex inode is unusable, and one
+    command restores it) appeared nowhere as a sentence.
+
+    Contention and an unusable inode need different words: the first clears by
+    itself, the second clears only when a human acts.
+    """
+
+    def test_an_unopenable_lock_raises_mutex_unusable_not_lock_held(self):
+        lock = qfd.TrainingLock(os.path.join(self.runs, "no-such-lock"), "light")
+        with self.assertRaises(qfd.MutexUnusable):
+            lock.acquire()
+
+    def test_mutex_unusable_is_not_a_lock_held_subclass(self):
+        # If it were, `try_one` would report a broken mutex as ordinary
+        # contention and wait for it for ever, and Recovery would take the
+        # mutex_lost path over a configuration fault.
+        self.assertFalse(issubclass(qfd.MutexUnusable, qfd.LockHeld))
+
+    def test_try_one_refuses_rather_than_raising(self):
+        self.a_job(state="QUEUED")
+        self.runner.cfg.lock_file = os.path.join(self.runs, "no-such-lock")
+        with self.assertLogs(qfd.log, level="ERROR") as caught:
+            self.assertFalse(self.runner.try_one("light"))
+        self.assertIn("systemd-tmpfiles", "\n".join(caught.output),
+                      "the refusal must carry the remedy; an operator cannot act"
+                      " on 'Permission denied'")
+
+    def test_the_fault_is_logged_once_not_once_per_poll(self):
+        self.a_job(state="QUEUED")
+        self.runner.cfg.lock_file = os.path.join(self.runs, "no-such-lock")
+        with self.assertLogs(qfd.log, level="ERROR") as caught:
+            for _ in range(5):
+                self.runner.try_one("light")
+        self.assertEqual(len(caught.output), 1, caught.output)
+
+    def test_contention_is_logged_at_the_transition_with_a_duration(self):
+        # 900 identical lines across one nightly run is unreadable, and hides the
+        # only interesting number: how long the wait lasted.
+        self.a_job(state="QUEUED")
+        held = qfd.TrainingLock(self.runner.cfg.lock_file, "heavy").acquire()
+        self.addCleanup(held.release)
+        with self.assertLogs(qfd.log, level="INFO") as caught:
+            for _ in range(5):
+                self.runner.try_one("light")
+        waits = [line for line in caught.output
+                 if "waiting for the training mutex" in line]
+        self.assertEqual(len(waits), 1, caught.output)
+        held.release()
+        with self.assertLogs(qfd.log, level="INFO") as caught:
+            self.runner.try_one("light")
+        self.assertTrue(any("acquired after" in line for line in caught.output),
+                        caught.output)
+
+
 class TestExitCodeClassification(RunnerCase):
     """An error_class is a ROUTING decision (same rule as the source classes).
 
