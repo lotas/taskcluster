@@ -106,42 +106,58 @@ class TestTheCredentialIsReadableOnlyByThisService(GateCase):
     shaped more conveniently than the real thing.
     """
 
-    def access(self, mode, uid, gid, *, my_uid=997, my_gid=997):
+    def access(self, mode, uid, gid, *, from_systemd, my_uid=997, my_gid=986):
         st = os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
         return service.Config._check_credential_access(
             "/run/credentials/qf-extract.service/dsn", st,
-            uid=my_uid, gid=my_gid)
+            from_systemd=from_systemd, uid=my_uid, gid=my_gid)
 
-    def test_the_shape_systemd_actually_produces_passes(self):
-        # THE POSITIVE CASE, and the one that was missing. 0440 root:qfextract.
-        self.assertEqual(self.access(0o440, 0, 997), [])
+    def test_what_systemd_actually_produces_passes(self):
+        # THE OBSERVED SHAPE, from the host: 0440 root:root, gid 0, readable by
+        # uid 997 anyway. Two earlier versions of this check refused it -- first
+        # by demanding 0600-owned-by-us, then by demanding our own group.
+        #
+        # A uid-997 process reading a 0440 root:root file is not something the
+        # mode and owner explain; the likely mechanism is an ACL. So for a
+        # systemd credential the DAC bits are not the access control, and this
+        # test exists to stop the assertion being reinvented a third time.
+        self.assertEqual(self.access(0o440, 0, 0, from_systemd=True), [])
+        self.assertEqual(self.access(0o400, 0, 0, from_systemd=True), [])
+        self.assertEqual(self.access(0o440, 0, 986, from_systemd=True), [])
 
-    def test_the_development_shape_also_passes(self):
-        # 0600 owned by us, which is what a hand-made file looks like.
-        self.assertEqual(self.access(0o600, 997, 997), [])
-
-    def test_0400_root_root_passes(self):
-        # Unreadable by us in practice, but not a DISCLOSURE problem, and the
-        # read that follows will fail loudly with its own message. The gate's job
-        # is who can read it, not whether we can.
-        self.assertEqual(self.access(0o400, 0, 0), [])
-
-    def test_any_other_bit_is_refused(self):
-        for mode in (0o644, 0o604, 0o777, 0o441, 0o604):
+    def test_other_bits_are_refused_even_from_systemd(self):
+        # The one assertion that survives every systemd version: whatever the
+        # ACL says, world-readable is world-readable.
+        for mode in (0o444, 0o644, 0o777):
             with self.subTest(mode=oct(mode)):
-                problems = self.access(mode, 0, 997)
+                problems = self.access(mode, 0, 0, from_systemd=True)
                 self.assertTrue(any("other" in p for p in problems), problems)
 
-    def test_group_readable_by_a_group_that_is_not_ours_is_refused(self):
-        # The case a mode-only check misses entirely: 0440 root:qfd would pass
-        # "no other bits" and hand the DSN to the one process D15 excludes.
-        problems = self.access(0o440, 0, 999)
+    def test_the_development_path_keeps_the_strict_rule(self):
+        # No systemd, so the DAC bits ARE the control.
+        self.assertEqual(self.access(0o600, 997, 986, from_systemd=False), [])
+        self.assertEqual(self.access(0o400, 0, 0, from_systemd=False), [])
+
+    def test_a_development_credential_readable_by_another_group_is_refused(self):
+        # 0640 root:qfd would pass "no other bits" and hand the DSN to the one
+        # process D15 excludes.
+        problems = self.access(0o640, 0, 999, from_systemd=False)
         self.assertTrue(any("group" in p for p in problems), problems)
 
-    def test_an_unexpected_owner_is_refused(self):
-        problems = self.access(0o400, 1234, 997)
+    def test_a_development_credential_with_a_stranger_owner_is_refused(self):
+        problems = self.access(0o400, 1234, 986, from_systemd=False)
         self.assertTrue(any("owned by uid 1234" in p for p in problems),
                         problems)
+
+    def test_the_source_file_is_the_setup_scripts_job_not_ours(self):
+        # We cannot see /etc/qf-extract/dsn from inside the service --
+        # ProtectSystem=strict, and it is 0600 root:root. The split is
+        # deliberate: the script checks the source, the gate checks what arrived.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "phase2b-setup.sh")) as fh:
+            setup = fh.read()
+        self.assertIn("root:root", setup)
 
     def test_a_missing_credential_is_refused(self):
         problems = self.problems(QFX_DSN_FILE=os.path.join(self.tmp, "nope"))
@@ -160,6 +176,27 @@ class TestTheCredentialIsReadableOnlyByThisService(GateCase):
             fh.write("ghp_notadsn\n")
         os.chmod(os.path.join(self.tmp, "dsn"), 0o600)
         self.assertTrue(any("postgres" in p.lower() for p in self.problems()))
+
+    def test_the_whole_gate_passes_with_a_systemd_shaped_credential(self):
+        # THE INTEGRATION FORM, not just the helper. Every round of this bug was
+        # a fixture that built the credential the convenient way, so the gate's
+        # real path never met the real shape. This test drives `check_startup`
+        # end to end with the mode/owner/group the host actually reports.
+        creds = os.path.join(self.tmp, "creds")
+        os.makedirs(creds)
+        with open(os.path.join(creds, "dsn"), "w") as fh:
+            fh.write("postgresql://forecast_experiment@127.0.0.1/forecasting\n")
+        cfg = a_config(self.tmp, CREDENTIALS_DIRECTORY=creds)
+
+        # 0440 root:root, as observed, without needing to be root to set it.
+        real = os.stat(os.path.join(creds, "dsn"))
+        faked = os.stat_result((0o100440, real.st_ino, real.st_dev, 1, 0, 0,
+                                real.st_size, 0, 0, 0))
+
+        problems = cfg.check_startup(
+            my_groups=[os.getgid()], group_name=lambda gid: f"g{gid}",
+            stat=lambda p: faked)
+        self.assertEqual(problems, [], problems)
 
     def test_the_systemd_credentials_directory_wins_when_present(self):
         creds = os.path.join(self.tmp, "creds")

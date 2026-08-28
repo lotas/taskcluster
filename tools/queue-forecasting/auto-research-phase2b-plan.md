@@ -5,6 +5,45 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 8, 2026-08-28: the credential check was wrong a THIRD time, and the
+third time is the one worth recording, because the first two were fixes to the
+wrong thing.
+
+Observed on the host: `0440`, uid 0, **gid 0** — and the gate READ IT
+SUCCESSFULLY, since no "cannot read" problem appeared alongside. A uid-997
+process reading a `0440 root:root` file is not something the mode and owner can
+explain; the likely mechanism is an ACL, systemd granting the service user read
+access with `setfacl` while the classic bits stay root-owned.
+
+**So for a systemd-delivered credential the DAC bits are not the access control,
+and a DAC-based assertion about it cannot be right in principle — not merely
+wrong in its constants.** Revision 5 demanded 0600-owned-by-us; revision 7
+allowed root ownership but demanded our own group. Both were adjustments to a
+rule whose premise was false, which is why each one refused the same correct host
+in a new way.
+
+The rule now depends on **provenance**:
+
+- From `$CREDENTIALS_DIRECTORY`, the confinement is systemd's — a per-service
+  ramfs in a private mount namespace, plus whatever ACL it applies. Re-deriving
+  that from the mode means encoding a model of systemd's implementation, and this
+  check has now been wrong about that model twice. The one assertion kept is the
+  one that survives any version: **no `other` bits**. World-readable is
+  world-readable whatever the ACL says.
+- From `QFX_DSN_FILE` — the development path, no systemd involved — the DAC bits
+  ARE the control, so the strict rule stands: no `other` bits, group bits only
+  for our own group, owner root or us.
+
+The source file's permissions (`/etc/qf-extract/dsn`, 0600 root:root) are checked
+by `phase2b-setup.sh`. That split is deliberate: the script checks the source, the
+gate checks what arrived, and neither pretends to see the other's half.
+
+Every round of this bug had the same root cause: **a fixture that built the
+credential the convenient way, so the gate's real path never met the real
+shape.** There is now an integration test that drives `check_startup` end to end
+with the mode, owner and group the host actually reports — not just a unit test
+of the helper.
+
 Revision 7, 2026-08-28: the service met a real systemd and the startup gate was
 wrong about it. Two defects, both mine, both found by running it:
 
@@ -46,7 +85,7 @@ wrong about it. Two defects, both mine, both found by running it:
   host. The journal carries ERROR lines and `ping` reports `ready: false` with the
   reasons, which is where someone debugging this will be looking.
 
-Suites: shared 53, extractor 170, dispatcher 539.
+Suites: shared 53, extractor 171, dispatcher 539.
 
 Revision 6, 2026-08-28: `phase2b-setup.sh install` succeeded on the host —
 `qfextract` uid 997 in none of the forbidden groups, socket `660 root:qfd`,

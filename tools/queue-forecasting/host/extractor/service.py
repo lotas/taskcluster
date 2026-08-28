@@ -163,7 +163,8 @@ class Config:
             except OSError as e:
                 problems.append(f"cannot stat the credential {path}: {e}")
             else:
-                problems.extend(self._check_credential_access(path, st))
+                problems.extend(self._check_credential_access(
+                    path, st, from_systemd=bool(self.credentials_dir)))
                 try:
                     dsn = self.read_dsn()
                 except OSError as e:
@@ -209,41 +210,54 @@ class Config:
         return problems
 
     @staticmethod
-    def _check_credential_access(path, st, *, uid=None, gid=None):
-        """Nothing outside this service may read the credential.
+    def _check_credential_access(path, st, *, from_systemd, uid=None, gid=None):
+        """Who can read the credential -- and the answer depends on WHO PUT IT
+        THERE, which is the thing two wrong versions of this check missed.
 
-        THE RULE, AND WHY THE FIRST VERSION REFUSED A CORRECT HOST. It asserted
-        "mode 0600 or stricter, owned by us", which is not what
-        `LoadCredential=` produces: systemd mounts the credential directory as a
-        root-owned ramfs and writes the file **0440 root:<service group>**, so
-        the service reads it through its GROUP and root stays the owner. The gate
-        therefore reported two precondition failures on a host that was
-        configured exactly right, and the service crash-looped 15 times.
+        THE HISTORY, because it is the whole argument. Version 1 asserted "mode
+        0600 or stricter, owned by us" and refused a correct host. Version 2
+        allowed root ownership but required any group bits to name OUR group, and
+        refused the same host again: what systemd actually produced was
+        `0440 root:root`, group 0, with this service (uid 997, gid 986) able to
+        read it anyway.
 
-        A fail-closed check that fails on the good case is worse than no check:
-        it blocks the working configuration and it teaches whoever is debugging
-        it to loosen the gate. The mistake underneath was that the test built
-        the credential as the TEST USER at 0600 -- the development path -- so the
-        production arrangement was never exercised.
+        A uid-997 process reading a `0440 root:root` file is not something the
+        mode and owner can explain, and the likely mechanism is an ACL -- systemd
+        granting the service user read access with `setfacl` while the classic
+        bits stay root-owned. **So for a systemd-delivered credential the DAC bits
+        are not the access control, and a DAC-based assertion about it cannot be
+        right in principle** -- not merely wrong in its constants. Two rounds of
+        adjusting the constants was two rounds of fixing the wrong thing.
 
-        What is actually required:
+        Hence a rule that depends on provenance:
 
-          * NO `other` bits. Anyone-can-read is the whole failure.
-          * If group bits are set, the group must be OUR OWN primary group.
-            `qfextract`'s group is created by `useradd --system` with exactly one
-            member, so group-readable-to-our-group is readable by us alone. A
-            credential group-readable to, say, `qfd` would pass a mode check and
-            fail the point of D15 entirely.
-          * The owner must be root (systemd's ramfs) or us. Nobody else.
+        * **From `$CREDENTIALS_DIRECTORY`** the confinement is systemd's: a
+          per-service ramfs in a private mount namespace, which other processes
+          cannot see at all. Re-deriving that from the mode would mean encoding a
+          model of systemd's implementation, and this check has now been wrong
+          about that model twice. What is still worth asserting is the one thing
+          that is cheap and version-independent: no `other` bits. The SOURCE
+          file's permissions (`/etc/qf-extract/dsn`, 0600 root:root) are checked
+          by `phase2b-setup.sh`, which is where they are checkable.
+
+        * **From `QFX_DSN_FILE`** -- the development path, no systemd involved --
+          the DAC bits ARE the control, so the strict rule applies: no `other`
+          bits, group bits only for our own group, owner root or us.
         """
         uid = os.getuid() if uid is None else uid
         gid = os.getgid() if gid is None else gid
         mode = st.st_mode & 0o777
         problems = []
+
         if mode & 0o007:
             problems.append(
                 f"the credential {path} is mode {mode:04o}: it has `other`"
-                f" permission bits, so anyone on the host can read the DSN")
+                f" permission bits, so anyone who can reach the path can read"
+                f" the DSN")
+        if from_systemd:
+            # Everything else about a systemd credential is systemd's business.
+            return problems
+
         if (mode & 0o070) and st.st_gid != gid:
             problems.append(
                 f"the credential {path} is mode {mode:04o} and group-owned by"
@@ -252,8 +266,7 @@ class Config:
         if st.st_uid not in (0, uid):
             problems.append(
                 f"the credential {path} is owned by uid {st.st_uid}, which is"
-                f" neither root (systemd's credential store) nor this service"
-                f" (uid {uid})")
+                f" neither root nor this service (uid {uid})")
         return problems
 
     def warnings(self):
