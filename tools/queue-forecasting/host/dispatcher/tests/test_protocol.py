@@ -1670,3 +1670,67 @@ class TestTheExtractsListingIsRelayedNotWalked(unittest.TestCase):
         body = body[:body.index("\n    def ")]
         self.assertIn("ExtractRelayError", body)
         self.assertIn("Refused", body)
+
+
+class TestARefreshMovesUnitsWithTheCode(unittest.TestCase):
+    """`mirror-refresh` reset the checkout and restarted the daemon while
+    /etc/systemd/system held a unit from an older commit, so it ran new code
+    under old configuration -- silently. The visible symptom was
+    `ModuleNotFoundError: No module named 'extract_spec'`: an error about a
+    module, for a cause that was a missing `Environment=PYTHONPATH` directive.
+
+    And the extractor kept serving from a process three commits old, because it
+    is socket-activated but LONG-LIVED once started -- it answered
+    `unknown op 'extracts'` for an op the new code had."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "phase2-setup.sh")) as fh:
+            self.setup = fh.read()
+        self.refresh = self.setup[self.setup.index("cmd_mirror_refresh()"):]
+        self.refresh = self.refresh[:self.refresh.index("\ncmd_verify")]
+
+    def test_the_refresh_checks_the_installed_units(self):
+        self.assertIn("assert_units_current", self.refresh)
+
+    def test_it_refuses_rather_than_reinstalling(self):
+        # The installed units carry substituted uids, and the substitution
+        # belongs to each setup script's own install path. Duplicating it here
+        # would give two places that decide what a unit says.
+        check = self.setup[self.setup.index("assert_units_current() {"):]
+        check = check[:check.index("\nunit_matches()")]
+        self.assertIn("die ", check)
+        self.assertIn("phase2b-setup.sh install", check)
+
+    def test_every_shipped_unit_is_in_the_comparison(self):
+        # A unit added later and left out of this list would drift unnoticed,
+        # which is the whole failure being closed.
+        check = self.setup[self.setup.index("assert_units_current() {"):]
+        check = check[:check.index("\nunit_matches()")]
+        shipped = []
+        for sub in ("dispatcher", "extractor"):
+            directory = os.path.join(self.host, sub)
+            if not os.path.isdir(directory):
+                continue
+            shipped += [name for name in os.listdir(directory)
+                        if name.endswith((".service", ".socket", ".timer"))]
+        for unit in shipped:
+            with self.subTest(unit=unit):
+                self.assertIn(unit, check)
+
+    def test_the_extractor_is_restarted_too(self):
+        self.assertIn("qf-extract.service", self.refresh)
+        # try-restart, not restart: with nothing having asked for an extract
+        # there is no process to cycle, and starting one eagerly would open a
+        # database connection nobody wanted.
+        self.assertIn("try-restart", self.refresh)
+
+    def test_the_drift_check_has_its_own_test(self):
+        script = os.path.join(self.host, "tests", "test_unit_drift.sh")
+        self.assertTrue(os.path.isfile(script), script)
+        self.assertTrue(os.stat(script).st_mode & 0o111, "not executable")
+        p = subprocess.run([script], capture_output=True, text=True,
+                           timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("unit-drift: pass=8 fail=0", p.stdout)

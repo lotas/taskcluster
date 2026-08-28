@@ -1081,7 +1081,54 @@ Original task description follows.
   that fixes it. An invariant of the environment belongs in the startup gate, not
   in the first request that trips over it.
 
-### Task 5: the `extract` kind in `qfd` — **DONE (revision 2)**
+### Task 5: the `extract` kind in `qfd` — **DONE (revision 3)**
+
+Deploying revision 2 failed twice, and both failures were the same defect in the
+DEPLOYMENT tooling rather than in the code:
+
+    $ qf extracts
+    qf: unknown op 'extracts'; known: ping, extract
+    $ qf extract --target wait_time ...
+    qf: ModuleNotFoundError: No module named 'extract_spec'
+
+**`mirror-refresh` moved the code and not the units.** It resets the checkout and
+restarts `qf-dispatch`, and never looks at `/etc/systemd/system` -- so the
+dispatcher ran new code under a unit copied from an older commit, without the
+`Environment=PYTHONPATH=.../host/shared` that 2b-1 added. The symptom was an
+error about a *module*, for a cause that was a missing *directive*.
+
+**And the extractor kept serving from a stale process.** It is socket-activated
+but LONG-LIVED once started, so the socket was current while the process behind it
+was three commits old -- which is why it answered `unknown op 'extracts'` for an
+op the new code has. Note the wording in that error: it is the EXTRACTOR's op
+list, not the dispatcher's, which is what identified the stale process.
+
+Both closed in `phase2-setup.sh`:
+
+- `assert_units_current` compares every shipped unit against its installed copy,
+  excluding only the directives whose value the installer substitutes, and
+  **refuses to restart** into a stale one -- naming the setup command that fixes
+  it. Refuses rather than reinstalls, because the substitution belongs to each
+  setup script's own install path and duplicating it would give two places that
+  decide what a unit says.
+- `systemctl try-restart qf-extract.service` after the refresh. `try-restart`
+  rather than `restart`: with nothing having asked for an extract there is no
+  process to cycle, and starting one eagerly would open a database connection
+  nobody wanted.
+
+**The drift check's first implementation was itself vacuous**, and that is the
+part worth keeping. It chained two `sed` expressions to derive the excluded keys,
+and the second fired on the first's output -- reducing
+`Environment=QFD_ADMIN_UID=%%DEPLOY_UID%%` to the key `Environment`, which
+excluded EVERY environment line. It passed on identical files. A check that has
+stopped checking looks, from outside, exactly like a check that passes. It is now
+one awk pass with `tests/test_unit_drift.sh` covering eight cases, including the
+regression that made the first version vacuous: one substituted environment line
+must not excuse the others.
+
+Suites: shared 61, extractor 184, dispatcher 600, unit-drift 8.
+
+### Task 5 revision 2
 
 Review round found six defects, four P1, and the first was fatal to the whole
 path. All fixed and red-green verified; suites shared 61, extractor 184,

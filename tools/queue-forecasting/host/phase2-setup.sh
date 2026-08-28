@@ -695,12 +695,125 @@ cmd_mirror_refresh() {
     sudo -u "$owner" git -C "$TRUSTED" reset --hard "$TRUSTED_REF"
     info "now at $(git -C "$TRUSTED" rev-parse --short HEAD)"
   fi
+  # THE UNITS ARE PART OF THE CODE, and this step used to move only the code.
+  #
+  # A refresh that resets the checkout and restarts the process, while
+  # /etc/systemd/system holds a unit copied from an older commit, runs NEW CODE
+  # UNDER OLD CONFIGURATION -- and it does so silently. It happened: 2b-1 added
+  # `Environment=PYTHONPATH=.../host/shared` to qf-dispatch.service, the refresh
+  # did not reinstall it, and every `qf extract` failed with
+  # `ModuleNotFoundError: No module named 'extract_spec'` -- an error about a
+  # module, for a cause that was a missing directive.
+  #
+  # Detected and REFUSED rather than fixed here: the installed units carry
+  # substituted uids, and the substitution belongs to each setup script's own
+  # install path. Duplicating it here would give two places that decide what a
+  # unit says.
+  assert_units_current
+
   if would "restart qf-dispatch"; then
     systemctl restart qf-dispatch
     sleep 5
     systemctl is-active --quiet qf-dispatch || die "qf-dispatch did not come back"
     info "restarted"
   fi
+
+  # THE EXTRACTOR TOO, and for a reason easy to miss: it is socket-activated but
+  # LONG-LIVED once started, so a refresh leaves the old process serving. It
+  # answered `unknown op 'extracts'` for an op the new code had -- the socket was
+  # current, the process behind it was three commits old.
+  #
+  # `try-restart`, not `restart`: if nothing has asked for an extract there is no
+  # process to cycle, and starting one eagerly would open a database connection
+  # nobody wanted. The next request starts fresh code and re-runs the startup
+  # probe.
+  if systemctl list-unit-files qf-extract.service >/dev/null 2>&1 \
+     && [ -f /etc/systemd/system/qf-extract.service ]; then
+    if would "try-restart qf-extract (socket-activated, but long-lived)"; then
+      systemctl try-restart qf-extract.service
+    fi
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Every unit this repository ships, compared against what is installed.
+#
+# Placeholder-bearing directives are excluded from the comparison: the checkout
+# says `%%QFD_UID%%` and the installed copy says `999`, and that difference is
+# the install doing its job. Everything else must match exactly.
+assert_units_current() {
+  local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local drifted=0 unit src
+  for spec in \
+      "dispatcher/qf-dispatch.service:phase2-setup.sh install" \
+      "dispatcher/qf-runs-prune.service:phase2-setup.sh install" \
+      "dispatcher/qf-runs-prune.timer:phase2-setup.sh install" \
+      "extractor/qf-extract.service:phase2b-setup.sh install" \
+      "extractor/qf-extract.socket:phase2b-setup.sh install" \
+  ; do
+    src="$here/${spec%%:*}"
+    unit="$(basename "$src")"
+    local remedy="${spec#*:}"
+    [ -f "$src" ] || continue
+    [ -f "/etc/systemd/system/$unit" ] || continue
+    if ! unit_matches "$src" "/etc/systemd/system/$unit"; then
+      warn "$unit differs from the checkout: the installed copy is from an"
+      warn "older commit, so the daemon would run new code under old settings."
+      warn "Remedy:  sudo ./$remedy"
+      drifted=$((drifted + 1))
+    fi
+  done
+  if [ "$drifted" -gt 0 ]; then
+    die "$drifted unit(s) are stale. Refusing to restart into them: an
+  install that moves code without its configuration is the failure this check
+  exists to make loud."
+  fi
+  info "installed units match the checkout"
+}
+
+unit_matches() {  # unit_matches <checkout> <installed>
+  #
+  # Compares every directive EXCEPT the ones whose value the installer
+  # substitutes: the checkout says `%%QFD_UID%%` and the installed copy says
+  # `999`, and that difference is the install doing its job.
+  #
+  # ONE awk pass, deliberately. The first version chained two `sed`
+  # expressions to derive the keys, and the second fired on the first's output:
+  # `Environment=QFD_ADMIN_UID=%%DEPLOY_UID%%` became the key `Environment`, so
+  # every `Environment=` line was excluded and the check silently stopped
+  # checking anything but the ExecStart. It still passed on identical files,
+  # which is how a check that has stopped working looks from the outside.
+  local tmp_a tmp_b rc=0
+  tmp_a="$(mktemp)"; tmp_b="$(mktemp)"
+  _unit_key_filter "$1" "$1" > "$tmp_a"
+  _unit_key_filter "$1" "$2" > "$tmp_b"
+  cmp -s "$tmp_a" "$tmp_b" || rc=1
+  rm -f "$tmp_a" "$tmp_b"
+  return $rc
+}
+
+_unit_key_filter() {  # _unit_key_filter <checkout-for-keys> <file-to-filter>
+  awk '
+    function key(line) {
+      # `Environment=NAME=value` keys on "Environment=NAME"; anything else on
+      # the directive name. Two levels, because one Environment line being
+      # substituted must not exclude the rest.
+      if (line ~ /^Environment=[A-Za-z_]+=/) {
+        split(line, parts, "=")
+        return "Environment=" parts[2]
+      }
+      if (line ~ /^[A-Za-z]+=/) {
+        split(line, parts, "=")
+        return parts[1]
+      }
+      return ""
+    }
+    NR == FNR {
+      if (index($0, "%%") > 0) { substituted[key($0)] = 1 }
+      next
+    }
+    { if (!(key($0) in substituted)) print }
+  ' "$1" "$2"
 }
 
 # --------------------------------------------------------------------------
