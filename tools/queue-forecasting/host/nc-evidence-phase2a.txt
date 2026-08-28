@@ -1,0 +1,24 @@
+=== 2026-08-28T13:30:50Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: f1471a61aacfb29b91568414f64b2419b439d1cb
+pass=107 fail=2
+failed: (c) the stand-in exited early; the clause could not observe the lock
+failed: NC18 the service passes a force flag from the wire
+
+=== 2026-08-28T14:18:30Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: fca2dc12ae9635132aa26c892c53558961fa6fae
+pass=107 fail=2
+failed: VOID:(c) l2 was FAILED when l1 finished, so no shared lock was held to survive -- the clause could not observe its subject
+failed: NC15 the run directory grew past its bound (7605MiB)
+
+=== 2026-08-28T16:14:59Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 6fd766b4feb995f1a7490a004cbc5601845dddd3
+pass=109 fail=0
+
+=== 2026-08-28T17:12:37Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 6fd766b4feb995f1a7490a004cbc5601845dddd3
+pass=111 fail=0
+
