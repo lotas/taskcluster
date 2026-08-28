@@ -78,9 +78,28 @@ WINDOW_LOOKBACK_MINUTES = 24 * 60
 # so a caller could ask for 2010..2026 and get exactly the full-history scan the
 # `lookback_days` ceiling exists to prevent.
 #
-# The largest promoted config spans 36 days (`run_duration.yaml`: lookback 30 +
-# validation 1 + holdout 5), so 120 is over three times the real requirement.
-MAX_WINDOW_DAYS = 120
+# 60, LOWERED FROM 120 BY MEASUREMENT (2026-08-28). The first real extraction ran
+# a 36-day window and the `runs` statement alone took 8 minutes against the role's
+# 30-minute `statement_timeout`, which is enforced PER STATEMENT. Extrapolated:
+#
+#     36d ->  8.0 min (27% of the timeout, measured)
+#     60d -> 13.3 min (44%)
+#     90d -> 20.0 min (67%)
+#    120d -> 26.7 min (89%)
+#
+# 120 was chosen for scan safety -- 3.3x the largest promoted config -- with no
+# knowledge of runtime, and at 89% it would not reliably complete.
+#
+# 60 rather than 90, and the reason is growth: those figures are 36 days of
+# TODAY'S volume, and the tables grow every day. A ceiling sitting at 67% of the
+# timeout now becomes a ceiling over 100% of it later, silently, and the failure
+# would look like a database problem rather than a bound nobody revisited.
+#
+# The ceiling's job is to bound an ACCIDENT, not to enable windows nobody needs:
+# the largest promoted config spans 36 days (`run_duration.yaml`: lookback 30 +
+# validation 1 + holdout 5), so 60 is still 1.7x the real requirement. Raising it
+# requires a measurement at the new size, which is the correct friction.
+MAX_WINDOW_DAYS = 60
 
 # No forecasting data predates the project. The floor turns a typo into a
 # refusal instead of a full-table scan, and it also keeps the derived bounds

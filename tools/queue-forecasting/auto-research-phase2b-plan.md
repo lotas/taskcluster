@@ -5,6 +5,89 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 10, 2026-08-28: the extract's SIZE and its per-statement TIMING both
+say the 120-day ceiling was unsupported. Measured, not extrapolated from nothing:
+
+    -rw-r--r-- qfextract qfextract  880904801  runs.parquet        (11:05->11:13)
+    -rw-r--r-- qfextract qfextract  346151777  qctx_runs.parquet   (11:04->11:05)
+    -rw-r--r-- qfextract qfextract  210611549  throughput_runs.parquet
+    -rw-r--r-- qfextract qfextract    6771077  worker_counts.parquet
+    total 1.4 GiB for 36 days at lookback 30
+
+**`MAX_WINDOW_DAYS`: 120 -> 60.** `statement_timeout` is 30 minutes and is
+enforced PER STATEMENT; `runs` alone took 8 minutes for 36 days. Straight-line:
+60d -> 13 min (44%), 90d -> 20 min (67%), 120d -> 27 min (89%). 120 would not
+reliably complete.
+
+60 rather than 90, and the reason is **growth**: those 8 minutes are today's row
+count, and the tables grow every day. A ceiling sitting at 67% of the timeout now
+is over 100% of it later, silently, and the failure would read as a database
+problem rather than as a bound nobody revisited. The ceiling's job is to bound an
+ACCIDENT, not to enable windows nobody needs — 60 is still 1.7x the 36 days the
+largest promoted config requires, and raising it takes a measurement at the new
+size, which is the correct friction.
+
+**`QFX_OUTPUT_MB` stops being a flat number.** The admission check reserved 4096
+MiB regardless of the request, which was right for 36 days (1378 MiB estimated)
+and wrong at the top of the range (4692 MiB) — wrong in the direction that eats
+the dispatcher's floor it exists to protect. It is now derived, because the two
+spans that drive the size are both request fields:
+
+- `runs` + `throughput_runs` + `worker_counts` scale with the **window**:
+  (881+211+7)/36 = **29.1 MiB/day**
+- `qctx_runs` scales with the window **plus the lookback**, since its floor is
+  `ref_lower`: 346/(36+30) = **5.0 MiB/day**
+
+with a 1.5x factor for being wrong about the shape rather than for being generous.
+The configured knob becomes a **floor**: an operator may reserve more than
+measured, never less.
+
+Also confirmed: the published files are `0644 qfextract:qfextract`, so 2b-2's
+read-only sandbox mount will work — the one thing about the extract that a
+different uid has to be able to do.
+
+Every fixture in three test files used a 61-day window and every test failed the
+moment the ceiling dropped. They now use 31 days, closer to the 36 the real
+configs need.
+
+Revision 9, 2026-08-28: **the first real extraction succeeded.** 36 days of
+`wait_time` in 688s, six files, published as request `8e94d833d4c6` / extract
+`bfb0ae0330f4`. `ping` reports `ready: true`. `pg.py` and `parquet_writer.py`
+executed for the first time; the write canary was refused, so the SELECT-only
+grant is in force on the live role; `max_parallel_workers_per_gather = 0` applied.
+
+**The watermark immediately demonstrated why D20 had to change.** From the
+manifest:
+
+    "pending_at":  "2026-08-25T23:59:59.105000+00:00"
+    "resolved_at": "2026-08-27T11:47:40.080000+00:00"
+
+`resolved_at` is **two days past the window's own `as_of_date`**, and correctly
+so: `runs` windows on `pending_at < as_of_date` and puts no bound on
+`resolved_at`, so a task that pended on the 25th and resolved on the 27th belongs
+in the extract. Which means the same request re-run tomorrow would carry a *later*
+`resolved_at` watermark and therefore a different `extract_hash` — exactly the
+case that made "reuse on an unchanged watermark" unsound, now visible in the
+first artifact rather than argued from the collector's cadence.
+
+**A new finding the measurement makes possible.** `statement_timeout` is 30
+minutes on the role, enforced per statement. 688s for 36 days extrapolates to:
+
+| window | est. total |
+|---|---|
+| 36d | 11.5 min (measured) |
+| 60d | 19 min |
+| 90d | 29 min |
+| 120d | 38 min |
+
+`MAX_WINDOW_DAYS` is 120. The total is spread across six statements so no single
+one necessarily exceeds the timeout, but the headroom at the ceiling is thin and
+the ceiling was chosen for scan safety (3.3x the largest promoted config's 36
+days) with no knowledge of runtime. **Either measure a 90-120 day window before
+anything relies on it, or lower the ceiling to a figure the timeout comfortably
+covers.** Recorded rather than acted on: the right number comes from a
+measurement, not from this table.
+
 Revision 8, 2026-08-28: the credential check was wrong a THIRD time, and the
 third time is the one worth recording, because the first two were fixes to the
 wrong thing.

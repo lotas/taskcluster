@@ -31,6 +31,7 @@ The five things this module exists to make true:
 from __future__ import annotations
 
 import contextlib
+import datetime
 import errno
 import fcntl
 import hashlib
@@ -55,6 +56,31 @@ DEFAULT_FLOOR_MB = 20 * 1024
 DEFAULT_TEMP_MB = 20 * 1024
 DEFAULT_OUTPUT_MB = 4 * 1024
 
+# MEASURED on the first real extraction, 2026-08-28: a 36-day window with
+# lookback_days=30 produced 1.4 GiB --
+#
+#     runs             881 MB  |  qctx_runs   346 MB
+#     throughput_runs  211 MB  |  worker_counts 6.8 MB
+#     dimensions        ~10 KB
+#
+# Two different spans drive the size, which is why one flat number cannot be
+# right across the allowed range:
+#
+#   * `runs`, `throughput_runs` and `worker_counts` scale with the WINDOW
+#     (as_of_date - train_start): (881 + 211 + 7) / 36 = 29.1 MiB/day.
+#   * `qctx_runs` scales with the window PLUS the lookback, because its floor is
+#     `ref_lower`: 346 / (36 + 30) = 5.0 MiB/day.
+#
+# A flat 4096 MiB was right for a 36-day window (1378 MiB estimated) and wrong at
+# the ceiling: 4692 MiB estimated for the largest allowed request, i.e. the
+# admission check would have reserved less than the extract needed and eaten into
+# the dispatcher's floor it exists to protect.
+WINDOW_MB_PER_DAY = 30
+QCTX_MB_PER_DAY = 6
+# One measurement, straight-line extrapolated, on data that grows. The margin is
+# for being wrong about the shape, not for being generous.
+SIZE_SAFETY_FACTOR = 1.5
+
 # Reasons `attempt_write` may give for a write having been refused. BOTH count,
 # and the reason that is missing from this set is "no reason": a write that
 # SUCCEEDS is the failure.
@@ -75,6 +101,25 @@ class ExtractError(Exception):
 def required_disk_mb(*, floor_mb=DEFAULT_FLOOR_MB, temp_mb=DEFAULT_TEMP_MB,
                      output_mb=DEFAULT_OUTPUT_MB):
     return floor_mb + temp_mb + output_mb
+
+
+def estimated_output_mb(request):
+    """How much this REQUEST will write, from the measured per-day figures.
+
+    Derived rather than configured, because the two spans that drive the size are
+    both request fields: a flat allowance is either wrong at the top of the
+    allowed range or wasteful at the bottom, and being wrong at the top is the
+    direction that eats the dispatcher's floor.
+    """
+    start = datetime.datetime.strptime(request["train_start"],
+                                       "%Y-%m-%dT%H:%M:%SZ")
+    end = datetime.datetime.strptime(request["as_of_date"],
+                                     "%Y-%m-%dT%H:%M:%SZ")
+    span_days = max(1, (end - start).days)
+    lookback = request["lookback_days"]
+    raw = (WINDOW_MB_PER_DAY * span_days
+           + QCTX_MB_PER_DAY * (span_days + lookback))
+    return int(raw * SIZE_SAFETY_FACTOR) + 1
 
 
 def published_dir(root, request_hash):
@@ -186,16 +231,22 @@ class Extractor:
             os.close(fd)
 
     # --- admission --------------------------------------------------------
-    def _check_disk(self):
+    def _check_disk(self, request):
+        # The configured knob is a FLOOR, not the answer: an operator can raise
+        # the reservation but cannot lower it below what this request is measured
+        # to need.
+        output_mb = max(self.output_mb, estimated_output_mb(request))
         need = required_disk_mb(floor_mb=self.floor_mb, temp_mb=self.temp_mb,
-                                output_mb=self.output_mb)
+                                output_mb=output_mb)
         free = self.free_disk_mb(self.root)
         if free is not None and free < need:
             raise ExtractError(
                 f"{free}MiB free, and an extraction needs about {need}MiB:"
                 f" the dispatcher's {self.floor_mb}MiB admission floor, which is"
                 f" not ours to spend, plus {self.temp_mb}MiB of PostgreSQL temp"
-                f" allowance, plus {self.output_mb}MiB of extract output."
+                f" allowance, plus {output_mb}MiB of extract output for"
+                f" this window (measured at ~{WINDOW_MB_PER_DAY}MiB per window"
+                f" day plus ~{QCTX_MB_PER_DAY}MiB per reference day)."
                 f" Note that queue-forecasting_pgdata spills temp files during"
                 f" large queries and can double transiently -- wait for it"
                 f" rather than lowering the floor."
@@ -226,7 +277,7 @@ class Extractor:
             existing = published_dir(self.root, request_hash)
             if existing is not None:
                 return self._reuse(request_hash, existing, force=force)
-            self._check_disk()
+            self._check_disk(request)
             return self._extract(request, request_hash)
 
     def _reuse(self, request_hash, path, *, force):

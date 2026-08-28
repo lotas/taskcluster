@@ -23,7 +23,9 @@ def a_request(**over):
     base = {
         "schema": 1,
         "target": "wait_time",
-        "train_start": "2026-06-01T00:00:00Z",
+        # 31 days: inside MAX_WINDOW_DAYS (60, lowered from 120 by measurement)
+        # and close to the 36 days the largest promoted config actually needs.
+        "train_start": "2026-07-01T00:00:00Z",
         "as_of_date": "2026-08-01T00:00:00Z",
         "lookback_days": 30,
     }
@@ -245,11 +247,11 @@ class TestLookbackDaysIsBoundedAndIsAnInt(unittest.TestCase):
         # which is 90 minutes LATER than the trainer's floor -- see
         # TestTheDerivedBoundsSupersetTheTrainersWindows for why that made the
         # extract a subset.
-        got = validate(a_request(train_start="2026-06-01T00:00:00Z",
+        got = validate(a_request(train_start="2026-07-01T00:00:00Z",
                                  lookback_days=30))
-        # Worked example: 2026-06-01 - 24h = 2026-05-31, - 30d = 2026-05-01.
-        self.assertEqual(got["window_lower"], "2026-05-31T00:00:00Z")
-        self.assertEqual(got["ref_lower"], "2026-05-01T00:00:00Z")
+        # Worked example: 2026-07-01 - 24h = 2026-06-30, - 30d = 2026-05-31.
+        self.assertEqual(got["window_lower"], "2026-06-30T00:00:00Z")
+        self.assertEqual(got["ref_lower"], "2026-05-31T00:00:00Z")
         # And the relation, so a wrong literal above cannot pass by agreeing
         # with a wrong implementation. Three literals in this file have now been
         # miscomputed by hand; the relation is what actually pins the rule.
@@ -546,3 +548,28 @@ class TestNoValidJsonShapeEscapesTheTypedRefusal(unittest.TestCase):
                     except Exception as e:            # noqa: BLE001
                         self.fail(f"{field}={shape!r} raised"
                                   f" {type(e).__name__}: {e}")
+
+
+class TestTheWindowCeilingIsWhatMeasurementSupports(unittest.TestCase):
+    """`MAX_WINDOW_DAYS` was 120, chosen for scan safety at 3.3x the largest
+    promoted config, with no knowledge of runtime. The first real extraction
+    measured the `runs` statement at 8 minutes for 36 days against a 30-minute
+    per-statement `statement_timeout`, which puts 120 days at 89% of the budget.
+    """
+
+    def test_the_ceiling_is_the_measured_one(self):
+        self.assertEqual(extract_spec.MAX_WINDOW_DAYS, 60)
+
+    def test_the_ceiling_still_covers_the_largest_promoted_config(self):
+        # `run_duration.yaml`: lookback 30 + validation 1 + holdout 5 = 36 days.
+        # A ceiling below that would break the thing 2b exists to reproduce.
+        self.assertGreaterEqual(extract_spec.MAX_WINDOW_DAYS, 36)
+
+    def test_the_binding_statement_stays_under_half_the_timeout(self):
+        # 8 minutes measured for 36 days, straight-line, against 30 minutes. The
+        # margin is for volume GROWTH: those 8 minutes are today's row count, and
+        # a ceiling sitting at 67% now is over 100% later, silently.
+        minutes = 8.0 / 36 * extract_spec.MAX_WINDOW_DAYS
+        self.assertLess(minutes, 15.0,
+                        f"the runs statement would take ~{minutes:.0f} min of a"
+                        f" 30 min statement_timeout at the ceiling")

@@ -159,8 +159,11 @@ class _Sink:
         return False
 
 
+# 31 days, inside MAX_WINDOW_DAYS (60). The fixture used 61 days until the
+# ceiling was lowered by measurement, at which point every test in this file
+# failed on a window the validator was right to refuse.
 RAW = {"schema": 1, "target": "wait_time",
-       "train_start": "2026-06-01T00:00:00Z",
+       "train_start": "2026-07-01T00:00:00Z",
        "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 30}
 
 
@@ -456,7 +459,7 @@ class TestTheManifestDescribesWhatWasActuallyWritten(ExtractorCase):
     def test_the_manifest_records_the_settlement_lag_in_force(self):
         manifest = self.make(settlement_lag_s=7200).run(raw(
             as_of_date="2026-08-04T00:00:00Z",
-            train_start="2026-07-05T00:00:00Z"))
+            train_start="2026-07-10T00:00:00Z"))
         self.assertEqual(manifest["settlement_lag_s"], 7200)
 
     def test_the_manifest_records_the_snapshot_not_just_a_txid(self):
@@ -672,3 +675,63 @@ class TestTheRunIsLegibleInTheJournal(ExtractorCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheOutputAllowanceIsDerivedFromTheRequest(ExtractorCase):
+    """A flat allowance cannot be right across the allowed range, because two
+    different spans drive the size: `runs`/`throughput_runs`/`worker_counts`
+    scale with the window, `qctx_runs` with the window plus the lookback.
+
+    Measured on the first real extraction (2026-08-28): a 36-day window at
+    lookback 30 produced 1.4 GiB. The flat 4096 MiB was right there and wrong at
+    the ceiling, in the direction that eats the dispatcher's floor."""
+
+    def test_the_measured_case_is_covered_with_margin(self):
+        # 36 days, lookback 30 -> 1378 MiB estimated raw, 1.4 GiB observed.
+        est = extractor.estimated_output_mb(
+            {"train_start": "2026-06-26T00:00:00Z",
+             "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 30})
+        self.assertGreater(est, 1434, "under the 1.4 GiB actually observed")
+        self.assertLess(est, 4096, "wildly over the observed size")
+
+    def test_it_grows_with_the_window(self):
+        small = extractor.estimated_output_mb(
+            {"train_start": "2026-07-25T00:00:00Z",
+             "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 30})
+        large = extractor.estimated_output_mb(
+            {"train_start": "2026-06-02T00:00:00Z",
+             "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 30})
+        self.assertGreater(large, small * 2)
+
+    def test_it_grows_with_the_lookback_too(self):
+        # `qctx_runs`' floor is `ref_lower`, so a bigger lookback is more rows
+        # even with the window unchanged. A flat allowance misses this entirely.
+        base = {"train_start": "2026-07-01T00:00:00Z",
+                "as_of_date": "2026-08-01T00:00:00Z"}
+        self.assertGreater(
+            extractor.estimated_output_mb({**base, "lookback_days": 120}),
+            extractor.estimated_output_mb({**base, "lookback_days": 1}))
+
+    def test_the_configured_knob_is_a_floor_not_the_answer(self):
+        # An operator may reserve MORE than measured, never less.
+        self.free_mb = 100_000
+        big = self.make(output_mb=90_000)
+        with self.assertRaises(extractor.ExtractError) as cm:
+            big.run(raw())
+        self.assertIn("90000MiB", str(cm.exception))
+
+    def test_the_refusal_names_the_per_day_figures(self):
+        with self.assertRaises(extractor.ExtractError) as cm:
+            self.make(free_disk_mb=lambda p: 1000).run(raw())
+        msg = str(cm.exception)
+        self.assertIn("per window day", msg)
+        self.assertIn("per reference day", msg)
+
+    def test_a_one_day_window_still_reserves_something(self):
+        # `max(1, days)` rather than 0: a same-day window is refused by the
+        # validator, but a zero here would make the reservation vanish if that
+        # ever changed.
+        est = extractor.estimated_output_mb(
+            {"train_start": "2026-07-31T00:00:00Z",
+             "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 1})
+        self.assertGreater(est, 0)

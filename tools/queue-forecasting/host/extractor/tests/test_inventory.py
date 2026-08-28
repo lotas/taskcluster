@@ -415,7 +415,7 @@ class TestTheInventoryAndTheValidatorCannotDrift(unittest.TestCase):
             {
                 "schema": 1,
                 "target": "wait_time",
-                "train_start": "2026-06-01T00:00:00Z",
+                "train_start": "2026-07-01T00:00:00Z",
                 "as_of_date": "2026-08-01T00:00:00Z",
                 "lookback_days": 30,
             },
@@ -580,7 +580,7 @@ class TestBoundValuesReachTheDriverAsDriverTypes(unittest.TestCase):
         import extract_spec
         request = extract_spec.validate(
             {"schema": 1, "target": "wait_time",
-             "train_start": "2026-06-01T00:00:00Z",
+             "train_start": "2026-07-01T00:00:00Z",
              "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 30},
             now=datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc))
         for name in inventory.DATASETS:
