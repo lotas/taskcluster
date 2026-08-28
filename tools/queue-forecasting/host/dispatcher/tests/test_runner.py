@@ -1200,3 +1200,32 @@ class TestTheRelayForwardsTheRightThing(ExtractRelayCase):
         self.assertGreaterEqual(self.sent[0][2], 688)
 
 
+
+
+class TestTheOutQuotaSamplerIsFastEnoughToMeanSomething(RunnerCase):
+    """A sampled bound cannot be exact, and at a 2s interval it was not close:
+    NC15's flood finished between 1.9x and 3.7x the 2048 MiB quota across five
+    runs, implying ~2.7 GB/s of buffered writes.
+
+    The point of these tests is not the constant -- it is that the constant has a
+    measurement behind it, and that nobody raises it back without meeting one."""
+
+    def test_the_interval_is_sub_second(self):
+        self.assertLessEqual(self.runner.out_sample_interval_s, 0.5)
+
+    def test_the_worst_measured_rate_stays_under_the_disk_floor(self):
+        # 2.7 GB/s measured. The floor is what actually protects the host, so the
+        # sampler only has to keep the overshoot far below it.
+        gb_per_s = 2.7
+        cap_mb = 2048
+        overshoot = gb_per_s * 1024 * self.runner.out_sample_interval_s
+        worst = cap_mb + overshoot
+        self.assertLess(worst, 20 * 1024 * 0.5,
+                        f"a flood could reach {worst:.0f}MiB, more than half the"
+                        f" 20GiB floor, before the sampler noticed")
+
+    def test_the_mem_sampler_is_not_dragged_along_with_it(self):
+        # Memory is a cgroup read for a high-water mark, not a bound being
+        # enforced -- there is nothing to be late for, and 0.5s of it would be
+        # cost with no return.
+        self.assertGreaterEqual(self.runner.mem_sample_interval_s, 2)

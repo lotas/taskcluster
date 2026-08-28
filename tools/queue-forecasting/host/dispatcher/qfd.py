@@ -1771,7 +1771,23 @@ class Runner:
         self.poll_interval_s = 2
         # Sampling cadences (design §4.5 and parent §15). Attributes for the
         # same reason.
-        self.out_sample_interval_s = 2
+        # 0.5s, LOWERED FROM 2s BY MEASUREMENT (2026-08-28).
+        #
+        # A sampled bound cannot be exact, and at 2s it was not close: NC15's
+        # flood fixture writes 1 MiB blocks in a tight loop, and the run
+        # directory finished between 1.9x and 3.7x the 2048 MiB quota across five
+        # runs (3845, 4205, 5963, 7042, 7605 MiB). The worst overshoot implies
+        # ~2.7 GB/s of buffered writes, so a 2s window is ~5 GiB of rope.
+        #
+        # 0.5s brings the worst case to roughly 1.7x. That is better and still
+        # approximate, which is why **the disk floor is the real protection** --
+        # 20 GiB reserved for the dispatcher, and the worst observed flood was
+        # 37% of it. OUT_QUOTA stops a runaway; the floor is what keeps the host
+        # alive while it is being stopped.
+        #
+        # The cost is a `du` of one run directory twice a second. It holds a
+        # handful of files, so this is a stat, not a walk.
+        self.out_sample_interval_s = 0.5
         self.mem_sample_interval_s = 5
         # How long `docker create` may take to acknowledge that the container
         # exists. This is the only Docker call made while the phase gate is

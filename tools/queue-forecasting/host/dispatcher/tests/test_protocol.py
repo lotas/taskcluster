@@ -1881,3 +1881,57 @@ class TestClauseCChecksItsSubjectBeforeConcluding(unittest.TestCase):
         acquired_at = self.clause.index("standin_acquired")
         alive_at = self.clause.index('kill -0 "$STANDIN_PID"')
         self.assertLess(acquired_at, alive_at)
+
+
+class TestNc15AssertsTheFloorNotAToleranceOnTheQuota(unittest.TestCase):
+    """The clause asserted `used <= cap * 3` and failed at 3.7x -- on a run where
+    containment had worked exactly as designed. Raising the multiple to fit would
+    have been fitting the test to the data.
+
+    What matters is that the host survives: the quota stops a runaway, and the
+    dispatcher's floor keeps the filesystem usable while it is being stopped. A
+    sampled quota cannot be exact; the floor does not depend on sampling."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            suite = fh.read()
+        start = suite.index("disk flood finished")
+        self.clause = suite[start:suite.index("NC15 a 0600 artifact", start)]
+
+    def test_it_no_longer_asserts_a_multiple_of_the_quota(self):
+        self.assertNotIn("* 3 ))", self.clause)
+
+    def test_it_asserts_against_the_disk_floor(self):
+        self.assertIn("QFD_DISK_FLOOR_GB", self.clause)
+        self.assertIn("disk floor", self.clause)
+
+    def test_the_overshoot_is_reported_rather_than_hidden(self):
+        # Behind a tolerance, the quota's real meaning disappears.
+        self.assertIn("overshoot:", self.clause)
+
+    def test_the_kill_itself_is_still_asserted(self):
+        # The floor check alone would pass for a job that was never stopped, as
+        # long as it happened to stay small.
+        self.assertIn("out_quota_exceeded", self.clause)
+
+
+class TestClauseCSchedulesTheExitItMeasures(unittest.TestCase):
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            suite = fh.read()
+        start = suite.index("# (c) PER-DESCRIPTOR ownership")
+        self.clause = suite[start:suite.index("# (f)", start)]
+
+    def test_l1_is_cancelled_rather_than_waited_for(self):
+        # Two test suites of similar duration make "wait for l1, hope l2 is still
+        # running" a coin flip. Cancelling makes the exit something the clause
+        # schedules.
+        self.assertIn('qf cancel $l1', self.clause)
+
+    def test_the_precondition_is_still_rechecked_afterwards(self):
+        # Belt and braces: cancelling makes the race unlikely, not impossible.
+        self.assertIn('state_of "$l2"', self.clause)

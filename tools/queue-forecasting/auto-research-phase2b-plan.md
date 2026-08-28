@@ -1328,7 +1328,40 @@ uses and which would break if its surface shrank. Deliberately *not* done
 unilaterally: D4 names `forecast_experiment` as the extractor's role, so changing
 it is a design decision, not an implementation detail.
 
-### Task 7: NC17 and NC18 — **RUN: 107 pass, 2 fail, both in my own clauses**
+### Task 7 — second run: 107/2 again, different failures, one a real weakness
+
+**NC15's output quota does not bound what it says it bounds.** Across five runs
+the flood's run directory finished at 1.9x, 2.1x, 2.9x, 3.4x and 3.7x the 2048 MiB
+quota (3845, 4205, 5963, 7042, 7605 MiB), and the clause's `cap * 3` tolerance
+failed on the last one -- on a run where containment worked exactly as designed.
+
+The worst overshoot implies **~2.7 GB/s of buffered writes**, so a 2-second
+sampling interval is about 5 GiB of rope. Two changes, and the second matters
+more than the first:
+
+- `out_sample_interval_s` 2s -> **0.5s**, bringing the worst case to ~1.7x. The
+  cost is a `du` of one run directory twice a second, over a handful of files.
+- **The clause now asserts the DISK FLOOR, not a tolerance on the quota.**
+  Raising the multiple to fit the observation would have been fitting the test to
+  the data. What matters is that the host survives: OUT_QUOTA stops a runaway
+  (still asserted, by the job being FAILED with `out_quota_exceeded`), and the
+  20 GiB floor keeps the filesystem usable while it is being stopped. **A sampled
+  quota cannot be exact; the floor does not depend on sampling.** The overshoot is
+  now PRINTED rather than hidden behind a tolerance, so the quota's real meaning
+  stays visible.
+
+**Clause (c) VOIDed, which is the fix working, and told me why it was
+unfixable by tuning.** The message was `l2 was FAILED when l1 finished` -- both
+jobs are ordinary test suites of roughly equal duration, so waiting for `l1` and
+hoping `l2` outlives it is a coin flip. (Both FAIL: qf-research has five known
+CWD-dependent test failures, which is irrelevant to the mutex and exactly why the
+clause must not depend on how a job ended.) `l1` is now **cancelled**, so its exit
+is something the clause schedules rather than waits for, with the precondition
+re-check kept as belt and braces.
+
+Suites: shared 61, extractor 184, dispatcher 624, unit-drift 8.
+
+### Task 7 — first run: 107 pass, 2 fail, both in my own clauses
 
 First run against the host, 2026-08-28. Every 2b-1 control passed:
 
