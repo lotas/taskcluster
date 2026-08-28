@@ -1531,9 +1531,28 @@ name; `query` kind; `resolve_baseline_file` reduced to a boolean choice in
 4. Fault gates still 32/0 and the rest of the suite still passes — 2b-1 adds a
    domain and must not perturb the spine.
 5. A real extract exists for a real window, its manifest carries a watermark and
-   a snapshot, and re-requesting it is a cache hit; moving the watermark is not.
-6. Evidence appended to `host/nc-evidence-phase2b.txt`, citing a commit on
-   `main`.
+   a snapshot, and re-requesting it is a cache hit. **DONE** — request
+   `8e94d833d4c6`, extract `bfb0ae0330f4`, 36 days in 688s, and NC18 asserts the
+   re-request serves the same bytes with no second artifact.
+
+   The original wording continued "...; moving the watermark is not", which is
+   **stale**: it predates the D20 rewrite. Reuse is keyed on `request_hash` and
+   the watermark is provenance, so a moved watermark is not a cache miss -- it is
+   nothing at all, and the artifact stays. The equivalent live assertion is that
+   bumping `generation` publishes a separate artifact, which is NC18's `NC_SLOW=1`
+   clause and **has not been run**.
+6. Evidence appended to `host/nc-evidence-phase2a.txt`, citing a commit on
+   `main`. **NOT DONE, and the gap is larger than the phase.** The suite writes to
+   `nc-evidence-phase2a.txt` -- one file for one suite, which is right, since
+   splitting one run's output by phase would leave neither file a complete record
+   -- but that file **has never been committed**: the repository holds
+   `nc-evidence-phase0.txt` and `nc-evidence-phase1.txt` and nothing since. Every
+   2a and 2b run has appended to a file in a working checkout, so there is no
+   committed record of any of them, including the 32/0 and 109/0 runs.
+
+   Two things are needed: commit the file, and produce a run that cites a
+   mainline commit rather than a branch, since a branch commit can be rewritten
+   and the evidence would then name nothing.
 
 ## 8. Deferred from 2b
 
