@@ -284,7 +284,8 @@ they cannot disagree about what existed. The manifest records the snapshot's sta
 could see. Without it, two files in one "frozen" extract could straddle a
 collector write and nothing in the record would show it. `extract/MANIFEST.json` records, per file, a
 SHA-256, a row count, the window, and the **data watermark** (the maximum
-`pending_at` and resolution timestamp included), which closes the parent §7 hole
+`pending_at` and resolution timestamp included), which RECORDS the parent §7 hole
+-- see D20 in §8a for why recording is not closing, and what closes it
 where the trainer's content-hashed cache key omitted a watermark and the same
 window re-extracted later silently picked up late-arriving rows.
 
@@ -835,6 +836,9 @@ So:
 | NC13 | **New.** Sandbox isolation, asserted from *inside* the dispatcher-built container: no network, no container-runtime socket, read-only source, no `DATABASE_URL`, no `.env`, cannot write `trainer/data/models` | 2a, extended in 2b |
 | NC14 | **New.** The dispatcher's read-only token authenticates (canary) and cannot push, create a ref, or open a pull request on `qf-research` | 2a |
 | NC15 | **New.** Disk containment: a job that writes without bound is killed at its output quota and at its log cap, and a full runs filesystem stops admission instead of scheduling into it | 2a |
+| NC16 | **Implemented in 2a and undocumented until 2026-08-27.** `docker create` then `start` relays the container's exit status; no container survives a terminal run; every resource row is released | 2a |
+| NC17 | **New.** The database credential is unreachable from both `qfd` and `research`, each refusal measured against a positive canary proving `qfextract` can | 2b-1 |
+| NC18 | **New.** A request naming anything outside D17 is refused; a published extract is IMMUTABLE -- re-requesting a `request_hash` is served byte-identically and a second extraction under an existing `request_hash` is refused rather than overwritten; bumping `generation` yields a separate artifact | 2b-1 |
 | NC9 | A job whose `contract_hash` disagrees with the trusted checkout is refused | 2c |
 | NC11 | A prediction set whose `row_id` multiset does not match the frozen extract is refused | 2c |
 
@@ -1426,6 +1430,42 @@ Unchanged from the parent unless noted.
 | new | Whether `/var/lib/qf-runs` can carry filesystem-enforced per-run quotas, or the sampler is the only bound (§4.5) | 2a Task 10 discovery |
 | new | Raising `TIMEOUT_MAX` above 3600 s for 2b/2d, which requires moving `BUILD_TIMEOUT_S`, `JOB_HOLD_DEADLINE_S` and `LOCK_WAIT_S` in the same change (D10a) | 2b, once real cohort runtimes are known |
 | new | Whether blocking all dispatcher work during the nightly window (D10) is too blunt once experiment volume rises; the alternative is a ~2 GB light ceiling | revisit after four weeks of Phase 0–3 operation |
+
+---
+
+## 8a. Decisions settled for 2b (2026-08-27)
+
+Recorded here because they **amend D4's shape** rather than extend it; the detail
+and the task breakdown live in `auto-research-phase2b-plan.md` (D15-D22).
+
+| # | Decision | Why it is not just an elaboration of D4 |
+|---|---|---|
+| D15 | The extractor is a **third privilege domain** -- a dedicated `qfextract` user and systemd unit, outside both `qfd` and the sandbox. `qfd` may *request* an extraction and never holds the database credential. | D4 said "trusted code, dispatcher-side", which reads as "inside `qfd`". Two constraints forbid that: Parquet needs `pyarrow` and D6 pins `qfd` to the standard library; and `qfd` is in the `docker` group (D5), so anything `qfd` hands a container it can read back -- a containerised extractor launched by `qfd` therefore *cannot* satisfy "`qfd` never holds the credential". Stated honestly: docker-group membership is root-equivalent, so this is a least-privilege boundary, not a barrier against a compromised `qfd`. What it buys is that no `qfd` **defect** can disclose the DSN, and it becomes a real barrier if D2 is revisited at Phase 5. |
+| D16 | The request channel is a **socket-activated unit**, and the request is validated **twice** -- by `qfd` for legibility, and by the extractor because a caller is a caller. | D4 specified the request's shape and not its delivery. A spool directory would need its own atomicity, absence-settling and liveness stories; 2a spent sixteen review rounds establishing that an absence is evidence only once something was asked and an answer came back. |
+| D17 | `lookback_days` is a **field of the typed request**, bounded `1..120`; the anomaly flag subset is **not** a field, and the whole `queue_forecast_daily_health` row set is emitted instead. | `load_task_runs_for_queue_context` derives its floor from `c.lookback_days` today, so a trusted query consults the research repo for a window bound -- admissible under D4's "window" but only if made explicit. `load_anomalous_dates` builds its `WHERE` with an f-string over a config value; emitting the rows deletes that f-string rather than making it safe. |
+| D18-D22 | Fixed column inventory; one `REPEATABLE READ` snapshot with `pg_current_snapshot()`; extract identity/reuse/retention; the sandbox read path; trusted baseline artifacts. | Elaborations of D4 and §4.6, detailed in the 2b plan. |
+| D20 | **Extracts are immutable**, reused by `request_hash`; `as_of_date` must be a completed UTC boundary past a settlement lag; the watermark is **provenance, not a cache-validity oracle**; late data requires a new `generation`. | This is a correction, not an elaboration. D4 introduced the watermark to close the parent §7 hole where a re-extracted window silently picked up late rows -- but the collector's one-minute enrichment backfill can update a row *inside* an already-extracted window without moving `max(pending_at)` or `max(resolved_at)`. So an unchanged watermark does not prove identical input, and reuse keyed on it would serve a stale extract while reporting a hit. Reproducibility has to rest on immutability. |
+| D23 | `max_parallel_workers_per_gather = 0` for the extractor, one extraction at a time, a measured `temp_file_limit`, and a free-space admission check. | `temp_file_limit` (20GB, set by Phase 0) is a **per-process** bound and parallel workers are separate processes, so the server's four-workers-per-gather default lets one query spill roughly five times the limit -- `work_mem = 512MB` multiplies identically. Setting the worker count to zero is what makes the existing limit a limit. |
+
+**A grant-surface finding that D4 should not be read around.** Phase 0 grants
+`SELECT` on **every table in schema `public`** (`phase0-setup.sh:509`), derived
+from the live database rather than a named list. D4's rule that "a genuinely new
+table or column is a human change, promoted into the trusted extractor" is
+therefore enforced **only** by the enumerated inventory in trusted code (D18);
+the grant does not constrain it. A dedicated `forecast_extract` role limited to
+the five tables the extractor reads would make the grant an independent second
+boundary -- an open decision, since narrowing `forecast_experiment` itself would
+break the nightly trainer that shares it.
+
+Two corrections to this document fall out of the 2b reading:
+
+- **`runs.parquet` must select `started_at`.** D4's inventory derives from
+  `_build_query`, which omits it, while `load_task_runs_for_queue_context`
+  selects it and bet 2's censoring filters on it. The union rule means the
+  widest superset wins.
+- **`anomalous_dates.json` becomes `daily_health.parquet`.** A set of dates is
+  the *result* of a config-dependent filter; the rows are the fact. The name
+  changes so nothing reads a narrowed artifact expecting the old one.
 
 ---
 
