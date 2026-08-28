@@ -864,10 +864,23 @@ nc8_protocol() {
     # (that is, l1's exit having released l2's LOCK_SH: precisely the bug this
     # clause exists to catch) is also alive, holding it, for the whole hold
     # window. The failure it was written to detect would have printed `ok`.
-    if ! kill -0 "$STANDIN_PID" 2>/dev/null; then
-      bad "(c) the stand-in exited early; the clause could not observe the lock"
+    # THE PRECONDITION IS RE-CHECKED AT THE MOMENT OF MEASUREMENT, and this is
+    # what the clause was missing. It needs l2 to STILL hold its LOCK_SH when l1
+    # finishes -- but both are ordinary test jobs of roughly equal duration, and
+    # `--timeout 600` is a ceiling, not a length. When l2 happened to finish
+    # first, no shared lock was held, the stand-in correctly acquired, and the
+    # clause reported a dispatcher failure for a race in its own setup.
+    local l2_state; l2_state="$(state_of "$l2")"
+    if [ "$l2_state" != RUNNING ]; then
+      void "(c) l2 was $l2_state when l1 finished, so no shared lock was held to survive -- the clause could not observe its subject"
+    # ACQUIRED IS CHECKED BEFORE ALIVE, because the marker is DURABLE and the
+    # process is not: a stand-in that took the lock, wrote its marker and
+    # finished its hold is indistinguishable from one that never ran if liveness
+    # is tested first. That inversion is what hid the real answer here.
     elif standin_acquired; then
       bad "(c) one job's exit released another's shared lock"
+    elif ! kill -0 "$STANDIN_PID" 2>/dev/null; then
+      bad "(c) the stand-in exited without acquiring; the clause could not observe the lock"
     else
       ok "(c) the second light job's LOCK_SH survived the first's exit"
     fi
@@ -1270,11 +1283,18 @@ print((json.load(sys.stdin)['job'].get('pins') or {}).get('extract_dir', ''))" 2
   # planned clause ("a forced second extraction is refused"). `force` exists in
   # the extractor's own API and is deliberately unreachable from the wire, so a
   # caller cannot ask for it by any means.
-  if grep -q 'run(raw_request)' "$TRUSTED/tools/queue-forecasting/host/extractor/service.py" \
-     && ! grep -q 'force' "$TRUSTED/tools/queue-forecasting/host/extractor/service.py"; then
+  # `force=`, NOT `force`. Searching for the WORD matched five times, all of
+  # them prose -- "in force on the live cluster", "enforced per process",
+  # "unenforceable", "enforces_peer_uid" -- so a correctly written service was
+  # reported as passing a force flag. Fifth time in this phase that a static scan
+  # of mine has matched its own documentation; the durable fix is to grep for the
+  # SYNTAX a caller would have to write, which prose cannot contain by accident.
+  local svc="$TRUSTED/tools/queue-forecasting/host/extractor/service.py"
+  if grep -q 'run(raw_request)' "$svc" && ! grep -q 'force=' "$svc"; then
     ok "NC18 the protocol exposes no way to force a re-extraction"
   else
     bad "NC18 the service passes a force flag from the wire"
+    grep -n 'force=' "$svc" | sed 's/^/        /'
   fi
 
   # SLOW CLAUSES. A real extraction is ~11 minutes, so these are opt-in -- and

@@ -1819,3 +1819,65 @@ class TestNc17AndNc18AreWiredAndHonest(unittest.TestCase):
         body = self.suite[self.suite.index(marker) + len(marker):]
         body = body[:body.index("\nPROBE\n")].replace("\\\\n", "\\n")
         compile(body, "<probe>", "exec")
+
+
+class TestAStaticScanMatchesSyntaxNotProse(unittest.TestCase):
+    """FIFTH time in this phase that a static scan of mine matched its own
+    documentation. `nc18` searched `service.py` for the word `force` to prove the
+    protocol cannot force a re-extraction, and matched five times -- "in force on
+    the live cluster", "enforced per process", "unenforceable",
+    "enforces_peer_uid" -- reporting a correct service as broken.
+
+    The durable fix is not "remember to strip comments". It is to search for the
+    SYNTAX a caller would have to write, which prose cannot contain by accident."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+
+    def test_the_force_scan_looks_for_an_assignment(self):
+        i = self.suite.index("no way to force a re-extraction")
+        clause = self.suite[i - 1200:i + 400]
+        self.assertIn("'force='", clause)
+
+    def test_the_word_alone_would_still_match_the_service(self):
+        # The premise, asserted: if this stops being true, the scan could be
+        # loosened again without anyone recalling why it was tightened.
+        with open(os.path.join(self.host, "extractor", "service.py")) as fh:
+            source = fh.read()
+        self.assertGreater(source.count("force"), 1)
+        self.assertEqual(source.count("force="), 0)
+
+
+class TestClauseCChecksItsSubjectBeforeConcluding(unittest.TestCase):
+    """It reported a dispatcher failure for a race in its own setup: it needs l2
+    to still hold a shared lock when l1 finishes, and both are ordinary test jobs
+    of similar duration -- `--timeout 600` is a ceiling, not a length."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            suite = fh.read()
+        start = suite.index("# (c) PER-DESCRIPTOR ownership")
+        self.clause = suite[start:suite.index("# (f)", start)]
+
+    def test_it_rechecks_l2_at_the_moment_of_measurement(self):
+        self.assertIn('state_of "$l2"', self.clause)
+        self.assertIn("could not observe its subject", self.clause)
+
+    def test_an_unobservable_run_is_VOID_not_FAIL(self):
+        # A precondition that did not hold is not evidence of a defect.
+        void_at = self.clause.index('void "(c)')
+        fail_at = self.clause.index('bad "(c) one job')
+        self.assertLess(void_at, fail_at)
+
+    def test_the_durable_signal_is_checked_before_the_transient_one(self):
+        # The marker file outlives the process. Testing liveness first made a
+        # stand-in that acquired, held and finished indistinguishable from one
+        # that never ran -- which is what hid the real answer.
+        acquired_at = self.clause.index("standin_acquired")
+        alive_at = self.clause.index('kill -0 "$STANDIN_PID"')
+        self.assertLess(acquired_at, alive_at)

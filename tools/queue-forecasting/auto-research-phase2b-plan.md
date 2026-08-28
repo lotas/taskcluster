@@ -1328,7 +1328,56 @@ uses and which would break if its surface shrank. Deliberately *not* done
 unilaterally: D4 names `forecast_experiment` as the extractor's role, so changing
 it is a design decision, not an implementation detail.
 
-### Task 7: NC17 and NC18 — **WRITTEN, not yet run**
+### Task 7: NC17 and NC18 — **RUN: 107 pass, 2 fail, both in my own clauses**
+
+First run against the host, 2026-08-28. Every 2b-1 control passed:
+
+    ok    NC17 canary: the extractor is ready, so it holds a usable credential
+    ok    NC17 qfd cannot read the credential  (refused)
+    ok    NC17 research cannot read the credential  (refused)
+    ok    NC17 not even qfextract reads the source (systemd hands it a copy)
+    ok    NC17 research cannot reach the extractor socket  (refused)
+    ok    NC17 qfextract is not in 'docker' / 'qfheavy' / 'qfclient'
+    ok    NC18 (lookback-zero) refused  (qf: lookback_days must be an int in [1,120], got 0)
+    ok    NC18 a mid-day as_of is refused, naming the boundary rule
+    ok    NC18 a window inside the settlement lag is refused, naming the lag
+    ok    NC18 re-requesting the same window serves the same bytes
+    ok    NC18 1 published extract(s); a re-request added none
+
+**Both failures were defects in the clauses, not the host.**
+
+1. **`NC18 the service passes a force flag from the wire`** — the scan searched
+   `service.py` for the WORD `force` and matched five times, every one of them
+   prose: "in force on the live cluster", "enforced per process",
+   "unenforceable", "enforces_peer_uid". A correct service reported as broken.
+
+   **Fifth time in this phase.** The durable fix is not "remember to strip
+   comments" — it is to grep for the SYNTAX a caller would have to write, which
+   prose cannot contain by accident: `force=`, of which the file has zero. A test
+   now asserts both that the clause looks for the assignment AND that the bare
+   word would still match, so nobody loosens it later without meeting the reason.
+
+2. **`(c) the stand-in exited early`** — two defects in one clause, and the
+   second hid the first.
+
+   The clause needs `l2` to STILL hold its shared lock when `l1` finishes. Both
+   are ordinary test jobs of similar duration, and `--timeout 600` is a **ceiling,
+   not a length** — so when `l2` finished first there was no shared lock to
+   survive, the stand-in correctly acquired, and the clause reported a dispatcher
+   failure for a race in its own setup. The precondition is now re-checked at the
+   moment of measurement, and an unobservable run is **VOID, not FAIL**: a
+   precondition that did not hold is not evidence of a defect.
+
+   And the checks were in the wrong order. `kill -0` came first, so a stand-in
+   that acquired the lock, wrote its marker and finished its five-second hold was
+   indistinguishable from one that never ran — which is precisely why the output
+   said "exited early" instead of naming what happened. **A durable signal must
+   be checked before a transient one:** the marker file outlives the process, so
+   `standin_acquired` is now tested first.
+
+Suites: shared 61, extractor 184, dispatcher 615, unit-drift 8, instrument 16.
+
+### Task 7 (as planned)
 
 Added to `nc-suite-phase2.sh` 2026-08-28 and wired into `main`. Suites: shared
 61, extractor 184, dispatcher 610, unit-drift 8. **Not yet executed against the
