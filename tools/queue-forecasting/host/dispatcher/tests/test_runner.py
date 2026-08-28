@@ -6,6 +6,7 @@
 # subprocess timeout on `docker kill` proves the CLI stopped waiting, not that
 # the workload died, and closing the training descriptor on that basis hands the
 # mutex to the nightly run while live work continues.
+import datetime
 import json
 import os
 import shutil
@@ -15,7 +16,19 @@ import threading
 import types
 import unittest
 
-import qfd
+import os
+import sys
+
+# `host/shared` on the path: `spec.normalize` delegates the `extract` kind to
+# `shared/extract_spec.py`, the one closed-world definition both privilege
+# domains use (D16). Inline rather than in a shared helper module, because
+# `tests/` is not a package and a helper only resolves under `unittest discover`
+# -- a bootstrap that works under one invocation is worse than two copies.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "shared"))
+
+import qfd                                                     # noqa: E402
 import source
 import spec
 import store
@@ -83,6 +96,11 @@ class RunnerCase(unittest.TestCase):
             trusted_dir=trusted, state_dir=root, runs_dir=self.runs,
             socket_path=os.path.join(root, "c.sock"),
             admin_socket_path=os.path.join(root, "a.sock"), admin_uid=4242,
+            # Never connected to in these tests -- `extract_client` is injected
+            # -- but present because `Config` sets only the keys it is given, so
+            # a fixture missing one fails at use rather than at construction.
+            extract_socket=os.path.join(root, "extract.sock"),
+            settlement_lag_s=48 * 3600,
             remote="https://example.invalid/x", token_file="",
             lock_file=self.lock_path, intent_dir=self.intent,
             build_lock=os.path.join(root, "build.lock"),
@@ -869,3 +887,316 @@ class TestTheLogPumpKeepsDrainingAfterTheCap(unittest.TestCase):
         self.assertTrue(produced_ok)
         self.assertFalse(writers[0].overflowed)
         self.assertEqual(os.path.getsize(files[0]), 1024)
+
+
+class ExtractRelayCase(RunnerCase):
+    """Task 5's relay, driven through `execute()` and `finish()`.
+
+    The first version of these tests called `_relay_extract` and inspected its
+    return tuple, and that is why they all passed over a fatal defect: `finish`
+    persists the state, and the machine has no LEASED -> SUCCEEDED edge, so every
+    successful extraction recorded "cannot move LEASED -> SUCCEEDED" and left the
+    row LEASED with no exit code. **A unit test of a function is not a test of
+    its caller**, and this file now goes through the caller.
+    """
+
+    REQUEST_HASH = None      # computed in setUp, from the real validator
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self.effective = self.an_extract_job()
+        self.REQUEST_HASH = self.effective["source_sha"]
+        self.reply = self.a_reply()
+
+        def client(path, payload, timeout):
+            self.sent.append((path, payload, timeout))
+            if isinstance(self.reply, Exception):
+                raise self.reply
+            return self.reply
+
+        self.runner.extract_client = client
+
+    def a_reply(self, **over):
+        """A reply that PASSES validation, so each test breaks exactly one rule."""
+        manifest = {
+            "request_hash": self.REQUEST_HASH,
+            "extract_hash": "b" * 64,
+            "watermark": {"pending_at": "2026-08-25T23:59:59+00:00"},
+            "files": {name: {"sha256": "c" * 64, "rows": 10}
+                      for name in ("runs", "worker_counts", "worker_pools",
+                                   "throughput_runs", "qctx_runs",
+                                   "daily_health")},
+        }
+        manifest.update(over.pop("manifest", {}))
+        # `str()` because some tests deliberately set request_hash to None or an
+        # int to exercise the validator; the fixture must build a reply, not
+        # crash while building one.
+        reply = {"ok": True, "manifest": manifest,
+                 "dir": "/var/lib/qf-extracts/"
+                        + str(manifest.get("request_hash"))}
+        reply.update(over)
+        return reply
+
+    def an_extract_job(self, **over):
+        args = {"target": "wait_time",
+                "train_start": "2026-07-01T00:00:00Z",
+                "as_of_date": "2026-08-01T00:00:00Z",
+                "lookback_days": 30}
+        args.update(over.pop("args", {}))
+        effective = dict(spec.normalize(
+            {"schema": 1, "kind": "extract", "args": args},
+            now=self.runner.clock_dt(),
+            settlement_lag_s=self.cfg.settlement_lag_s))
+        effective.update(over)
+        return effective
+
+    def submit_extract(self, effective=None, state="LEASED"):
+        """A real row, dequeued to LEASED, with a hold that is NOT the mutex."""
+        effective = self.effective if effective is None else effective
+        # UNIQUE per submit. Several tests submit more than once in one method
+        # (a `subTest` loop over invalid replies), and a repeated run id is a
+        # primary-key collision that reads as a validator failure.
+        self._seq = getattr(self, "_seq", 0) + 1
+        run_id = (f"extract-20260828T000000Z-{effective['source_sha'][:12]}"
+                  f"-{self._seq}")
+        self.db.call("submit", effective, run_id=run_id, uid=1001,
+                     now="2026-08-28T00:00:00Z")
+        self.db.call("dequeue", effective["lane"], owner="qfd",
+                     now="2026-08-28T00:00:01Z",
+                     lease_expires_at="2036-08-28T00:05:00Z",
+                     hold_deadline_at="2036-08-28T02:00:00Z", max_running=2)
+        job = self.db.call("get", run_id)
+        # An ExtractSlot, not a TrainingLock: that substitution IS the fix for
+        # extracts holding the nightly's mutex.
+        lock = qfd.ExtractSlot(self.runner._extract_slot,
+                               effective["lane"]).acquire()
+        self.addCleanup(lock.release)
+        return qfd.Hold(job, lock, qfd.parse_iso(job["hold_deadline_at"]))
+
+
+class TestAnExtractReachesATerminalState(ExtractRelayCase):
+    def test_a_successful_extraction_reaches_SUCCEEDED(self):
+        # THE REGRESSION. This is what the previous tests could not see.
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        job = self.db.call("get", hold.run_id)
+        self.assertEqual(job["state"], "SUCCEEDED", job)
+        self.assertEqual(job["exit_code"], 0)
+        self.assertIsNotNone(job["finished_at"])
+
+    def test_it_passes_through_RUNNING_on_the_way(self):
+        # LEASED -> SUCCEEDED is not an edge, and RUNNING is also the honest
+        # answer while the extractor is working.
+        hold = self.submit_extract()
+        seen = []
+        original = self.db.call
+
+        def spy(method, *a, **kw):
+            if method == "transition":
+                seen.append(a[1])
+            return original(method, *a, **kw)
+
+        self.db.call = spy
+        self.runner.execute(hold)
+        self.assertIn("RUNNING", seen)
+
+    def test_a_failed_relay_reaches_FAILED_with_its_class(self):
+        self.reply = qfd.ExtractRelayError("no socket", "extractor_unreachable")
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        job = self.db.call("get", hold.run_id)
+        self.assertEqual(job["state"], "FAILED")
+        self.assertEqual(job["error_class"], "extractor_unreachable")
+
+    def test_the_pins_survive_to_the_finished_row(self):
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["extract_hash"], "b" * 64)
+        self.assertEqual(pins["request_hash"], self.REQUEST_HASH)
+        self.assertIn("qf-extracts", pins["extract_dir"])
+        self.assertIn("pending_at", pins["extract_watermark"])
+
+    def test_no_container_no_worktree_no_image(self):
+        # The branch short-circuits before all of it. If any of these were
+        # reached, an extraction would need a research commit it does not have.
+        touched = []
+        self.src.resolve = lambda *a, **kw: touched.append("resolve")
+        self.src.add_worktree = lambda *a, **kw: touched.append("worktree")
+        self.runner._ensure_image = lambda *a, **kw: touched.append("image")
+        self.runner.execute(self.submit_extract())
+        self.assertEqual(touched, [])
+
+
+class TestAnExtractDoesNotHoldTheTrainingMutex(ExtractRelayCase):
+    """The nightly acquires the training lock EXCLUSIVELY. A shared holder is
+    what blocks it, and a minutes-long extraction was taking one."""
+
+    def test_the_lock_is_chosen_before_the_kind_is_known_to_nobody(self):
+        # Asserted on the source: `peek` returns the row, so the kind is
+        # available at step 1 and the lock decision belongs at step 3.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        step3 = source[source.index("try:                                                    # 3"):]
+        step3 = step3[:step3.index("except MutexUnusable")]
+        self.assertIn("ExtractSlot", step3)
+        self.assertIn("is_extract", step3)
+
+    def test_the_training_lock_is_free_while_an_extract_runs(self):
+        # The property, measured rather than argued: an exclusive acquisition
+        # must succeed while an extract job holds its slot.
+        hold = self.submit_extract()
+        self.assertEqual(qfd.probe_mutex(self.cfg.lock_file), "free")
+        self.runner.execute(hold)
+        self.assertEqual(qfd.probe_mutex(self.cfg.lock_file), "free")
+
+    def test_a_second_extraction_waits_rather_than_failing(self):
+        # The extractor's own mutex is NON-BLOCKING, so without a slot here the
+        # second job would be refused instead of queued.
+        first = qfd.ExtractSlot(self.runner._extract_slot, "light").acquire()
+        self.addCleanup(first.release)
+        with self.assertRaises(qfd.LockHeld):
+            qfd.ExtractSlot(self.runner._extract_slot, "light").acquire()
+
+    def test_the_slot_is_released_so_the_next_one_proceeds(self):
+        slot = qfd.ExtractSlot(self.runner._extract_slot, "light").acquire()
+        slot.release()
+        again = qfd.ExtractSlot(self.runner._extract_slot, "light").acquire()
+        again.release()
+
+    def test_releasing_twice_is_harmless(self):
+        # Every release path in the runner calls `release` on whatever the hold
+        # holds, and some call it more than once.
+        slot = qfd.ExtractSlot(self.runner._extract_slot, "light").acquire()
+        slot.release()
+        slot.release()
+        qfd.ExtractSlot(self.runner._extract_slot, "light").acquire().release()
+
+
+class TestAReplySayingOkIsNotAnExtract(ExtractRelayCase):
+    """The previous version accepted `{"ok": true, "manifest": {}}`, skipped
+    every missing pin and recorded SUCCEEDED -- and a test enshrined that as
+    "does not crash". A job row claiming an extract that is not there is worse
+    than a failure, because 2b-2 will go looking for it.
+
+    The extractor is trusted, and "trusted" is not "incapable of a bug"."""
+
+    def outcome(self, **over):
+        self.reply = self.a_reply(**over)
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        return self.db.call("get", hold.run_id)
+
+    def test_an_empty_manifest_is_refused(self):
+        self.reply = {"ok": True, "manifest": {}}
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        job = self.db.call("get", hold.run_id)
+        self.assertEqual(job["state"], "FAILED")
+        self.assertEqual(job["error_class"], "extract_reply_invalid")
+
+    def test_a_missing_or_malformed_hash_is_refused(self):
+        for field in ("request_hash", "extract_hash"):
+            for value in (None, "", "short", 7):
+                with self.subTest(field=field, value=value):
+                    job = self.outcome(manifest={field: value})
+                    self.assertEqual(job["error_class"],
+                                     "extract_reply_invalid")
+
+    def test_a_reply_about_a_different_request_is_refused(self):
+        # The field capable of pointing this row at somebody else's extract:
+        # reuse is keyed on request_hash (D20).
+        job = self.outcome(manifest={"request_hash": "d" * 64})
+        self.assertEqual(job["error_class"], "extract_reply_invalid")
+
+    def test_a_directory_outside_the_canonical_location_is_refused(self):
+        for directory in ("", None, "/tmp/somewhere",
+                          "/var/lib/qf-extracts/" + "e" * 64):
+            with self.subTest(directory=directory):
+                job = self.outcome(dir=directory)
+                self.assertEqual(job["error_class"], "extract_reply_invalid")
+
+    def test_a_dataset_with_no_rows_is_refused(self):
+        files = {name: {"sha256": "c" * 64, "rows": 10}
+                 for name in ("runs", "worker_counts")}
+        files["runs"] = {"sha256": "c" * 64, "rows": 0}
+        job = self.outcome(manifest={"files": files})
+        self.assertEqual(job["error_class"], "extract_reply_invalid")
+
+    def test_a_file_entry_with_no_digest_is_refused(self):
+        job = self.outcome(manifest={"files": {"runs": {"rows": 10}}})
+        self.assertEqual(job["error_class"], "extract_reply_invalid")
+
+    def test_a_manifest_with_no_watermark_is_refused(self):
+        job = self.outcome(manifest={"watermark": {}})
+        self.assertEqual(job["error_class"], "extract_reply_invalid")
+
+    def test_nothing_is_pinned_when_the_reply_is_refused(self):
+        # A partial pin set would advertise an extract the row does not have.
+        self.reply = {"ok": True, "manifest": {}}
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        self.assertEqual(self.db.call("pins_for", hold.run_id), {})
+
+    def test_the_valid_reply_still_passes(self):
+        # The positive canary for this whole class: if a good reply cannot pass,
+        # every refusal above proves nothing.
+        job = self.outcome()
+        self.assertEqual(job["state"], "SUCCEEDED")
+
+
+class TestCancellingDuringAnExtraction(ExtractRelayCase):
+    """A cancel cannot stop an extraction -- the work is in a domain this
+    process has no authority to signal -- so by the time the reply arrives the
+    extract is published and immutable. What is still true is that the operator
+    asked, and the job's state has to say so."""
+
+    def test_a_cancelled_job_reports_CANCELLED_not_SUCCEEDED(self):
+        hold = self.submit_extract()
+        hold.cancel_requested.set()
+        self.runner.execute(hold)
+        job = self.db.call("get", hold.run_id)
+        self.assertEqual(job["state"], "CANCELLED")
+        self.assertEqual(job["error_class"], "cancelled")
+
+    def test_the_pins_are_still_recorded(self):
+        # The extract exists and is immutable. Losing its identity because the
+        # job was cancelled would orphan an artifact on disk.
+        hold = self.submit_extract()
+        hold.cancel_requested.set()
+        self.runner.execute(hold)
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["extract_hash"], "b" * 64)
+
+    def test_an_uncancelled_job_still_succeeds(self):
+        hold = self.submit_extract()
+        self.runner.execute(hold)
+        self.assertEqual(self.db.call("get", hold.run_id)["state"],
+                         "SUCCEEDED")
+
+
+class TestTheRelayForwardsTheRightThing(ExtractRelayCase):
+    def test_it_forwards_the_input_fields_only(self):
+        self.runner.execute(self.submit_extract())
+        _path, payload, _timeout = self.sent[0]
+        self.assertEqual(payload["op"], "extract")
+        for derived in ("target_column", "window_lower", "ref_lower"):
+            with self.subTest(field=derived):
+                self.assertNotIn(derived, payload["request"])
+        self.assertEqual(payload["request"]["target"], "wait_time")
+
+    def test_the_timeout_is_bounded_by_the_hold(self):
+        hold = self.submit_extract()
+        hold.deadline_epoch = self.runner.disp.clock() + 120
+        self.runner.execute(hold)
+        self.assertLessEqual(self.sent[0][2], 120)
+
+    def test_the_timeout_is_generous_enough_for_a_measured_extraction(self):
+        # 688s measured for 36 days. A short timeout abandons work the extractor
+        # completes and publishes, leaving an extract nothing points at.
+        self.runner.execute(self.submit_extract())
+        self.assertGreaterEqual(self.sent[0][2], 688)
+
+

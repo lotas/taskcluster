@@ -573,3 +573,41 @@ class TestTheWindowCeilingIsWhatMeasurementSupports(unittest.TestCase):
         self.assertLess(minutes, 15.0,
                         f"the runs statement would take ~{minutes:.0f} min of a"
                         f" 30 min statement_timeout at the ceiling")
+
+
+class TestARelayCannotForwardWhatItValidated(unittest.TestCase):
+    """The dispatcher validates a request, stores the normalised form, and must
+    then send it on to the extractor -- which validates again (D16) and refuses
+    derived fields BY NAME. So forwarding the validated form would be refused by
+    the far end for carrying `target_column`, `window_lower` and `ref_lower`."""
+
+    def test_the_projection_is_accepted_by_the_far_end(self):
+        effective = validate()
+        again = extract_spec.validate(extract_spec.to_raw(effective), now=NOW)
+        self.assertEqual(dict(again), dict(effective))
+
+    def test_forwarding_the_validated_form_verbatim_is_refused(self):
+        # The failure this exists to prevent, asserted rather than assumed.
+        effective = validate()
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
+            extract_spec.validate(dict(effective), now=NOW)
+        self.assertIn("target_column", str(cm.exception))
+
+    def test_the_projection_carries_no_derived_field(self):
+        raw_again = extract_spec.to_raw(validate())
+        for derived in ("target_column", "window_lower", "ref_lower"):
+            with self.subTest(field=derived):
+                self.assertNotIn(derived, raw_again)
+
+    def test_the_field_list_is_the_validators_own(self):
+        # Not a copy in the relay: a list that could fall out of step with
+        # `_FORBIDDEN` is a list that will.
+        self.assertEqual(set(extract_spec.INPUT_FIELDS) - {"generation"},
+                         {"schema", "target", "train_start", "as_of_date",
+                          "lookback_days"})
+
+    def test_the_round_trip_preserves_the_request_hash(self):
+        effective = validate()
+        again = extract_spec.validate(extract_spec.to_raw(effective), now=NOW)
+        self.assertEqual(extract_spec.request_hash(again),
+                         extract_spec.request_hash(effective))

@@ -41,6 +41,8 @@ class ProtocolCase(unittest.TestCase):
         os.makedirs(self.intent)
 
         self.cfg = qfd.Config(
+            extract_socket="/nonexistent/extract.sock",
+            settlement_lag_s=48 * 3600,
             trusted_dir=self.trusted, state_dir=root, runs_dir=self.runs,
             socket_path=os.path.join(root, "client.sock"),
             admin_socket_path=os.path.join(root, "admin.sock"),
@@ -594,11 +596,20 @@ class TestConfig(unittest.TestCase):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(here, "qf-dispatch.service")) as fh:
             unit = fh.read()
+        # SCOPED TO `QFD_*`. The unit also sets PYTHONPATH, which is an
+        # interpreter setting rather than dispatcher configuration -- it points at
+        # `host/shared`, where the extraction validator both domains use lives.
+        # `Config.ENV_KEYS` is the enumeration of what the DISPATCHER reads, and
+        # widening it to hold PYTHONPATH would make it a list of two different
+        # kinds of thing. Non-QFD_ variables are asserted separately, by
+        # `TestBothUnitsCanFindTheSharedValidator`.
         in_unit = set()
         for line in unit.splitlines():
             line = line.strip()
             if line.startswith("Environment=") and "=" in line[12:]:
-                in_unit.add(line[len("Environment="):].split("=", 1)[0])
+                key = line[len("Environment="):].split("=", 1)[0]
+                if key.startswith("QFD_"):
+                    in_unit.add(key)
         self.assertEqual(in_unit, set(qfd.Config.ENV_KEYS),
                          "Config.ENV_KEYS and the unit file disagree:"
                          f" unit-only={sorted(in_unit - set(qfd.Config.ENV_KEYS))}"
@@ -609,11 +620,11 @@ class TestConfig(unittest.TestCase):
                   build_lock_wait_s=900, handoff_timeout_s=120,
                   setup_teardown_allowance_s=600, job_hold_deadline_s=7800,
                   kill_confirm_s=300, lock_wait_s=9000)
-        qfd.Config(**kw).check_deadline_chain()          # the shipped figures
+        qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **kw).check_deadline_chain()          # the shipped figures
         with self.assertRaises(qfd.ConfigError):
-            qfd.Config(**{**kw, "job_hold_deadline_s": 7000}).check_deadline_chain()
+            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **{**kw, "job_hold_deadline_s": 7000}).check_deadline_chain()
         with self.assertRaises(qfd.ConfigError):
-            qfd.Config(**{**kw, "lock_wait_s": 8000}).check_deadline_chain()
+            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **{**kw, "lock_wait_s": 8000}).check_deadline_chain()
 
     def test_the_timeout_ceiling_must_agree_with_spec(self):
         kw = dict(timeout_max_s=1800, build_timeout_s=1800,
@@ -621,7 +632,7 @@ class TestConfig(unittest.TestCase):
                   setup_teardown_allowance_s=600, job_hold_deadline_s=7800,
                   kill_confirm_s=300, lock_wait_s=9000)
         with self.assertRaises(qfd.ConfigError):
-            qfd.Config(**kw).check_deadline_chain()
+            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **kw).check_deadline_chain()
 
 
 class TestStartupPreconditions(unittest.TestCase):
@@ -639,6 +650,8 @@ class TestStartupPreconditions(unittest.TestCase):
         os.chmod(self.intent, 0o2770)
         open(self.marker, "w").close()
         self.cfg = qfd.Config(
+            extract_socket="/nonexistent/extract.sock",
+            settlement_lag_s=48 * 3600,
             trusted_dir=self.trusted, state_dir=self.root, runs_dir=self.root,
             lock_file=self.lock, intent_dir=self.intent,
             lock_migrated_marker=self.marker)
@@ -754,7 +767,7 @@ class TestTrustedPathResolution(unittest.TestCase):
         self.root = os.path.realpath(self.tmp.name)
         self.trusted = os.path.join(self.root, "trusted")
         os.makedirs(self.trusted)
-        self.cfg = qfd.Config(trusted_dir=self.trusted)
+        self.cfg = qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, trusted_dir=self.trusted)
 
     def test_a_path_inside_resolves(self):
         target = os.path.join(self.trusted, "spec.py")
@@ -1425,3 +1438,235 @@ class TestNc16AssertsTheClassTheClassifierActuallyProduces(unittest.TestCase):
     def test_and_the_classifier_agrees_with_it(self):
         # Pinned together so the two cannot drift again in either direction.
         self.assertEqual(qfd.Runner.EXIT_CLASSES.get(4), "bad_invocation")
+
+
+class TestBothUnitsCanFindTheSharedValidator(unittest.TestCase):
+    """`spec.normalize` delegates the `extract` kind to
+    `host/shared/extract_spec.py`, and the extractor's service imports the same
+    module. If either unit's `PYTHONPATH` misses it, that domain cannot start --
+    and the failure is an ImportError in a journal, days after the change.
+
+    The extractor learned this the expensive way: its `ExecStart` shipped as
+    `/usr/bin/python3 service.py` with nothing on the path, and the tests hid it
+    by inserting `sys.path` themselves."""
+
+    def setUp(self):
+        self.here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(self.here)
+
+    def _pythonpath(self, unit_path):
+        with open(unit_path) as fh:
+            lines = [l for l in fh.read().splitlines()
+                     if l.startswith("Environment=PYTHONPATH=")]
+        self.assertEqual(len(lines), 1, f"{unit_path}: {lines}")
+        return lines[0].split("=", 2)[2].split(":")
+
+    def test_the_shared_module_exists_where_both_units_point(self):
+        module = os.path.join(self.host, "shared", "extract_spec.py")
+        self.assertTrue(os.path.isfile(module), module)
+
+    def test_the_dispatcher_unit_has_shared_on_its_path(self):
+        paths = self._pythonpath(os.path.join(self.here, "qf-dispatch.service"))
+        self.assertTrue(any(p.endswith("/host/shared") for p in paths), paths)
+
+    def test_the_extractor_unit_has_shared_on_its_path(self):
+        paths = self._pythonpath(
+            os.path.join(self.host, "extractor", "qf-extract.service"))
+        self.assertTrue(any(p.endswith("/host/shared") for p in paths), paths)
+
+    def test_the_shared_module_imports_nothing_outside_the_stdlib(self):
+        # It is importable by qfd, which is stdlib-only by D6. An import of
+        # anything else here would break the dispatcher, not just the extractor.
+        with open(os.path.join(self.host, "shared", "extract_spec.py")) as fh:
+            source = fh.read()
+        imports = re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)",
+                             source, re.M)
+        for name in imports:
+            with self.subTest(module=name):
+                self.assertIn(name.split(".")[0],
+                              {"datetime", "hashlib", "json", "re", "types",
+                               "__future__"})
+
+    def test_shared_does_not_import_from_either_domain(self):
+        # The dependency runs one way. `shared` is the bottom, which is why
+        # `ExtractSpecError` does not subclass `spec.SpecError`.
+        with open(os.path.join(self.host, "shared", "extract_spec.py")) as fh:
+            source = fh.read()
+        for forbidden in ("import spec", "import qfd", "import store",
+                          "import extractor", "import inventory"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+
+class TestTheExtractCommandInTheClient(unittest.TestCase):
+    """Task 5's client half. The one thing worth pinning beyond argument
+    parsing: `extract` must NOT take a `--sha`, because an extraction runs no
+    code and a commit would record a dependency it does not have."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.mod = {}
+        with open(os.path.join(here, "qf")) as fh:
+            exec(compile(fh.read(), "qf", "exec"), self.mod)  # noqa: S102
+
+    def parse(self, argv):
+        return self.mod["build_parser"](False).parse_args(argv)
+
+    def _base(self, *extra):
+        return ["extract", "--target", "wait_time",
+                "--train-start", "2026-07-01T00:00:00Z",
+                "--as-of", "2026-08-01T00:00:00Z", *extra]
+
+    def test_it_takes_no_sha(self):
+        with self.assertRaises(SystemExit):
+            self.parse(self._base("--sha", "a" * 40))
+
+    def test_the_target_is_a_closed_choice_in_the_client_too(self):
+        # Refused before a socket is opened. The dispatcher and the extractor
+        # both refuse it as well; this one just saves a round trip and gives the
+        # caller the list.
+        with self.assertRaises(SystemExit):
+            self.parse(["extract", "--target", "p90",
+                        "--train-start", "2026-07-01T00:00:00Z",
+                        "--as-of", "2026-08-01T00:00:00Z"])
+
+    def test_the_window_is_required(self):
+        for missing in (["--train-start", "2026-07-01T00:00:00Z"],
+                        ["--as-of", "2026-08-01T00:00:00Z"]):
+            with self.subTest(given=missing):
+                with self.assertRaises(SystemExit):
+                    self.parse(["extract", "--target", "wait_time", *missing])
+
+    def test_lookback_days_has_the_configs_default(self):
+        # 30 is what every promoted config uses.
+        self.assertEqual(self.parse(self._base()).lookback_days, 30)
+
+    def test_generation_defaults_to_absent_not_one(self):
+        # Absent, so the dispatcher's normalisation supplies the default and
+        # there is one place that decides it.
+        self.assertIsNone(self.parse(self._base()).generation)
+        self.assertEqual(self.parse(self._base("--generation", "3")).generation,
+                         3)
+
+    def test_the_command_builds_a_spec_with_no_source_sha(self):
+        source = self.mod["cmd_extract"].__doc__ or ""
+        self.assertIn("runs no code", source)
+        # And structurally: the spec body it sends.
+        import inspect
+        body = inspect.getsource(self.mod["cmd_extract"])
+        self.assertNotIn("source_sha", body)
+        self.assertIn('"kind": "extract"', body)
+
+    def test_wait_reports_the_extracts_identity(self):
+        import inspect
+        body = inspect.getsource(self.mod["cmd_extract"])
+        for key in ("extract_hash", "extract_dir", "extract_watermark"):
+            with self.subTest(key=key):
+                self.assertIn(key, body)
+
+
+class TestSubmittingAnExtractThroughTheOp(unittest.TestCase):
+    """The gap this exists to close: every test of the `extract` kind called
+    `spec.normalize` DIRECTLY, so none of them noticed that `_op_submit` passed
+    it neither a clock nor a settlement lag -- which would have refused every
+    extract submit with "kind extract needs a clock and a settlement lag".
+
+    A unit test of a function is not a test of its caller.
+    """
+
+    def test_the_op_passes_a_clock_and_a_lag(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        call = source[source.index("effective = spec_mod.normalize("):]
+        call = call[:call.index(")\n")]
+        self.assertIn("now=", call)
+        self.assertIn("settlement_lag_s=", call)
+
+    def test_the_lag_is_configured_and_matches_the_extractors(self):
+        # Two copies on purpose (D17), so a test keeps them equal: a dispatcher
+        # that refused a window the extractor would accept, or accepted one the
+        # extractor refuses, turns a policy into a coin toss.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        host = os.path.dirname(here)
+        with open(os.path.join(here, "qf-dispatch.service")) as fh:
+            disp = fh.read()
+        with open(os.path.join(host, "extractor",
+                               "qf-extract.service")) as fh:
+            extractor_unit = fh.read()
+        mine = re.search(r"QFD_SETTLEMENT_LAG_S=(\d+)", disp)
+        theirs = re.search(r"QFX_SETTLEMENT_LAG_S=(\d+)", extractor_unit)
+        self.assertIsNotNone(mine, "the dispatcher unit does not set the lag")
+        self.assertIsNotNone(theirs, "the extractor unit does not set the lag")
+        self.assertEqual(mine.group(1), theirs.group(1))
+
+    def test_the_config_key_is_enumerated(self):
+        self.assertIn("QFD_SETTLEMENT_LAG_S", qfd.Config.ENV_KEYS)
+        self.assertIn("QFD_EXTRACT_SOCKET", qfd.Config.ENV_KEYS)
+
+
+class TestSourceRefIsActuallyRecorded(unittest.TestCase):
+    """`normalize` produced `source_ref` for an extract job and `submit` never
+    passed it anywhere, so the job row kept `source_ref = NULL` and the literal
+    that stops `source_sha` being mistaken for a commit appeared nowhere a reader
+    looks.
+
+    It goes in as a PIN, because that is where `source_ref` actually lives: the
+    same-named `jobs` column stays NULL for every job -- the runner writes the pin
+    mid-run for a test job -- so a value put only in the column would be as
+    invisible as one put nowhere."""
+
+    def test_the_submit_op_writes_the_pin(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        body = source[source.index('self.db.call("submit", effective'):]
+        body = body[:body.index("return {")]
+        self.assertIn('"source_ref"', body)
+        self.assertIn("set_pin", body)
+
+    def test_the_literal_says_it_is_not_a_commit(self):
+        # The whole purpose: a 64-hex value in a field called source_sha will be
+        # read as a commit unless the record says otherwise itself.
+        self.assertIn("not a commit", spec.EXTRACT_SOURCE_REF)
+
+    def test_only_kinds_that_have_one_get_the_pin(self):
+        # A test job's source_ref is the remote-tracking ref the runner resolves;
+        # writing a placeholder at submit time would overwrite it later or race.
+        effective = spec.normalize({"schema": 1, "kind": "test",
+                                    "source_sha": "a" * 40})
+        self.assertIsNone(effective.get("source_ref"))
+
+
+class TestTheExtractsListingIsRelayedNotWalked(unittest.TestCase):
+    """The extracts directory belongs to `qfextract`. Having the dispatcher walk
+    it would put the layout in two places, which is how the publication path came
+    to have a side index that could disagree with the artifacts."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            self.source = fh.read()
+
+    def test_the_op_exists_and_is_a_client_op(self):
+        self.assertIn("extracts", qfd.CLIENT_OPS)
+        self.assertNotIn("extracts", qfd.ADMIN_OPS)
+
+    def test_it_relays_rather_than_reading_the_directory(self):
+        body = self.source[self.source.index("def _op_extracts"):]
+        body = body[:body.index("\n    def ")]
+        self.assertIn("extract_request", body)
+        for walking in ("listdir", "MANIFEST", "glob"):
+            with self.subTest(walking=walking):
+                self.assertNotIn(walking, body)
+
+    def test_the_dispatcher_has_no_extracts_directory_setting(self):
+        # Nothing here should know where they live. If a config key for it ever
+        # appears, the layout is in two places again.
+        self.assertNotIn("QFD_EXTRACTS_DIR", qfd.Config.ENV_KEYS)
+
+    def test_an_unreachable_extractor_is_a_refusal_not_a_traceback(self):
+        body = self.source[self.source.index("def _op_extracts"):]
+        body = body[:body.index("\n    def ")]
+        self.assertIn("ExtractRelayError", body)
+        self.assertIn("Refused", body)

@@ -45,6 +45,20 @@ KINDS = {
     #                timeout        mem            cpus
     "test":     dict(timeout_s=1800, mem_limit="4g", cpus=4.0),
     "selftest": dict(timeout_s=300, mem_limit="1g", cpus=1.0),
+    # An extraction runs in ANOTHER PROCESS -- the trusted extractor, in its own
+    # privilege domain (D15) -- so none of these numbers describes a container.
+    #
+    # `mem_limit` is a slot reservation and nothing else: the dispatcher's
+    # admission is an aggregate memory budget (D10), and a job that occupied
+    # nothing would let any number of extractions be admitted at once while the
+    # extractor serialises them anyway. 256m keeps the bookkeeping honest and
+    # keeps this in the LIGHT lane -- a read must never take the training mutex,
+    # or a data pull could block the nightly.
+    #
+    # `timeout_s` is 3600 because the first real extraction took 688s for 36 days
+    # and the window ceiling is 60 (auto-research-phase2b-plan.md revision 10). A
+    # timeout under the measured time would kill work the extractor had finished.
+    "extract":  dict(timeout_s=3600, mem_limit="256m", cpus=1.0),
 }
 
 # The lane is DERIVED from mem_limit, never requested (design D10). A job at or
@@ -60,6 +74,18 @@ def lane_for(mem_mb):
 
 _TOP_OPTIONAL = ("args", "timeout_s", "mem_limit", "cpus", "note")
 _TOP_REQUIRED = ("schema", "kind", "source_sha")
+
+# Kinds whose identity is NOT a commit. See `_extract_identity`.
+_NO_SOURCE_SHA = ("extract",)
+
+# Written into `source_ref` for an extract job. `source_sha TEXT NOT NULL` holds
+# sixteen hundred live rows, so rather than migrate the column an extract stores
+# its REQUEST HASH there: the column's role is "the immutable identity of what
+# this job ran", which for a test is a commit and for an extraction is the
+# request. This literal is what stops a reader treating that value as a commit
+# and joining on it -- the value looks exactly like a sha, so the record has to
+# say otherwise itself.
+EXTRACT_SOURCE_REF = "extract-request (not a commit)"
 
 
 class SpecError(ValueError):
@@ -135,6 +161,46 @@ def _check_test_args(args):
     return {"paths": paths, "k": k, "pytest_args": list(flags)}
 
 
+def _check_extract_args(args, *, now, settlement_lag_s):
+    """Delegates to the ONE closed-world definition, in `host/shared`.
+
+    Not a second implementation: D16 requires that qfd and the extractor agree,
+    and two validators that agree by having been written twice do not agree for
+    long. qfd validates so a bad request is refused cheaply and legibly at submit
+    time; the extractor validates again because a caller is a caller.
+    """
+    import extract_spec
+
+    if not isinstance(args, dict):
+        _err("args must be an object")
+    if now is None or settlement_lag_s is None:
+        _err("kind extract needs a clock and a settlement lag: they are what"
+             " make the completed-boundary rule enforceable, and defaulting"
+             " them would make this half of the check silently absent")
+    try:
+        request = extract_spec.validate({"schema": SCHEMA_VERSION, **args},
+                                        now=now,
+                                        settlement_lag_s=settlement_lag_s)
+    except extract_spec.ExtractSpecError as e:
+        # TRANSLATED HERE, so `normalize`'s contract stays "raises SpecError".
+        #
+        # `ExtractSpecError` deliberately does not subclass `SpecError`: it lives
+        # in `host/shared`, which both privilege domains import, and subclassing
+        # would make `shared` depend on `dispatcher`. That decision has a cost of
+        # one line in each consumer, and this is the consumer -- doing it here
+        # rather than in `qfd` means every caller of `normalize` keeps the single
+        # error type it already handles, instead of each one growing a second
+        # `except`.
+        raise SpecError(str(e)) from e
+    return dict(request)
+
+
+def _extract_identity(effective_args):
+    """`(source_sha, source_ref)` for an extract job: the request hash."""
+    import extract_spec
+    return (extract_spec.request_hash(effective_args), EXTRACT_SOURCE_REF)
+
+
 def _check_selftest_args(args):
     if args not in ({}, None):
         _err("kind selftest takes no args")
@@ -144,7 +210,7 @@ def _check_selftest_args(args):
 _ARG_CHECKS = {"test": _check_test_args, "selftest": _check_selftest_args}
 
 
-def normalize(raw):
+def normalize(raw, *, now=None, settlement_lag_s=None):
     """Validate a submitted spec and return the *effective* spec.
 
     The effective spec carries every field, defaults included, because that is
@@ -156,21 +222,33 @@ def normalize(raw):
     unknown = set(raw) - set(_TOP_REQUIRED) - set(_TOP_OPTIONAL)
     if unknown:
         _err(f"unknown key(s): {sorted(unknown)}")
-    missing = [k for k in _TOP_REQUIRED if k not in raw]
-    if missing:
-        _err(f"missing key(s): {missing}")
 
-    if raw["schema"] != SCHEMA_VERSION:
-        _err(f"schema must be {SCHEMA_VERSION}, got {raw['schema']!r}")
+    if raw.get("schema") != SCHEMA_VERSION:
+        _err(f"schema must be {SCHEMA_VERSION}, got {raw.get('schema')!r}")
 
-    kind = raw["kind"]
+    kind = raw.get("kind")
     if kind not in KINDS:
         _err(f"unknown kind {kind!r}; known: {sorted(KINDS)}")
     d = KINDS[kind]
 
-    sha = raw["source_sha"]
-    if not isinstance(sha, str) or not _SHA_RE.match(sha):
-        _err("source_sha must be a full lowercase 40-hex commit id")
+    required = [k for k in _TOP_REQUIRED
+                if not (k == "source_sha" and kind in _NO_SOURCE_SHA)]
+    missing = [k for k in required if k not in raw]
+    if missing:
+        _err(f"missing key(s): {missing}")
+
+    source_ref = None
+    if kind in _NO_SOURCE_SHA:
+        if "source_sha" in raw:
+            # REFUSED, not ignored. A caller that believed it was choosing the
+            # identity of an extract would be wrong, and silently.
+            _err(f"kind {kind} takes no source_sha: its identity is its request,"
+                 f" and the dispatcher derives it")
+        sha = None                      # filled in below, from the request
+    else:
+        sha = raw["source_sha"]
+        if not isinstance(sha, str) or not _SHA_RE.match(sha):
+            _err("source_sha must be a full lowercase 40-hex commit id")
 
     timeout_s = raw.get("timeout_s", d["timeout_s"])
     if not _is_int(timeout_s) or not (TIMEOUT_MIN <= timeout_s <= TIMEOUT_MAX):
@@ -192,12 +270,18 @@ def normalize(raw):
     if not isinstance(note, str) or not _NOTE_RE.match(note):
         _err("note must be printable ASCII, at most 500 characters, no newlines")
 
-    args = _ARG_CHECKS[kind](raw.get("args", {} if kind == "selftest" else {}))
+    if kind == "extract":
+        args = _check_extract_args(raw.get("args", {}), now=now,
+                                   settlement_lag_s=settlement_lag_s)
+        sha, source_ref = _extract_identity(args)
+    else:
+        args = _ARG_CHECKS[kind](raw.get("args", {}))
 
     return {
         "schema": SCHEMA_VERSION,
         "kind": kind,
         "source_sha": sha,
+        "source_ref": source_ref,
         "lane": lane,
         "args": args,
         "timeout_s": timeout_s,

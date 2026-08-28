@@ -14,6 +14,14 @@ Group=qfd
 # mutex -- but naming it here means the unit states its own requirement.
 SupplementaryGroups=docker qfrun qfclient qfheavy
 ExecStart=/usr/bin/python3 /srv/queue-forecasting/tools/queue-forecasting/host/dispatcher/qfd.py
+# `host/shared` on the path: `spec.normalize` delegates the `extract` kind to
+# `shared/extract_spec.py`, which is the SAME module the extractor validates
+# with. D16 requires both domains to agree, and two validators that agree by
+# having been written twice do not agree for long.
+#
+# qfd stays stdlib-only (D6) -- `extract_spec` imports nothing outside the
+# standard library, which is why it can live in `shared` at all.
+Environment=PYTHONPATH=/srv/queue-forecasting/tools/queue-forecasting/host/shared
 Environment=QFD_TRUSTED_DIR=/srv/queue-forecasting/tools/queue-forecasting/host/dispatcher
 Environment=QFD_STATE_DIR=/var/lib/qf-platform
 Environment=QFD_RUNS_DIR=/var/lib/qf-runs
@@ -33,6 +41,19 @@ Environment=QFD_STOP_TIMEOUT_S=10
 # the last, so the first was dead but read as if it were the value.
 Environment=QFD_SOCKET=/run/qf-dispatch/client/sock
 Environment=QFD_ADMIN_SOCKET=/run/qf-dispatch/admin/sock
+# The extractor's socket. qfd is a CLIENT of it and holds no database
+# credential of its own (D15): it asks a service that holds one. The socket is
+# 0660 root:qfd, so this membership is what lets the dispatcher connect --
+# and `research`, which is in qfclient but not in qfd, cannot reach it at all.
+Environment=QFD_EXTRACT_SOCKET=/run/qf-extract/sock
+# A SECOND copy of the settlement lag, and the duplication is deliberate (D17).
+# The EXTRACTOR's value is authoritative and it validates every request again;
+# this copy exists only so a request naming an unsettled window is refused at
+# submit time with a legible message, instead of after the job has been queued,
+# leased and relayed. If the two disagree the extractor wins -- which is
+# fail-closed, since the extractor's is the stricter check by construction.
+# Keep it equal to QFX_SETTLEMENT_LAG_S in qf-extract.service.
+Environment=QFD_SETTLEMENT_LAG_S=172800
 Environment=QFD_ADMIN_UID=%%DEPLOY_UID%%
 Environment=QFD_REAP_INTERVAL_S=60
 Environment=QFD_SETUP_TEARDOWN_ALLOWANCE_S=600

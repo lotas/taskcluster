@@ -138,6 +138,8 @@ class Base(unittest.TestCase):
                 fh.write("#!/bin/sh\nexit 0\n")
 
         self.cfg = qfd.Config(
+            extract_socket="/nonexistent/extract.sock",
+            settlement_lag_s=48 * 3600,
             trusted_dir=trusted, state_dir=root, runs_dir=self.runs,
             socket_path=os.path.join(root, "c.sock"),
             admin_socket_path=os.path.join(root, "a.sock"), admin_uid=4242,

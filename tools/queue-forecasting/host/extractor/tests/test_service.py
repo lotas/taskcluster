@@ -33,6 +33,7 @@ sys.path.insert(0, _HERE)
 
 import extract_spec                                            # noqa: E402
 import extractor                                               # noqa: E402
+import inventory                                               # noqa: E402
 import service                                                 # noqa: E402
 
 # `main()` registers these once the extractor modules are importable; the tests
@@ -743,3 +744,63 @@ class TestAnUnreadyServiceAnswersInsteadOfHanging(unittest.TestCase):
         reply = handler.handle({"op": "extract", "request": {}})
         self.assertFalse(reply["ok"])
         self.assertIn("unreadable", reply["error"])
+
+
+class TestListingPublishedExtracts(ProtocolCase):
+    """`qf extracts` needs hashes and watermarks, and the answer comes from HERE
+    because this directory belongs to this service. Having the dispatcher walk it
+    would put the layout in two places, and the publication path has already been
+    bitten once by a second thing that could disagree with the artifacts."""
+
+    def test_an_empty_directory_lists_nothing(self):
+        reply = self.call({"op": "extracts"})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["extracts"], [])
+
+    def test_a_published_extract_appears_with_its_identity(self):
+        made = self.call({"op": "extract", "request": raw()})["manifest"]
+        listed = self.call({"op": "extracts"})["extracts"]
+        self.assertEqual(len(listed), 1)
+        row = listed[0]
+        self.assertEqual(row["request_hash"], made["request_hash"])
+        self.assertEqual(row["extract_hash"], made["extract_hash"])
+        self.assertEqual(row["target"], "wait_time")
+        self.assertEqual(row["watermark"], made["watermark"])
+        self.assertTrue(row["dir"].endswith(made["request_hash"]))
+
+    def test_row_counts_are_reported_per_file(self):
+        self.call({"op": "extract", "request": raw()})
+        rows = self.call({"op": "extracts"})["extracts"][0]["rows"]
+        self.assertEqual(set(rows), set(inventory.DATASETS))
+        for name, count in rows.items():
+            with self.subTest(name=name):
+                self.assertGreater(count, 0)
+
+    def test_a_directory_without_a_manifest_is_skipped_not_reported(self):
+        # Only a complete artifact counts -- the same rule `published_dir` uses.
+        # Reporting a bare directory would advertise an extract with no files.
+        os.makedirs(os.path.join(self.cfg.extracts_dir, "f" * 64))
+        self.assertEqual(self.call({"op": "extracts"})["extracts"], [])
+
+    def test_an_unreadable_manifest_is_skipped(self):
+        made = self.call({"op": "extract", "request": raw()})["manifest"]
+        path = os.path.join(self.cfg.extracts_dir, made["request_hash"],
+                            "MANIFEST.json")
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(self.call({"op": "extracts"})["extracts"], [])
+
+    def test_two_generations_both_appear(self):
+        first = self.call({"op": "extract", "request": raw()})["manifest"]
+        second = self.call({"op": "extract",
+                            "request": raw(generation=2)})["manifest"]
+        listed = {row["request_hash"]
+                  for row in self.call({"op": "extracts"})["extracts"]}
+        self.assertEqual(listed, {first["request_hash"],
+                                  second["request_hash"]})
+
+    def test_the_dsn_does_not_appear_in_a_listing(self):
+        self.call({"op": "extract", "request": raw()})
+        blob = json.dumps(self.call({"op": "extracts"}))
+        self.assertNotIn("postgresql://", blob)
+        self.assertNotIn("forecast_experiment", blob)

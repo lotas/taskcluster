@@ -118,6 +118,86 @@ def cmd_submit(args):
             raise SystemExit(code if isinstance(code, int) else 1)
 
 
+def cmd_extract(args):
+    """Ask for a frozen extract. Prints the run id; `--wait` polls to terminal.
+
+    No `--sha`: an extraction runs no code, so a commit would record a
+    dependency it does not have. Its identity is its REQUEST, which the
+    dispatcher derives (see `spec.EXTRACT_SOURCE_REF`).
+    """
+    spec_body = {
+        "schema": 1,
+        "kind": "extract",
+        "args": {
+            "target": args.target,
+            "train_start": args.train_start,
+            "as_of_date": args.as_of,
+            "lookback_days": args.lookback_days,
+        },
+    }
+    if args.generation is not None:
+        spec_body["args"]["generation"] = args.generation
+    if args.note:
+        spec_body["note"] = args.note
+
+    resp = call("submit", {"spec": spec_body})
+    if not resp.get("ok"):
+        die(resp.get("error", "submit refused"))
+    run_id = resp["run_id"]
+    print(run_id)
+    if not args.wait:
+        return
+    # POLLED, not held open. A real extraction took 688 seconds; a client that
+    # blocked on one socket for that long would look hung, and the dispatcher's
+    # job row is the thing that actually knows how it went.
+    while True:
+        time.sleep(POLL_S)
+        st = call("status", {"run_id": run_id})
+        if not st.get("ok"):
+            die(st.get("error", "status failed"))
+        job = st["job"]
+        if job["state"] in TERMINAL:
+            pins = job.get("pins") or {}
+            print(f"{job['state']} error_class={job['error_class']}",
+                  file=sys.stderr)
+            for key in ("extract_hash", "extract_dir", "extract_watermark"):
+                if pins.get(key):
+                    print(f"{key}: {pins[key]}", file=sys.stderr)
+            raise SystemExit(0 if job["state"] == "SUCCEEDED" else 1)
+
+
+def cmd_extracts(args):
+    """What the extractor has published: identity, window and watermark.
+
+    Relayed by the dispatcher from the extractor, which owns the directory.
+    """
+    resp = call("extracts")
+    if args.json:
+        show(resp, True)
+        return
+    if not resp.get("ok"):
+        die(resp.get("error", "extracts failed"))
+    rows = resp.get("extracts") or []
+    if not rows:
+        print("no published extracts")
+        return
+    for row in rows:
+        watermark = row.get("watermark") or {}
+        print(f"{(row.get('request_hash') or '?')[:12]}"
+              f"  extract={(row.get('extract_hash') or '?')[:12]}"
+              f"  {row.get('target')}"
+              f"  {row.get('train_start')}..{row.get('as_of_date')}"
+              f"  gen={row.get('generation')}")
+        print(f"    dir={row.get('dir')}")
+        if watermark:
+            print("    watermark=" + " ".join(
+                f"{k}={v}" for k, v in sorted(watermark.items())))
+        rows_by_file = row.get("rows") or {}
+        if rows_by_file:
+            print("    rows=" + " ".join(
+                f"{k}={v}" for k, v in sorted(rows_by_file.items())))
+
+
 def cmd_status(args):
     show(call("status", {"run_id": args.run_id}), args.json)
 
@@ -249,6 +329,32 @@ def build_parser(admin_mode):
     s.add_argument("--wait", action="store_true",
                    help="poll to a terminal state and exit with the job's code")
     s.set_defaults(func=cmd_submit)
+
+    ex = sub.add_parser("extract",
+                        help="ask the trusted extractor for a frozen extract")
+    ex.add_argument("--target", required=True,
+                    choices=("wait_time", "run_duration"))
+    ex.add_argument("--train-start", required=True, dest="train_start",
+                    metavar="YYYY-MM-DDT00:00:00Z",
+                    help="UTC day boundary; the window start")
+    ex.add_argument("--as-of", required=True, dest="as_of",
+                    metavar="YYYY-MM-DDT00:00:00Z",
+                    help="UTC day boundary; must be past the settlement lag")
+    ex.add_argument("--lookback-days", type=int, default=30,
+                    dest="lookback_days",
+                    help="reference-window floor for queue-context features")
+    ex.add_argument("--generation", type=int,
+                    help="bump to re-extract the same window deliberately;"
+                         " a published extract is immutable")
+    ex.add_argument("--note")
+    ex.add_argument("--wait", action="store_true",
+                    help="poll to a terminal state and print the extract's"
+                         " identity")
+    ex.set_defaults(func=cmd_extract)
+
+    sub.add_parser("extracts",
+                   help="list published extracts with hashes and watermarks"
+                   ).set_defaults(func=cmd_extracts)
 
     st = sub.add_parser("status")
     st.add_argument("run_id")

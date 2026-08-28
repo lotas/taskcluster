@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import calendar
 import contextlib
+import datetime
 import errno
 import fcntl
 import grp
@@ -59,7 +60,7 @@ FORCE_RELEASE_FLAG = "i_have_verified_nothing_is_running"
 # The client socket's op table. `force-release` is deliberately ABSENT: the
 # group on this socket contains `research` (revision 8's regression).
 CLIENT_OPS = ("ping", "submit", "status", "list", "cancel", "verify-chain",
-              "trusted-paths")
+              "trusted-paths", "extracts")
 ADMIN_OPS = ("force-release",)
 
 # Trusted files whose realpath and digest `trusted-paths` reports -- the live
@@ -111,6 +112,7 @@ class Config:
         "QFD_MARKER_STALE_MARGIN_S", "QFD_LOCK_MIGRATED_MARKER",
         "QFD_ADMITTED_MEM_BUDGET_MB", "QFD_TIMEOUT_MAX_S", "QFD_LOCK_WAIT_S",
         "QFD_IMAGE_BUILD_MEM_MB", "QFD_LIGHT_WORKERS", "QFD_LOG_CAP_MB",
+        "QFD_EXTRACT_SOCKET", "QFD_SETTLEMENT_LAG_S",
         "QFD_ARTIFACT_CAP_MB", "QFD_HANDOFF_TIMEOUT_S", "QFD_DISK_FLOOR_GB",
         "QFD_QUEUED_CAP_PER_UID", "QFD_LEASE_S",
     )
@@ -152,6 +154,9 @@ class Config:
             image_build_mem_mb=_int_env("QFD_IMAGE_BUILD_MEM_MB", 2048),
             light_workers=_int_env("QFD_LIGHT_WORKERS", 2),
             log_cap_mb=_int_env("QFD_LOG_CAP_MB", 16),
+            extract_socket=os.environ.get("QFD_EXTRACT_SOCKET",
+                                          "/run/qf-extract/sock"),
+            settlement_lag_s=_int_env("QFD_SETTLEMENT_LAG_S", 48 * 3600),
             artifact_cap_mb=_int_env("QFD_ARTIFACT_CAP_MB", 2048),
             handoff_timeout_s=_int_env("QFD_HANDOFF_TIMEOUT_S", 120),
             disk_floor_gb=_int_env("QFD_DISK_FLOOR_GB", 20),
@@ -611,6 +616,45 @@ def probe_mutex(path):
             os.close(fd)
 
 
+class ExtractSlot:
+    """What an EXTRACT job holds instead of the training mutex.
+
+    THE BUG THIS FIXES. Every job took `TrainingLock` before its kind was
+    inspected, so a minutes-long extraction held the shared training lock -- and
+    a shared holder is exactly what blocks the nightly's exclusive acquisition.
+    An extraction reads a replica of the same database the nightly trains from;
+    it has no business making the nightly wait, and the plan said so.
+
+    It is still a slot rather than nothing, for two reasons:
+
+      * Two light workers would otherwise relay two extractions at once, and the
+        second would be refused by the extractor's NON-BLOCKING mutex -- turning
+        "wait your turn" into "failed". A slot here means the second job simply
+        stays QUEUED, which is what backpressure should look like.
+      * The dispatcher's own bookkeeping stays honest: something is occupied
+        while an extraction is in flight.
+
+    Same shape as `TrainingLock` (`lane`, `held`, `release`) so every release
+    path treats them alike.
+    """
+
+    def __init__(self, semaphore, lane):
+        self._sem = semaphore
+        self.lane = lane
+        self.held = False
+
+    def acquire(self):
+        if not self._sem.acquire(blocking=False):
+            raise LockHeld("another extraction is in flight")
+        self.held = True
+        return self
+
+    def release(self):
+        if self.held:
+            self.held = False
+            self._sem.release()
+
+
 class TrainingLock:
     """One open file description per job.
 
@@ -849,6 +893,70 @@ class Docker:
 
 
 # --- run ids -------------------------------------------------------------
+class ExtractRelayError(Exception):
+    """The extractor could not be asked, or would not answer.
+
+    Carries an `error_class` so the job's record names the subsystem: an
+    operator sent to the dispatcher for a fault in the extractor loses an
+    afternoon, which is the whole reason error classes are routing decisions.
+    """
+
+    def __init__(self, message, error_class):
+        super().__init__(message)
+        self.error_class = error_class
+
+
+def extract_request(socket_path, payload, timeout):
+    """One request, one reply, over the extractor's socket.
+
+    THE DISPATCHER HOLDS NO CREDENTIAL AND THIS IS WHY IT DOES NOT NEED ONE
+    (D15): it asks a service that holds one. Nothing here reads a DSN, and the
+    reply is a manifest.
+
+    The timeout is generous by design. A real extraction took 688 seconds, so a
+    short timeout would abandon work the extractor completed and then publish --
+    leaving a SUCCEEDED extract on disk that no job row points at.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(socket_path)
+            sock.sendall(json.dumps(payload).encode() + b"\n")
+            buf = bytearray()
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+    except FileNotFoundError:
+        raise ExtractRelayError(
+            f"no extractor socket at {socket_path}: qf-extract.socket is not"
+            f" listening", "extractor_unreachable") from None
+    except PermissionError:
+        raise ExtractRelayError(
+            f"permission denied on {socket_path}: the dispatcher's uid must"
+            f" match QFX_CLIENT_UID in qf-extract.service",
+            "extractor_unreachable") from None
+    except socket.timeout:
+        raise ExtractRelayError(
+            f"the extractor did not answer within {timeout}s. It may still be"
+            f" extracting; check `journalctl -u qf-extract`, and note that a"
+            f" published extract is immutable so a retry will reuse it rather"
+            f" than duplicate it", "extract_timeout") from None
+    except OSError as e:
+        raise ExtractRelayError(f"cannot talk to {socket_path}: {e}",
+                                "extractor_unreachable") from None
+    if not buf:
+        raise ExtractRelayError(
+            "the extractor closed the connection without replying",
+            "extractor_unreachable")
+    try:
+        return json.loads(bytes(buf).split(b"\n")[0])
+    except ValueError as e:
+        raise ExtractRelayError(f"the extractor's reply is not JSON: {e}",
+                                "extractor_protocol") from None
+
+
 def make_run_id(kind, sha, seq, now=None):
     """`<kind>-<YYYYmmddTHHMMSSZ>-<sha[:12]>-<seq>`.
 
@@ -1131,7 +1239,20 @@ class Dispatcher:
         if not isinstance(raw, dict):
             raise Refused("submit needs a 'spec' object")
         # The payload's own idea of who is calling is IGNORED. SO_PEERCRED wins.
-        effective = spec_mod.normalize(raw)
+        # The CLOCK and the SETTLEMENT LAG, because the `extract` kind needs
+        # both: `as_of_date` must be a completed UTC boundary past the lag (D20),
+        # and a validator with no clock cannot check that.
+        #
+        # This is qfd's OWN copy of the lag, and the duplication is deliberate
+        # per D17: the extractor holds the authoritative value and validates
+        # again, so if the two disagree the extractor wins. qfd's copy exists
+        # only so a bad request is refused at submit time with a legible message
+        # rather than after a job has been queued, leased and relayed.
+        effective = spec_mod.normalize(
+            raw,
+            now=datetime.datetime.fromtimestamp(self.clock(),
+                                                datetime.timezone.utc),
+            settlement_lag_s=self.cfg.settlement_lag_s)
 
         queued = self.db.call("queued_count_for_uid", uid)
         if queued >= self.cfg.queued_cap_per_uid:
@@ -1147,6 +1268,15 @@ class Dispatcher:
             # A job whose memory exceeds the CURRENT budget is QUEUED, not
             # refused: contention is not invalidity, and it will fit later.
             self.db.call("submit", effective, run_id=run_id, uid=uid, now=now)
+            # AS A PIN, because that is where `source_ref` actually lives: the
+            # same-named `jobs` column stays NULL for every job (the runner
+            # writes the pin mid-run for a test job), so a value put only in the
+            # spec would appear nowhere a reader looks. For an extract this
+            # matters more than usual -- it is the literal that stops
+            # `source_sha` being mistaken for a commit.
+            if effective.get("source_ref"):
+                self.db.call("set_pin", run_id, "source_ref",
+                             effective["source_ref"], now=now)
         return {"run_id": run_id, "state": "QUEUED",
                 "spec_hash": spec_mod.spec_hash(effective)}
 
@@ -1164,6 +1294,23 @@ class Dispatcher:
         # sat one table away.
         job["pins"] = self.db.call("pins_for", run_id)
         return {"job": job, "stall": self.cleanup_stall()}
+
+    def _op_extracts(self, payload, uid):
+        """What the extractor has published, with hashes and watermarks.
+
+        RELAYED, not read. The extracts directory belongs to `qfextract`, and
+        having the dispatcher walk it would put the layout in two places -- which
+        is exactly how the publication path came to have a side index that could
+        disagree with the artifacts. The extractor knows what it published.
+        """
+        try:
+            reply = extract_request(self.cfg.extract_socket,
+                                    {"op": "extracts"}, timeout=30)
+        except ExtractRelayError as e:
+            raise Refused(str(e)) from None
+        if not reply.get("ok"):
+            raise Refused(reply.get("error", "the extractor refused"))
+        return {"extracts": reply.get("extracts", [])}
 
     def _op_list(self, payload, uid):
         limit = payload.get("limit", 20)
@@ -1651,6 +1798,11 @@ class Runner:
         self._mutex_fault = set()
         self._refusals = {}
         self._lock_state_lock = threading.Lock()
+        # ONE extraction at a time, and NOT via the training mutex. The extractor
+        # enforces this too, with a non-blocking flock -- but its refusal would
+        # fail a job that should simply have waited, so the queue holds the
+        # second one here instead.
+        self._extract_slot = threading.Semaphore(1)
         self.qfrun_gid = _gid("qfrun")
         self.qfclient_gid = _gid("qfclient")
         # Injectable so the whole execute path is testable without a docker
@@ -1716,8 +1868,15 @@ class Runner:
             self._note_refusal(lane, reason, reason)
             return False
 
+        # THE KIND IS KNOWN HERE -- `peek` returned the row -- and it decides
+        # WHICH lock is taken. An extraction must not hold the training mutex:
+        # see `ExtractSlot`.
+        is_extract = head["kind"] == "extract"
         try:                                                    # 3
-            lock = TrainingLock(self.cfg.lock_file, lane).acquire()
+            if is_extract:
+                lock = ExtractSlot(self._extract_slot, lane).acquire()
+            else:
+                lock = TrainingLock(self.cfg.lock_file, lane).acquire()
         except MutexUnusable as e:
             # ERROR, and once: this does not clear on its own, and repeating it
             # every two seconds would bury it in itself.
@@ -1835,6 +1994,28 @@ class Runner:
             # earlier version measured the deadline only from the container.
             if hold.expired():
                 raise DeadlineExpired("the hold deadline passed before setup")
+
+            # AN EXTRACTION RUNS NO CODE, so none of the setup below applies to
+            # it: no run directory, no worktree, no image, no container. It is a
+            # job so that it gets the state machine, the event chain and
+            # `qf status`; the work itself happens in another privilege domain
+            # (D15), and all this side does is ask and record what came back.
+            if effective["kind"] == "extract":
+                # LEASED -> RUNNING FIRST, and this is not bookkeeping.
+                #
+                # `finish` returns whatever the relay returned, and the state
+                # machine has no LEASED -> SUCCEEDED edge (store.ALLOWED): a
+                # successful extraction persisted "cannot move LEASED ->
+                # SUCCEEDED" and the row stayed LEASED with no exit code. Every
+                # test of this path called `_relay_extract` and inspected its
+                # return tuple, so none of them ever reached `finish`.
+                #
+                # RUNNING is also the honest answer while a relay is in flight:
+                # the extraction genuinely is running, in another process.
+                self.db.call("transition", hold.run_id, "RUNNING",
+                             now=utcnow())
+                outcome = self._relay_extract(hold, effective)
+                return
             paths = self.prepare_run_dir(run_id, qfrun_gid=self.qfrun_gid,
                                          qfclient_gid=self.qfclient_gid)
             # ONE absolute deadline covering ALL the setup git work, passed as
@@ -1909,6 +2090,164 @@ class Runner:
         finally:
             renewer.set()
             self.finish(hold, *outcome)
+
+    # Injectable so the relay is testable without a listening socket. The
+    # default is the real transport.
+    extract_client = staticmethod(extract_request)
+
+    def _relay_extract(self, hold, effective):
+        """Ask the extractor, record what came back. Returns an outcome tuple.
+
+        A CANCEL CANNOT INTERRUPT THIS, and that is a property rather than an
+        oversight: the work is happening in another privilege domain, which the
+        dispatcher has no authority over and deliberately cannot signal. A cancel
+        requested during a relay takes effect when the reply arrives. Since a
+        published extract is immutable, the extraction is not wasted either way.
+        """
+        run_id = hold.run_id
+        import extract_spec
+
+        # The INPUT fields, not the normalised ones: the extractor validates
+        # again and refuses derived fields by name, so forwarding what we
+        # validated would be refused for carrying `target_column`.
+        request = extract_spec.to_raw(effective["args"])
+        budget = min(effective["timeout_s"], max(1, int(hold.remaining())))
+        log.info("%s: asking the extractor for %s %s..%s (timeout %ss)",
+                 run_id, request["target"], request["train_start"],
+                 request["as_of_date"], budget)
+        try:
+            reply = self.extract_client(
+                self.cfg.extract_socket,
+                {"op": "extract", "request": request}, budget)
+        except ExtractRelayError as e:
+            log.error("%s: extractor: %s", run_id, e)
+            return ("FAILED", {"error_class": e.error_class,
+                               "finished_at": utcnow()})
+
+        if not reply.get("ok"):
+            # The extractor's own refusal text, which it wrote to be read. Its
+            # unexpected failures already arrive here as an opaque reference, so
+            # nothing a dependency produced is passed through.
+            log.error("%s: extractor refused: %s", run_id,
+                      reply.get("error"))
+            return ("FAILED", {"error_class": "extract_refused",
+                               "finished_at": utcnow()})
+
+        manifest = reply.get("manifest") or {}
+        problem = self._extract_reply_problem(reply, manifest, request,
+                                              effective)
+        if problem is not None:
+            # A REPLY THAT SAYS `ok` IS NOT AN EXTRACT.
+            #
+            # The first version accepted `{"ok": true, "manifest": {}}`, skipped
+            # every missing pin, and recorded SUCCEEDED -- and a test enshrined
+            # it as "does not crash". A job row saying an extract exists, with no
+            # hash and no directory, is worse than a failure: 2b-2 would look for
+            # an extract this row claims to have.
+            log.error("%s: the extractor's reply is not usable: %s",
+                      run_id, problem)
+            return ("FAILED", {"error_class": "extract_reply_invalid",
+                               "finished_at": utcnow()})
+        now = utcnow()
+        # PINS, never new columns (design 4.6). These are the identities 2b-2 and
+        # 2c need: `request_hash` is what reuse is keyed on, `extract_hash` is
+        # what every member of a comparison must share, and the watermark is the
+        # provenance that says what this extract actually contained.
+        for key, value in (
+                ("request_hash", manifest.get("request_hash")),
+                ("extract_hash", manifest.get("extract_hash")),
+                ("extract_dir", reply.get("dir")),
+                ("extract_watermark",
+                 json.dumps(manifest.get("watermark") or {}, sort_keys=True)),
+                ("extract_rows", json.dumps(
+                    {name: entry.get("rows")
+                     for name, entry in (manifest.get("files") or {}).items()},
+                    sort_keys=True)),
+        ):
+            if value is not None:
+                self.db.call("set_pin", run_id, key, value, now=now)
+        log.info("%s: extract %s ready at %s", run_id,
+                 (manifest.get("extract_hash") or "?")[:12], reply.get("dir"))
+
+        # THE CANCEL IS CHECKED AFTER THE PINS ARE WRITTEN, and the order is the
+        # whole point. A cancel cannot stop an extraction -- the work is in
+        # another privilege domain this process has no authority to signal -- so
+        # by the time the reply arrives the extract is published and immutable.
+        #
+        # Recording the pins first means the artifact is discoverable whatever
+        # the job's state; reporting CANCELLED then means the JOB says what
+        # actually happened to it. Reporting SUCCEEDED for something an operator
+        # cancelled would make `qf list --state CANCELLED` stop meaning anything,
+        # which is the same rule the container path follows.
+        if hold.cancel_requested.is_set():
+            log.info("%s: cancelled while the extractor was working; the"
+                     " extract is published and its pins are recorded", run_id)
+            return ("CANCELLED", {"error_class": "cancelled",
+                                  "finished_at": now})
+        return ("SUCCEEDED", {"exit_code": 0, "finished_at": now})
+
+    _HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
+
+    def _extract_reply_problem(self, reply, manifest, request, effective):
+        """Why this reply cannot be recorded as an extract, or None.
+
+        Checked because the reply crosses a trust boundary in the direction
+        nobody usually looks: the extractor is trusted, but "trusted" is not
+        "incapable of a bug", and the failure mode of believing it is a job row
+        that claims an extract which is not there.
+        """
+        import extract_spec
+
+        for field in ("request_hash", "extract_hash"):
+            value = manifest.get(field)
+            if not isinstance(value, str) or not self._HEX64.match(value):
+                return f"{field} is {value!r}, not a sha256"
+
+        # THE REQUEST HASH MUST BE THE ONE WE ASKED FOR. Otherwise a reply about
+        # a different window would be recorded against this job -- and since
+        # reuse is keyed on `request_hash` (D20), that is the one field capable
+        # of pointing this row at somebody else's extract.
+        expected = extract_spec.request_hash(
+            extract_spec.validate(request, now=self.clock_dt(),
+                                  settlement_lag_s=self.cfg.settlement_lag_s))
+        if manifest["request_hash"] != expected:
+            return (f"request_hash {manifest['request_hash'][:12]} is not the"
+                    f" request we sent ({expected[:12]})")
+        if effective["source_sha"] != expected:
+            return (f"the job's identity {effective['source_sha'][:12]} does not"
+                    f" match the request we sent ({expected[:12]})")
+
+        directory = reply.get("dir")
+        if not isinstance(directory, str) or not directory:
+            return "the reply names no directory"
+        if os.path.basename(directory.rstrip("/")) != manifest["request_hash"]:
+            # D20 publishes under `<request_hash>`; a directory anywhere else is
+            # either a different layout or a different extract.
+            return (f"the directory {directory} is not the canonical location"
+                    f" for {manifest['request_hash'][:12]}")
+
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            return "the manifest lists no files"
+        for name, entry in files.items():
+            if not isinstance(entry, dict) or not entry.get("sha256"):
+                return f"the manifest entry for {name} has no digest"
+            if not entry.get("rows"):
+                return f"the manifest says {name} has no rows"
+        if not manifest.get("watermark"):
+            return "the manifest carries no watermark"
+        return None
+
+    def clock_dt(self):
+        """The DISPATCHER's clock as an aware datetime, for the shared validator.
+
+        `self.disp.clock`, not a clock of the runner's own: the request was
+        validated at submit time against that clock, and re-validating against a
+        different one could disagree about the settlement boundary and reject a
+        reply for a request the same process had accepted.
+        """
+        return datetime.datetime.fromtimestamp(self.disp.clock(),
+                                               datetime.timezone.utc)
 
     def _setup_deadline(self, hold):
         """An ABSOLUTE instant by which all source work for this job must be

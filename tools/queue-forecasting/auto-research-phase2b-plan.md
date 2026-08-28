@@ -1081,7 +1081,127 @@ Original task description follows.
   that fixes it. An invariant of the environment belongs in the startup gate, not
   in the first request that trips over it.
 
-### Task 5: the `extract` kind in `qfd`
+### Task 5: the `extract` kind in `qfd` — **DONE (revision 2)**
+
+Review round found six defects, four P1, and the first was fatal to the whole
+path. All fixed and red-green verified; suites shared 61, extractor 184,
+dispatcher 595.
+
+- **P1: a successful extract never reached SUCCEEDED.** The branch returned
+  success while the row was still `LEASED`, and `store.ALLOWED` has no
+  `LEASED -> SUCCEEDED` edge -- so `finish` persisted "cannot move LEASED ->
+  SUCCEEDED" and left the row `LEASED` with no exit code. **Every test called
+  `_relay_extract` and inspected its return tuple; not one reached `finish`.**
+  The fix transitions `LEASED -> RUNNING` before relaying, which is also the
+  honest answer: the extraction genuinely is running, in another process. The
+  test class now drives `execute()` end to end, and reverting the transition
+  fails four tests.
+- **P1: extracts held the training mutex.** `try_one` took `TrainingLock` before
+  inspecting the kind, so a minutes-long extraction held a SHARED lock -- which is
+  exactly what blocks the nightly's exclusive acquisition -- and cleanup then
+  treated it as an empty-container build, adding the 30s build settle. `peek`
+  already returns the row, so the kind is available at step 1: the lock decision
+  moved to step 3 and an extract takes an `ExtractSlot` instead. Still a slot
+  rather than nothing, because two light workers would otherwise relay two
+  extractions and the second would be REFUSED by the extractor's non-blocking
+  mutex -- turning "wait your turn" into "failed". A test measures the training
+  lock as free while an extract runs.
+- **P1: a malformed success was recorded as a successful extract.**
+  `{"ok": true, "manifest": {}}` was accepted, every missing pin skipped, and
+  SUCCEEDED recorded -- **and my test enshrined that as "does not crash".** A job
+  row claiming an extract that is not there is worse than a failure, because 2b-2
+  goes looking for it. The reply is now validated: both hashes 64-hex, the
+  `request_hash` equal to the one we sent AND to the job's own identity, the
+  directory the canonical `<request_hash>` location, every file entry carrying a
+  digest and a non-zero row count, and a non-empty watermark. Nothing is pinned
+  when the reply is refused. The extractor is trusted, and **"trusted" is not
+  "incapable of a bug"** -- the failure mode of believing it is a row that
+  advertises an artifact which does not exist.
+- **P1: a cancel during extraction was ignored.** The relay never re-checked
+  `cancel_requested`, so once the state defect was fixed a job reported as
+  CANCELLING would have finished SUCCEEDED. Now checked AFTER the pins are
+  written, and the order is the point: a cancel cannot stop work in another
+  privilege domain, so the extract is already published and immutable -- recording
+  the pins keeps the artifact discoverable, and reporting CANCELLED keeps
+  `qf list --state CANCELLED` meaningful.
+- **P2: `source_ref` was produced and never stored.** `normalize` set it and
+  `submit` passed it nowhere, so the literal that stops `source_sha` being read
+  as a commit appeared nowhere a reader looks. It goes in as a **pin**, because
+  that is where `source_ref` actually lives -- the same-named column stays NULL
+  for every job.
+- **P2: `qf extracts` was missing.** Added, and **relayed rather than walked**:
+  the extractor answers, because that directory belongs to it. A dispatcher that
+  walked it would put the layout in two places, which is precisely how the
+  publication path came to have a side index that could disagree with the
+  artifacts. A test asserts the dispatcher has no extracts-directory setting at
+  all.
+
+Delivered 2026-08-28. `spec.py` gains the kind, `qfd.py` the relay,
+`shared/extract_spec.to_raw` the projection both sides need, and `qf` the
+command. Suites: shared 61, extractor 177, dispatcher 571.
+
+**An extraction runs no code, and the modelling had to say so.** The branch in
+`Runner.execute` short-circuits before `prepare_run_dir`, `resolve`,
+`add_worktree` and `_ensure_image` — none of which apply. It is a job only so
+that it gets the state machine, the event chain and `qf status`; the work happens
+in another privilege domain.
+
+**`source_sha` holds the REQUEST HASH.** The column is `NOT NULL` in a schema
+with sixteen hundred live rows, so migrating it mid-phase was the wrong trade.
+The column's role is "the immutable identity of what this job ran" — a commit for
+a test, a request for an extraction — and `source_ref` is set to
+`extract-request (not a commit)` so a reader cannot mistake the value for a
+commit and join on it. A caller supplying `source_sha` for this kind is
+**refused, not ignored**: someone who believed they were choosing the identity of
+an extract would be wrong, silently. A nice side effect is that run ids read
+`extract-<ts>-<request_hash[:12]>-<seq>`, which is more useful than a commit
+would have been.
+
+**A relay cannot forward what it validated.** The extractor validates again
+(D16) and refuses derived fields by name, so sending the normalised request would
+be refused for carrying `target_column`. `extract_spec.to_raw` projects back to
+the input fields, and it lives in `shared` beside `_FORBIDDEN` rather than as a
+field list copied into the relay — where it would fall out of step. There is a
+test that forwarding the validated form verbatim IS refused, so the hazard is
+asserted rather than assumed.
+
+**A cancel cannot interrupt a relay, and that is a property.** The work is in a
+domain the dispatcher has no authority over and deliberately cannot signal; a
+cancel takes effect when the reply arrives. Since a published extract is
+immutable, nothing is wasted either way.
+
+Identities land as **pins**, never columns (§4.6): `request_hash`,
+`extract_hash`, `extract_dir`, `extract_watermark`, `extract_rows`. A pin whose
+value is absent is skipped rather than stored as `"None"`, which would read as a
+recorded fact.
+
+Three gaps worth recording, all of them the same shape — **a unit test of a
+function is not a test of its caller**:
+
+1. `_op_submit` called `spec_mod.normalize(raw)` with no clock and no settlement
+   lag, so **every extract submit would have been refused** with "kind extract
+   needs a clock and a settlement lag". Every test of the kind called `normalize`
+   directly and none noticed. There is now a test on the call site, and one
+   asserting `QFD_SETTLEMENT_LAG_S` equals `QFX_SETTLEMENT_LAG_S` — two copies on
+   purpose (D17, extractor authoritative), so a test keeps them equal rather than
+   leaving the policy a coin toss.
+2. Nothing put `host/shared` on the dispatcher unit's `PYTHONPATH`, which is the
+   same defect the extractor shipped with. Both units now carry it and a test
+   asserts both, plus that `shared` imports nothing outside the stdlib (it is
+   imported by qfd, which is stdlib-only by D6) and imports nothing from either
+   domain.
+3. `ExtractSpecError` does not subclass `SpecError` — the one-way dependency —
+   and the translation now happens in `spec.normalize`, so `normalize`'s contract
+   stays "raises SpecError" and no caller grows a second `except`.
+
+My own test defects this task: I invented `spec.validate` when the entry point is
+`normalize`; and a bulk edit added `settlement_lag_s` to a fixture that already
+had it, producing a `SyntaxError` that silently dropped 62 tests from the run —
+the test COUNT falling was the only signal, which is worth remembering.
+
+Original task description follows.
+
+#### Task 5 (as planned)
 
 - `spec.py` gains `extract` with the D17 fields; `qfd` validates, then relays
 - the relay is a client of `/run/qf-extract/sock` and **holds no credential** —

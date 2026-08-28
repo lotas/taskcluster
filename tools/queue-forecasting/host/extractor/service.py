@@ -386,8 +386,52 @@ class Handler:
                     "extracts_dir": self.cfg.extracts_dir}
         if op == "extract":
             return self._extract(request.get("request"))
+        if op == "extracts":
+            return self._extracts()
         return {"ok": False,
                 "error": f"unknown op {op!r}; known: ping, extract"}
+
+    def _extracts(self):
+        """Every published extract, with its identity and its watermark.
+
+        Answered HERE because this directory belongs to this service. Having the
+        dispatcher walk it would put the layout in two places, and the
+        publication path has already been bitten once by a second thing that
+        could disagree with the artifacts.
+
+        A directory with no manifest is skipped, not reported as an extract: only
+        a complete artifact counts, which is the same rule `published_dir` uses.
+        """
+        out = []
+        root = self.cfg.extracts_dir
+        try:
+            names = sorted(os.listdir(root))
+        except OSError as e:
+            return {"ok": False, "error": f"cannot list {root}: {e}"}
+        for name in names:
+            if name.startswith("."):
+                continue
+            path = os.path.join(root, name, "MANIFEST.json")
+            try:
+                with open(path) as fh:
+                    manifest = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            out.append({
+                "request_hash": manifest.get("request_hash"),
+                "extract_hash": manifest.get("extract_hash"),
+                "dir": os.path.join(root, name),
+                "target": (manifest.get("request") or {}).get("target"),
+                "train_start": (manifest.get("request") or {}).get(
+                    "train_start"),
+                "as_of_date": (manifest.get("request") or {}).get("as_of_date"),
+                "generation": (manifest.get("request") or {}).get("generation"),
+                "watermark": manifest.get("watermark"),
+                "rows": {n: e.get("rows")
+                         for n, e in (manifest.get("files") or {}).items()},
+                "snapshot_start_ts": manifest.get("snapshot_start_ts"),
+            })
+        return {"ok": True, "extracts": out}
 
     def _extract(self, raw_request):
         if not isinstance(raw_request, dict):
@@ -421,7 +465,13 @@ class Handler:
                     "error": f"the extractor failed unexpectedly."
                              f" Reference {ref}; the detail is in"
                              f" `journalctl -u qf-extract -g {ref}`."}
-        return {"ok": True, "manifest": manifest}
+        # The DIRECTORY is part of the answer. The caller has to mount it
+        # read-only into a sandbox (D21) and would otherwise have to reconstruct
+        # the path from a root it does not own -- two places holding one layout,
+        # which is how they diverge.
+        return {"ok": True, "manifest": manifest,
+                "dir": os.path.join(self.cfg.extracts_dir,
+                                    manifest["request_hash"])}
 
 
 class Listener:

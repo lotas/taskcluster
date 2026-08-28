@@ -4,8 +4,22 @@
 # Each case names the failure it prevents. A job field is not a convenience:
 # it is the only thing an untrusted caller controls, so a field that is
 # accepted loosely is a hole in the boundary (design D12).
+import datetime
 import unittest
-import spec
+
+import os
+import sys
+
+# `host/shared` on the path: `spec.normalize` delegates the `extract` kind to
+# `shared/extract_spec.py`, the one closed-world definition both privilege
+# domains use (D16). Inline rather than in a shared helper module, because
+# `tests/` is not a package and a helper only resolves under `unittest discover`
+# -- a bootstrap that works under one invocation is worse than two copies.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "shared"))
+
+import spec                                                    # noqa: E402
 
 SHA = "3f1c" + "0" * 36
 
@@ -209,3 +223,100 @@ class TestTrailingNewlineIsNotAnAnchorHole(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheExtractKind(unittest.TestCase):
+    """Phase 2b-1 Task 5. An extraction is a job so that it gets the state
+    machine, the event chain and `qf status` -- but it runs no container, no
+    image build and no worktree, and it has no commit.
+
+    `source_sha` is `NOT NULL` in a schema with sixteen hundred live rows, so
+    rather than migrate it, an extract job stores its **request_hash** there: the
+    column's role is "the immutable identity of what this job ran", which for a
+    test is a commit and for an extraction is the request. `source_ref` is set to
+    a literal that makes it unmistakable the value is not a commit, because a
+    reader who assumed it was would join on it.
+    """
+
+    def a_raw(self, **over):
+        args = {"target": "wait_time",
+                "train_start": "2026-07-01T00:00:00Z",
+                "as_of_date": "2026-08-01T00:00:00Z",
+                "lookback_days": 30}
+        args.update(over.pop("args", {}))
+        raw = {"schema": 1, "kind": "extract", "args": args}
+        raw.update(over)
+        return raw
+
+    def validate(self, raw=None, **kw):
+        kw.setdefault("now", datetime.datetime(2026, 8, 5,
+                                               tzinfo=datetime.timezone.utc))
+        kw.setdefault("settlement_lag_s", 48 * 3600)
+        return spec.normalize(self.a_raw() if raw is None else raw, **kw)
+
+    def test_it_needs_no_source_sha_from_the_caller(self):
+        # The caller cannot know the request hash, and requiring a commit would
+        # record a dependency the extract does not have.
+        effective = self.validate()
+        self.assertEqual(len(effective["source_sha"]), 64)
+        self.assertEqual(effective["source_ref"], spec.EXTRACT_SOURCE_REF)
+
+    def test_the_source_sha_is_the_request_hash(self):
+        import extract_spec
+        effective = self.validate()
+        request = extract_spec.validate(
+            {"schema": 1, **self.a_raw()["args"]},
+            now=datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc),
+            settlement_lag_s=48 * 3600)
+        self.assertEqual(effective["source_sha"],
+                         extract_spec.request_hash(request))
+
+    def test_a_supplied_source_sha_is_refused(self):
+        # Not ignored: a caller that thought it was choosing the identity of the
+        # extract would be wrong, and silently.
+        with self.assertRaises(spec.SpecError) as cm:
+            self.validate(self.a_raw(source_sha="a" * 40))
+        self.assertIn("source_sha", str(cm.exception))
+
+    def test_the_effective_spec_carries_the_normalised_request(self):
+        effective = self.validate()
+        self.assertEqual(effective["args"]["target_column"], "wait_duration_s")
+        self.assertEqual(effective["args"]["generation"], 1)
+        self.assertIn("window_lower", effective["args"])
+
+    def test_an_invalid_request_is_refused_here_too(self):
+        # qfd validates so a bad request is refused cheaply and legibly at submit
+        # time. The extractor validates again because a caller is a caller (D16).
+        for bad in ({"target": "p90"}, {"lookback_days": 0},
+                    {"as_of_date": "2026-08-01T06:00:00Z"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(spec.SpecError):
+                    self.validate(self.a_raw(args=bad))
+
+    def test_it_lands_in_the_light_lane_and_takes_no_mutex(self):
+        # An extraction runs in another process entirely. It occupies a slot so
+        # the dispatcher's bookkeeping stays honest, and nothing more -- putting
+        # it in the heavy lane would let a read block the nightly.
+        effective = self.validate()
+        self.assertEqual(effective["lane"], "light")
+        self.assertLessEqual(spec.mem_mb(effective["mem_limit"]),
+                             spec.LIGHT_MEM_CEILING_MB)
+
+    def test_its_timeout_covers_a_measured_extraction(self):
+        # The first real extraction took 688s for 36 days, and the ceiling is 60
+        # days. A timeout under that would kill work the extractor completed.
+        effective = self.validate()
+        self.assertGreaterEqual(effective["timeout_s"], 1800)
+
+    def test_the_clock_and_lag_are_required_for_this_kind(self):
+        # They are what make the settlement rule enforceable. Defaulting them
+        # would make qfd's copy of the rule silently absent.
+        with self.assertRaises(spec.SpecError):
+            spec.normalize(self.a_raw())
+
+    def test_other_kinds_still_require_a_real_sha(self):
+        with self.assertRaises(spec.SpecError):
+            spec.normalize({"schema": 1, "kind": "test"})
+        ok = spec.normalize({"schema": 1, "kind": "test", "source_sha": "b" * 40})
+        self.assertEqual(ok["source_sha"], "b" * 40)
+        self.assertIsNone(ok.get("source_ref"))

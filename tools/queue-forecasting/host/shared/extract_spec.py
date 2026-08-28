@@ -120,6 +120,12 @@ _TS_RE = re.compile(
 _REQUIRED = ("schema", "target", "train_start", "as_of_date", "lookback_days")
 _OPTIONAL = ("generation",)
 
+# The fields a CALLER may supply. Everything else in a validated request is
+# derived, and `_FORBIDDEN` refuses derived fields by name -- so a relay that
+# forwarded a validated request verbatim would be refused by the far end for
+# carrying `target_column`, `window_lower` and `ref_lower`.
+INPUT_FIELDS = _REQUIRED + _OPTIONAL
+
 # Fields the request must NOT carry, each refused by name. They are listed
 # rather than left to the unknown-key check so the message can say why: these
 # are the ones somebody will reach for, and "unknown key" would read as a
@@ -152,9 +158,10 @@ class ExtractSpecError(ValueError):
     depend on `dispatcher`, which is the dependency direction this directory
     exists to forbid. A tidy hierarchy is worth less than a one-way dependency.
 
-    The cost is one line in each consumer: `qfd` catches both this and
-    `SpecError` on its refusal path (Task 5), and the extractor's service lists
-    both in `SAFE_ERRORS`.
+    The cost is one line in each consumer, and both consumers pay it in one
+    place rather than everywhere: `spec.normalize` translates this into
+    `SpecError` so the dispatcher's callers keep the single error type they
+    already handle, and the extractor's service lists both in `SAFE_ERRORS`.
     """
 
 
@@ -341,3 +348,17 @@ def request_hash(effective):
     provenance instead.
     """
     return hashlib.sha256(canonical(effective)).hexdigest()
+
+
+def to_raw(effective):
+    """A validated request projected back to the fields a caller may supply.
+
+    The dispatcher validates a request, records the normalised form in the job
+    spec, and then has to send it ON to the extractor -- which validates again
+    (D16) and REFUSES derived fields by name. So the relay cannot forward what it
+    validated; it has to forward what it was given. This is that projection, in
+    the one module both sides share, rather than a field list copied into the
+    relay where it could fall out of step with `_FORBIDDEN`.
+    """
+    return {name: effective[name] for name in INPUT_FIELDS
+            if name in effective}
