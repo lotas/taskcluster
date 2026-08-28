@@ -30,6 +30,8 @@ literal SQL.
 """
 from __future__ import annotations
 
+import datetime
+
 # NO WINDOW ARITHMETIC AND NO LOOKBACK CONSTANT HERE, deliberately.
 #
 # Every derived bound -- `window_lower`, `ref_lower` -- is computed by
@@ -347,3 +349,43 @@ def bindings(name, request):
     ever indexes, never iterates.
     """
     return {param: request[param] for param in DATASETS[name].params}
+
+
+# ISO-8601 UTC, the shape `extract_spec` produces.
+_TS_RE_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def bind_values(params):
+    """The bound parameters as DRIVER types: timestamps as `datetime`.
+
+    WHY THIS EXISTS AT ALL. Every window bound travels as an ISO-8601 string,
+    because it has to be JSON-serialisable: it goes into `request_hash` and into
+    each file's recorded `window` in the manifest. But psycopg **3** sends a
+    Python `str` as PostgreSQL `text`, and `timestamptz >= text` is not an
+    operator -- so binding the string form would fail every windowed query with
+    "operator does not exist: timestamp with time zone >= text".
+
+    psycopg **2** sent parameters as untyped literals, which PostgreSQL coerced
+    from context, so the string form worked there. That difference is a documented
+    migration gotcha and it is exactly the sort of thing that only appears the
+    first time real code meets a real driver.
+
+    So the string stays in the record and the `datetime` goes to the database,
+    and the conversion is HERE rather than in `pg.py` because a pure function is
+    one a test can reach -- `pg.py` is not importable without psycopg.
+    """
+    out = {}
+    for name, value in params.items():
+        if isinstance(value, str):
+            try:
+                parsed = datetime.datetime.strptime(value, _TS_RE_FMT)
+            except ValueError:
+                # Not a timestamp: pass it through rather than guessing. No
+                # such parameter exists today, and inventing a coercion for a
+                # hypothetical one is how a silent conversion arrives.
+                out[name] = value
+                continue
+            out[name] = parsed.replace(tzinfo=datetime.timezone.utc)
+        else:
+            out[name] = value
+    return out

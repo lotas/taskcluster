@@ -16,6 +16,8 @@ import contextlib
 
 import psycopg
 
+import inventory
+
 # Rows per round trip. Small enough that peak memory is a batch rather than a
 # dataset (D23), large enough that a months-long window is not a million round
 # trips. The extractor's manifest is identical whatever this is -- there is a
@@ -145,7 +147,10 @@ class PgSession:
         cursor_name = f"qf_extract_{name}"
         cur = self.conn.cursor(name=cursor_name)
         cur.itersize = self.batch_rows
-        cur.execute(sql, params)
+        # `bind_values`, not `params`: the window bounds travel as ISO-8601
+        # strings so they can be hashed and recorded, and psycopg 3 would send a
+        # string as `text` -- against which `timestamptz >=` is not an operator.
+        cur.execute(sql, inventory.bind_values(params))
         columns = [d.name for d in cur.description]
 
         def batches():

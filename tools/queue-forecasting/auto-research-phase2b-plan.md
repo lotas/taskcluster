@@ -5,6 +5,33 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 6, 2026-08-28: `phase2b-setup.sh install` succeeded on the host —
+`qfextract` uid 997 in none of the forbidden groups, socket `660 root:qfd`,
+credential `600 root:root`, venv importing all three modules. Two follow-ups, one
+of them a predicted defect fixed before it could be observed:
+
+- **`env/uv.lock` was generated on the host and is not in the repository.**
+  pyarrow 25.0.1, psycopg 3.3.4, CPython 3.13.5. It must be copied back and
+  committed; until then one host has a lock and the repo does not, which is the
+  situation `env/README.md` warns about.
+- **The bound parameters would have failed every windowed query.** Every window
+  bound travels as an ISO-8601 *string*, because it must be JSON-serialisable —
+  it goes into `request_hash` and into each file's recorded `window`. But psycopg
+  **3** sends a Python `str` as PostgreSQL `text`, and `timestamptz >= text` is
+  not an operator: `"operator does not exist: timestamp with time zone >= text"`.
+  psycopg **2** sent untyped literals and let PostgreSQL coerce from context, so
+  the string form worked there — a documented migration gotcha, and precisely the
+  class of thing that only surfaces the first time real code meets a real driver.
+
+  Fixed with `inventory.bind_values`, which converts to `datetime` for the driver
+  while the record keeps the string. The conversion lives in `inventory.py` rather
+  than in `pg.py` because a pure function is one a test can reach — `pg.py` is not
+  importable without psycopg, and putting it there would have made the fix as
+  unverifiable as the bug. 7 new tests; extractor suite 158 → 165.
+
+  **This was predicted, not observed.** It is recorded that way on purpose: the
+  reasoning was psycopg's documented type handling, not a traceback.
+
 Revision 5, 2026-08-28: review round on Task 4. Seven findings, five P1.
 
 - **P1: the installed service could not have started.**

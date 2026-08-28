@@ -517,3 +517,75 @@ class TestEveryColumnDeclaresItsArrowType(unittest.TestCase):
                 with self.subTest(name=name, column=column):
                     self.assertIn(ds.types[column],
                                   {"timestamp", "date", "int32", "float64"})
+
+
+class TestBoundValuesReachTheDriverAsDriverTypes(unittest.TestCase):
+    """The window bounds travel as ISO-8601 strings because they must be
+    JSON-serialisable -- they go into `request_hash` and into each file's
+    recorded `window`. psycopg 3 sends a `str` as PostgreSQL `text`, and
+    `timestamptz >= text` is not an operator, so the string form would fail
+    every windowed query. psycopg 2 sent untyped literals and coerced from
+    context, which is why this is a migration gotcha rather than an obvious bug.
+    """
+
+    def setUp(self):
+        self.params = {
+            "train_start": "2026-06-01T00:00:00Z",
+            "as_of_date": "2026-08-01T00:00:00Z",
+            "ref_lower": "2026-05-01T00:00:00Z",
+            "window_lower": "2026-05-31T00:00:00Z",
+        }
+
+    def test_every_timestamp_becomes_an_aware_datetime(self):
+        bound = inventory.bind_values(self.params)
+        for name, value in bound.items():
+            with self.subTest(name=name):
+                self.assertIsInstance(value, datetime.datetime)
+                self.assertIsNotNone(value.tzinfo)
+                self.assertEqual(value.utcoffset(), datetime.timedelta(0))
+
+    def test_the_instant_is_preserved_exactly(self):
+        bound = inventory.bind_values(self.params)
+        self.assertEqual(
+            bound["train_start"],
+            datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc))
+
+    def test_the_keys_are_unchanged(self):
+        self.assertEqual(set(inventory.bind_values(self.params)),
+                         set(self.params))
+
+    def test_a_non_timestamp_string_passes_through_rather_than_guessing(self):
+        # No such parameter exists today. Inventing a coercion for a
+        # hypothetical one is how a silent conversion arrives later.
+        bound = inventory.bind_values({"x": "not-a-timestamp"})
+        self.assertEqual(bound["x"], "not-a-timestamp")
+
+    def test_non_strings_pass_through(self):
+        bound = inventory.bind_values({"n": 7, "b": True, "z": None})
+        self.assertEqual(bound, {"n": 7, "b": True, "z": None})
+
+    def test_the_manifest_keeps_the_string_form(self):
+        # The two representations are deliberately different: the record must be
+        # JSON, the driver must have a datetime. A single representation cannot
+        # be both.
+        bound = inventory.bind_values(self.params)
+        self.assertIsInstance(self.params["train_start"], str)
+        self.assertNotIsInstance(bound["train_start"], str)
+
+    def test_every_dataset_binds_cleanly_from_a_validated_request(self):
+        import os as _os
+        import sys as _sys
+        here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(here), "shared"))
+        import extract_spec
+        request = extract_spec.validate(
+            {"schema": 1, "target": "wait_time",
+             "train_start": "2026-06-01T00:00:00Z",
+             "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 30},
+            now=datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc))
+        for name in inventory.DATASETS:
+            with self.subTest(name=name):
+                bound = inventory.bind_values(
+                    inventory.bindings(name, request))
+                for value in bound.values():
+                    self.assertIsInstance(value, datetime.datetime)
