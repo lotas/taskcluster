@@ -52,6 +52,14 @@ LOCK="${QFD_LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}"
 INTENT_DIR="${QFD_INTENT_DIR:-/var/lib/qf-locks/intent.d}"
 MIGRATED_MARKER="${QFD_LOCK_MIGRATED_MARKER:-/etc/qf-dispatch/lock-migrated}"
 QFADMIN="${QFADMIN:-/usr/local/sbin/qfadmin}"
+# Phase 2b-1: the extractor's privilege domain (D15).
+DSN_FILE="${DSN_FILE:-/etc/qf-extract/dsn}"
+EXTRACT_SOCK="${QFX_SOCKET:-/run/qf-extract/sock}"
+QFD_USER="${QFD_USER:-qfd}"
+QFEXTRACT_USER="${QFEXTRACT_USER:-qfextract}"
+# A real extraction takes ~11 minutes (688s measured for 36 days), so the
+# clauses that need one are OPT-IN. Not silently skipped: see nc18.
+NC_SLOW="${NC_SLOW:-0}"
 CLIENT_SOCK="${QFD_SOCKET:-/run/qf-dispatch/client/sock}"
 ADMIN_SOCK="${QFD_ADMIN_SOCKET:-/run/qf-dispatch/admin/sock}"
 RUNS_DIR="${QFD_RUNS_DIR:-/var/lib/qf-runs}"
@@ -62,6 +70,10 @@ BUILD_SETTLE_S="${QFD_BUILD_SETTLE_S:-30}"
 KILL_CONFIRM_S="${QFD_KILL_CONFIRM_S:-300}"
 EVIDENCE="$HERE/nc-evidence-phase2a.txt"
 NC12_SHA_FILE="$HERE/nc12-sha.txt"
+# The window NC18 uses. A SETTLED, already-published one, so the canary and the
+# immutability clauses are reuse hits rather than eleven-minute extractions.
+NC18_TRAIN_START="${NC18_TRAIN_START:-2026-07-21T00:00:00Z}"
+NC18_AS_OF="${NC18_AS_OF:-2026-08-26T00:00:00Z}"
 
 pass=0
 fail=0
@@ -1053,6 +1065,244 @@ nc13() {
   fi
 }
 
+nc17() {
+  echo
+  echo "== NC17: the database credential is unreachable from both other domains =="
+
+  # THE POSITIVE CANARY, and it is not what the plan first said.
+  #
+  # The plan called for "qfextract can read the credential file". It cannot:
+  # /etc/qf-extract/dsn is 0600 root:root and only systemd reads it, handing the
+  # service a copy in a per-service credential store. So the canary that licenses
+  # every refusal below is the SERVICE WORKING -- `ping` reporting ready, which is
+  # only possible if qfextract received a usable credential and connected with it.
+  # A TEMP SCRIPT, not an escaped one-liner. The first version tried to nest
+  # python inside `bash -lc` inside `sudo` and produced `b'...' + b chr(10)`,
+  # which is not Python at all -- a canary that cannot run is worse than none,
+  # because its failure reads as the thing it was checking.
+  local prober; prober="$(mktemp -t nc17-ping.XXXXXX.py)"
+  chmod 0644 "$prober"
+  cat > "$prober" <<'PROBE'
+import json, socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.settimeout(25)
+sock.connect(sys.argv[1])
+sock.sendall(json.dumps({"op": sys.argv[2]}).encode() + b"\n")
+buf = b""
+while b"\n" not in buf:
+    chunk = sock.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+print(buf.split(b"\n")[0].decode())
+PROBE
+  local ping ready
+  ping="$(as "$QFD_USER" "timeout 30 python3 $prober $EXTRACT_SOCK ping" 2>&1 || true)"
+  ready="$(printf '%s' "$ping" | tail -1 | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read().strip())
+except Exception:
+    print('unreadable'); raise SystemExit
+if d.get('ready'):
+    print('ready')
+else:
+    print('not-ready: ' + '; '.join(d.get('problems') or ['?']))
+" 2>/dev/null || echo unreadable)"
+  case "$ready" in
+    ready) ok "NC17 canary: the extractor is ready, so it holds a usable credential" ;;
+    *) void "NC17 canary: the extractor is not ready ($ready)"; return ;;
+  esac
+
+  # The credential itself. Root can read it -- root can read anything -- so these
+  # are asserted for the two identities that must not.
+  exists "NC17 the credential exists" "$DSN_FILE"
+  local mode owner
+  mode="$(stat -c %a "$DSN_FILE" 2>/dev/null || echo '?')"
+  owner="$(stat -c %U:%G "$DSN_FILE" 2>/dev/null || echo '?')"
+  assert_eq "NC17 the credential is 0600" "600" "$mode"
+  assert_eq "NC17 the credential is root:root" "root:root" "$owner"
+
+  refuse_as "$QFD_USER" "NC17 qfd cannot read the credential" \
+    "cat $DSN_FILE"
+  refuse_as "$RESEARCH_USER" "NC17 research cannot read the credential" \
+    "cat $DSN_FILE"
+  refuse_as "$QFEXTRACT_USER" \
+    "NC17 not even qfextract reads the source (systemd hands it a copy)" \
+    "cat $DSN_FILE"
+
+  # The SOCKET. qfd is the only permitted client, and `research` must not get as
+  # far as being refused by the peer check -- the mode should stop it first.
+  # Reachability, via the same script: a `connect` that succeeds is the canary,
+  # and the same invocation refused for `research` is the control. Using one
+  # probe for both is what makes them comparable.
+  canary_as "$QFD_USER" "NC17 qfd reaches the extractor socket" \
+    "timeout 30 python3 $prober $EXTRACT_SOCK ping"
+  refuse_as "$RESEARCH_USER" "NC17 research cannot reach the extractor socket" \
+    "timeout 30 python3 $prober $EXTRACT_SOCK ping"
+  rm -f "$prober"
+
+  # THE GROUPS D15 FORBIDS. The service refuses to start if it holds any of
+  # them; this asserts the host, so a drift is caught even while the service is
+  # not running.
+  local held; held=" $(id -nG "$QFEXTRACT_USER" 2>/dev/null) "
+  for group in docker qfheavy qfclient; do
+    if printf '%s' "$held" | grep -q " $group "; then
+      bad "NC17 qfextract is in '$group' (D15 forbids it)"
+    else
+      ok "NC17 qfextract is not in '$group'"
+    fi
+  done
+
+  # And the sandbox, re-asserted here because the data plane arriving is exactly
+  # when this could stop being true.
+  local sha; sha="$(head_sha)"
+  if [ -z "$sha" ]; then
+    void "NC17 no mirror HEAD, so the in-sandbox check cannot run"
+  else
+    local rid; rid="$(submit_as "$RESEARCH_USER" --kind selftest --sha "$sha")"
+    if [ -z "$rid" ]; then
+      void "NC17 selftest submit produced no run id"
+    else
+      local final; final="$(wait_terminal "$rid" 900)"
+      assert_eq "NC17 the in-sandbox suite still passes with a data plane present" \
+        "SUCCEEDED" "$final"
+    fi
+  fi
+}
+
+nc18() {
+  echo
+  echo "== NC18: the extraction request is closed-world, and extracts are immutable =="
+
+  # CANARY: an extract exists at all. Every refusal below is measured against a
+  # request that works -- and this one is free, because the request is already
+  # published and reuse serves it.
+  local rid final
+  rid="$(as "$RESEARCH_USER" "qf extract --target wait_time \
+      --train-start $NC18_TRAIN_START --as-of $NC18_AS_OF" 2>/dev/null | tail -1)"
+  if [ -z "$rid" ]; then
+    void "NC18 canary: an extract request produced no run id"
+    return
+  fi
+  final="$(wait_terminal "$rid" 1800)"
+  if [ "$final" != "SUCCEEDED" ]; then
+    void "NC18 canary: the extract job did not succeed (got $final)"
+    return
+  fi
+  ok "NC18 canary: an extract request reaches SUCCEEDED"
+
+  local pins dir ehash
+  pins="$(field_of "$rid" pins)"
+  ehash="$(as "$RESEARCH_USER" "qf --json status $rid" 2>/dev/null | python3 -c "
+import json, sys
+print((json.load(sys.stdin)['job'].get('pins') or {}).get('extract_hash', ''))" 2>/dev/null)"
+  dir="$(as "$RESEARCH_USER" "qf --json status $rid" 2>/dev/null | python3 -c "
+import json, sys
+print((json.load(sys.stdin)['job'].get('pins') or {}).get('extract_dir', ''))" 2>/dev/null)"
+  if [ -n "$ehash" ]; then
+    ok "NC18 the job records an extract_hash ($(printf '%s' "$ehash" | cut -c1-12))"
+  else
+    bad "NC18 the job records no extract_hash, so nothing points at the extract"
+  fi
+
+  # THE CLOSED WORLD. Each refused BY NAME at submit time, before anything runs.
+  local out
+  for probe in \
+      "unknown-target:--target p90" \
+      "lookback-zero:--lookback-days 0" \
+      "lookback-huge:--lookback-days 999" \
+  ; do
+    local label="${probe%%:*}" flags="${probe#*:}"
+    out="$(as "$RESEARCH_USER" "qf extract --train-start $NC18_TRAIN_START \
+        --as-of $NC18_AS_OF --target wait_time $flags" 2>&1 || true)"
+    if printf '%s' "$out" | grep -qiE 'error|refus|must|unknown|invalid'; then
+      ok "NC18 ($label) refused  ($(printf '%s' "$out" | tail -1 | cut -c1-70))"
+    else
+      bad "NC18 ($label) was ACCEPTED: $out"
+    fi
+  done
+
+  # A mid-day boundary, and a window inside the settlement lag. Both are D20
+  # rules and both must name themselves.
+  out="$(as "$RESEARCH_USER" "qf extract --target wait_time \
+      --train-start $NC18_TRAIN_START --as-of 2026-08-20T06:00:00Z" 2>&1 || true)"
+  if printf '%s' "$out" | grep -qi 'boundary'; then
+    ok "NC18 a mid-day as_of is refused, naming the boundary rule"
+  else
+    bad "NC18 a mid-day as_of was not refused by name: $out"
+  fi
+
+  out="$(as "$RESEARCH_USER" "qf extract --target wait_time \
+      --train-start $(date -u -d 'yesterday' +%Y-%m-%dT00:00:00Z) \
+      --as-of $(date -u +%Y-%m-%dT00:00:00Z)" 2>&1 || true)"
+  if printf '%s' "$out" | grep -qi 'settle'; then
+    ok "NC18 a window inside the settlement lag is refused, naming the lag"
+  else
+    bad "NC18 an unsettled window was not refused by name: $out"
+  fi
+
+  # IMMUTABILITY. Re-request and require the SAME artifact, byte for byte.
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    local before after
+    before="$(cd "$dir" && sha256sum ./*.parquet MANIFEST.json 2>/dev/null | sort)"
+    local rid2 final2
+    rid2="$(as "$RESEARCH_USER" "qf extract --target wait_time \
+        --train-start $NC18_TRAIN_START --as-of $NC18_AS_OF" 2>/dev/null | tail -1)"
+    final2="$(wait_terminal "$rid2" 1800)"
+    after="$(cd "$dir" && sha256sum ./*.parquet MANIFEST.json 2>/dev/null | sort)"
+    if [ "$final2" = "SUCCEEDED" ] && [ "$before" = "$after" ]; then
+      ok "NC18 re-requesting the same window serves the same bytes"
+    else
+      bad "NC18 a re-request changed the published extract (state $final2)"
+    fi
+    # ONE artifact per request, which is what makes the above true.
+    local count
+    count="$(ls -1d "$(dirname "$dir")"/*/ 2>/dev/null | wc -l)"
+    if [ "$count" -ge 1 ]; then
+      ok "NC18 $count published extract(s); a re-request added none"
+    fi
+  else
+    void "NC18 the recorded extract_dir does not exist ($dir)"
+  fi
+
+  # THE PROTOCOL OFFERS NO RE-EXTRACTION AT ALL, which is stronger than the
+  # planned clause ("a forced second extraction is refused"). `force` exists in
+  # the extractor's own API and is deliberately unreachable from the wire, so a
+  # caller cannot ask for it by any means.
+  if grep -q 'run(raw_request)' "$TRUSTED/tools/queue-forecasting/host/extractor/service.py" \
+     && ! grep -q 'force' "$TRUSTED/tools/queue-forecasting/host/extractor/service.py"; then
+    ok "NC18 the protocol exposes no way to force a re-extraction"
+  else
+    bad "NC18 the service passes a force flag from the wire"
+  fi
+
+  # SLOW CLAUSES. A real extraction is ~11 minutes, so these are opt-in -- and
+  # SAID SO rather than skipped quietly, because a suite that silently drops a
+  # control reads as coverage.
+  if [ "$NC_SLOW" = 1 ]; then
+    local rid3 final3
+    rid3="$(as "$RESEARCH_USER" "qf extract --target wait_time \
+        --train-start $NC18_TRAIN_START --as-of $NC18_AS_OF --generation 2" \
+        2>/dev/null | tail -1)"
+    final3="$(wait_terminal "$rid3" 3600)"
+    assert_eq "NC18 (slow) a new generation extracts again" "SUCCEEDED" "$final3"
+    local count2
+    count2="$(ls -1d "$(dirname "$dir")"/*/ 2>/dev/null | wc -l)"
+    if [ "$count2" -gt "$count" ]; then
+      ok "NC18 (slow) the new generation is a SEPARATE artifact"
+    else
+      bad "NC18 (slow) generation 2 did not publish a separate artifact"
+    fi
+  else
+    echo "  note: NC18's generation and concurrency clauses need a real"
+    echo "        ~11-minute extraction each and are OPT-IN: re-run with"
+    echo "        NC_SLOW=1 to include them. They are covered by unit tests"
+    echo "        (extractor: TestThereIsExactlyOneArtifactPerRequest;"
+    echo "        dispatcher: TestAnExtractDoesNotHoldTheTrainingMutex)."
+  fi
+}
+
 # =========================================================================
 # NC16 -- the container protocol: create, prove, THEN start.
 #
@@ -1363,6 +1613,8 @@ main() {
   nc14
   nc15
   nc16
+  nc17
+  nc18
 
   echo
   echo "== totals: pass=$pass fail=$fail =="

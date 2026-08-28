@@ -1328,7 +1328,43 @@ uses and which would break if its surface shrank. Deliberately *not* done
 unilaterally: D4 names `forecast_experiment` as the extractor's role, so changing
 it is a design decision, not an implementation detail.
 
-### Task 7: NC17 and NC18
+### Task 7: NC17 and NC18 — **WRITTEN, not yet run**
+
+Added to `nc-suite-phase2.sh` 2026-08-28 and wired into `main`. Suites: shared
+61, extractor 184, dispatcher 610, unit-drift 8. **Not yet executed against the
+host**, which is the remaining step.
+
+Three planned clauses could not be written as planned, and each for a reason
+worth recording rather than working around:
+
+1. **The canary is not "qfextract can read the credential".** It cannot:
+   `/etc/qf-extract/dsn` is `0600 root:root` and only systemd reads it, handing
+   the service a copy. A canary asserting the impossible would void every
+   refusal beneath it. The canary is the SERVICE WORKING — `ping` reporting
+   `ready: true`, which is only possible if qfextract received a usable
+   credential and connected with it. It gates: a not-ready extractor returns
+   before any refusal is scored.
+2. **"A forced second extraction is refused" cannot be triggered**, because
+   `force` is deliberately unreachable from the wire — `service.py` calls
+   `run(raw_request)` with no flag. So the clause asserts the stronger property
+   instead: **the protocol exposes no way to request a re-extraction at all.**
+3. **The generation and concurrency clauses need a real ~11-minute extraction
+   each**, so they are opt-in behind `NC_SLOW=1` — and the suite PRINTS that they
+   were omitted and where they are covered instead. No silent caps: a suite that
+   drops a control quietly reads as coverage.
+
+NC18's canary and immutability clauses use an **already-published window**, so
+they are reuse hits rather than eleven-minute extractions. An eleven-minute
+canary is a canary nobody runs.
+
+One defect in my own clause, found before running it: the ping probe nested
+python inside `bash -lc` inside `sudo` and produced `b'...' + b chr(10)`, which is
+not Python. **A canary that cannot run is worse than none, because its failure
+reads as the thing it was checking.** It is now a temp script, verified to
+compile and to round-trip against a fake server, with a test that compiles the
+embedded source.
+
+### Task 7 (as planned)
 
 Extends `host/nc-suite-phase2.sh`, using the instrument the 2a runs earned:
 `state_of` that can say `UNREADABLE`, canaries that gate, `never_concurrent`-style

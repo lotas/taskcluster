@@ -1734,3 +1734,88 @@ class TestARefreshMovesUnitsWithTheCode(unittest.TestCase):
                            timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("unit-drift: pass=8 fail=0", p.stdout)
+
+
+class TestNc17AndNc18AreWiredAndHonest(unittest.TestCase):
+    """The suite cannot be run from here -- it needs the host -- so what is
+    checked is that the clauses exist, that they are wired into `main`, and that
+    the two habits this project keeps having to relearn are present: a positive
+    canary that gates, and no silently-dropped control."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+
+    def _clause(self, name):
+        body = self.suite[self.suite.index(f"{name}() {{"):]
+        return body[:body.index("\n}\n")]
+
+    def test_both_clauses_are_called_from_main(self):
+        main = self.suite[self.suite.index("main() {"):]
+        for name in ("nc17", "nc18"):
+            with self.subTest(clause=name):
+                # re.M, or `^` anchors to the start of the whole string and the
+                # test fails on a correctly wired suite.
+                self.assertRegex(main, re.compile(rf"^\s+{name}$", re.M))
+
+    def test_nc17_gates_on_its_canary(self):
+        # A canary that reports without gating is decoration -- the lesson from
+        # the 49/24 run, where three clauses printed `ok` having observed
+        # nothing.
+        body = self._clause("nc17")
+        canary = body[body.index("NC17 canary"):]
+        self.assertIn("return", canary[:600])
+
+    def test_nc17_canary_is_the_service_working_not_a_file_read(self):
+        # The plan called for "qfextract can read the credential file". It
+        # cannot: the source is 0600 root:root and systemd hands the service a
+        # copy. A canary asserting the impossible would void every refusal.
+        body = self._clause("nc17")
+        self.assertIn("ready", body)
+        self.assertNotIn('canary_as "$QFEXTRACT_USER"', body)
+
+    def test_nc17_refuses_for_all_three_identities(self):
+        body = self._clause("nc17")
+        for user in ("$QFD_USER", "$RESEARCH_USER", "$QFEXTRACT_USER"):
+            with self.subTest(user=user):
+                self.assertIn(user, body)
+
+    def test_nc17_asserts_the_groups_d15_forbids(self):
+        body = self._clause("nc17")
+        for group in ("docker", "qfheavy", "qfclient"):
+            with self.subTest(group=group):
+                self.assertIn(group, body)
+
+    def test_nc18_uses_a_published_window_so_the_canary_is_cheap(self):
+        # An 11-minute canary is a canary nobody runs.
+        self.assertIn("NC18_TRAIN_START", self.suite)
+        self.assertIn("already-published", self.suite)
+
+    def test_nc18_asserts_immutability_by_digest(self):
+        body = self._clause("nc18")
+        self.assertIn("sha256sum", body)
+        self.assertIn("serves the same bytes", body)
+
+    def test_nc18_asserts_the_protocol_cannot_force_a_re_extraction(self):
+        # Stronger than the planned clause: `force` exists in the extractor's own
+        # API and is deliberately unreachable from the wire.
+        body = self._clause("nc18")
+        self.assertIn("no way to force a re-extraction", body)
+
+    def test_the_slow_clauses_are_opt_in_and_say_so(self):
+        # NO SILENT CAPS. A suite that drops a control quietly reads as coverage.
+        body = self._clause("nc18")
+        self.assertIn("NC_SLOW", body)
+        self.assertIn("OPT-IN", body)
+        self.assertIn("covered by unit tests", body)
+
+    def test_the_probe_script_is_valid_python(self):
+        # It was not: the first version nested python inside `bash -lc` inside
+        # `sudo` and produced `b'...' + b chr(10)`. A canary that cannot run is
+        # worse than none, because its failure reads as the thing it checked.
+        marker = "cat > \"$prober\" <<'PROBE'\n"
+        body = self.suite[self.suite.index(marker) + len(marker):]
+        body = body[:body.index("\nPROBE\n")].replace("\\\\n", "\\n")
+        compile(body, "<probe>", "exec")
