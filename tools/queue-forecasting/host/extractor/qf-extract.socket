@@ -1,0 +1,35 @@
+[Unit]
+Description=Socket for the queue-forecasting trusted extractor
+# Documentation is the design, not a man page: this socket IS the D15 boundary.
+Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/auto-research-phase2b-plan.md
+
+[Socket]
+ListenStream=/run/qf-extract/sock
+# SOCKET-ACTIVATED, which is the point rather than a convenience: the socket
+# exists whether or not the service is running, so the dispatcher never has to
+# ask "is the extractor up yet". 2a answered that question with a `wait_ready`
+# poll loop; here there is no question to answer.
+Accept=no
+
+# 0660 root:qfd. Three things have to be true at once and each is load-bearing:
+#
+#   * qfd can connect. It is the only client.
+#   * `research` cannot connect AT ALL -- it is not in qfd's group, so it does
+#     not get as far as being refused. The refusal in code (SO_PEERCRED) is the
+#     control; this is the layer beneath it.
+#   * `qfextract` does NOT need to be in qfd's group to own the socket, and is
+#     not put in it. Ownership of a socket is not membership of a group (2a
+#     revision 9 learned the inverse of this the hard way: chowning a socket
+#     does not grant traversal of its directory).
+SocketUser=root
+SocketGroup=qfd
+SocketMode=0660
+
+# 0755 on the runtime directory: TRAVERSABLE. 2a shipped 0750 qfd:qfd here once
+# and made the entire control plane unreachable, because chowning a socket does
+# nothing about traversing the directory that holds it.
+RuntimeDirectory=qf-extract
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target

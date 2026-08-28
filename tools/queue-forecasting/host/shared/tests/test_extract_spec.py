@@ -13,7 +13,6 @@ import datetime
 import unittest
 
 import extract_spec
-import spec
 
 
 UTC = datetime.timezone.utc
@@ -56,7 +55,7 @@ class TestTheClosedWorldIsClosed(unittest.TestCase):
         # An ignored key is how `filters` arrives one day and nobody notices:
         # the request would validate, the extract would be narrowed, and the
         # audit record would show a request that never ran.
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(filters=["r.priority_at_pending = 'high'"]))
         self.assertIn("filters", str(cm.exception))
 
@@ -64,20 +63,20 @@ class TestTheClosedWorldIsClosed(unittest.TestCase):
         for key in ("schema", "target", "train_start", "as_of_date",
                     "lookback_days"):
             with self.subTest(key=key):
-                with self.assertRaises(spec.SpecError) as cm:
+                with self.assertRaises(extract_spec.ExtractSpecError) as cm:
                     validate(a_request(**{key: extract_spec.OMIT}))
                 self.assertIn(key, str(cm.exception))
 
     def test_a_wrong_schema_is_refused(self):
         for bad in (0, 2, "1", None, True):
             with self.subTest(schema=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(schema=bad))
 
     def test_the_request_must_be_an_object(self):
         for bad in ([], "x", 3, None):
             with self.subTest(raw=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(bad)
 
 
@@ -97,7 +96,7 @@ class TestTheTargetIsAnEnumNotAColumnName(unittest.TestCase):
     def test_an_unknown_target_is_refused_by_name(self):
         # By name and with the allowed set, because "invalid target" sends the
         # caller to the source and a list sends them to the fix.
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(target="p90"))
         msg = str(cm.exception)
         self.assertIn("p90", msg)
@@ -109,18 +108,18 @@ class TestTheTargetIsAnEnumNotAColumnName(unittest.TestCase):
         # calls it. It must fail rather than work by coincidence.
         for bad in ("wait_duration_s", "run_duration_s", "y"):
             with self.subTest(target=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(target=bad))
 
     def test_the_target_column_cannot_be_supplied_directly(self):
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(target_column="wait_duration_s"))
         self.assertIn("target_column", str(cm.exception))
 
 
 class TestTimestampsAreUtcDayBoundaries(unittest.TestCase):
     def test_a_naive_timestamp_is_refused(self):
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(as_of_date="2026-08-01T00:00:00"))
         self.assertIn("UTC", str(cm.exception))
 
@@ -129,39 +128,39 @@ class TestTimestampsAreUtcDayBoundaries(unittest.TestCase):
         # day boundaries depend on where the caller was sitting.
         for bad in ("2026-08-01T00:00:00+02:00", "2026-08-01T00:00:00-07:00"):
             with self.subTest(ts=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(as_of_date=bad))
 
     def test_a_mid_day_boundary_is_refused(self):
         # D20: `as_of_date` must be a completed UTC day boundary. The rest of the
         # system speaks in days -- `daily_health` is keyed by `sample_date` --
         # so a window ending at 13:47 is one nothing else can describe.
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(as_of_date="2026-08-01T13:47:00Z"))
         self.assertIn("boundary", str(cm.exception))
 
     def test_train_start_is_held_to_the_same_rule(self):
-        with self.assertRaises(spec.SpecError):
+        with self.assertRaises(extract_spec.ExtractSpecError):
             validate(a_request(train_start="2026-06-01T06:00:00Z"))
 
     def test_a_nonsense_date_is_refused(self):
         for bad in ("2026-13-01T00:00:00Z", "2026-02-30T00:00:00Z",
                     "not-a-date", "", "20260801T000000Z"):
             with self.subTest(ts=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(as_of_date=bad))
 
     def test_a_non_string_timestamp_is_refused(self):
         for bad in (0, 1786000000, None, True, ["2026-08-01T00:00:00Z"]):
             with self.subTest(ts=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(as_of_date=bad))
 
     def test_an_empty_or_inverted_window_is_refused(self):
         for start, end in (("2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z"),
                            ("2026-08-02T00:00:00Z", "2026-08-01T00:00:00Z")):
             with self.subTest(start=start):
-                with self.assertRaises(spec.SpecError) as cm:
+                with self.assertRaises(extract_spec.ExtractSpecError) as cm:
                     validate(a_request(train_start=start, as_of_date=end))
                 self.assertIn("train_start", str(cm.exception))
 
@@ -171,14 +170,14 @@ class TestTheSettlementLagIsTrustedConfigNotARequestField(unittest.TestCase):
     completed-boundary rule would buy nothing."""
 
     def test_it_cannot_be_supplied_in_the_request(self):
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(settlement_lag_s=0))
         self.assertIn("settlement_lag_s", str(cm.exception))
 
     def test_an_as_of_date_inside_the_lag_is_refused(self):
         # The window ends at 2026-08-01T00:00Z; with a 48h lag it is not
         # extractable until 2026-08-03T00:00Z.
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(now=datetime.datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
                      lag=48 * 3600)
         msg = str(cm.exception)
@@ -192,7 +191,7 @@ class TestTheSettlementLagIsTrustedConfigNotARequestField(unittest.TestCase):
         self.assertEqual(got["as_of_date"], "2026-08-01T00:00:00Z")
 
     def test_a_future_window_is_refused_whatever_the_lag(self):
-        with self.assertRaises(spec.SpecError):
+        with self.assertRaises(extract_spec.ExtractSpecError):
             validate(now=datetime.datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
                      lag=0)
 
@@ -223,7 +222,7 @@ class TestLookbackDaysIsBoundedAndIsAnInt(unittest.TestCase):
     def test_out_of_range_is_refused(self):
         for bad in (0, -1, 121, 10000):
             with self.subTest(n=bad):
-                with self.assertRaises(spec.SpecError) as cm:
+                with self.assertRaises(extract_spec.ExtractSpecError) as cm:
                     validate(a_request(lookback_days=bad))
                 self.assertIn("lookback_days", str(cm.exception))
 
@@ -232,13 +231,13 @@ class TestLookbackDaysIsBoundedAndIsAnInt(unittest.TestCase):
         # `lookback_days: true` becomes a one-day lookback.
         for bad in (True, False):
             with self.subTest(n=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(lookback_days=bad))
 
     def test_a_string_or_float_is_refused(self):
         for bad in ("30", 30.0, 30.5, None):
             with self.subTest(n=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(lookback_days=bad))
 
     def test_ref_lower_is_derived_from_window_lower_not_train_start(self):
@@ -263,12 +262,12 @@ class TestLookbackDaysIsBoundedAndIsAnInt(unittest.TestCase):
                 minutes=extract_spec.WINDOW_LOOKBACK_MINUTES))
 
     def test_ref_lower_cannot_be_supplied(self):
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(ref_lower="2024-01-01T00:00:00Z"))
         self.assertIn("ref_lower", str(cm.exception))
 
     def test_window_lower_cannot_be_supplied(self):
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(window_lower="2024-01-01T00:00:00Z"))
         self.assertIn("window_lower", str(cm.exception))
 
@@ -289,20 +288,20 @@ class TestGenerationIsHowReExtractionIsDeliberate(unittest.TestCase):
     def test_zero_and_negative_are_refused(self):
         for bad in (0, -1):
             with self.subTest(n=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(generation=bad))
 
     def test_a_bool_or_string_is_refused(self):
         for bad in (True, "2", 2.0, None):
             with self.subTest(n=bad):
-                with self.assertRaises(spec.SpecError):
+                with self.assertRaises(extract_spec.ExtractSpecError):
                     validate(a_request(generation=bad))
 
     def test_it_is_bounded(self):
         # Not because a large generation is dangerous, but because an unbounded
         # integer field in a closed-world validator is an inconsistency someone
         # will later read as permission.
-        with self.assertRaises(spec.SpecError):
+        with self.assertRaises(extract_spec.ExtractSpecError):
             validate(a_request(generation=10**6))
 
 
@@ -493,13 +492,13 @@ class TestTheWindowSpanIsBounded(unittest.TestCase):
     def test_a_span_past_the_ceiling_is_refused_and_names_the_bound(self):
         start = (_parse("2026-08-01T00:00:00Z")
                  - datetime.timedelta(days=extract_spec.MAX_WINDOW_DAYS + 1))
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(train_start=start.strftime("%Y-%m-%dT%H:%M:%SZ")))
         msg = str(cm.exception)
         self.assertIn(str(extract_spec.MAX_WINDOW_DAYS), msg)
 
     def test_a_multi_year_window_is_refused(self):
-        with self.assertRaises(spec.SpecError):
+        with self.assertRaises(extract_spec.ExtractSpecError):
             validate(a_request(train_start="2021-01-01T00:00:00Z"))
 
 
@@ -513,7 +512,7 @@ class TestNoValidJsonShapeEscapesTheTypedRefusal(unittest.TestCase):
         # membership test runs before the type check.
         for bad in ([], ["wait_time"], {}, {"a": 1}, set()):
             with self.subTest(target=type(bad).__name__):
-                with self.assertRaises(spec.SpecError) as cm:
+                with self.assertRaises(extract_spec.ExtractSpecError) as cm:
                     validate(a_request(target=bad))
                 self.assertIn("target", str(cm.exception))
 
@@ -522,12 +521,12 @@ class TestNoValidJsonShapeEscapesTheTypedRefusal(unittest.TestCase):
         # escaped as a crash rather than a refusal.
         for bad in ("0001-01-01T00:00:00Z", "0002-01-01T00:00:00Z"):
             with self.subTest(train_start=bad):
-                with self.assertRaises(spec.SpecError) as cm:
+                with self.assertRaises(extract_spec.ExtractSpecError) as cm:
                     validate(a_request(train_start=bad))
                 self.assertIn("train_start", str(cm.exception))
 
     def test_a_date_before_the_data_exists_is_refused(self):
-        with self.assertRaises(spec.SpecError) as cm:
+        with self.assertRaises(extract_spec.ExtractSpecError) as cm:
             validate(a_request(train_start="2015-01-01T00:00:00Z"))
         self.assertIn("2020", str(cm.exception))
 
@@ -542,7 +541,7 @@ class TestNoValidJsonShapeEscapesTheTypedRefusal(unittest.TestCase):
                 with self.subTest(field=field, shape=repr(shape)):
                     try:
                         validate(a_request(**{field: shape}))
-                    except spec.SpecError:
+                    except extract_spec.ExtractSpecError:
                         pass
                     except Exception as e:            # noqa: BLE001
                         self.fail(f"{field}={shape!r} raised"

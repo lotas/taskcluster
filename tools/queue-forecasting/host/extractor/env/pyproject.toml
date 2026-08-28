@@ -1,0 +1,26 @@
+# The extractor's HOST environment. Task 4.
+#
+# WHY THIS EXISTS, AND WHY MY EARLIER CLAIM THAT IT DID NOT WAS WRONG. Plan
+# revision 1 said the extractor "needs no new dependency closure" because
+# `dispatcher/env/pyproject.toml` already pins pyarrow and psycopg. Those
+# manifests build the TRAINER IMAGE -- they are promoted into a container. There
+# is no host-side environment anywhere in Phase 2a, because `qfd` is stdlib-only
+# by design (D6). So `/usr/bin/python3` on the host has neither package, and
+# `ExecStart=/usr/bin/python3 service.py` would have failed at the first start.
+#
+# Two packages, and deliberately not the trainer's list: reusing that manifest
+# would pull lightgbm and pandas onto the host and couple the extractor's
+# environment to a trainer dependency bump.
+[project]
+name = "qf-extractor-env"
+version = "0"
+requires-python = ">=3.11"
+dependencies = [
+    # Ranges here, exact versions in uv.lock. The lock is what makes an install
+    # reproducible; a range in a manifest with no lock is a wish.
+    "pyarrow>=15.0.0",
+    "psycopg[binary]>=3.2.0",
+]
+
+[tool.uv]
+package = false

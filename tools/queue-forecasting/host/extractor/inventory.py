@@ -44,6 +44,29 @@ from __future__ import annotations
 #
 # So `bindings()` is a lookup with no arithmetic in it at all.
 
+# The Arrow type each column is written as, named in a closed vocabulary so this
+# module stays stdlib-only and the mapping to pyarrow lives on the other side of
+# the seam. Read off the live DDL in `init.sql` / `migrate.sql`, not guessed.
+#
+# WHY EXPLICIT TYPES AT ALL, when Arrow can infer them. Inference is per BATCH,
+# and the extract is written in batches:
+#
+#   * A nullable column that is all-NULL in the first batch infers as `null`, and
+#     the first real timestamp in a later batch then fails with
+#     ArrowNotImplementedError. `started_at` is NULL for every still-pending run,
+#     so this is not a corner case, it is Tuesday.
+#   * `tags` is JSONB and psycopg returns a dict. Inference makes a STRUCT from
+#     the keys present in the first batch, and a key that first appears later is
+#     SILENTLY DROPPED -- `{"retries": "2"}` becoming `{"kind": null}`. A dropped
+#     tag is a feature a candidate cannot see and cannot know it cannot see.
+#
+# So `tags` is `json_text`: the raw JSON as a string. It preserves arbitrary keys
+# by construction, and the trainer already parses `tags.*` features out of the
+# same JSON.
+TYPES = frozenset({"string", "int32", "float64", "timestamp", "date", "bool",
+                   "json_text"})
+
+
 class Dataset:
     """One extract file: its SQL, its bound parameters, and what it produces.
 
@@ -52,14 +75,18 @@ class Dataset:
     thing it describes cannot detect a change in it.
     """
 
-    __slots__ = ("file", "sql", "params", "columns", "watermark_columns")
+    __slots__ = ("file", "sql", "params", "columns", "watermark_columns",
+                 "types")
 
-    def __init__(self, file, sql, params, columns, watermark_columns):
+    def __init__(self, file, sql, params, columns, watermark_columns, types):
         self.file = file
         self.sql = sql
         self.params = tuple(params)
         self.columns = tuple(columns)
         self.watermark_columns = tuple(watermark_columns)
+        # column -> type name. Ordered as `columns` is, because the writer needs
+        # a schema in the file's column order.
+        self.types = dict(types)
 
 
 # --- runs -------------------------------------------------------------------
@@ -218,6 +245,17 @@ DATASETS = {
             "max_run_time_s", "repo_family", "tags",
         ),
         watermark_columns=("pending_at", "resolved_at"),
+        types={
+            "task_id": "string", "run_id": "int32",
+            "pending_at": "timestamp", "started_at": "timestamp",
+            "resolved_at": "timestamp", "reason_resolved": "string",
+            "wait_duration_s": "float64", "run_duration_s": "float64",
+            "priority_at_pending": "string", "queue_pending": "int32",
+            "task_queue_id": "string", "scheduler_id": "string",
+            "metadata_name": "string", "normalized_name": "string",
+            "max_run_time_s": "int32", "repo_family": "string",
+            "tags": "json_text",
+        },
     ),
     "worker_counts": Dataset(
         file="worker_counts.parquet",
@@ -226,6 +264,11 @@ DATASETS = {
         columns=("task_queue_id", "sampled_at", "running_workers",
                  "claimed_tasks", "existing_capacity"),
         watermark_columns=("sampled_at",),
+        types={
+            "task_queue_id": "string", "sampled_at": "timestamp",
+            "running_workers": "int32", "claimed_tasks": "int32",
+            "existing_capacity": "int32",
+        },
     ),
     "worker_pools": Dataset(
         file="worker_pools.parquet",
@@ -233,6 +276,10 @@ DATASETS = {
         params=(),
         columns=("task_queue_id", "pool_kind", "provider_type"),
         watermark_columns=(),
+        types={
+            "task_queue_id": "string", "pool_kind": "string",
+            "provider_type": "string",
+        },
     ),
     "throughput_runs": Dataset(
         file="throughput_runs.parquet",
@@ -241,6 +288,11 @@ DATASETS = {
         columns=("task_queue_id", "started_at", "resolved_at",
                  "wait_duration_s", "run_duration_s"),
         watermark_columns=("resolved_at",),
+        types={
+            "task_queue_id": "string", "started_at": "timestamp",
+            "resolved_at": "timestamp", "wait_duration_s": "float64",
+            "run_duration_s": "float64",
+        },
     ),
     "qctx_runs": Dataset(
         file="qctx_runs.parquet",
@@ -250,6 +302,12 @@ DATASETS = {
                  "resolved_at", "priority_at_pending", "task_queue_id",
                  "repo_family"),
         watermark_columns=("pending_at", "resolved_at"),
+        types={
+            "task_id": "string", "run_id": "int32",
+            "pending_at": "timestamp", "started_at": "timestamp",
+            "resolved_at": "timestamp", "priority_at_pending": "string",
+            "task_queue_id": "string", "repo_family": "string",
+        },
     ),
     "daily_health": Dataset(
         file="daily_health.parquet",
@@ -263,6 +321,15 @@ DATASETS = {
             "flag_low_utilization", "flag_sampler_offline",
         ),
         watermark_columns=("sample_date",),
+        types={
+            "sample_date": "date", "is_anomalous": "bool",
+            "flag_exception_spike": "bool",
+            "flag_stuck_pending_spike": "bool",
+            "flag_wait_p99_spike": "bool", "flag_volume_anomaly": "bool",
+            "flag_low_completion": "bool", "flag_capacity_drop": "bool",
+            "flag_capacity_spike": "bool", "flag_low_utilization": "bool",
+            "flag_sampler_offline": "bool",
+        },
     ),
 }
 

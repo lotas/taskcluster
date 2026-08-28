@@ -29,8 +29,6 @@ import json
 import re
 import types
 
-import spec as spec_mod
-
 SCHEMA_VERSION = 1
 
 # The target -> column mapping, and the entire closed world of targets.
@@ -126,11 +124,18 @@ class OMIT:
     """Sentinel for tests that build a request with a field left out."""
 
 
-class ExtractSpecError(spec_mod.SpecError):
+class ExtractSpecError(ValueError):
     """An extraction request that must not be accepted.
 
-    A subclass of `SpecError` so the dispatcher's existing refusal path reports
-    it identically -- one error family, one place that turns it into a reply.
+    DELIBERATELY NOT a subclass of `spec.SpecError`, though one error family
+    would be tidier. `spec.py` lives in `dispatcher/`, and this module is
+    imported by BOTH privilege domains -- so subclassing it would make `shared`
+    depend on `dispatcher`, which is the dependency direction this directory
+    exists to forbid. A tidy hierarchy is worth less than a one-way dependency.
+
+    The cost is one line in each consumer: `qfd` catches both this and
+    `SpecError` on its refusal path (Task 5), and the extractor's service lists
+    both in `SAFE_ERRORS`.
     """
 
 

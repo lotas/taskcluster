@@ -5,6 +5,131 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 5, 2026-08-28: review round on Task 4. Seven findings, five P1.
+
+- **P1: the installed service could not have started.**
+  `ExecStart=/usr/bin/python3 service.py` — and the host python has neither
+  `pyarrow` nor `psycopg` (Phase 2a needs neither, since `qfd` is stdlib-only by
+  D6), while `extract_spec` lived in `dispatcher/` with nothing putting it on the
+  path. **The tests hid both by inserting `sys.path` themselves.** Revision 1's
+  claim that the extractor "needs no new dependency closure" was wrong: those
+  manifests build the trainer IMAGE, and there is no host environment anywhere in
+  2a. Fixed three ways: a new `host/shared/` holding `extract_spec.py` (both units
+  put it on `PYTHONPATH`; the alternative — pointing at `dispatcher/` — would make
+  `qfd.py` and `store.py` importable by the extractor for the sake of one shared
+  module); a new `env/pyproject.toml` with `pyarrow` and `psycopg` only, built by
+  the installer with `uv`; and an ExecStart naming the venv's interpreter. The
+  installer now *proves* the interpreter can import all three before declaring
+  success. **`env/uv.lock` is not in the repository** — `uv` is unavailable here —
+  and `env/README.md` says so rather than leaving it to be discovered.
+  Consequence: `shared/extract_spec.py` no longer subclasses `spec.SpecError`,
+  because that would make `shared` depend on `dispatcher`. A one-way dependency is
+  worth more than a tidy exception hierarchy; the cost is that `qfd` catches both
+  on its refusal path (Task 5).
+- **P1: streaming Parquet corrupted valid data.** The schema was inferred from the
+  first batch, which is a schema derived from an arbitrary subset. An all-NULL
+  first batch infers `null` and the first real timestamp later raises
+  `ArrowNotImplementedError` — and `started_at` is NULL for every still-pending
+  run, so that is Tuesday, not a corner case. Worse, `tags` is JSONB: inference
+  builds a STRUCT from the first batch's keys and **silently drops** keys that
+  first appear later (`{"retries": "2"}` observed becoming `{"kind": null}`). A
+  dropped tag is a feature a candidate cannot see and cannot know it cannot see.
+  Fixed with declared types in `inventory.py`, read off the live DDL — which also
+  caught that `wait_duration_s`/`run_duration_s` are `DOUBLE PRECISION` while my
+  fake used ints — and `tags` written as `json_text`, the raw JSON, which
+  preserves arbitrary keys by construction and is what the trainer already parses
+  `tags.*` out of.
+- **P1: the publication fix changed a public contract and left the docs behind.**
+  D20 still specified `<extract_hash>/` directories and D21 still mounted
+  `/extract/<extract_hash>`. Both amended: the directory is named by
+  `request_hash`, `extract_hash` is a manifest field, and resolving one to a
+  directory is a read of the manifests rather than a path join. An atomicity fix
+  that leaves half a contract behind is a fix that a later session implements
+  against the old half.
+- **P1: `discover` put the DSN in `psql`'s argv**, where any user on the host can
+  read it out of `/proc` — a setup script leaking the credential in order to
+  defend the claim that one process holds it. The live-role check moved into
+  `service.py`'s `probe_database`, which is the one process legitimately holding
+  the DSN, and `ping` now reports `ready: false` with the reason. `discover` also
+  accepted a 0600 **qfd:qfd** credential as good: mode alone is not a boundary,
+  since "owner-only" is only meaningful once you know the owner. Now requires
+  `root:root`.
+- **P1: arbitrary dependency exceptions were returned to `qfd`.** `str(e)` for
+  everything, on the reasoning that nothing in this codebase puts a DSN in an
+  exception — true of this codebase and **unenforceable about psycopg**, whose
+  connection errors quote the conninfo, to the one process that must never see
+  it. Now: our own refusal types keep their text (they were written to be read);
+  everything else returns an opaque message with an 8-hex reference that appears
+  in the journal. **An assertion about every dependency's future error text is not
+  a control.**
+- **P2: the installer was not fail-closed.** `set -Eeuo pipefail` with an ERR trap
+  naming the line, and positive confirmation that the socket is active and the
+  socket file exists — `enable --now` returning 0 is not the same as listening.
+- **P2: the gate did not check the database.** Files and local configuration only,
+  so a perfect credential and an unreachable cluster passed and failed at the
+  first extraction. `probe_database` runs at startup and its result is part of
+  `ping`'s answer, so the NC17 canary cannot pass while nothing can be extracted.
+
+Suites: shared 53, extractor 158, dispatcher 539.
+
+Revision 4, 2026-08-28: review round on Task 3. Six findings, four of them P1,
+and every one was a case of the same thing: **the fake was easier to satisfy than
+the real system.**
+
+- **P1: real timestamps crashed the watermark.** The merge kept the first value
+  native and compared later ones against `str(value)`, so a second batch raised
+  `TypeError: '>' not supported between instances of 'str' and
+  'datetime.datetime'`. psycopg returns `datetime`/`date`; the fake returned ISO
+  strings, so 44 tests passed over a crash. Fixed by comparing natively and
+  stringifying once, in `_Watermark`. **The fake now uses production types
+  throughout** -- that single divergence was the whole bug, and a fake whose
+  types are more convenient than the real thing's is a hole in the coverage, not
+  a simplification.
+- **P1: the extractor did not enforce its own boundary.** `run` took a
+  pre-validated mapping, hashed whatever it was given, and never read its
+  injected clock. So D16's independent validation and the extractor-authoritative
+  settlement lag did not exist, and a caller could supply forged `ref_lower` /
+  `window_lower` and bypass the 120-day scan ceiling. `run` now takes a RAW
+  request and calls `extract_spec.validate(..., now=self.clock(),
+  settlement_lag_s=self.settlement_lag_s)` itself. **An injected dependency
+  nothing consults is a claim nothing backs** -- the unused `clock` parameter was
+  the visible symptom and I did not read it as one.
+- **P1: publication and discoverability were two acts.** Renaming staging to
+  `<extract_hash>/` and then writing a side index left a window in which the
+  artifact existed and could not be found -- and the retry took a fresh snapshot,
+  got a different `extract_hash`, and published a SECOND artifact for the same
+  request. Fault injection reproduced exactly that. Publication is now a single
+  atomic rename into `<request_hash>/` and the index is gone: the artifact and
+  its discoverability are the same act, so there is nothing to die between.
+- **P1: the large reads were materialised several times over.** `fetchall()`,
+  then a Python list per column, then a file-sized row group. Against a 4 GiB
+  output allowance that is a resource bound nobody declared. The seam is now
+  batched end to end -- a server-side cursor with `fetchmany`, a `ParquetWriter`
+  fed batch by batch, and row counts and watermarks accumulated incrementally.
+  A test asserts the batch size changes nothing about the manifest.
+- **P2: the write canary accepted unrelated failures as proof.**
+  `except psycopg.Error: return False` treats a connection failure as "the write
+  was refused". Worse, the canary itself was wrong: `phase0-setup.sh` revokes ALL
+  on the database from PUBLIC and grants back only CONNECT, so `CREATE TEMP
+  TABLE` fails on *privileges* and TEMP is a distinct privilege in PostgreSQL's
+  GRANT model. The canary is now `UPDATE ... WHERE false`, which is harmless if
+  it succeeds and is refused by *either* control; `read_only` (25006) and
+  `insufficient_privilege` (42501) both count, and anything else aborts. Note
+  what this changed conceptually: with a SELECT-only role, **no write attempt can
+  isolate read-onlyness** -- both controls refuse everything -- so what the canary
+  actually asserts is "this role cannot write", and the grant is the stronger
+  half. When I first fixed this it had no test; reverting the check produced zero
+  failures. Now it has four.
+- **P2: the claimed serialisation determinism did not exist.** No query has an
+  `ORDER BY`, so the same row set can serialise to different bytes. The
+  guarantee is **withdrawn** rather than implemented, because nothing depends on
+  it: NC18's byte-identical reuse holds because the bytes are not regenerated,
+  and adding `ORDER BY` over a months-long window invites the external sort that
+  D23 exists to bound. The docstring now says so, so nobody re-adds the sort to
+  restore a property nothing needs.
+
+Suites: extractor 91, dispatcher 592.
+
 Revision 3, 2026-08-28: review round on Tasks 1 and 2, four findings, one of
 them a correctness bug in delivered code.
 
@@ -285,12 +410,27 @@ So reproducibility is a property of **immutability**, not of change detection:
 - **Incorporating late data requires a new `generation` or a new `as_of_date`.**
   Both change `request_hash`, so the new extract is a new artifact with a new
   `extract_hash` and a comparison cannot mix it with its predecessor by accident.
-- Publication is still `rename()` from
-  `/var/lib/qf-extracts/.staging/<request_hash>.<pid>/` to
-  `/var/lib/qf-extracts/<extract_hash>/`, with a `request_hash -> extract_hash`
-  index so reuse is a lookup rather than a scan. A partially written extract is
-  never visible under a real name — the same discipline as the nightly's marker
-  publication (D10a).
+- **The published directory is named by `request_hash`.** Extraction writes to
+  `/var/lib/qf-extracts/.staging/<request_hash>.<pid>/` and is published by ONE
+  `rename()` to `/var/lib/qf-extracts/<request_hash>/`. `extract_hash` is a field
+  of the manifest, not a path.
+
+  Revision 2 said `<extract_hash>/` plus a `request_hash -> extract_hash` index,
+  and that is two acts: a crash between them leaves the artifact published and
+  undiscoverable, and the retry takes a fresh snapshot, computes a different
+  `extract_hash`, and publishes a SECOND artifact for the same request —
+  reproduced by fault injection. Naming the directory after the request makes
+  publication and discoverability the same act, so there is nothing to die
+  between, and `rename()` onto an existing directory is itself the
+  "refused, not overwritten" rule.
+
+  So resolving an `extract_hash` to a directory is a read of the manifests, not
+  a path join. Nothing in 2b needs that: reuse is by `request_hash`, and §4.6's
+  requirement that every member of a comparison share an `extract_hash` is
+  satisfied by reading the field. 2c's evaluator gets an index if it wants one —
+  built from the manifests, and therefore derivable rather than authoritative.
+  A partially written extract is never visible under a real name, the same
+  discipline as the nightly's marker publication (D10a).
 - Retention extends `qf-runs-prune.sh`'s knobs to `/var/lib/qf-extracts` with its
   own cap. An extract is large and immutable, so the size cap matters more here
   than the age tier; and the "no silent caps" rule applies. **Pruning an extract
@@ -344,7 +484,9 @@ So 2b-1 makes it a real boundary:
 
 ### D21 — The sandbox read path (2b-2)
 
-`/extract/<extract_hash>` mounted **read-only** at `/extract`. The research
+`<extracts_dir>/<request_hash>` mounted **read-only** at `/extract` — named by
+the request, per D20's single-rename publication, with `extract_hash` read from
+`/extract/MANIFEST.json` rather than inferred from the path. The research
 worktree stays read-only at `/app/trainer` with a writable run-private directory
 over `/app/trainer/data`, because `CACHE_DIR = trainer/data/cache` is computed
 relative to the module — which is why 2b needs no path refactor inside
@@ -591,7 +733,57 @@ Tests first:
 - `daily_health` selects all nine flags plus `is_anomalous` — a subset here would
   silently narrow what a candidate can filter on
 
-### Task 3: `extractor.py` — snapshot, files, manifest
+### Task 3: `extractor.py` — snapshot, files, manifest — **DONE**
+
+Delivered 2026-08-28. `host/extractor/extractor.py` (orchestration, stdlib-only)
+plus `pg.py` and `parquet_writer.py` (the two adapters), and 44 new tests —
+extractor suite 36 → 80. Red-green verified on all four invariants: one snapshot
+per dataset instead of one for six, reuse that re-extracts in place, staging left
+behind on failure, and read-onlyness trusted rather than attempted. Each is caught.
+
+**Structure: a seam, because neither `psycopg` nor `pyarrow` is importable in the
+development environment.** All ordering rules, refusals and staging guarantees
+live in `extractor.py`, which takes a `session_factory` and a `writer` as
+arguments and is therefore fully exercised against a fake that can be made to
+misbehave on demand — a role whose read-only default was lost, a session still
+allowing parallel workers, a query that raises, a dataset that comes back empty.
+
+**`pg.py` and `parquet_writer.py` have never executed and the plan should not
+pretend otherwise.** They are flagged as untested in their own docstrings, kept
+thin enough that reading them is a reasonable substitute for running them, and
+they first run in the privileged tasks. Anything with a decision in it was pushed
+back across the seam where a test can reach it.
+
+Four things worth recording:
+
+1. **The read-only canary must run before `BEGIN`.** A failed statement aborts a
+   PostgreSQL transaction, so attempting a deliberate write *inside* the
+   extraction transaction would poison the very transaction the extract is read
+   from. Asserted by ordering, not by comment.
+2. **`CREATE TEMP TABLE` is the canary**, because it is the write whose *success*
+   is harmless: a read-only transaction refuses `CREATE`, and if the role has
+   lost its default all that exists is a temp table that dies with the
+   connection. A canary that did damage when it succeeded would be a worse
+   bargain than no canary.
+3. **The parallel-worker check reads the INHERITED value.** `begin_snapshot` also
+   issues `SET LOCAL max_parallel_workers_per_gather = 0` defensively, and if the
+   check ran after that it would be reading its own answer — a canary that cannot
+   fail. Ordering is what makes the refusal a statement about the *role*, and
+   there is now a test on that ordering specifically.
+4. **The watermark takes the max of non-null values.** A `max()` that propagated
+   a `None` — `started_at` is NULL for a still-pending run — would erase the
+   watermark for the whole column, and a missing watermark reads as "nothing was
+   extracted" rather than "some rows are still open".
+
+One test of mine had to be rewritten because it asserted nothing: it grepped
+`published_for.__doc__` for the word "watermark" to "prove" the reuse path does
+not consult one. **A comment is not a control.** Replaced with a behavioural
+test: publish, rewrite the stored manifest's watermark to something absurd, and
+require that reuse still resolves the same extract without opening a session.
+
+Original task description follows.
+
+#### Task 3 (as planned)
 
 One `REPEATABLE READ` read-only transaction; six files; manifest; publish by
 rename (D20).
@@ -612,7 +804,72 @@ rename (D20).
   when it publishes naming the `extract_hash`, and duration. 2a's lesson: a
   subsystem that only speaks when unhappy cannot be watched.
 
-### Task 4: the unit, the user, the credential
+### Task 4: the unit, the user, the credential — **DONE (unprivileged half)**
+
+Delivered 2026-08-28. `host/extractor/service.py`, `qf-extract.socket`,
+`qf-extract.service`, `host/phase2b-setup.sh`, plus Task 6's two SQL files
+(`migrate-extractor-session.sql`, `verify-role.sql`) since the setup script's
+`discover` reads the live setting they concern. 40 new tests; extractor suite
+91 → 131. Red-green verified on all four clauses that ARE the D15 boundary:
+a group-readable credential, forbidden group membership, the peer-uid check, and
+`SupplementaryGroups=docker` appearing in the unit.
+
+**The gate asserts a privilege it must NOT have**, which is the inverse of a
+normal permission check and the most important clause in the file: membership of
+`docker`, `qfheavy` or `qfclient` is a refusal to start, and the message names
+`SupplementaryGroups=`. A future operator adding one for convenience gets a
+service that will not start rather than a domain that silently went
+root-equivalent. `phase2b-setup.sh install` also *removes* those memberships
+rather than only reporting them — taking a group off a service account is safe;
+leaving it is not.
+
+**The credential rule is "no group or other bit at all", not "not readable by
+qfd".** Owner-only makes the question moot however the groups are arranged later,
+and it is checkable in one `stat`. The unit delivers it with `LoadCredential=`,
+so systemd reads the source as root and hands this process a 0400 copy — the DSN
+never passes through `qfd`, never appears in the unit, and is not in any group.
+`phase2b-setup.sh` deliberately **will not generate a credential**: one a setup
+script can generate is one in a shell history.
+
+Three places where this unit deliberately differs from `qf-dispatch.service`, all
+stated in the file so the divergence reads as a decision:
+
+- `RestrictSUIDSGID=yes` **here**, `no` there. The dispatcher needs the setgid
+  bit on each run's `out/` and the seccomp filter fails any such chmod; the
+  extractor sets no setgid bit, so the restriction is free.
+- `PrivateTmp=yes` **here**, `no` there. PostgreSQL's temp files live on the
+  server, so a private `/tmp` cannot affect D23's accounting; the dispatcher
+  keeps it off only to stop a future reader moving the training lock back to
+  `/tmp` and silently getting two private inodes and no mutex.
+- `StateDirectoryMode=0755`, not 0750. The extract is mounted into a sandbox
+  running as a different uid, and the data is task metadata rather than a secret
+  — the secret is the DSN, 0400 in another directory. 0750 would make every
+  extract unreadable by the container that exists to read it.
+
+Socket activation is load-bearing rather than tidy: the socket exists whether or
+not the service runs, so `qfd` never asks "is the extractor up yet". 2a answered
+that question with a `wait_ready` poll loop; here there is no question.
+
+`%%QFD_UID%%` is substituted at install time, and the installer refuses if any
+`%%placeholder%%` survives. A checked-in uid would be wrong on every host but
+one, and wrong in the direction of admitting the wrong client.
+
+Two of my own tests were wrong before the code was, and one of them is a
+repeat: `test_the_socket_is_not_world_writable` demanded `0600` or `0640`, which a
+correct socket cannot be (`qfd` reaches it through its group, so group rw is
+required) — the test asserted a mode that would have broken the only client it
+has. And a static scan matched the unit's own explanatory comment for the **third
+time this phase**; comment-stripping is now a shared `directives()` helper rather
+than a thing I remember to do.
+
+**Still outstanding for Task 4:** everything privileged. `phase2b-setup.sh
+install` has not run, the units have never been loaded, `pg.py` and
+`parquet_writer.py` have still never executed, and the two SQL files have not
+touched a database. That is the next thing to do on the host.
+
+Original task description follows.
+
+#### Task 4 (as planned)
 
 `host/extractor/qf-extract.socket`, `qf-extract.service`, and `phase2b-setup.sh`.
 

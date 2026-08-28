@@ -1,0 +1,107 @@
+[Unit]
+Description=Queue-forecasting trusted extractor (the only holder of the DB credential)
+Requires=qf-extract.socket
+After=qf-extract.socket network-online.target
+
+[Service]
+Type=simple
+User=qfextract
+Group=qfextract
+
+# NO SupplementaryGroups. This is the whole of D15 in one absence, so it is
+# stated rather than left implicit:
+#
+#   docker    -> root-equivalent (D5). The extractor never runs a container.
+#   qfheavy   -> could hold the training mutex and stop the nightly, with no job
+#                involved and therefore no timeout to save it.
+#   qfclient  -> could reach the dispatcher's client socket and submit jobs.
+#
+# `service.py`'s startup gate REFUSES TO START if it finds itself in any of the
+# three, so adding one here for convenience fails loudly instead of silently
+# widening the domain. A test also greps this file for their names.
+
+# THE VENV'S python, not /usr/bin/python3, and PYTHONPATH covering `shared`.
+#
+# This line was `/usr/bin/python3 service.py` and the service could not have
+# started: the host python has neither `pyarrow` nor `psycopg` (Phase 2a needs
+# neither, because qfd is stdlib-only by D6), and `extract_spec` lives in
+# `host/shared`, which nothing put on the path. The tests hid both by inserting
+# paths themselves -- a dependency that only resolves under the test harness is
+# not a dependency that resolves.
+#
+# `env/.venv` is built by `phase2b-setup.sh install` from `env/pyproject.toml`
+# and `env/uv.lock`.
+ExecStart=/srv/queue-forecasting/tools/queue-forecasting/host/extractor/env/.venv/bin/python /srv/queue-forecasting/tools/queue-forecasting/host/extractor/service.py
+Environment=PYTHONPATH=/srv/queue-forecasting/tools/queue-forecasting/host/shared:/srv/queue-forecasting/tools/queue-forecasting/host/extractor
+# Unbuffered, or the journal shows nothing until the process exits -- and the
+# whole point of the startup gate is that its refusals are visible immediately.
+Environment=PYTHONUNBUFFERED=1
+
+# THE CREDENTIAL, and the reason this unit exists at all.
+#
+# systemd reads the source file as root and places a 0400 copy owned by
+# qfextract in $CREDENTIALS_DIRECTORY. So the DSN reaches this process without
+# passing through qfd, without appearing in this unit, and without being
+# readable by anything else -- which is what "qfd never holds the credential"
+# means operationally.
+#
+# The source is 0600 root:root. It is NOT 0640 with a group, because a group is
+# a thing someone can be added to later.
+LoadCredential=dsn:/etc/qf-extract/dsn
+
+Environment=QFX_EXTRACTS_DIR=/var/lib/qf-extracts
+Environment=QFX_SOCKET=/run/qf-extract/sock
+Environment=QFX_CLIENT_UID=%%QFD_UID%%
+# The settlement lag. THIS NUMBER IS A CHOICE, NOT A MEASUREMENT: there is no
+# lateness SLA anywhere in the repository (plan D20), and the collector runs a
+# one-minute enrichment backfill that can update a row inside an
+# already-extracted window. 48h is deliberately generous. The first real
+# extractions are what turn it into a measured value; until then it should be
+# read as "nobody has measured this yet".
+Environment=QFX_SETTLEMENT_LAG_S=172800
+# The three claims on the same filesystem (D23). The floor is the DISPATCHER's
+# and is not ours to spend; we refuse rather than eat into it.
+Environment=QFX_DISK_FLOOR_MB=20480
+Environment=QFX_PG_TEMP_MB=20480
+Environment=QFX_OUTPUT_MB=4096
+
+StateDirectory=qf-extracts
+# 0755, not 0750. The extract is mounted read-only into a sandbox that runs as a
+# different uid entirely, and the data is Taskcluster task metadata rather than a
+# secret -- the secret is the DSN, which is 0400 in a different directory. A
+# 0750 qfextract:qfextract directory here would make every extract unreadable by
+# the container that exists to read it, and StateDirectoryMode sets User:Group in
+# a way that excludes other groups (a trap 2a paid for).
+StateDirectoryMode=0755
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# YES here, unlike qf-dispatch. That unit disables it because
+# `prepare_run_dir` needs the setgid bit on each run's out/ directory and the
+# seccomp filter fails any chmod carrying S_ISGID. The extractor sets no setgid
+# bit on anything, so the restriction costs nothing and is kept.
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/qf-extracts
+
+# PrivateTmp is ON, unlike qf-dispatch, and for a reason specific to this
+# service: PostgreSQL's temp files live on the SERVER, not here, so a private
+# /tmp cannot break the temp-file accounting D23 is about. qf-dispatch keeps it
+# off only to stop a future reader moving the training lock back to /tmp and
+# silently getting two private inodes and no mutex; this unit holds no lock that
+# anything else shares.
+PrivateTmp=yes
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

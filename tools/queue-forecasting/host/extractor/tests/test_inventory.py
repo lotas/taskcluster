@@ -408,7 +408,7 @@ class TestTheInventoryAndTheValidatorCannotDrift(unittest.TestCase):
         import os
         import sys
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        sys.path.insert(0, os.path.join(os.path.dirname(here), "dispatcher"))
+        sys.path.insert(0, os.path.join(os.path.dirname(here), "shared"))
         import extract_spec
         cls.extract_spec = extract_spec
         cls.request = extract_spec.validate(
@@ -443,3 +443,77 @@ class TestTheInventoryAndTheValidatorCannotDrift(unittest.TestCase):
         self.assertLess(r["ref_lower"], r["window_lower"])
         self.assertLess(r["window_lower"], r["train_start"])
         self.assertLess(r["train_start"], r["as_of_date"])
+
+
+class TestEveryColumnDeclaresItsArrowType(unittest.TestCase):
+    """Inference is per BATCH and the extract is written in batches, so a schema
+    inferred from the first batch is a schema derived from an arbitrary subset:
+
+      * an all-NULL first batch infers `null`, and the first real timestamp in a
+        later batch fails with ArrowNotImplementedError. `started_at` is NULL for
+        every still-pending run, so that is not a corner case.
+      * `tags` is JSONB; inference builds a STRUCT from the keys present in the
+        first batch and SILENTLY DROPS keys that first appear later --
+        `{"retries": "2"}` observed becoming `{"kind": null}`.
+
+    Hence declared types, read off the live DDL rather than guessed."""
+
+    def test_every_column_has_a_type(self):
+        for name, ds in inventory.DATASETS.items():
+            with self.subTest(name=name):
+                self.assertEqual(set(ds.types), set(ds.columns))
+
+    def test_every_declared_type_is_in_the_closed_vocabulary(self):
+        for name, ds in inventory.DATASETS.items():
+            for column, type_name in ds.types.items():
+                with self.subTest(name=name, column=column):
+                    self.assertIn(type_name, inventory.TYPES)
+
+    def test_tags_is_json_text_not_a_struct(self):
+        # The representation that preserves arbitrary keys. The trainer already
+        # parses `tags.*` features out of this same JSON.
+        self.assertEqual(inventory.DATASETS["runs"].types["tags"], "json_text")
+
+    def test_the_frozen_row_identity_types_are_honoured(self):
+        # Design section 4.6 freezes `task_id` string and `run_id` int32, and the
+        # evaluator's row key depends on them.
+        for name in ("runs", "qctx_runs"):
+            with self.subTest(name=name):
+                self.assertEqual(inventory.DATASETS[name].types["task_id"],
+                                 "string")
+                self.assertEqual(inventory.DATASETS[name].types["run_id"],
+                                 "int32")
+
+    def test_the_durations_are_float64_because_the_column_is_double(self):
+        # `wait_duration_s DOUBLE PRECISION` in init.sql. Declaring int32 would
+        # truncate every fractional second, silently.
+        for name in ("runs", "throughput_runs"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    inventory.DATASETS[name].types["wait_duration_s"],
+                    "float64")
+
+    def test_every_timestamp_column_is_declared_as_one(self):
+        # A timestamp declared `string` would still write, and every downstream
+        # comparison would then be lexical.
+        for name, ds in inventory.DATASETS.items():
+            for column in ds.columns:
+                if column.endswith("_at"):
+                    with self.subTest(name=name, column=column):
+                        self.assertEqual(ds.types[column], "timestamp")
+
+    def test_every_flag_is_a_bool(self):
+        ds = inventory.DATASETS["daily_health"]
+        for column in ds.columns:
+            if column.startswith("flag_") or column == "is_anomalous":
+                with self.subTest(column=column):
+                    self.assertEqual(ds.types[column], "bool")
+
+    def test_the_watermark_columns_are_orderable_types(self):
+        # The watermark takes a maximum, so a `json_text` or `bool` watermark
+        # column would be meaningless even though it would not crash.
+        for name, ds in inventory.DATASETS.items():
+            for column in ds.watermark_columns:
+                with self.subTest(name=name, column=column):
+                    self.assertIn(ds.types[column],
+                                  {"timestamp", "date", "int32", "float64"})
