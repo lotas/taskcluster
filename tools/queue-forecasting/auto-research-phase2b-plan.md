@@ -5,6 +5,49 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 7, 2026-08-28: the service met a real systemd and the startup gate was
+wrong about it. Two defects, both mine, both found by running it:
+
+- **The credential check refused a correctly configured host.** It asserted "mode
+  0600 or stricter, owned by us". `LoadCredential=` does not produce that: systemd
+  mounts the credential directory as a root-owned ramfs and writes the file
+  **`0440 root:<service group>`**, so the service reads it through its GROUP and
+  root stays the owner. The gate reported two precondition failures on a host
+  configured exactly right.
+
+  **A fail-closed check that fails on the good case is worse than no check**: it
+  blocks the working configuration and it teaches whoever is debugging it to
+  loosen the gate. The rule is now what it should always have been — *nothing
+  outside this service may read it*: no `other` bits at all; if group bits are
+  set, the group must be our own; owner must be root or us. That accepts what
+  systemd produces and still refuses `0440 root:qfd`, which a mode-only check
+  would have passed while handing the DSN to the one process D15 excludes.
+
+  The mistake underneath was in the FIXTURE: it created the credential as the
+  test user at 0600 — the development path — so the production arrangement was
+  never exercised. **Fourth time this phase that a fake has been shaped more
+  conveniently than the real thing** (ISO strings for datetimes, ints for
+  doubles, first-batch schema inference, and now this). The positive case is now
+  the first test in the class.
+
+- **Exiting non-zero at startup is a HANG, not a refusal.** With socket
+  activation systemd accepts the client's connection, starts the service, the
+  service exits 2, and the client blocks on `recv` for ever while
+  `Restart=on-failure` loops — observed at restart counter 15, with a `ping` that
+  had to be interrupted by hand.
+
+  "Refuses to start" and "fail-closed" are not the same thing. Nothing can be
+  extracted either way, because every op refuses while `problems` is non-empty;
+  the difference is that the caller is now TOLD. Same lesson as 2a's "the
+  dispatcher closed the connection without replying". `main()` now serves
+  refusals instead of returning 2, and a test asserts `return 2` is gone from it.
+
+  The cost, stated in the code: `systemctl status` reads green on a misconfigured
+  host. The journal carries ERROR lines and `ping` reports `ready: false` with the
+  reasons, which is where someone debugging this will be looking.
+
+Suites: shared 53, extractor 170, dispatcher 539.
+
 Revision 6, 2026-08-28: `phase2b-setup.sh install` succeeded on the host —
 `qfextract` uid 997 in none of the forbidden groups, socket `660 root:qfd`,
 credential `600 root:root`, venv importing all three modules. Two follow-ups, one

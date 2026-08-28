@@ -90,35 +90,60 @@ class TestAGoodHostPasses(GateCase):
         self.assertEqual(self.problems(), [])
 
 
-class TestTheCredentialIsOwnerOnly(GateCase):
-    """The filesystem is what enforces D15, not a comment. If the DSN file has
-    any group or other permission bit, someone other than the extractor can read
-    it -- and the whole reason this is a separate privilege domain is that `qfd`
-    cannot."""
+class TestTheCredentialIsReadableOnlyByThisService(GateCase):
+    """The rule is "nothing outside this service can read it", NOT "mode 0600
+    owned by us" -- which is what the first version asserted, and which
+    `LoadCredential=` does not produce.
 
-    def test_a_group_readable_credential_is_refused(self):
-        dsn = os.path.join(self.tmp, "dsn")
-        a_config(self.tmp)
-        os.chmod(dsn, 0o640)
-        problems = self.problems()
-        self.assertTrue(any("0640" in p or "group" in p.lower()
-                            for p in problems), problems)
+    systemd mounts the credential directory as a root-owned ramfs and writes the
+    file **0440 root:<service group>**: the service reads it through its group
+    and root stays the owner. The gate reported two precondition failures on a
+    correctly configured host and the service crash-looped fifteen times.
 
-    def test_a_world_readable_credential_is_refused(self):
-        a_config(self.tmp)
-        os.chmod(os.path.join(self.tmp, "dsn"), 0o644)
-        self.assertTrue(self.problems())
+    The mistake underneath was in the FIXTURE: it created the credential as the
+    test user at 0600, which is the development path, so the production
+    arrangement was never exercised. Fourth time this phase that a fake has been
+    shaped more conveniently than the real thing.
+    """
 
-    def test_the_message_names_the_file_and_the_required_mode(self):
-        a_config(self.tmp)
-        os.chmod(os.path.join(self.tmp, "dsn"), 0o644)
-        blob = " ".join(self.problems())
-        self.assertIn("dsn", blob)
-        self.assertIn("0600", blob)
+    def access(self, mode, uid, gid, *, my_uid=997, my_gid=997):
+        st = os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+        return service.Config._check_credential_access(
+            "/run/credentials/qf-extract.service/dsn", st,
+            uid=my_uid, gid=my_gid)
+
+    def test_the_shape_systemd_actually_produces_passes(self):
+        # THE POSITIVE CASE, and the one that was missing. 0440 root:qfextract.
+        self.assertEqual(self.access(0o440, 0, 997), [])
+
+    def test_the_development_shape_also_passes(self):
+        # 0600 owned by us, which is what a hand-made file looks like.
+        self.assertEqual(self.access(0o600, 997, 997), [])
+
+    def test_0400_root_root_passes(self):
+        # Unreadable by us in practice, but not a DISCLOSURE problem, and the
+        # read that follows will fail loudly with its own message. The gate's job
+        # is who can read it, not whether we can.
+        self.assertEqual(self.access(0o400, 0, 0), [])
+
+    def test_any_other_bit_is_refused(self):
+        for mode in (0o644, 0o604, 0o777, 0o441, 0o604):
+            with self.subTest(mode=oct(mode)):
+                problems = self.access(mode, 0, 997)
+                self.assertTrue(any("other" in p for p in problems), problems)
+
+    def test_group_readable_by_a_group_that_is_not_ours_is_refused(self):
+        # The case a mode-only check misses entirely: 0440 root:qfd would pass
+        # "no other bits" and hand the DSN to the one process D15 excludes.
+        problems = self.access(0o440, 0, 999)
+        self.assertTrue(any("group" in p for p in problems), problems)
+
+    def test_an_unexpected_owner_is_refused(self):
+        problems = self.access(0o400, 1234, 997)
+        self.assertTrue(any("owned by uid 1234" in p for p in problems),
+                        problems)
 
     def test_a_missing_credential_is_refused(self):
-        os.unlink(os.path.join(self.tmp, "dsn")) if os.path.exists(
-            os.path.join(self.tmp, "dsn")) else None
         problems = self.problems(QFX_DSN_FILE=os.path.join(self.tmp, "nope"))
         self.assertTrue(any("nope" in p for p in problems), problems)
 
@@ -130,8 +155,6 @@ class TestTheCredentialIsOwnerOnly(GateCase):
         self.assertTrue(any("empty" in p.lower() for p in self.problems()))
 
     def test_something_that_is_not_a_dsn_is_refused(self):
-        # A path, a token, or a stray log line in the credential file would
-        # otherwise surface as a connection error at the first request.
         a_config(self.tmp)
         with open(os.path.join(self.tmp, "dsn"), "w") as fh:
             fh.write("ghp_notadsn\n")
@@ -139,14 +162,11 @@ class TestTheCredentialIsOwnerOnly(GateCase):
         self.assertTrue(any("postgres" in p.lower() for p in self.problems()))
 
     def test_the_systemd_credentials_directory_wins_when_present(self):
-        # `LoadCredential=` puts the credential in $CREDENTIALS_DIRECTORY at
-        # 0400, owned by the service user. That is the production path, and it
-        # must take precedence over any environment override.
         creds = os.path.join(self.tmp, "creds")
         os.makedirs(creds)
         with open(os.path.join(creds, "dsn"), "w") as fh:
             fh.write("postgresql://x@127.0.0.1/forecasting\n")
-        os.chmod(os.path.join(creds, "dsn"), 0o400)
+        os.chmod(os.path.join(creds, "dsn"), 0o440)
         cfg = a_config(self.tmp, CREDENTIALS_DIRECTORY=creds)
         self.assertEqual(cfg.dsn_file, os.path.join(creds, "dsn"))
 
@@ -651,3 +671,38 @@ class TestUnexpectedFailuresAreOpaqueOnTheWire(ProtocolCase):
         # text through.
         self.assertNotIn(Exception, self._saved)
         self.assertNotIn(BaseException, self._saved)
+
+
+class TestAnUnreadyServiceAnswersInsteadOfHanging(unittest.TestCase):
+    """With socket activation, exiting non-zero at startup is a HANG: systemd
+    accepts the client's connection, starts the service, the service exits, and
+    the client blocks on `recv` for ever while `Restart=on-failure` loops.
+    Observed on the host at restart counter 15, with a `ping` that had to be
+    interrupted by hand.
+
+    "Refuses to start" and "fail-closed" are not the same thing. Nothing can be
+    extracted either way; this way the caller is TOLD."""
+
+    def test_main_serves_rather_than_returning_nonzero(self):
+        # Asserted on the source, because running `main()` would block. The
+        # behavioural half is covered by the Handler tests: every op refuses
+        # while `db_problems` is non-empty.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "service.py")) as fh:
+            source = fh.read()
+        body = source[source.index("def main("):]
+        code = "\n".join(l for l in body.splitlines()
+                         if not l.lstrip().startswith("#"))
+        self.assertNotIn("return 2", code,
+                         "main() exits non-zero on an unmet precondition, which"
+                         " with socket activation is a hang for the client")
+        self.assertIn("serving refusals", body)
+
+    def test_the_unready_path_still_refuses_every_op(self):
+        cfg_problems = ["the credential is unreadable"]
+        handler = service.Handler(None, extractor_factory=None,
+                                  db_problems=cfg_problems)
+        self.assertFalse(handler.ready)
+        reply = handler.handle({"op": "extract", "request": {}})
+        self.assertFalse(reply["ok"])
+        self.assertIn("unreadable", reply["error"])

@@ -163,18 +163,7 @@ class Config:
             except OSError as e:
                 problems.append(f"cannot stat the credential {path}: {e}")
             else:
-                mode = st.st_mode & 0o777
-                if mode & 0o077:
-                    problems.append(
-                        f"the credential {path} is mode {mode:04o} and must be"
-                        f" 0600 or stricter: any group or other bit means"
-                        f" something besides this service can read the DSN,"
-                        f" which is the one thing D15 exists to prevent"
-                    )
-                if st.st_uid != os.getuid():
-                    problems.append(
-                        f"the credential {path} is owned by uid {st.st_uid},"
-                        f" not by this service (uid {os.getuid()})")
+                problems.extend(self._check_credential_access(path, st))
                 try:
                     dsn = self.read_dsn()
                 except OSError as e:
@@ -217,6 +206,54 @@ class Config:
             if not isinstance(value, int) or value < 0:
                 problems.append(f"{name} is {value!r}: expected a"
                                 f" non-negative integer")
+        return problems
+
+    @staticmethod
+    def _check_credential_access(path, st, *, uid=None, gid=None):
+        """Nothing outside this service may read the credential.
+
+        THE RULE, AND WHY THE FIRST VERSION REFUSED A CORRECT HOST. It asserted
+        "mode 0600 or stricter, owned by us", which is not what
+        `LoadCredential=` produces: systemd mounts the credential directory as a
+        root-owned ramfs and writes the file **0440 root:<service group>**, so
+        the service reads it through its GROUP and root stays the owner. The gate
+        therefore reported two precondition failures on a host that was
+        configured exactly right, and the service crash-looped 15 times.
+
+        A fail-closed check that fails on the good case is worse than no check:
+        it blocks the working configuration and it teaches whoever is debugging
+        it to loosen the gate. The mistake underneath was that the test built
+        the credential as the TEST USER at 0600 -- the development path -- so the
+        production arrangement was never exercised.
+
+        What is actually required:
+
+          * NO `other` bits. Anyone-can-read is the whole failure.
+          * If group bits are set, the group must be OUR OWN primary group.
+            `qfextract`'s group is created by `useradd --system` with exactly one
+            member, so group-readable-to-our-group is readable by us alone. A
+            credential group-readable to, say, `qfd` would pass a mode check and
+            fail the point of D15 entirely.
+          * The owner must be root (systemd's ramfs) or us. Nobody else.
+        """
+        uid = os.getuid() if uid is None else uid
+        gid = os.getgid() if gid is None else gid
+        mode = st.st_mode & 0o777
+        problems = []
+        if mode & 0o007:
+            problems.append(
+                f"the credential {path} is mode {mode:04o}: it has `other`"
+                f" permission bits, so anyone on the host can read the DSN")
+        if (mode & 0o070) and st.st_gid != gid:
+            problems.append(
+                f"the credential {path} is mode {mode:04o} and group-owned by"
+                f" gid {st.st_gid}, which is not this service's group ({gid}):"
+                f" some other group can read the DSN")
+        if st.st_uid not in (0, uid):
+            problems.append(
+                f"the credential {path} is owned by uid {st.st_uid}, which is"
+                f" neither root (systemd's credential store) nor this service"
+                f" (uid {uid})")
         return problems
 
     def warnings(self):
@@ -513,12 +550,37 @@ def main(argv=None):
     problems = cfg.check_startup()
     for warning in cfg.warnings():
         log.warning("%s", warning)
+    for problem in problems:
+        log.error("startup precondition: %s", problem)
+
+    # SERVE EVEN WHEN UNREADY, AND THIS IS THE DELIBERATE PART.
+    #
+    # The first version returned 2 here. With socket activation that is a hang:
+    # systemd accepts the client's connection, starts this service, the service
+    # exits, and the client blocks on `recv` for ever while `Restart=on-failure`
+    # loops. Observed on the host at restart counter 15, with the operator
+    # having to Ctrl-C a `ping`.
+    #
+    # "Refuses to start" and "fail-closed" are not the same thing. Nothing can be
+    # extracted either way -- every op refuses while `problems` is non-empty --
+    # but this way the client is TOLD, in the reply, which is the difference
+    # between a fixable message and a hang. It is the same lesson as 2a's "the
+    # dispatcher closed the connection without replying".
+    #
+    # The cost is that `systemctl status` reads green on a misconfigured host.
+    # The journal carries ERROR lines and `ping` reports `ready: false` with the
+    # reasons, which is where an operator who is debugging this will actually be
+    # looking.
     if problems:
-        for problem in problems:
-            log.error("startup precondition: %s", problem)
-        log.error("refusing to start: %d precondition(s) unmet",
-                  len(problems))
-        return 2
+        log.error("NOT READY: %d precondition(s) unmet; serving refusals so the"
+                  " caller is told rather than left waiting", len(problems))
+        listener = Listener(cfg, Handler(cfg, extractor_factory=None,
+                                         db_problems=problems)).bind()
+        try:
+            listener.serve_forever()
+        finally:
+            listener.stop()
+        return 0
 
     # Imported HERE and nowhere above, so the gate and the protocol stay
     # testable on a machine with neither installed.
