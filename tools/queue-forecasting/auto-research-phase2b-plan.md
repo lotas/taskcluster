@@ -1671,9 +1671,72 @@ worth recording, three of which changed the plan:
      loader in `qf-research`, and it is the honest boundary of 2b-2 rather than
      an oversight in it.
 
-**2b-3.** Trusted baseline production via the Node predictor, mounted at a fixed
-name; `query` kind; `resolve_baseline_file` reduced to a boolean choice in
-`qf-research`.
+**2b-3, scoped 2026-08-29 after reading the producer.** Two decisions settled
+first, because the plan's one-line outline could not be built as written.
+
+**PROMOTE, DO NOT PRODUCE.** The baseline comes from `node src/predictor.js`
+inside `docker compose run --rm predictor` (`scripts/run_training.sh` steps 1.6
+and 2) -- so producing one on demand needs a DB credential **and** docker. No
+existing domain may have both: `qfextract` must not be in `docker` (D15's whole
+point) and `qfd` is in `docker` but must never hold the credential. Producing
+would therefore mean a fourth root-equivalent domain, which is the property D15
+exists to keep out of the data plane.
+
+The nightly already produces these files, in the **deployment domain** -- which
+already legitimately holds both docker and the database credential, because that
+is what the nightly is. So promotion reuses that domain rather than inventing a
+fourth: **no new credential, no new domain, no new docker access anywhere.**
+
+**And the store sits OUTSIDE that domain's write access**, which is the part that
+makes immutability more than a convention. If the deploy user owned
+`/var/lib/qf-baselines`, the domain that produces baselines could also rewrite
+published ones, and "immutable" would rest on nobody choosing to. The store is
+root-owned; promotion is a **mediated** write -- the deploy user invokes a
+privileged step that will only ever write the shape it validates, never an
+arbitrary file. Being able to publish through a validating step is not the same
+as being able to write to the directory.
+
+The cost is real and acceptable: a probe can only use a baseline that already
+exists -- exactly right for reproducing a past result, and for a brand-new window
+it means waiting for the nightly or running the producer by hand.
+
+**The file set is closed-world**, like the artifact allowlist and for the same
+reason: an aggregate NDJSON and per-day JSONs, named and counted, never a glob
+over whatever happened to be in the directory. A baseline directory accumulates
+per-day files over months, and "everything here" is not a description of anything.
+
+**A baseline has the same provenance problem as an extract**, and one thing an
+extract does not have. Same window, produced twice, different content -- so the
+same answer: immutable publication with a content digest. The difference is that
+`exclude_dates` (the Policy B filtered baseline) affects the percentile HISTORY
+rather than the output rows, so it is **not recoverable from the files**. It is
+declared by the promoter, and the manifest must say that it is declared rather
+than measured -- a manifest that presented a declared value as a derived one would
+be the strongest claim in the record and the weakest fact in it.
+
+Tasks:
+
+- **Task 13 — `baseline.py` and `promote-baseline.sh`.** The identity is a
+  CONTENT key: `sha256` of the canonicalised manifest, so promoting identical
+  files twice yields one artifact. The manifest DERIVES everything derivable --
+  per-file digests, the per-day dates from the filenames, the NDJSON's row count
+  and its `pending_at` range -- and declares only `exclude_dates`, marked as
+  declared. The closed-world file set is validated before anything is published.
+  One atomic rename into `/var/lib/qf-baselines/<baseline_hash>/`, the same
+  discipline as D20, and a second promotion of the same hash is a no-op rather
+  than a rewrite. Runs as root so the store stays outside the deployment domain's
+  write access; invoked by the deploy user with `sudo`.
+- **Task 14 — the mount and the pin.** `/baseline` read-only, and **read-only
+  only**, for the same reason `/extract` is: a promoted baseline is immutable and
+  a run that could write to it would change what a recorded comparison was
+  measured against. `args.baseline` is an OPTIONAL probe field -- a non-residual
+  cohort needs none -- and `baseline_hash` is pinned when present.
+- **Task 15 — `qf baselines`**, with the same client-side prefix resolution
+  `--extract` has, for the same reason: the ergonomics belong in the client and
+  the strictness at the boundary.
+- **Task 16 — NC19.** A promoted baseline is immutable; promoting the same files
+  twice is one artifact; a probe records which baseline it used; and a probe
+  naming an absent baseline is refused before anything starts.
 
 ---
 
@@ -1716,6 +1779,13 @@ name; `query` kind; `resolve_baseline_file` reduced to a boolean choice in
    retroactively, or produce one run after merging.
 
 ## 8. Deferred from 2b
+
+**The `query` kind**, explicitly as deferred FUNCTIONALITY and not as a 2b-3
+acceptance gap. It is the agent's bounded way to ask small questions of the
+database without extracting 1.4 GiB, and it is independent of cohort
+reproduction: nothing in 2b needs it, and it would add a new typed protocol and a
+new database workload to a phase whose remaining risk is elsewhere. Recorded here
+so a later reader finds a decision rather than an omission.
 
 Contracts and `contract_hash`; `eval.parquet`, `verdict.py`, the independent
 derivation, the evaluator image (all 2c); `screen`, `confirm`, `summarize`,

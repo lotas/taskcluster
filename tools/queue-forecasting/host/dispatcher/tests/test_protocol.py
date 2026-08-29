@@ -1440,6 +1440,22 @@ class TestNc16AssertsTheClassTheClassifierActuallyProduces(unittest.TestCase):
         self.assertEqual(qfd.Runner.EXIT_CLASSES.get(4), "bad_invocation")
 
 
+def code_only(text, comment="#"):
+    """`text` with comment lines removed.
+
+    SIXTH time in this phase that a static scan matched its own documentation:
+    `extract_spec`, `standin_nightly`, the unit files, the `force` word, the
+    `%%placeholder%%` keys, and now a mode glob quoted in the comment explaining
+    why it was replaced.
+
+    "Remember to strip comments" has demonstrably not stuck as a habit, so it is
+    a function. A scan over source has to decide what counts as code before it
+    decides what counts as wrong, and that decision now lives in one place.
+    """
+    return "\n".join(line for line in text.splitlines()
+                      if not line.lstrip().startswith(comment))
+
+
 class TestBothUnitsCanFindTheSharedValidator(unittest.TestCase):
     """`spec.normalize` delegates the `extract` kind to
     `host/shared/extract_spec.py`, and the extractor's service imports the same
@@ -2204,3 +2220,71 @@ class TestTheFixtureAgreesWithTheMountConstants(unittest.TestCase):
         # A fixture already pushed with the wrong path would keep failing, and
         # the failure would look like a dispatcher bug.
         self.assertIn("RE-RUN THIS", self.gen)
+
+
+class TestTheBaselinePromoterIsWiredAndItsCheckIsReal(unittest.TestCase):
+    """Task 13. The store must sit outside the deployment domain's write access,
+    or the domain that PRODUCES baselines can rewrite PUBLISHED ones and
+    "immutable" rests on nobody choosing to."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "promote-baseline.sh")) as fh:
+            self.script = fh.read()
+
+    def test_the_promoter_exists_and_is_executable(self):
+        path = os.path.join(self.host, "promote-baseline.sh")
+        self.assertTrue(os.path.isfile(path))
+        self.assertTrue(os.stat(path).st_mode & 0o111)
+
+    def test_the_write_check_is_bitwise_not_a_glob(self):
+        # The first version was `case "$mode" in *[2367])`, which matches only
+        # the LAST digit: it caught other-writable and let 0775 through.
+        self.assertIn("8#022", code_only(self.script))
+        # Against the CODE: the glob appears in the comment explaining why it was
+        # replaced, and asserting over prose would fail on the fix.
+        self.assertNotIn("*[2367]", code_only(self.script))
+
+    def test_it_refuses_a_store_it_does_not_expect_the_owner_of(self):
+        self.assertIn("QF_BASELINE_STORE_OWNER", self.script)
+        self.assertIn("outside the deployment domain's write access",
+                      self.script)
+
+    def test_publication_is_one_atomic_rename(self):
+        self.assertIn("mv -T", self.script)
+        self.assertIn(".staging", self.script)
+
+    def test_it_copies_only_the_files_the_manifest_names(self):
+        # Copying the directory wholesale would publish whatever else was in it,
+        # and the validation exists precisely to decide what belongs.
+        self.assertIn('json.load(sys.stdin)["files"]', self.script)
+
+    def test_a_second_promotion_is_a_no_op(self):
+        self.assertIn("already published", self.script)
+
+    def test_it_is_fail_closed(self):
+        self.assertIn("set -Eeuo pipefail", self.script)
+        self.assertIn("trap ", self.script)
+
+    def test_baseline_py_is_stdlib_only(self):
+        # The promoter runs it with the SYSTEM python: no venv, no dependency on
+        # the extractor's environment, so promotion works on a host where the
+        # extractor was never installed.
+        with open(os.path.join(self.host, "dispatcher", "baseline.py")) as fh:
+            source = fh.read()
+        imports = re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)",
+                             source, re.M)
+        for name in imports:
+            with self.subTest(module=name):
+                self.assertIn(name.split(".")[0],
+                              {"hashlib", "json", "os", "re", "__future__"})
+
+    def test_the_promoter_has_its_own_test_suite(self):
+        script = os.path.join(self.host, "tests", "test_promote_baseline.sh")
+        self.assertTrue(os.path.isfile(script), script)
+        self.assertTrue(os.stat(script).st_mode & 0o111)
+        p = subprocess.run([script], capture_output=True, text=True,
+                           timeout=180)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("promote-baseline: pass=17 fail=0", p.stdout)
