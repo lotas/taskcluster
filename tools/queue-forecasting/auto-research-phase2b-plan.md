@@ -1861,6 +1861,36 @@ Tasks:
 
 ## 8. Deferred from 2b
 
+### TODO — the deferred 2b verification run (deferred 2026-08-29, by decision)
+
+Held deliberately, so that iterating on suite instrumentation stopped competing
+with delivering 2c. **What is deferred is the verification, not the fixes** --
+every item below is already implemented and unit-tested; none is a known defect
+in the product.
+
+Re-run `sudo NC_SLOW=1 ./host/nc-suite-phase2.sh` at the end of the phase and
+read these four:
+
+1. **NC19 has never passed live.** Its first run voided on a defect in its own
+   canary. So 2b-3's controls are asserted only by unit tests and a hand-run of
+   the probe fixture against a synthetic baseline -- the mount, the pin, the
+   store's permissions and the edited-manifest refusal have not been exercised
+   on the host. This is the one item that is a genuine acceptance gap rather
+   than a cosmetic one.
+2. **NC15's admission-floor clause** still has not reported: two host runs were
+   pasted with the output cut off immediately before it. Its `ping resource:`
+   line now distinguishes "the control failed" from "the raised floor never
+   applied", which is what the 2026-08-28 `fail=1` could not.
+3. **NC18's generation clause**, rewritten from a directory count to the two
+   runs' `request_hash` pins. It should now pass on every re-run rather than
+   only the first per host.
+4. **`is_run_id`** replacing the run-directory guard in four NC19 clauses. The
+   instrument self-test covers it (27 clauses), but no host run has used it.
+
+Also still open, and unchanged by the above: every evidence run cites a
+**feature-branch** commit (see §7.6).
+
+
 **The `query` kind**, explicitly as deferred FUNCTIONALITY and not as a 2b-3
 acceptance gap. It is the agent's bounded way to ask small questions of the
 database without extracting 1.4 GiB, and it is independent of cohort
