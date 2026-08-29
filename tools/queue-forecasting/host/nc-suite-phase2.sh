@@ -229,7 +229,13 @@ if job is None:
 value = job.get(key, "__MISSING__")
 if value == "__MISSING__":
     sys.exit("the job has no %s field" % key)
-print(value)
+# A JSON NULL IS AN ABSENT VALUE HERE, and printing Python`s `None` for it put
+# the four-character string "None" in the middle of every result a clause then
+# pattern-matched. NC11 (a) expected `SUCCEEDED  no-go` -- state, empty class,
+# verdict -- and got `SUCCEEDED None no-go`, so a prediction set that WAS scored
+# voided the group. One place in this file already worked around it by comparing
+# against the literal "None"; this is the fix at the source.
+print("" if value is None else value)
 ' "$1"
 }
 
@@ -1065,6 +1071,45 @@ sys.exit(0 if r.get('ok') else 1)\""
 # =========================================================================
 # NC10 -- trusted paths resolve only from the trusted checkout.
 # =========================================================================
+# --- NC11's outcome vocabulary, in three testable pieces -------------------
+# WHY THESE ARE FUNCTIONS. Every clause in this group decides on one string of
+# the form "<state> <error_class> <verdict>", and matching it inline has now been
+# wrong twice: once because `is_run_id` rejected the run id the dispatcher had
+# just minted, and once because a null `error_class` rendered as "None" and no
+# pattern expected the word. Both cost a live round trip to find. As named
+# predicates they are driven off-host in test-nc-instrument.sh against the exact
+# strings the host produced.
+
+nc11_outcome_line() {  # nc11_outcome_line <state> <error_class> <verdict>
+  # NORMALISED, so a downstream pattern has one shape to know: `-` for "nothing
+  # here", whatever the transport called it.
+  local klass="${2:-}" verdict="${3:-}"
+  case "$klass" in ""|None|null) klass="-" ;; esac
+  case "$verdict" in ""|None|null) verdict="-" ;; esac
+  printf '%s %s %s' "$1" "$klass" "$verdict"
+}
+
+nc11_scored() {  # nc11_scored "<outcome>" -- a verdict was produced
+  case "$1" in
+    "SUCCEEDED - go"|"SUCCEEDED - no-go") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+nc11_refused_as() {  # nc11_refused_as "<outcome>" <error_class>
+  # FAILED with that class and NO verdict: a refusal that also recorded a verdict
+  # would be the worse of the two failures, and this is where it would show.
+  [ "$1" = "FAILED $2 -" ]
+}
+
+nc11_verdict_of() {
+  # MULTI-LINE, deliberately: every extractable helper in this file is
+  # `name() {` ... `}` on lines of its own, because the harness pulls them out
+  # with `sed -n "/^name()/,/^}/p"` and a one-liner has no closing line -- the
+  # range then runs on to the NEXT function's brace and drags its body in.
+  printf '%s' "${1##* }"
+}
+
 nc11_restore() {  # nc11_restore <scratch> <artifact> <out copy>
   # IDEMPOTENT AND SELF-DISARMING, because a RETURN trap outlives the function
   # that set it: it fires again for the caller, and a second firing must be a
@@ -1188,7 +1233,7 @@ nc11() {
       return
     fi
     st="$(wait_terminal "$r" 1200)"
-    printf '%s %s %s' "$st" "$(field_of "$r" error_class)" \
+    nc11_outcome_line "$st" "$(field_of "$r" error_class)" \
       "$(pin_of "$r" verdict)"
   }
 
@@ -1199,19 +1244,18 @@ nc11() {
   # the whole group.
   local result verdict_seen
   result="$(_nc11_eval)"
-  case "$result" in
-    "SUCCEEDED  go"|"SUCCEEDED  no-go")
-      verdict_seen="$(printf '%s' "$result" | awk '{print $3}')"
-      ok "NC11 (a) the real prediction set is scored (verdict $verdict_seen)" ;;
-    *)
-      void "NC11 (a) canary: the unmutated prediction set did not produce a
+  if nc11_scored "$result"; then
+    verdict_seen="$(nc11_verdict_of "$result")"
+    ok "NC11 (a) the real prediction set is scored (verdict $verdict_seen)"
+  else
+    void "NC11 (a) canary: the unmutated prediction set did not produce a
   verdict: $result
   The subject was $probe ($(spec_paths_of "$probe")). If that is 2b-2's
   extract_contract.py, its predictions.parquet is a 1000-row STUB with the right
   columns and an arbitrary row set -- refused by design, and not a finding. Run
   nc11_honest from nc-fixtures-phase2c.sh, which emits a scorable set."
-      return ;;
-  esac
+    return
+  fi
 
   # (b) THE JUDGED BYTES ARE THE RECORDED BYTES. Two halves, and the second is
   # the one that would have caught the original defect.
@@ -1224,11 +1268,11 @@ t = pq.read_table(sys.argv[1])
 pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
 ' "$art" || { bad "NC11 (b1) could not rewrite the artifact"; return; }
   result="$(_nc11_eval)"
-  case "$result" in
-    "FAILED evaluate_input_missing "*)
-      ok "NC11 (b1) an artifact changed since the run is refused on its digest" ;;
-    *) bad "NC11 (b1) a changed artifact was not refused on its digest: $result" ;;
-  esac
+  if nc11_refused_as "$result" evaluate_input_missing; then
+    ok "NC11 (b1) an artifact changed since the run is refused on its digest"
+  else
+    bad "NC11 (b1) a changed artifact was not refused on its digest: $result"
+  fi
   cp -p "$scratch/artifact.parquet" "$art"; chown qfd "$art" 2>/dev/null || true
 
   # (b2) Changing `out/` changes NOTHING, because `out/` is not the input. This
@@ -1242,13 +1286,13 @@ t = pq.read_table(sys.argv[1])
 pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
 ' "$out_copy" || { bad "NC11 (b2) could not rewrite out/"; return; }
     result="$(_nc11_eval)"
-    case "$result" in
-      "SUCCEEDED  $verdict_seen")
-        ok "NC11 (b2) mutating out/ does not change the verdict: it is not the input" ;;
-      *) bad "NC11 (b2) mutating out/ changed the outcome, so the relay is
+    if [ "$result" = "SUCCEEDED - $verdict_seen" ]; then
+      ok "NC11 (b2) mutating out/ does not change the verdict: it is not the input"
+    else
+      bad "NC11 (b2) mutating out/ changed the outcome, so the relay is
   reading the candidate's own output directory rather than the recorded
-  artifact: $result" ;;
-    esac
+  artifact: $result"
+    fi
     cp -p "$scratch/out.parquet" "$out_copy"
   else
     # Expected once D9 pruning has run -- and its absence is itself the point.
@@ -1301,18 +1345,17 @@ pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
   feeds its output to the real evaluator."
   else
     result="$(_nc11_eval_of "${fixture_run[nc11_honest]}")"
-    case "$result" in
-      "SUCCEEDED  go"|"SUCCEEDED  no-go")
+    if nc11_scored "$result"; then
         canary_ok=1
-        ok "NC11 (c) canary: the honest fixture's row set is scored ($result)" ;;
-      *)
+        ok "NC11 (c) canary: the honest fixture's row set is scored ($result)"
+    else
         void "NC11 (c) the HONEST fixture was REFUSED: $result. Every refusal
   below would then be measuring that rather than the property it names. Most
   likely the fixture and the contract disagree about the holdout: the scripts use
   NC11_HOLDOUT_DAYS (default 5) and PRIMARY_SLICE ('completed'), and the contract
   in the trusted checkout is authoritative for both. The evaluator's own message
-  says which:  journalctl -u qf-eval -n 40" ;;
-    esac
+  says which:  journalctl -u qf-eval -n 40"
+    fi
   fi
 
   if [ "$canary_ok" = 1 ]; then
@@ -1323,15 +1366,14 @@ pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
         continue
       fi
       result="$(_nc11_eval_of "${fixture_run[$name]}")"
-      case "$result" in
-        "FAILED row_set_rejected "*)
-          ok "NC11 (c) $name is refused as an unscorable row set" ;;
-        *)
-          bad "NC11 (c) $name was not refused as a row set: $result. The
+      if nc11_refused_as "$result" row_set_rejected; then
+        ok "NC11 (c) $name is refused as an unscorable row set"
+      else
+        bad "NC11 (c) $name was not refused as a row set: $result. The
   fixture violates exactly one part of the property and is proved to do so in
   evaluator/tests/test_nc11_fixtures.py, so a different outcome here is either
-  the host's contract or the evaluator." ;;
-      esac
+  the host's contract or the evaluator."
+      fi
     done
   fi
 

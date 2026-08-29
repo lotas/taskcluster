@@ -866,6 +866,41 @@ This completes **2c-2**.
   is a routing decision, which this programme has written down twice before --
   once for `source_unavailable` and once for `contract_not_trusted`.
 
+- **The third NC11 attempt: the honest fixture WAS scored, and the clause could
+  not read the answer.** `SUCCEEDED None no-go` -- a verdict, in the middle of a
+  void that said no verdict had been produced. `qf --json status` renders an
+  unset `error_class` as JSON `null`, `_extract` printed Python's `None` for it,
+  and clause (a) matched on `"SUCCEEDED  <verdict>"` with the class field empty.
+  One clause elsewhere in the file already worked around the same thing by
+  comparing against the literal string `"None"`, which is what a known leak with
+  no fix looks like.
+
+  Fixed at the transport (a JSON null prints as empty) AND given a vocabulary on
+  top of it, because the pattern-matching is what has now been wrong twice:
+  `nc11_outcome_line` normalises a missing class or verdict to `-`, and
+  `nc11_scored` / `nc11_refused_as` / `nc11_verdict_of` are the only things that
+  read it. Every clause in the group now decides through them.
+
+  **THE POINT OF THAT REFACTOR IS THE ROUND TRIP.** Six live attempts on this
+  group, and every failure was in the SUITE'S OWN PLUMBING rather than in the
+  system under test: a run-id shape that depended on a sha ending in a digit, a
+  flag the client does not have, a spec key that belongs to a different job kind,
+  a RETURN trap that outlives its function, and a null rendered as a word. Each
+  cost a full deploy-and-run cycle because the deciding logic only ever executed
+  on the host. As named predicates they are driven off-host against the exact
+  strings the host produced -- the harness went from 27 clauses to 61 in a day,
+  and 11 of those exist because a live run found what they now check.
+
+  Two of my own harness attempts were the same species again, which is worth
+  recording: a test that asserted the four fixture names APPEARED in the
+  discovery block (they appear in the comment explaining the skip, so deleting
+  the `continue` left it green), and an extraction that loaded five functions
+  with one multi-range `sed` -- which prints any line two ranges share TWICE, so
+  the sourced bodies were duplicated garbage and the tests failed on the code
+  under test for a defect in how they had loaded it. One sed per function now,
+  and every extractable helper is `name() {` ... `}` on its own lines, because a
+  one-liner has no closing line for the range to stop at.
+
 - **The second NC11 attempt got past staging and voided on my helper reading the
   wrong key.** No `PermissionError` this time: the evaluation reached the row-set
   check, which is the staging fix working. But the canary's subject was

@@ -84,8 +84,12 @@ as() {
                  elif [ "${SPEC_WITHOUT_ARGS:-0}" = 1 ]; then
                    spec="{\"kind\": \"probe\"}"
                  fi
+                 local extra=""
+                 if [ "${NULL_CLASS:-0}" = 1 ]; then
+                   extra=", \"error_class\": null"
+                 fi
                  echo "{\"ok\": true, \"job\": {\"state\":" \
-                      "\"${STATES[$rid]:-QUEUED}\", \"spec\": $spec}}" ;;
+                      "\"${STATES[$rid]:-QUEUED}\", \"spec\": $spec$extra}}" ;;
       esac ;;
     "qf list "*)
       # argparse's ACTUAL behaviour reproduced, flag by flag. `list` takes
@@ -127,6 +131,21 @@ for m in die refused nojob garbage; do
     HBAD "$m -> got '$got' with reason '$reason' (the pass=49 defect)"
   fi
 done
+
+# A JSON NULL IS AN EMPTY FIELD, at the transport rather than in each caller.
+# `qf --json status` renders an unset `error_class` as `null`, and printing
+# Python's `None` for it put that word in the middle of every result string a
+# clause matched on -- which voided NC11 on a prediction set that HAD been
+# scored. Every clause that compares a class by name was unaffected, which is
+# exactly why it survived a day of runs.
+MODE=good; : > "$BLIND_FILE"; STATES[r-null]=SUCCEEDED; NULL_CLASS=1
+got="$(field_of r-null error_class)"
+if [ -z "$got" ]; then
+  HOK "a null error_class reads back as empty, not as the word None"
+else
+  HBAD "field_of returned '$got' for a JSON null"
+fi
+NULL_CLASS=0
 
 MODE=good; : > "$BLIND_FILE"; STATES[r1]=RUNNING
 got="$(state_of r1)"
@@ -368,6 +387,75 @@ else
 fi
 MODE=good
 
+# ONE SED PER FUNCTION. A single script with several ranges prints any line that
+# two ranges share TWICE -- `sed` applies each `p` independently -- so the sourced
+# text came back with duplicated lines inside a function body, and `declare -F`
+# said the function existed while its body was garbage. The tests below then
+# failed on the code under test for a defect in how they had loaded it.
+for _fn in nc11_restore nc11_outcome_line nc11_scored nc11_refused_as \
+           nc11_verdict_of; do
+  # shellcheck disable=SC1090
+  source <(sed -n "/^$_fn()/,/^}/p" "$SUITE")
+  declare -F "$_fn" >/dev/null || HBAD "extraction missed $_fn()"
+done
+
+echo "== NC11 reads an outcome the way the dispatcher writes one =="
+# THE STRINGS ARE THE ONES THE HOST PRODUCED, verbatim. Two live rounds were
+# spent on this: `SUCCEEDED None no-go` -- a prediction set that WAS scored, with
+# a null error_class rendered as Python's `None` -- matched no pattern, so the
+# clause reported that no verdict had been produced and voided the group. The
+# transport is fixed (a JSON null prints as empty now) and the vocabulary is
+# normalised on top of it, so both spellings mean the same thing here.
+if declare -F nc11_outcome_line >/dev/null && declare -F nc11_scored >/dev/null; then
+  for raw in "SUCCEEDED::no-go" "SUCCEEDED:None:no-go" "SUCCEEDED:null:no-go" \
+             "SUCCEEDED::go"; do
+    IFS=: read -r st kl vd <<<"$raw"
+    line="$(nc11_outcome_line "$st" "$kl" "$vd")"
+    if nc11_scored "$line"; then
+      HOK "'$raw' -> '$line' reads as scored"
+    else
+      HBAD "'$raw' -> '$line' did NOT read as scored (the void that cost two rounds)"
+    fi
+  done
+  # And the verdict is recoverable from the line, because (b2) compares against it.
+  line="$(nc11_outcome_line SUCCEEDED None no-go)"
+  [ "$(nc11_verdict_of "$line")" = "no-go" ] \
+    && HOK "the verdict is the last field of the line" \
+    || HBAD "nc11_verdict_of returned '$(nc11_verdict_of "$line")'"
+
+  # A REFUSAL IS NOT A SCORE, and a refusal that also carried a verdict is the
+  # worse of the two failures -- so `nc11_refused_as` requires no verdict.
+  for raw in "FAILED:row_set_rejected:" "FAILED:evaluate_input_missing:" \
+             "FAILED:eval_staging_denied:" "FAILED:evaluator_internal:"; do
+    IFS=: read -r st kl vd <<<"$raw"
+    line="$(nc11_outcome_line "$st" "$kl" "$vd")"
+    if nc11_scored "$line"; then
+      HBAD "'$line' read as scored"
+    elif nc11_refused_as "$line" "$kl"; then
+      HOK "'$line' reads as refused with class $kl"
+    else
+      HBAD "'$line' did not read as refused with $kl"
+    fi
+  done
+  line="$(nc11_outcome_line FAILED row_set_rejected go)"
+  if nc11_refused_as "$line" row_set_rejected; then
+    HBAD "a refusal carrying a verdict was accepted as a clean refusal"
+  else
+    HOK "a refusal that also recorded a verdict is not accepted as one"
+  fi
+  # The classes must not be interchangeable: (b1) and (c) assert different ones.
+  line="$(nc11_outcome_line FAILED evaluate_input_missing "")"
+  nc11_refused_as "$line" row_set_rejected \
+    && HBAD "one refusal class matched another" \
+    || HOK "a refusal class is not matched by a different one"
+  # NOTSUBMITTED, which `_nc11_eval_of` emits when the submit never returned an id.
+  line="$(nc11_outcome_line NOTSUBMITTED "qf:error" "")"
+  nc11_scored "$line" && HBAD "a failed submit read as scored" \
+    || HOK "a failed submit is neither scored nor a refusal"
+else
+  HBAD "extraction missed NC11's outcome predicates"
+fi
+
 echo "== the NC11 restore fires once and is a no-op the second time =="
 # WHY THIS IS A UNIT TEST. A RETURN trap set inside a function is not scoped to
 # it: it fires when the clause returns and AGAIN when its caller returns. The
@@ -377,8 +465,6 @@ echo "== the NC11 restore fires once and is a no-op the second time =="
 # after the suite's totals -- a restore that HAD happened, reported as a failure
 # of the code that cleans up after failures. On a host, with a mutated artifact
 # in play, "did the restore run?" is not a question to answer by reading.
-# shellcheck disable=SC1090
-source <(sed -n '/^nc11_restore()/,/^}/p' "$SUITE")
 if declare -F nc11_restore >/dev/null; then
   RTMP="$(mktemp -d)"
   mkdir -p "$RTMP/scratch" "$RTMP/run"
