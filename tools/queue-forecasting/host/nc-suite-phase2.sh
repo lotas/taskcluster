@@ -254,6 +254,35 @@ field_of() {  # field_of <run_id> <field> -> the value, or UNREADABLE
   printf '%s' "$value"
 }
 
+is_run_id() {  # is_run_id <candidate>
+  # A SHAPE check, never "does its directory exist". The run directory is
+  # created by `prepare_run_dir` during execute, so between submit and the
+  # first lease there is a perfectly good QUEUED job with no directory at all.
+  # Four clauses guarded on the directory immediately after submitting, which
+  # voided NC19's canary on a working submit -- and in the unpromoted-baseline
+  # clause it printed `ok "never became a run"` for a job that HAD been created
+  # and simply had not started. A positive claim about absence, resting on a
+  # directory that does not exist yet.
+  # The SHAPE qfd actually mints (`make_run_id`):
+  #   <kind>-<YYYYmmddTHHMMSSZ>-<sha[:12]>-<seq>
+  # Matched rather than length-checked, because the values this has to reject
+  # are the client's error messages -- "qf: error: unrecognized arguments",
+  # "no dispatcher socket at ..." -- and a length floor accepts most of those
+  # once `tail -1` has trimmed them to one line.
+  case "$1" in
+    *[0-9]-[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    [a-z]*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
 pin_of() {  # pin_of <run_id> <pin key> -> the value, or empty
   # A JOB PIN, not a column. Written out once here because NC18 carried two
   # copies of the same six lines and NC19 would have made four -- and a pin
@@ -1340,12 +1369,35 @@ nc18() {
         2>/dev/null | tail -1)"
     final3="$(wait_terminal "$rid3" 3600)"
     assert_eq "NC18 (slow) a new generation extracts again" "SUCCEEDED" "$final3"
-    local count2
-    count2="$(ls -1d "$(dirname "$dir")"/*/ 2>/dev/null | wc -l)"
-    if [ "$count2" -gt "$count" ]; then
-      ok "NC18 (slow) the new generation is a SEPARATE artifact"
+
+    # SEPARATENESS, asserted on the IDENTITIES rather than on a directory count.
+    #
+    # The clause used to require the count to INCREASE, which made it valid
+    # exactly once per host: extracts are immutable and reused by request_hash
+    # (D20), so the second time this suite runs, generation 2 for this window is
+    # already published, the extraction is a reuse hit, and no directory appears.
+    # It passed on its first run and then reported a FAILURE the second time --
+    # for the reason that the reuse it exists to protect was working.
+    #
+    # And the count was never the property anyway: it would have risen for any
+    # unrelated extract published in the same interval, and it says nothing
+    # about the two artifacts being DIFFERENT. Comparing the two runs' recorded
+    # request hashes does, and it holds however many times this runs.
+    local h1 h2 d1 d2
+    h1="$(pin_of "$rid" request_hash)"
+    h2="$(pin_of "$rid3" request_hash)"
+    d1="$(pin_of "$rid" extract_dir)"
+    d2="$(pin_of "$rid3" extract_dir)"
+    if [ -z "$h1" ] || [ -z "$h2" ]; then
+      void "NC18 (slow) a generation run recorded no request_hash (gen1='$h1' gen2='$h2')"
+    elif [ "$h1" = "$h2" ]; then
+      bad "NC18 (slow) generation 2 has the SAME request hash as generation 1 ($h1): generation is not part of the identity"
+    elif [ ! -d "$d1" ] || [ ! -d "$d2" ]; then
+      bad "NC18 (slow) the two generations do not both exist on disk ($d1, $d2)"
+    elif [ "$d1" = "$d2" ]; then
+      bad "NC18 (slow) both generations resolved to one directory ($d1)"
     else
-      bad "NC18 (slow) generation 2 did not publish a separate artifact"
+      ok "NC18 (slow) generation 2 is a SEPARATE artifact, and generation 1 survives it"
     fi
   else
     echo "  note: NC18's generation and concurrency clauses need a real"
@@ -1744,7 +1796,7 @@ print(rows[0]['request_hash'] if rows else '')" 2>/dev/null)"
   rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
       --path research/experiments/baseline_contract.py --extract $ex" 2>&1 \
       | tail -1)"
-  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+  if ! is_run_id "$rid"; then
     void "NC19 canary: the no-baseline probe produced no run id: $rid"
     return
   fi
@@ -1851,7 +1903,7 @@ PYEOF
   rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
       --path research/experiments/baseline_contract.py \
       --extract $ex --baseline $full" 2>&1 | tail -1)"
-  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+  if ! is_run_id "$rid"; then
     void "NC19 (d) the probe produced no run id: $rid"
   else
     final="$(wait_terminal "$rid" 3600)"
@@ -1879,10 +1931,14 @@ PYEOF
   rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
       --path research/experiments/baseline_contract.py \
       --extract $ex --baseline $(printf 'f%.0s' $(seq 64))" 2>&1 | tail -1)"
-  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+  if ! is_run_id "$rid"; then
     # The client resolves a prefix and refuses an unknown FULL hash only at the
     # dispatcher, so an absent run id here means the client refused first --
     # which is also correct, and is what this clause is about either way.
+    #
+    # NOT "its directory is missing": that was true of every job that had not
+    # been leased yet, so this branch claimed the refusal for jobs the
+    # dispatcher had accepted and was about to run.
     ok "NC19 (f) an unpromoted baseline never became a run"
   else
     final="$(wait_terminal "$rid" 600)"
@@ -1919,7 +1975,7 @@ PYEOF
   rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
       --path research/experiments/baseline_contract.py \
       --extract $ex --baseline $full" 2>&1 | tail -1)"
-  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+  if ! is_run_id "$rid"; then
     void "NC19 (g) the edited-baseline probe produced no run id: $rid"
   else
     final="$(wait_terminal "$rid" 600)"

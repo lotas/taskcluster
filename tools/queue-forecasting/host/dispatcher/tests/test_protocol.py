@@ -5,6 +5,7 @@
 # The store, however, is real and on disk, and several of these drive it from
 # many threads at once -- a fake runner alone would hide the thread-bound
 # connection defect the DB-owner thread exists to prevent.
+import datetime
 import json
 import os
 import re
@@ -1319,7 +1320,15 @@ class TestTheNcSuiteCanTellBlindnessFromAnAnswer(unittest.TestCase):
                            timeout=300)
         self.assertEqual(p.returncode, 0,
                          f"harness failed:\n{p.stdout}\n{p.stderr}")
-        self.assertIn("harness: pass=16 fail=0", p.stdout)
+        # `fail=0` AND a floor, not an exact count -- the same correction the
+        # promoter's wrapper needed. An exact figure makes every added shell
+        # clause a two-place edit whose second place is a Python test with
+        # nothing to say about the instrument. What this must catch is a harness
+        # that stopped running or stopped asserting; a floor catches both, and
+        # 0/0 passing catches neither.
+        self.assertIn("fail=0", p.stdout)
+        count = int(re.search(r"harness: pass=(\d+)", p.stdout).group(1))
+        self.assertGreaterEqual(count, 16, p.stdout)
 
 
 class TestJsonIsAcceptedOnEitherSideOfTheSubcommand(unittest.TestCase):
@@ -1907,7 +1916,11 @@ class TestARefreshMovesUnitsWithTheCode(unittest.TestCase):
         p = subprocess.run([script], capture_output=True, text=True,
                            timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("unit-drift: pass=8 fail=0", p.stdout)
+        # A floor, not an exact count: the third instance of this pattern, so
+        # it is applied everywhere rather than where it happened to bite.
+        self.assertIn("fail=0", p.stdout)
+        count = int(re.search(r"unit-drift: pass=(\d+)", p.stdout).group(1))
+        self.assertGreaterEqual(count, 8, p.stdout)
 
 
 class TestNc17AndNc18AreWiredAndHonest(unittest.TestCase):
@@ -2943,3 +2956,112 @@ class TestFromEnvActuallyReadsTheEnvItWasGiven(unittest.TestCase):
         body = code_only(body[:body.index("        cfg.check_deadline_chain()")])
         # Exactly one: the `env if env is not None else os.environ` default.
         self.assertEqual(body.count("os.environ"), 1, body)
+
+
+class TestTheSuiteNeverGuardsOnARunDirectoryAtSubmitTime(unittest.TestCase):
+    """A submitted job is QUEUED and has NO run directory: it is created by
+    `prepare_run_dir` during execute, after the lease.
+
+    Four NC19 clauses guarded on `[ -d "$RUNS_DIR/$rid" ]` immediately after
+    submitting. On the host that voided the group's canary on a working probe --
+    the message read "produced no run id" and then printed one -- and in the
+    unpromoted-baseline clause it printed `ok "never became a run"` for a job the
+    dispatcher had accepted and was about to start. A positive claim about
+    absence, resting on a directory that does not exist yet.
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+        self.code = code_only(self.suite)
+
+    def test_no_clause_tests_for_a_run_directory_right_after_submitting(self):
+        self.assertNotIn('[ -d "$RUNS_DIR/$rid" ]', self.code)
+
+    def test_the_shape_check_exists_and_reads_no_filesystem(self):
+        body = self.code[self.code.index("is_run_id() {"):]
+        body = body[:body.index("\n}")]
+        for probe in ("-d ", "-e ", "RUNS_DIR", "ls ", "stat "):
+            self.assertNotIn(probe, body, f"is_run_id consults {probe!r}")
+
+    def test_it_matches_what_make_run_id_actually_mints(self):
+        # Grounded in the generator, not in a guessed length. The first version
+        # used an 8-character floor, which rejected nothing the suite actually
+        # has to reject: the client's one-line error messages are all longer.
+        run_id = qfd.make_run_id("probe", "9d54e39271d7" + "0" * 28, 4290,
+                                 now=1756470000)
+        self.assertRegex(run_id, r"^probe-\d{8}T\d{6}Z-[0-9a-f]{12}-4290$")
+        script = ("set -u\n"
+                  + self.code[self.code.index("is_run_id() {"):
+                              self.code.index("\n}", self.code.index(
+                                  "is_run_id() {")) + 2]
+                  + f'\nis_run_id {run_id!r}\n')
+        self.assertEqual(subprocess.run(["bash", "-c", script]).returncode, 0,
+                         run_id)
+
+    def test_it_rejects_the_client_error_that_was_being_accepted(self):
+        script_head = self.code[self.code.index("is_run_id() {"):]
+        script_head = script_head[:script_head.index("\n}") + 2]
+        for junk in ("qf: error: unrecognized arguments: --baseline",
+                     "no dispatcher socket at /run/qf-dispatch/client/sock",
+                     "submit refused"):
+            with self.subTest(junk=junk):
+                script = f"set -u\n{script_head}\nis_run_id {junk!r}\n"
+                self.assertEqual(
+                    subprocess.run(["bash", "-c", script]).returncode, 1, junk)
+
+
+class TestNc18GenerationClauseIsRerunnable(unittest.TestCase):
+    """It required the extract directory COUNT to increase, which made it valid
+    exactly once per host: extracts are immutable and reused by `request_hash`
+    (D20), so on the second run generation 2 is already published, the extraction
+    is a reuse hit, and no directory appears. It passed on its first run and then
+    reported a failure -- because the reuse it exists to protect was working.
+
+    The count was never the property either: it would rise for any unrelated
+    extract published in the same interval, and it says nothing about the two
+    artifacts being DIFFERENT.
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            suite = fh.read()
+        body = suite[suite.index("nc18() {"):]
+        self.nc18 = code_only(body[:body.index("\nnc19() {")])
+
+    def test_separateness_is_asserted_on_the_recorded_identities(self):
+        self.assertIn('pin_of "$rid" request_hash', self.nc18)
+        self.assertIn('pin_of "$rid3" request_hash', self.nc18)
+
+    def test_it_no_longer_depends_on_a_directory_count_increasing(self):
+        self.assertNotIn("count2", self.nc18)
+        self.assertNotIn('-gt "$count"', self.nc18)
+
+    def test_both_generations_are_required_to_survive(self):
+        # "different hashes" alone would pass if generation 2 had replaced
+        # generation 1, which is the failure immutability exists to prevent.
+        self.assertIn('[ ! -d "$d1" ] || [ ! -d "$d2" ]', self.nc18)
+
+    def test_a_missing_pin_is_void_rather_than_a_failed_control(self):
+        i = self.nc18.index("recorded no request_hash")
+        self.assertIn("void", self.nc18[i - 120:i])
+
+    def test_generation_really_is_part_of_the_request_identity(self):
+        # The clause's premise, checked against the validator rather than
+        # assumed: if generation were not in the hash, the clause would be
+        # asserting something the design does not provide.
+        import extract_spec
+        base = {"schema": 1,
+                "target": "wait_time", "train_start": "2026-07-21T00:00:00Z",
+                "as_of_date": "2026-08-26T00:00:00Z", "lookback_days": 30}
+        now = datetime.datetime(2026, 8, 29, tzinfo=datetime.timezone.utc)
+        one = extract_spec.validate({**base, "generation": 1}, now=now,
+                                    settlement_lag_s=48 * 3600)
+        two = extract_spec.validate({**base, "generation": 2}, now=now,
+                                    settlement_lag_s=48 * 3600)
+        self.assertNotEqual(extract_spec.request_hash(one),
+                            extract_spec.request_hash(two))

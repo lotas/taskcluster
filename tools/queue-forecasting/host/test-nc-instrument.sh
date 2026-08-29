@@ -36,6 +36,7 @@ awk '/^# A stand-in for the nightly:/{f=1} /^# NC8 -- the mutex/{f=0} f' \
   "$SUITE" >> "$BLOCK"
 for fn in state_of field_of submit_as wait_state wait_terminal \
           require_state_for never_concurrent terminal_state note_blind \
+          is_run_id \
           standin_nightly standin_acquired wait_standin_acquired; do
   grep -q "^$fn()" "$BLOCK" || { echo "extraction missed $fn()" >&2; exit 2; }
 done
@@ -218,6 +219,40 @@ else
 fi
 kill "$blocker" 2>/dev/null; wait "$blocker" 2>/dev/null
 rm -f "$STANDIN_ACQUIRED" "$SLOCK"
+
+# --- is_run_id: a SHAPE check, never "does its directory exist" -----------
+#
+# The guard it replaced was `[ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]`, run
+# immediately after submit. A submitted job is QUEUED and has no run directory
+# until `prepare_run_dir` runs during execute, so that guard fired on every
+# healthy submit: NC19's canary voided on a working probe, and the
+# unpromoted-baseline clause printed `ok "never became a run"` for a job the
+# dispatcher had accepted and was about to start.
+for good in "probe-20260829T123756Z-9d54e39271d7-4290" \
+            "extract-20260829T000000Z-abcdef012345-1" \
+            "test-20260829T235959Z-000000000000-999"; do
+  if is_run_id "$good"; then
+    HOK "is_run_id accepts $good"
+  else
+    HBAD "is_run_id rejected a real run id: $good"
+  fi
+done
+for bad in "" "short" "abcdefgh" "qf: error: unrecognized arguments: --baseline" \
+           "no dispatcher socket at /run/qf-dispatch/client/sock" \
+           "../../etc/passwd" "probe 20260829"; do
+  if is_run_id "$bad"; then
+    HBAD "is_run_id accepted something that is not a run id: '$bad'"
+  else
+    HOK "is_run_id rejects '$(printf '%.30s' "$bad")'"
+  fi
+done
+
+# The property that matters: acceptance must not depend on a directory.
+if is_run_id "probe-20260829T123756Z-9d54e39271d7-4290"; then
+  HOK "a run id with no directory anywhere is still a run id"
+else
+  HBAD "is_run_id consulted the filesystem"
+fi
 
 echo
 echo "harness: pass=$hpass fail=$hfail"

@@ -1792,6 +1792,18 @@ Tasks:
   next, and asserts `present=` against what it requested. A fixture that assumed
   either answer would pass for the wrong reason on half its runs.
 
+  **First host run (2026-08-29) voided at the canary, on a defect in the canary
+  itself.** The guard was `[ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]`, run
+  immediately after submit -- but a submitted job is QUEUED and has no run
+  directory until `prepare_run_dir` runs during execute. So it fired on a
+  working probe, and printed "produced no run id" followed by the run id. Four
+  clauses carried it, and in the unpromoted-baseline clause it was a FALSE PASS:
+  `ok "an unpromoted baseline never became a run"` for a job the dispatcher had
+  accepted and was about to start -- a positive claim about absence resting on a
+  directory that does not exist yet. Replaced by `is_run_id`, a shape check
+  matching what `make_run_id` mints, driven by 11 clauses in the instrument
+  self-test including the exact id the host rejected.
+
   The fixture also carries a SECOND implementation of the manifest's canonical
   form, deliberately: agent-authored code inside the sandbox cannot import the
   trusted module, and this is the one place a content key is checked against the
@@ -1823,7 +1835,15 @@ Tasks:
    the watermark is provenance, so a moved watermark is not a cache miss -- it is
    nothing at all, and the artifact stays. The equivalent live assertion is that
    bumping `generation` publishes a separate artifact, which is NC18's `NC_SLOW=1`
-   clause and **has not been run**.
+   clause. **Run 2026-08-29, and it failed -- for the reason the property holds.**
+   The clause required the extract directory COUNT to increase, which made it
+   valid exactly once per host: generation 2 for that window was already
+   published from the previous run, so the extraction was a reuse hit and no
+   directory appeared. The count was never the property anyway -- it would rise
+   for any unrelated extract published in the same interval, and says nothing
+   about the two artifacts being DIFFERENT. Now asserted on the two runs'
+   recorded `request_hash` pins, plus both directories still existing, which
+   holds however many times the suite runs.
 6. Evidence appended to `host/nc-evidence-phase2a.txt`, citing a commit on
    `main`. **PARTLY DONE.** The file is committed (`3ca4ffc4ce`) and carries the
    whole arc -- 107/2, 107/2, 109/0, 111/0 -- with the commit each run was made
