@@ -213,6 +213,141 @@ EOF
 
 echo "wrote research/experiments/extract_contract.py"
 
+cat > "$EXP/baseline_contract.py" <<'EOF'
+"""2b-3: the probe's view of the BASELINE mount, asserted from inside the sandbox.
+
+Reports what it SAW rather than what it expected, and prints `present=0|1` in its
+summary. The script cannot know whether this run asked for a baseline -- only the
+submitter knows that -- so a fixture that assumed either answer would pass for
+the wrong reason on half its runs. The NC suite asks for a baseline on one run
+and not on the next, and asserts `present=` against what IT requested. That split
+is the point: the fixture observes, the suite claims.
+"""
+import hashlib
+import json
+import os
+import sys
+
+BASELINE = "/baseline"
+EXTRACT = "/extract"
+
+_pass = 0
+_fail = 0
+
+
+def ok(msg):
+    global _pass
+    _pass += 1
+    print(f"ok    {msg}", flush=True)
+
+
+def bad(msg):
+    global _fail
+    _fail += 1
+    print(f"FAIL  {msg}", flush=True)
+
+
+def canonical(manifest):
+    """Byte-for-byte what `baseline.canonical` produces.
+
+    A SECOND implementation, deliberately, and this is the one place in the
+    project where duplicating logic is the right call: this runs as
+    agent-authored code inside the sandbox, which cannot import the trusted
+    module. If the two ever disagree, that disagreement is the finding.
+    """
+    body = {k: v for k, v in manifest.items() if k != "baseline_hash"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+
+def main():
+    present = os.path.isdir(BASELINE)
+
+    if present:
+        manifest = None
+        try:
+            with open(os.path.join(BASELINE, "MANIFEST.json")) as fh:
+                manifest = json.load(fh)
+            ok("MANIFEST.json is readable and is JSON")
+        except Exception as e:                                 # noqa: BLE001
+            bad(f"MANIFEST.json is unreadable: {e}")
+
+        # THE ASSERTION THAT MATTERS, and the same one /extract gets: a promoted
+        # baseline is immutable, and a run that could write to it would change
+        # what a recorded comparison was measured against -- silently, because
+        # the hash is computed once at promotion and never recomputed on read.
+        try:
+            with open(os.path.join(BASELINE, ".probe-write"), "w") as fh:
+                fh.write("x")
+            bad(f"{BASELINE} is WRITABLE: a promoted baseline can be rewritten")
+            os.unlink(os.path.join(BASELINE, ".probe-write"))
+        except OSError:
+            ok(f"{BASELINE} is not writable")
+
+        if manifest:
+            # The identity is a CONTENT key, so it can be verified rather than
+            # trusted -- from inside the sandbox, against the bytes actually
+            # mounted. Nothing else in this project can check an identity this
+            # directly.
+            digest = hashlib.sha256(canonical(manifest)).hexdigest()
+            declared = manifest.get("baseline_hash")
+            if digest == declared:
+                ok(f"the baseline hashes to its declared identity {digest[:12]}")
+            else:
+                bad(f"the mounted baseline hashes to {digest[:12]} but declares"
+                    f" {str(declared)[:12]}")
+
+            files = manifest.get("files") or {}
+            if not files:
+                bad("the manifest lists no files")
+            for name, entry in sorted(files.items()):
+                target = os.path.join(BASELINE, name)
+                try:
+                    size = os.path.getsize(target)
+                except OSError as e:
+                    bad(f"{name}: unreadable ({e})")
+                    continue
+                # DIGEST, not just size. The manifest carries a sha256 per file
+                # and this is the only place it is ever checked against the
+                # bytes; a size check would pass on a file of the right length
+                # and the wrong content.
+                h = hashlib.sha256()
+                with open(target, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                if h.hexdigest() == entry.get("sha256") and size > 0:
+                    ok(f"{name}: {size} bytes, digest matches the manifest")
+                else:
+                    bad(f"{name}: digest {h.hexdigest()[:12]} vs manifest"
+                        f" {str(entry.get('sha256'))[:12]}, size={size}")
+
+            print(f"    baseline_hash={str(declared)[:12]}"
+                  f" days={len(manifest.get('days') or [])}"
+                  f" rows={manifest.get('ndjson_rows')}"
+                  f" exclude_dates={manifest.get('exclude_dates')}", flush=True)
+    else:
+        # Absence is a control too: the baseline must not be AMBIENT. A probe
+        # that reads no baseline must not find one lying around, or a cohort
+        # could compare against data its record does not name.
+        ok(f"{BASELINE} is absent, as it must be when none was requested")
+
+    # The extract is there either way -- a probe always has one -- so a missing
+    # /extract here means the baseline mount displaced it rather than joining it.
+    if os.path.isdir(EXTRACT):
+        ok(f"{EXTRACT} is still mounted alongside")
+    else:
+        bad(f"{EXTRACT} is missing: adding a mount replaced one")
+
+    print(f"== BASELINE-CONTRACT: present={int(present)}"
+          f" pass={_pass} fail={_fail} ==", flush=True)
+    return 1 if _fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+
+echo "wrote research/experiments/baseline_contract.py"
+
 cat <<'NEXT'
 
 Next, in the qf-research checkout, with the AGENT's credential. RE-RUN THIS
@@ -221,7 +356,8 @@ path was one level short (`/app/trainer/data` rather than
 `/app/trainer/trainer/data`), which is the same defect the dispatcher had.
 
   git checkout -b probe-extract-contract    # or commit to the fixture branch
-  git add research/experiments/extract_contract.py
+  git add research/experiments/extract_contract.py \
+          research/experiments/baseline_contract.py
   git commit -m '2b-2: probe fixture asserting the extract mount contract'
   git push -u origin HEAD
   git rev-parse HEAD

@@ -20,7 +20,10 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 _MEM_RE = re.compile(r"^([1-9][0-9]{0,4})([mg])\Z")
 _PATH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./:-]{0,199}\Z")
 _K_RE = re.compile(r"^[A-Za-z0-9_ ()\[\].:-]{1,200}\Z")
-_EXTRACT_RE = re.compile(r"^[0-9a-f]{64}\Z")
+# ONE pattern for both of a probe's identities: an extract's request hash and a
+# baseline's content hash. "64 lowercase hex" is the same claim either way, and
+# two copies of it are two things that can drift.
+_HASH64_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _NOTE_RE = re.compile(r"^[\x20-\x7e]{0,500}\Z")
 
 # An allowlist, not a pattern. `--pdb` on an unattended runner is a wedged slot;
@@ -223,7 +226,7 @@ def _check_probe_args(args):
     """
     if not isinstance(args, dict):
         _err("args must be an object")
-    unknown = set(args) - {"path", "extract"}
+    unknown = set(args) - {"path", "extract", "baseline"}
     if unknown:
         _err(f"unknown args key(s) for kind probe: {sorted(unknown)}")
 
@@ -242,12 +245,25 @@ def _check_probe_args(args):
              f" container instead of here")
 
     extract = args.get("extract")
-    if not isinstance(extract, str) or not _EXTRACT_RE.match(extract):
+    if not isinstance(extract, str) or not _HASH64_RE.match(extract):
         _err(f"args.extract must be an extract request hash (64 lowercase hex),"
              f" got {extract!r}. The extract must already exist: `qf extracts`"
              f" lists what is published, and `qf extract` publishes one")
 
-    return {"path": path, "extract": extract}
+    # OPTIONAL, and it has to be: a non-residual cohort reads no baseline, and
+    # requiring one would mean inventing a baseline for a probe that never
+    # consults it. Absent means absent -- there is no default and no "latest",
+    # because a comparison whose baseline was chosen for it cannot say what it
+    # was measured against.
+    out = {"path": path, "extract": extract}
+    baseline = args.get("baseline")
+    if baseline is not None:
+        if not isinstance(baseline, str) or not _HASH64_RE.match(baseline):
+            _err(f"args.baseline must be a baseline hash (64 lowercase hex),"
+                 f" got {baseline!r}. `qf baselines` lists what is published,"
+                 f" and promote-baseline.sh publishes one")
+        out["baseline"] = baseline
+    return out
 
 
 def _check_selftest_args(args):

@@ -56,6 +56,28 @@ stored="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["basel
   && ok "the directory name is the manifest's baseline_hash" \
   || bad "directory $(basename "$hash_dir") != manifest $stored"
 
+# --- the promotion time, OUTSIDE the identity ---------------------------
+# A sidecar rather than a manifest field: the manifest IS the content key, so a
+# timestamp inside it would make every promotion of the same bytes a different
+# artifact. And a sidecar rather than the directory mtime, which survives a
+# filesystem copy as a confident wrong answer.
+if [ -f "$hash_dir/PROMOTED_AT" ]; then
+  ok "the promotion time is recorded beside the manifest"
+  stamp="$(cat "$hash_dir/PROMOTED_AT")"
+  case "$stamp" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z)
+      ok "PROMOTED_AT is an ISO-8601 UTC instant ($stamp)" ;;
+    *) bad "PROMOTED_AT is not an ISO UTC instant: $stamp" ;;
+  esac
+else
+  bad "no PROMOTED_AT beside the manifest"
+fi
+if python3 -c 'import json,sys; sys.exit("promoted_at" in json.load(open(sys.argv[1])))' "$hash_dir/MANIFEST.json"; then
+  ok "the manifest itself carries no promotion time"
+else
+  bad "a promotion time leaked into the manifest, so the identity is not a content key"
+fi
+
 # --- FIRST PUBLICATION WINS ----------------------------------------------
 before="$(find "$hash_dir" -type f -exec sha256sum {} \; | sort)"
 out="$(run "$TMP/src")"

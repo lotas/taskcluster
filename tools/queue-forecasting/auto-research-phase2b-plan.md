@@ -1726,17 +1726,78 @@ Tasks:
   discipline as D20, and a second promotion of the same hash is a no-op rather
   than a rewrite. Runs as root so the store stays outside the deployment domain's
   write access; invoked by the deploy user with `sudo`.
-- **Task 14 — the mount and the pin.** `/baseline` read-only, and **read-only
-  only**, for the same reason `/extract` is: a promoted baseline is immutable and
-  a run that could write to it would change what a recorded comparison was
-  measured against. `args.baseline` is an OPTIONAL probe field -- a non-residual
-  cohort needs none -- and `baseline_hash` is pinned when present.
-- **Task 15 — `qf baselines`**, with the same client-side prefix resolution
-  `--extract` has, for the same reason: the ergonomics belong in the client and
-  the strictness at the boundary.
-- **Task 16 — NC19.** A promoted baseline is immutable; promoting the same files
-  twice is one artifact; a probe records which baseline it used; and a probe
-  naming an absent baseline is refused before anything starts.
+- **Task 14 — the mount and the pin. DONE (2026-08-29).** `/baseline` read-only,
+  and **read-only only**, for the same reason `/extract` is: a promoted baseline
+  is immutable and a run that could write to it would change what a recorded
+  comparison was measured against. `args.baseline` is an OPTIONAL probe field --
+  a non-residual cohort needs none -- and `baseline_hash` is pinned when present.
+
+  Three things the implementation added over this outline, each because the
+  weaker version could report a comfortable answer it had not earned:
+
+  1. **The hash is RECOMPUTED from the manifest body on every resolve.** It is a
+     content key, so this is the only frozen input whose declared identity can be
+     *verified* rather than trusted. Checking only that the directory name and
+     the manifest's `baseline_hash` agree passes on any edit that leaves that one
+     field alone -- and then the pinned hash proves only that somebody wrote it
+     down.
+  2. **Absence is PINNED as `baseline: none`, not left absent.** An absent pin is
+     two facts at once: this probe read no baseline, or this probe predates
+     baselines being pinned. A reader crossing that version boundary cannot tell
+     them apart, and provenance exists so a later reader does not have to guess.
+  3. **The unit makes the write impossible, not merely unintended.**
+     `ProtectSystem=strict` with a `ReadWritePaths=` that omits both stores means
+     a future bug in qfd cannot corrupt an artifact a published comparison cites.
+     "Only reads" is a property of today's code; the store is an input to every
+     recorded result.
+
+  Also fixed in passing: `Config.from_env(env)` took an argument that its integer
+  reads and three of its string reads ignored -- they went to `os.environ`. A
+  parameter that looks like an injection point and is not is the same defect as
+  an injected clock nothing consults, and it made the object look testable while
+  the values under test came from the process.
+
+- **Task 15 — `qf baselines`. DONE (2026-08-29)**, with the same client-side
+  prefix resolution `--extract` has, for the same reason: the ergonomics belong
+  in the client and the strictness at the boundary. The two resolvers are ONE
+  implementation with two thin wrappers -- two copies would be two places for
+  the ambiguity refusal to drift out of, and an ambiguous baseline is worse than
+  an ambiguous extract, because a probe whose comparison shifted underneath it
+  still produces plausible numbers.
+
+  Read by the dispatcher rather than relayed, and the asymmetry with `extracts`
+  is deliberate: the extracts directory belongs to another privilege domain, so
+  walking it from qfd would put the layout in two places. The baseline store has
+  no service at all, and qfd is already its only reader.
+
+  A directory whose manifest is missing, unreadable or no longer hashes to its
+  own name is reported `broken` rather than omitted -- omitting it makes a
+  half-promoted directory invisible to the one command an operator runs to find
+  out why a probe was refused. The listing cap says when it truncated, because a
+  listing that quietly stops is how a prefix resolves to "no match" for a
+  baseline that is right there. And `promoted_at` is a SIDECAR: it cannot live in
+  the manifest (that would make every promotion of the same bytes a different
+  artifact) and it must not be the directory mtime, which survives a filesystem
+  copy as a confident wrong answer.
+
+- **Task 16 — NC19. WRITTEN, NOT YET RUN (2026-08-29).** A promoted baseline is
+  immutable; promoting the same files twice is one artifact; a probe records
+  which baseline it used; and a probe naming an absent baseline is refused before
+  anything starts. Seven clause groups, gated on a canary that a baseline
+  promotes at all, plus a `baseline_contract.py` probe fixture.
+
+  The fixture **reports what it saw rather than what it expected** -- it prints
+  `present=0|1` -- because it cannot know whether its run asked for a baseline;
+  only the submitter knows. The suite asks for one on one run and not on the
+  next, and asserts `present=` against what it requested. A fixture that assumed
+  either answer would pass for the wrong reason on half its runs.
+
+  The fixture also carries a SECOND implementation of the manifest's canonical
+  form, deliberately: agent-authored code inside the sandbox cannot import the
+  trusted module, and this is the one place a content key is checked against the
+  bytes actually mounted. A unit test pins the two implementations together, so a
+  divergence is a test failure rather than "the mounted baseline does not hash to
+  its identity" on every probe.
 
 ---
 

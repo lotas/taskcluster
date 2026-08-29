@@ -1603,3 +1603,201 @@ class TestTheNestedMountpointIsCreatedBeforeLaunch(RunnerCase):
         self.assertEqual(mounts, ((paths["data"], sandbox.DATA_DEST),))
         relative = sandbox.DATA_DEST[len(sandbox.SRC_DEST):].lstrip("/")
         self.assertTrue(os.path.isdir(os.path.join(paths["src"], relative)))
+
+
+class BaselineProbeCase(RunnerCase):
+    """Task 14. A promoted baseline mounts read-only at /baseline, and the probe
+    records which one -- including that it read none."""
+
+    def setUp(self):
+        super().setUp()
+        base = os.path.dirname(self.runs)
+        self.extracts = os.path.join(base, "qf-extracts-bl")
+        self.baselines = os.path.join(base, "qf-baselines")
+        os.makedirs(self.extracts, exist_ok=True)
+        os.makedirs(self.baselines, exist_ok=True)
+        self.cfg.extracts_dir = self.extracts
+        self.cfg.baselines_dir = self.baselines
+        self.request_hash = "c" * 64
+        path = os.path.join(self.extracts, self.request_hash)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump({"request_hash": self.request_hash,
+                       "extract_hash": "d" * 64,
+                       "files": {"runs": {"rows": 1}}}, fh)
+
+    def promote(self, **over):
+        """A manifest that HASHES TO ITS OWN NAME, because that is the property
+        the resolver checks. A fixture that wrote an arbitrary name would have
+        agreed with a resolver that did not check, which is how four earlier
+        fakes in this phase licensed the bug they were testing."""
+        import baseline
+        manifest = {
+            "schema": 1,
+            "files": {"baseline_predictions.ndjson":
+                      {"sha256": "a" * 64, "bytes": 12},
+                      "2026-08-01.json": {"sha256": "b" * 64, "bytes": 3}},
+            "days": ["2026-08-01"],
+            "ndjson_rows": 7,
+            "pending_at_min": "2026-08-01T00:00:00+00:00",
+            "pending_at_max": "2026-08-01T23:59:59+00:00",
+            "exclude_dates": [],
+            "exclude_dates_provenance": "declared by the promoter",
+        }
+        manifest.update(over)
+        digest = baseline.baseline_hash(manifest)
+        manifest["baseline_hash"] = digest
+        path = os.path.join(self.baselines, digest)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump(manifest, fh)
+        return digest, path
+
+    def a_probe(self, baseline_hash=None):
+        args = {"path": "research/experiments/cohort.py",
+                "extract": self.request_hash}
+        if baseline_hash is not None:
+            args["baseline"] = baseline_hash
+        return dict(spec.normalize({"schema": 1, "kind": "probe",
+                                    "source_sha": "b" * 40, "args": args}))
+
+    def _hold_for(self, effective):
+        run_id = "probe-20260829T000000Z-" + effective["source_sha"][:12] + "-9"
+        self.db.call("submit", effective, run_id=run_id, uid=1001,
+                     now="2026-08-29T00:00:00Z")
+        return types.SimpleNamespace(run_id=run_id,
+                                     job=self.db.call("get", run_id))
+
+
+class TestTheBaselineMount(BaselineProbeCase):
+    def test_a_promoted_baseline_mounts_read_only_at_the_fixed_path(self):
+        digest, path = self.promote()
+        mounts = self.runner._probe_ro_mounts(self.a_probe(digest))
+        self.assertIn((path, "/baseline"), mounts)
+        # And the extract is still there: adding an input must not replace one.
+        self.assertIn((os.path.join(self.extracts, self.request_hash),
+                       "/extract"), mounts)
+
+    def test_no_baseline_means_no_mount_not_a_refusal(self):
+        # The one probe input with a legitimate "not asked for" case: a
+        # non-residual cohort reads no baseline.
+        mounts = self.runner._probe_ro_mounts(self.a_probe())
+        self.assertEqual(mounts, ((os.path.join(self.extracts,
+                                                self.request_hash),
+                                   "/extract"),))
+
+    def test_the_mount_is_never_writable(self):
+        # Asserted through the sandbox's own check rather than by reading the
+        # tuple: /baseline read-write must be impossible to configure, not
+        # merely absent from what this path happens to build.
+        import sandbox
+        with self.assertRaises(sandbox.SandboxError) as cm:
+            sandbox._check_extra_dest("/baseline", writable=True)
+        self.assertIn("read-only", str(cm.exception))
+
+    def test_an_absent_baseline_is_refused_naming_the_promoter(self):
+        with self.assertRaises(qfd.ProbeBaselineMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe("f" * 64))
+        msg = str(cm.exception)
+        self.assertIn("promote-baseline.sh", msg)
+        self.assertIn("qf baselines", msg)
+
+    def test_its_error_class_is_its_own(self):
+        # "the baseline is not promoted" and "the extract is not published" send
+        # an operator to different places; a shared class costs the difference.
+        self.assertEqual(qfd.ProbeBaselineMissing.error_class,
+                         "baseline_not_published")
+        self.assertNotEqual(qfd.ProbeBaselineMissing.error_class,
+                            qfd.ProbeExtractMissing.error_class)
+
+    def test_both_are_caught_by_the_handler_that_records_the_class(self):
+        for cls in (qfd.ProbeExtractMissing, qfd.ProbeBaselineMissing):
+            self.assertTrue(issubclass(cls, qfd.ProbeInputMissing))
+
+    def test_a_manifest_that_does_not_hash_to_its_own_name_is_refused(self):
+        digest, path = self.promote()
+        with open(os.path.join(path, "MANIFEST.json")) as fh:
+            manifest = json.load(fh)
+        # An edit that leaves `baseline_hash` alone: the directory name and the
+        # declared hash still agree, and only recomputing catches it.
+        manifest["ndjson_rows"] = 999999
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump(manifest, fh)
+        with self.assertRaises(qfd.ProbeBaselineMissing) as cm:
+            self.runner._probe_baseline(self.a_probe(digest))
+        self.assertIn("does not hash to its own name", str(cm.exception))
+
+    def test_a_directory_disagreeing_with_its_manifest_is_refused(self):
+        digest, path = self.promote()
+        other = os.path.join(self.baselines, "e" * 64)
+        os.makedirs(other, exist_ok=True)
+        with open(os.path.join(path, "MANIFEST.json")) as fh:
+            body = fh.read()
+        with open(os.path.join(other, "MANIFEST.json"), "w") as fh:
+            fh.write(body)          # a copy under the wrong name
+        with self.assertRaises(qfd.ProbeBaselineMissing) as cm:
+            self.runner._probe_baseline(self.a_probe("e" * 64))
+        self.assertIn("disagree", str(cm.exception))
+
+    def test_an_unreadable_manifest_is_refused_not_ignored(self):
+        digest, path = self.promote()
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            fh.write("{not json")
+        with self.assertRaises(qfd.ProbeBaselineMissing) as cm:
+            self.runner._probe_baseline(self.a_probe(digest))
+        self.assertIn("unreadable", str(cm.exception))
+
+    def test_a_manifest_listing_no_files_is_refused(self):
+        digest, path = self.promote(files={})
+        with self.assertRaises(qfd.ProbeBaselineMissing) as cm:
+            self.runner._probe_baseline(self.a_probe(digest))
+        self.assertIn("no files", str(cm.exception))
+
+    def test_the_path_cannot_escape_the_baseline_store(self):
+        # The spec validator is the reason: 64 hex characters cannot contain a
+        # separator, so the only path this can build is a direct child.
+        for bad in ("../etc", "/etc/passwd", "c" * 63, "C" * 64, "c" * 65):
+            with self.subTest(bad=bad), self.assertRaises(spec.SpecError):
+                self.a_probe(bad)
+
+
+class TestAProbeRecordsWhichBaselineItSaw(BaselineProbeCase):
+    def test_it_pins_the_hash_and_the_coverage(self):
+        digest, path = self.promote()
+        effective = self.a_probe(digest)
+        hold = self._hold_for(effective)
+        self.runner._pin_probe_baseline(hold, effective)
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["baseline_hash"], digest)
+        self.assertEqual(pins["baseline_dir"], path)
+        self.assertEqual(pins["baseline_days"], "1")
+        self.assertEqual(pins["baseline_pending_at_min"],
+                         "2026-08-01T00:00:00+00:00")
+
+    def test_reading_no_baseline_is_pinned_as_none_not_left_absent(self):
+        # An absent pin is two facts at once: this probe read no baseline, or
+        # this probe predates baselines being pinned at all. A reader crossing
+        # that version boundary cannot tell them apart.
+        effective = self.a_probe()
+        hold = self._hold_for(effective)
+        self.runner._pin_probe_baseline(hold, effective)
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["baseline"], "none")
+        self.assertNotIn("baseline_hash", pins)
+
+    def test_it_happens_before_the_worktree_and_the_image(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        body = source[source.index("def execute(self, hold):"):]
+        body = body[:body.index("\n    def ")]
+        self.assertLess(body.index("_pin_probe_baseline"),
+                        body.index("prepare_run_dir"))
+
+    def test_a_bad_baseline_stops_the_run_before_any_setup(self):
+        # The pin call is also the validation, so a typo costs seconds. If the
+        # mount were the only place it were checked, the image would build first.
+        effective = self.a_probe("f" * 64)
+        hold = self._hold_for(effective)
+        with self.assertRaises(qfd.ProbeBaselineMissing):
+            self.runner._pin_probe_baseline(hold, effective)

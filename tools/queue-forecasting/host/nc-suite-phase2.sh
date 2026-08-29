@@ -254,6 +254,21 @@ field_of() {  # field_of <run_id> <field> -> the value, or UNREADABLE
   printf '%s' "$value"
 }
 
+pin_of() {  # pin_of <run_id> <pin key> -> the value, or empty
+  # A JOB PIN, not a column. Written out once here because NC18 carried two
+  # copies of the same six lines and NC19 would have made four -- and a pin
+  # helper that disagrees with itself across clauses is how a missing pin comes
+  # to look like a different pin.
+  local out
+  if ! out="$(status_json "$1" 2>&1)"; then
+    note_blind "$out"; return 1
+  fi
+  printf '%s' "$out" | python3 -c "
+import json, sys
+print((json.load(sys.stdin)['job'].get('pins') or {}).get(sys.argv[1], ''))
+" "$2" 2>/dev/null
+}
+
 # THE GATE. Called at the top of every clause that is about to conclude
 # something from a job's state. It runs in the MAIN shell (not a substitution),
 # so unlike note_blind it can actually stop the run.
@@ -307,8 +322,17 @@ wait_terminal() {
   echo "TIMEOUT_WAITING"; return 1
 }
 
+# The state that made the last `require_state_for` return 1. A caller that says
+# WHICH state it saw is the difference between a finding and a guess: the disk
+# floor clause used to print "a job was admitted below the disk floor" for every
+# non-QUEUED state, including the terminal ones that mean the opposite of
+# admitted. This is a global rather than stdout because the function is called
+# in `if`, not in `$(...)`, so an assignment here survives.
+LAST_LEFT_FOR=""
+
 require_state_for() {  # require_state_for <run_id> <state> <seconds>
   local rid="$1" want="$2" secs="$3" waited=0 st
+  LAST_LEFT_FOR=""
   while [ "$waited" -lt "$secs" ]; do
     st="$(state_of "$rid")"
     if [ "$st" = "$UNREADABLE" ]; then
@@ -316,6 +340,7 @@ require_state_for() {  # require_state_for <run_id> <state> <seconds>
       return 2
     fi
     if [ "$st" != "$want" ]; then
+      LAST_LEFT_FOR="$st"
       echo "  (left $want for $st after ${waited}s)" >&2
       return 1
     fi
@@ -826,11 +851,12 @@ nc8_protocol() {
   local corrupt="$INTENT_DIR/nightly.$$.$(date +%s).intent"
   printf 'pid=' > "$corrupt"
   probe="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" --mem 2g)"
-  if require_state_for "$probe" QUEUED 20; then
-    ok "(h) an unparseable marker fails closed"
-  else
-    bad "(h) an unparseable marker was admitted through"
-  fi
+  require_state_for "$probe" QUEUED 20
+  case $? in
+    0) ok  "(h) an unparseable marker fails closed" ;;
+    1) bad "(h) an unparseable marker was admitted through (state $LAST_LEFT_FOR)" ;;
+    *) void "(h) an unparseable marker fails closed  (could not watch it)" ;;
+  esac
   rm -f "$corrupt"
   as "$RESEARCH_USER" "qf cancel $probe" >/dev/null 2>&1
 
@@ -1218,12 +1244,8 @@ nc18() {
 
   local pins dir ehash
   pins="$(field_of "$rid" pins)"
-  ehash="$(as "$RESEARCH_USER" "qf --json status $rid" 2>/dev/null | python3 -c "
-import json, sys
-print((json.load(sys.stdin)['job'].get('pins') or {}).get('extract_hash', ''))" 2>/dev/null)"
-  dir="$(as "$RESEARCH_USER" "qf --json status $rid" 2>/dev/null | python3 -c "
-import json, sys
-print((json.load(sys.stdin)['job'].get('pins') or {}).get('extract_dir', ''))" 2>/dev/null)"
+  ehash="$(pin_of "$rid" extract_hash)"
+  dir="$(pin_of "$rid" extract_dir)"
   if [ -n "$ehash" ]; then
     ok "NC18 the job records an extract_hash ($(printf '%s' "$ehash" | cut -c1-12))"
   else
@@ -1633,17 +1655,272 @@ nc15() {
   printf '[Service]\nEnvironment=QFD_DISK_FLOOR_GB=%d\n' "$floor_gb" \
     > /etc/systemd/system/qf-dispatch.service.d/nc15-floor.conf
   systemctl daemon-reload && systemctl restart qf-dispatch && sleep 5
-  local blocked; blocked="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha")"
-  if require_state_for "$blocked" QUEUED 20; then
-    ok "NC15 a job stays QUEUED with free space below the floor"
-  else
-    bad "NC15 a job was admitted below the disk floor"
-  fi
+
+  # CANARY THAT GATES. This clause raises the floor by writing a drop-in and
+  # restarting -- two steps, either of which can silently not happen (a stale
+  # unit, a restart that came back on the old environment, a daemon-reload that
+  # did not). If the floor is NOT in force, a job is admitted for the ordinary
+  # reason that there is plenty of disk, and the clause used to report that as
+  # "a job was admitted below the disk floor" -- naming a control as broken on
+  # evidence that never involved it.
+  #
+  # `ping` reports the resource gate at the smallest reservation any kind can
+  # ask for, so a blocking floor is visible from outside. Nothing is asserted
+  # about admission unless the daemon first agrees the floor is blocking.
+  local gate; gate="$(as "$RESEARCH_USER" "qf --json ping" 2>/dev/null \
+    | sed -n 's/.*"resource": *"\([^"]*\)".*/\1/p' | head -1)"
+  echo "  floor raised to ${floor_gb}GiB; ping resource: ${gate:-<unreadable>}"
+  case "$gate" in
+    "disk floor"*)
+      local blocked
+      blocked="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha")"
+      require_state_for "$blocked" QUEUED 20
+      case $? in
+        0) ok  "NC15 a job stays QUEUED with free space below the floor" ;;
+        1) bad "NC15 a job left QUEUED for $LAST_LEFT_FOR below the disk floor" ;;
+        *) void "NC15 a job stays QUEUED below the floor  (could not watch it)" ;;
+      esac
+      as "$RESEARCH_USER" "qf cancel $blocked" >/dev/null 2>&1
+      ;;
+    ok)
+      void "NC15 the raised floor never took effect (ping says resources are ok)"
+      ;;
+    *)
+      void "NC15 could not read the resource gate from ping (${gate:-empty})"
+      ;;
+  esac
   rm -f /etc/systemd/system/qf-dispatch.service.d/nc15-floor.conf
   systemctl daemon-reload && systemctl restart qf-dispatch && sleep 5
-  as "$RESEARCH_USER" "qf cancel $blocked" >/dev/null 2>&1
 }
 
+
+# =========================================================================
+# NC19: a promoted baseline is immutable, and a probe records which one it read.
+#
+# The extract half of this argument is NC18's. This is the other input: a
+# baseline is what a residual cohort's numbers are MEASURED AGAINST, so a
+# baseline that can change after publication does not corrupt a prediction --
+# it corrupts a comparison, which is worse, because the prediction still looks
+# right.
+# =========================================================================
+nc19() {
+  echo
+  echo "== NC19: the promoted baseline is immutable, and probes record it =="
+
+  local store="${QF_BASELINE_STORE:-/var/lib/qf-baselines}"
+  local promoter="$HERE/promote-baseline.sh"
+
+  local fx
+  if ! fx="$(fixture_sha)"; then
+    void "NC19 needs the fixture branch: a 40-hex sha in $NC12_SHA_FILE"
+    return
+  fi
+
+  # An extract to probe against. Reuse serves it: NC18 published this window.
+  local ex
+  ex="$(as "$RESEARCH_USER" "qf --json extracts" 2>/dev/null | python3 -c "
+import json, sys
+rows = json.load(sys.stdin).get('extracts') or []
+print(rows[0]['request_hash'] if rows else '')" 2>/dev/null)"
+  if [ -z "$ex" ]; then
+    void "NC19 canary: no extract is published, so no probe can run"
+    return
+  fi
+
+  # --- promote a small baseline ------------------------------------------
+  # SYNTHESISED rather than taken from the nightly's output, and the reason is
+  # scope: the promoter's own suite already validates real-shaped sets against
+  # `describe`. What NC19 is about is the boundary AFTER promotion -- immutable,
+  # mounted read-only, recorded in the run -- and a two-day set exercises every
+  # one of those in seconds.
+  local src; src="$(mktemp -d -t nc19-baseline.XXXXXX)"
+  python3 - "$src" <<'PYEOF'
+import json, os, sys
+d = sys.argv[1]
+with open(os.path.join(d, "baseline_predictions.ndjson"), "w") as fh:
+    for i in range(4):
+        fh.write(json.dumps({"task_id": f"nc19-{i}", "run_id": 0, "p50": 1.0,
+                             "pending_at": f"2026-08-0{i + 1}T00:00:00+00:00"})
+                 + "\n")
+for day in ("2026-08-01", "2026-08-02"):
+    with open(os.path.join(d, day + ".json"), "w") as fh:
+        json.dump({"day": day, "rows": 2}, fh)
+PYEOF
+  chmod -R a+rX "$src"
+
+  local out bhash
+  out="$("$promoter" "$src" 2>&1)"
+  bhash="$(printf '%s' "$out" | sed -n 's/.*published \([0-9a-f]\{12\}\).*/\1/p' \
+    | head -1)"
+  if [ -z "$bhash" ]; then
+    void "NC19 canary: the promoter published nothing: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    rm -rf "$src"
+    return
+  fi
+  local full; full="$(find "$store" -mindepth 1 -maxdepth 1 -type d \
+    -name "$bhash*" -printf '%f\n' 2>/dev/null | head -1)"
+  if [ -z "$full" ]; then
+    void "NC19 canary: nothing under $store matches $bhash"
+    rm -rf "$src"
+    return
+  fi
+  ok "NC19 canary: a baseline promotes ($bhash)"
+
+  # (a) DOUBLE PROMOTION IS ONE ARTIFACT. The identity is a content key, so the
+  # second run has nothing to publish -- and rewriting would open a window in
+  # which a mounted baseline was incomplete.
+  local before after
+  before="$(find "$store/$full" -type f -exec sha256sum {} \; | sort)"
+  "$promoter" "$src" >/dev/null 2>&1 || true
+  after="$(find "$store/$full" -type f -exec sha256sum {} \; | sort)"
+  local dirs; dirs="$(find "$store" -mindepth 1 -maxdepth 1 -type d \
+    -name "$bhash*" | wc -l)"
+  [ "$dirs" = 1 ] && ok "NC19 (a) promoting the same files twice is one artifact" \
+    || bad "NC19 (a) a second promotion created $dirs artifacts"
+  [ "$before" = "$after" ] \
+    && ok "NC19 (a) the published bytes were not rewritten" \
+    || bad "NC19 (a) a re-promotion rewrote the artifact"
+
+  # (b) THE STORE IS NOT WRITABLE by either non-root domain. This is the
+  # boundary the promoter refuses to run without, asserted from outside it.
+  refuse_as "$RESEARCH_USER" "NC19 (b) research cannot write to the store" \
+    "touch $store/.nc19-research"
+  refuse_as "$DEPLOY_USER" "NC19 (b) the nightly user cannot write to the store" \
+    "touch $store/.nc19-deploy"
+  refuse_as "$RESEARCH_USER" "NC19 (b) research cannot alter a published manifest" \
+    "printf x >> $store/$full/MANIFEST.json"
+
+  # (c) `qf baselines` LISTS IT, with the full hash on a copyable line. The same
+  # defect as `qf extracts` had: printing only the short form makes the natural
+  # copy-paste the value the validator refuses.
+  local listing; listing="$(as "$RESEARCH_USER" "qf baselines" 2>&1)"
+  if printf '%s' "$listing" | grep -q -- "--baseline $full"; then
+    ok "NC19 (c) qf baselines prints the full hash on its own line"
+  else
+    bad "NC19 (c) qf baselines did not print a copyable --baseline line"
+  fi
+
+  # (d) A PROBE WITH A BASELINE. The fixture reports what it SAW; this clause
+  # asserts that against what it ASKED FOR, which is why the fixture prints
+  # `present=`. A fixture that assumed a baseline would pass for the wrong
+  # reason on the run that asks for none.
+  local rid final log
+  rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
+      --path research/experiments/baseline_contract.py \
+      --extract $ex --baseline $full" 2>&1 | tail -1)"
+  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+    void "NC19 (d) the probe produced no run id: $rid"
+  else
+    final="$(wait_terminal "$rid" 3600)"
+    assert_eq "NC19 (d) a probe with a baseline SUCCEEDS" "SUCCEEDED" "$final"
+    log="$(cat "$RUNS_DIR/$rid/logs/"* 2>/dev/null)"
+    if printf '%s' "$log" | grep -q "BASELINE-CONTRACT: present=1 pass=[0-9]* fail=0 "; then
+      ok "NC19 (d) the in-sandbox contract holds with a baseline mounted"
+    else
+      bad "NC19 (d) the in-sandbox contract failed: $(printf '%s' "$log" | grep -c '^FAIL') FAIL line(s)"
+      printf '%s\n' "$log" | grep '^FAIL' | sed 's/^/    /'
+    fi
+    # THE PROVENANCE. Promised and not recorded is worse than absent: the record
+    # looks complete. This is the same gap the extract pins had.
+    local pinned; pinned="$(pin_of "$rid" baseline_hash)"
+    assert_eq "NC19 (d) the run records which baseline it read" "$full" "$pinned"
+    local pdir; pdir="$(pin_of "$rid" baseline_dir)"
+    [ "$pdir" = "$store/$full" ] \
+      && ok "NC19 (d) and the directory it was mounted from" \
+      || bad "NC19 (d) baseline_dir is '$pdir', not $store/$full"
+  fi
+
+  # (e) A PROBE WITHOUT ONE. Absence is a control too: a baseline must not be
+  # ambient, or a cohort could compare against data its record does not name.
+  rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
+      --path research/experiments/baseline_contract.py --extract $ex" 2>&1 \
+      | tail -1)"
+  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+    void "NC19 (e) the no-baseline probe produced no run id: $rid"
+  else
+    final="$(wait_terminal "$rid" 3600)"
+    assert_eq "NC19 (e) a probe without a baseline still SUCCEEDS" "SUCCEEDED" \
+      "$final"
+    log="$(cat "$RUNS_DIR/$rid/logs/"* 2>/dev/null)"
+    if printf '%s' "$log" | grep -q "BASELINE-CONTRACT: present=0 pass=[0-9]* fail=0 "; then
+      ok "NC19 (e) no baseline was mounted, and none was lying around"
+    else
+      bad "NC19 (e) a probe that asked for no baseline saw one, or failed"
+      printf '%s\n' "$log" | grep -E '^(FAIL|== BASELINE)' | sed 's/^/    /'
+    fi
+    assert_eq "NC19 (e) and it is pinned as none, not left absent" "none" \
+      "$(pin_of "$rid" baseline)"
+  fi
+
+  # (f) AN UNPROMOTED BASELINE IS REFUSED BEFORE ANYTHING STARTS. Its own error
+  # class, because "the baseline is not promoted" is a request to fix and
+  # "the extraction failed" is a subsystem to look at.
+  rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
+      --path research/experiments/baseline_contract.py \
+      --extract $ex --baseline $(printf 'f%.0s' $(seq 64))" 2>&1 | tail -1)"
+  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+    # The client resolves a prefix and refuses an unknown FULL hash only at the
+    # dispatcher, so an absent run id here means the client refused first --
+    # which is also correct, and is what this clause is about either way.
+    ok "NC19 (f) an unpromoted baseline never became a run"
+  else
+    final="$(wait_terminal "$rid" 600)"
+    assert_eq "NC19 (f) an unpromoted baseline is FAILED" "FAILED" "$final"
+    assert_eq "NC19 (f) with its own error class" "baseline_not_published" \
+      "$(field_of "$rid" error_class)"
+    # BEFORE THE IMAGE BUILD, which is the whole reason the pin happens early.
+    # A build takes minutes; a refusal must cost seconds.
+    local wall; wall="$(field_of "$rid" wall_s)"
+    if [ -n "$wall" ] && [ "$wall" != "$UNREADABLE" ] \
+        && [ "${wall%%.*}" -lt "$BUILD_SETTLE_S" ]; then
+      ok "NC19 (f) refused in ${wall%%.*}s, before any image work"
+    else
+      bad "NC19 (f) took ${wall}s: the reference was checked too late"
+    fi
+  fi
+
+  # (g) AN EDITED BASELINE IS REFUSED. The hash is a content key, so this is the
+  # one input whose declared identity can be VERIFIED rather than trusted -- and
+  # an edit that leaves `baseline_hash` alone is invisible to any check that
+  # only compares the directory name to the manifest's field.
+  local manifest="$store/$full/MANIFEST.json"
+  local saved; saved="$(mktemp -t nc19-manifest.XXXXXX)"
+  cp -p "$manifest" "$saved"
+  python3 - "$manifest" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+with open(p) as fh:
+    m = json.load(fh)
+m["ndjson_rows"] = (m.get("ndjson_rows") or 0) + 1000   # leaves baseline_hash
+with open(p, "w") as fh:
+    json.dump(m, fh)
+PYEOF
+  rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
+      --path research/experiments/baseline_contract.py \
+      --extract $ex --baseline $full" 2>&1 | tail -1)"
+  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+    void "NC19 (g) the edited-baseline probe produced no run id: $rid"
+  else
+    final="$(wait_terminal "$rid" 600)"
+    assert_eq "NC19 (g) a baseline edited after promotion is FAILED" "FAILED" \
+      "$final"
+    assert_eq "NC19 (g) as a baseline that is not published" \
+      "baseline_not_published" "$(field_of "$rid" error_class)"
+  fi
+  cp -p "$saved" "$manifest"
+  rm -f "$saved"
+  # And the restore has to have worked, or every later run of this suite fails
+  # for a reason this clause caused.
+  rid="$(as "$RESEARCH_USER" "qf --json baselines" 2>/dev/null | python3 -c "
+import json, sys
+rows = json.load(sys.stdin).get('baselines') or []
+print(sum(1 for r in rows if r.get('broken')))" 2>/dev/null)"
+  [ "$rid" = "0" ] \
+    && ok "NC19 (g) the store was left intact" \
+    || bad "NC19 (g) $rid baseline(s) are still broken after the restore"
+
+  rm -rf "$src"
+}
 # =========================================================================
 main() {
   [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 2; }
@@ -1669,6 +1946,7 @@ main() {
   nc16
   nc17
   nc18
+  nc19
 
   echo
   echo "== totals: pass=$pass fail=$fail =="

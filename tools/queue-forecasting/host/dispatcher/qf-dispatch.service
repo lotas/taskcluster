@@ -51,6 +51,11 @@ Environment=QFD_EXTRACT_SOCKET=/run/qf-extract/sock
 # belongs to qfextract -- but mounting needs a path, so this is the one place the
 # dispatcher has to know the layout. It never writes here.
 Environment=QFD_EXTRACTS_DIR=/var/lib/qf-extracts
+# The promoted baseline store. Read-only here too, and the ownership says why:
+# the directory is root-owned and written only by promote-baseline.sh, run by a
+# human on the deployment host. qfd resolves a baseline_hash to a path so it can
+# mount it read-only at /baseline, and has no way to publish one.
+Environment=QFD_BASELINES_DIR=/var/lib/qf-baselines
 # A SECOND copy of the settlement lag, and the duplication is deliberate (D17).
 # The EXTRACTOR's value is authoritative and it validates every request again;
 # this copy exists only so a request naming an unsettled window is refused at

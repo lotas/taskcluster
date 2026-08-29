@@ -982,6 +982,61 @@ class TestThePruneUnitAndItsScriptAgree(unittest.TestCase):
                 self.assertIn(f"Environment={knob}=", self.unit)
 
 
+class TestPingReportsTheResourceGate(ProtocolCase):
+    """The second half of the gap TestMutexProbe names.
+
+    `ping` exists to answer "why is my job still QUEUED". It reported the
+    cleanup stall and the nightly intent gate (`admit`), and the mutex, and
+    `free_disk_mb` -- but not the memory budget or the disk floor, which are
+    read one step later inside `try_one`. So the two commonest reasons were the
+    two it could not give, and it printed a free-space figure with no floor to
+    compare it against, which reads like an answer without being one.
+
+    This is not only a diagnostic. NC15 raises the floor by writing a drop-in
+    and restarting, then asserts nothing is admitted -- and with no way to ask
+    whether the floor took effect, "a job was admitted" was indistinguishable
+    from "the drop-in never applied". The suite failed on that exact
+    ambiguity, naming the control as broken on evidence that never touched it.
+    """
+
+    def test_a_blocking_floor_is_visible_from_outside(self):
+        # A floor far above any real free space: every admission is refused.
+        self.disp.db.store.disk_floor_mb = 1 << 40
+        resp = self.do("ping")
+        self.assertTrue(resp["ok"], resp)
+        self.assertTrue(resp["resource"].startswith("disk floor"),
+                        resp["resource"])
+        # `admit` is UNCHANGED: the resource gate is a separate boundary, and
+        # folding them together would lose which one is blocking.
+        self.assertEqual(resp["admit"], "ok")
+
+    def test_an_exhausted_memory_budget_is_visible_too(self):
+        self.disp.db.store.mem_budget_mb = 0
+        resp = self.do("ping")
+        self.assertTrue(resp["resource"].startswith("memory budget"),
+                        resp["resource"])
+
+    def test_it_says_ok_when_nothing_is_blocking(self):
+        resp = self.do("ping")
+        self.assertEqual(resp["resource"], "ok", resp["resource"])
+
+    def test_the_gate_is_asked_at_the_smallest_reservation_any_kind_can_ask(self):
+        # A false "ok" is the dangerous direction: if this were asked at a large
+        # reservation it could report blocked while small jobs flow, and if it
+        # were asked at an arbitrary size it could report ok while the smallest
+        # job is refused. The smallest is the only size for which "ok" means
+        # "something can get in".
+        smallest = min((k["mem_limit"] for k in spec.KINDS.values()),
+                       key=spec.mem_mb)
+        self.assertEqual(qfd.SMALLEST_MEM_LIMIT, smallest)
+        self.assertEqual(self.do("ping")["resource_at"], smallest)
+
+    def test_the_floor_itself_is_reported_so_free_space_can_be_read(self):
+        resp = self.do("ping")
+        self.assertEqual(resp["disk_floor_mb"], self.cfg.disk_floor_gb * 1024)
+        self.assertIn("free_disk_mb", resp)
+
+
 class TestMutexProbe(unittest.TestCase):
     """The gap that made a frozen queue indistinguishable from an idle one.
 
@@ -1417,6 +1472,79 @@ class TestTheAdminCanaryDoesNotDependOnPath(unittest.TestCase):
                      "force-release does not exist on the client socket"):
             i = g4.index(name)
             self.assertIn("python3 -c", g4[i:i + 400], name)
+
+
+class TestNc15FloorClauseCannotClaimWhatItDidNotSee(unittest.TestCase):
+    """The clause raised the floor with a drop-in and a restart, then reported
+    any non-QUEUED state as "a job was admitted below the disk floor".
+
+    Two different worlds produce that: the floor was in force and admission
+    ignored it (the finding the clause exists to make), or the floor never
+    applied and the job was admitted because there is plenty of disk (a setup
+    failure that says nothing about the control). It also caught the terminal
+    states, which mean the opposite of admitted-and-running.
+
+    So the negative claim is now GATED on the daemon first agreeing the floor is
+    blocking, and it names the state it saw.
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+        clause = self.suite[self.suite.index("# Admission floor: with the floor"):]
+        self.clause = code_only(clause[:clause.index("\n}")])
+
+    def test_the_claim_is_gated_on_the_floor_being_in_force(self):
+        # The submit must sit INSIDE the "disk floor" branch, not before the
+        # case that reads the gate.
+        self.assertIn('qf --json ping', self.clause)
+        gate_at = self.clause.index('case "$gate" in')
+        self.assertGreater(self.clause.index("submit_as"), gate_at,
+                           "the job is submitted before the gate is read")
+
+    def test_a_floor_that_never_applied_is_void_not_a_failure(self):
+        branch = self.clause[self.clause.index("    ok)"):]
+        self.assertIn("void", branch[:branch.index(";;")])
+
+    def test_an_unreadable_gate_is_void_too(self):
+        # An empty `resource` -- an older dispatcher, a broken socket -- must not
+        # be read as "the floor is not blocking" and must not be read as a pass.
+        self.assertIn("could not read the resource gate", self.clause)
+
+    def test_the_failure_names_the_state_it_observed(self):
+        self.assertIn("$LAST_LEFT_FOR", self.clause)
+        # SEVENTH instance, and this one is in THIS FILE: the comment above
+        # quotes the accusation it is asserting is gone. `code_only` exists for
+        # exactly this and I still did not reach for it on the first write.
+        self.assertNotIn("a job was admitted below the disk floor",
+                         code_only(self.suite))
+
+    def test_being_unable_to_watch_is_separated_from_the_job_moving(self):
+        # require_state_for returns 1 (moved) and 2 (blind); an `if` folds them.
+        self.assertIn("case $? in", self.clause)
+
+    def test_every_require_state_for_caller_distinguishes_blind_from_moved(self):
+        # The whole point: two of the three callers used a bare `if`, and both
+        # printed a specific accusation for a state they had not identified.
+        code = code_only(self.suite)
+        # `require_state_for()` -- the definition -- is not a caller, and its
+        # body legitimately has no `case`. Split on the CALL form: a space, then
+        # a dollar-quoted run id.
+        for chunk in code.split('require_state_for "$')[1:]:
+            head = chunk[:400]
+            self.assertIn("case $?", head,
+                          "a require_state_for caller folds blind into moved:"
+                          f" {head.splitlines()[0]!r}")
+
+    def test_the_field_the_gate_reads_is_the_one_ping_emits(self):
+        # A scan of the suite proves the clause asks; this proves the daemon
+        # answers, under that exact key. Pinned so neither can drift alone.
+        self.assertIn('"resource": *"', self.clause.replace('\\', ''))
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "qfd.py")) as fh:
+            self.assertIn('"resource": "ok" if res_ok else res_why', fh.read())
 
 
 class TestNc16AssertsTheClassTheClassifierActuallyProduces(unittest.TestCase):
@@ -2287,4 +2415,515 @@ class TestTheBaselinePromoterIsWiredAndItsCheckIsReal(unittest.TestCase):
         p = subprocess.run([script], capture_output=True, text=True,
                            timeout=180)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("promote-baseline: pass=17 fail=0", p.stdout)
+        # `fail=0` AND a floor on the pass count, rather than an exact figure.
+        # The exact form made every added clause a two-place edit, and the second
+        # place is a Python test that has nothing to say about the promoter. What
+        # this needs to catch is a suite that stopped running or stopped
+        # asserting -- a floor catches both, and 0/0 passing catches neither.
+        self.assertIn("fail=0", p.stdout)
+        count = int(re.search(r"promote-baseline: pass=(\d+)", p.stdout).group(1))
+        self.assertGreaterEqual(count, 17, p.stdout)
+
+
+class TestTheBaselinesListing(ProtocolCase):
+    """Task 15. Read here rather than relayed, and the asymmetry with `extracts`
+    is deliberate: the extracts directory belongs to another privilege domain,
+    while the baseline store has no service at all -- it is root-owned and
+    written by a human running promote-baseline.sh. qfd already reads it to
+    resolve a mount, so this is not a second reader."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = os.path.join(self.tmp.name, "qf-baselines")
+        os.makedirs(self.store)
+        self.cfg.baselines_dir = self.store
+
+    def promote(self, *, promoted_at="2026-08-29T00:00:00Z", **over):
+        import baseline as baseline_mod
+        manifest = {
+            "schema": 1,
+            "files": {"baseline_predictions.ndjson":
+                      {"sha256": "a" * 64, "bytes": 12}},
+            "days": ["2026-08-01", "2026-08-02"],
+            "ndjson_rows": 11,
+            "pending_at_min": "2026-08-01T00:00:00+00:00",
+            "pending_at_max": "2026-08-02T23:59:59+00:00",
+            "exclude_dates": [],
+            "exclude_dates_provenance": "declared by the promoter",
+        }
+        manifest.update(over)
+        digest = baseline_mod.baseline_hash(manifest)
+        manifest["baseline_hash"] = digest
+        path = os.path.join(self.store, digest)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump(manifest, fh)
+        if promoted_at:
+            with open(os.path.join(path, "PROMOTED_AT"), "w") as fh:
+                fh.write(promoted_at + "\n")
+        return digest, path
+
+    def test_an_empty_store_is_an_empty_list_not_an_error(self):
+        resp = self.do("baselines")
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["baselines"], [])
+
+    def test_a_store_that_does_not_exist_yet_is_not_an_error_either(self):
+        # Before the first promotion the directory may simply not be there, and
+        # `qf baselines` is exactly the command someone runs to find that out.
+        self.cfg.baselines_dir = os.path.join(self.tmp.name, "nope")
+        resp = self.do("baselines")
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["baselines"], [])
+
+    def test_a_promoted_baseline_is_reported_with_its_coverage(self):
+        digest, _path = self.promote()
+        rows = self.do("baselines")["baselines"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["baseline_hash"], digest)
+        self.assertEqual(row["days"], 2)
+        self.assertEqual(row["ndjson_rows"], 11)
+        self.assertEqual(row["promoted_at"], "2026-08-29T00:00:00Z")
+        self.assertNotIn("broken", row)
+
+    def test_a_manifest_that_no_longer_hashes_to_its_name_is_reported_broken(self):
+        # NOT omitted. A half-promoted or edited directory has to be visible to
+        # the one command an operator runs to find out why a probe refused; an
+        # omitted row makes it look like the hash was never promoted at all.
+        digest, path = self.promote()
+        with open(os.path.join(path, "MANIFEST.json")) as fh:
+            manifest = json.load(fh)
+        manifest["ndjson_rows"] = 99
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump(manifest, fh)
+        rows = self.do("baselines")["baselines"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("does not hash", rows[0]["broken"])
+
+    def test_an_unreadable_manifest_is_reported_broken_too(self):
+        digest, path = self.promote()
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            fh.write("{nope")
+        rows = self.do("baselines")["baselines"]
+        self.assertIn("unreadable", rows[0]["broken"])
+
+    def test_a_directory_with_no_manifest_at_all_is_reported_broken(self):
+        os.makedirs(os.path.join(self.store, "b" * 64))
+        rows = self.do("baselines")["baselines"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("unreadable", rows[0]["broken"])
+
+    def test_the_stores_own_scratch_is_not_a_row(self):
+        # promote-baseline.sh stages under `.staging.<hash>.<pid>` and renames.
+        # A staging directory caught mid-promotion is not a baseline and is not
+        # an error; reporting it broken would cry wolf on a healthy promotion.
+        os.makedirs(os.path.join(self.store, ".staging." + "a" * 64 + ".77"))
+        os.makedirs(os.path.join(self.store, "README"))
+        self.assertEqual(self.do("baselines")["baselines"], [])
+
+    def test_exclude_dates_are_reported_because_they_were_declared(self):
+        # Not derivable from the files, so a listing that hid them would present
+        # a choice as though it had none.
+        self.promote(exclude_dates=["2026-07-04"])
+        rows = self.do("baselines")["baselines"]
+        self.assertEqual(rows[0]["exclude_dates"], ["2026-07-04"])
+
+    def test_the_listing_is_ordered_by_promotion_time(self):
+        first, _ = self.promote(promoted_at="2026-08-01T00:00:00Z",
+                                ndjson_rows=1)
+        second, _ = self.promote(promoted_at="2026-08-20T00:00:00Z",
+                                 ndjson_rows=2)
+        order = [r["baseline_hash"] for r in self.do("baselines")["baselines"]]
+        self.assertEqual(order, [first, second])
+
+    def test_a_truncated_listing_says_so(self):
+        # A listing that quietly stops is how a prefix resolves to "no match"
+        # for a baseline that is right there.
+        for n in range(3):
+            self.promote(ndjson_rows=n)
+        with mock.patch.object(qfd.Dispatcher, "BASELINES_LIMIT", 2):
+            resp = self.do("baselines")
+        self.assertEqual(len(resp["baselines"]), 2)
+        self.assertTrue(resp["truncated"])
+        self.assertEqual(resp["published"], 3)
+
+    def test_a_full_listing_says_it_is_not_truncated(self):
+        self.promote()
+        resp = self.do("baselines")
+        self.assertFalse(resp["truncated"])
+
+    def test_promoted_at_is_a_sidecar_never_the_directory_mtime(self):
+        # An mtime survives a filesystem copy as a confident wrong answer, and
+        # the promotion time cannot live in the manifest: the manifest IS the
+        # content key, so a timestamp inside it would make every promotion of
+        # the same bytes a different artifact.
+        digest, path = self.promote(promoted_at="")
+        rows = self.do("baselines")["baselines"]
+        self.assertIsNone(rows[0]["promoted_at"])
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            body = fh.read()
+        resolve = body[body.index("def _promoted_at("):]
+        resolve = resolve[:resolve.index("\n    def ")]
+        self.assertNotIn("getmtime", code_only(resolve))
+        self.assertNotIn("st_mtime", code_only(resolve))
+
+    def test_the_promoter_writes_the_sidecar_the_listing_reads(self):
+        # Pinned together: a sidecar nothing writes reports "unknown" for every
+        # baseline, which reads like a store that has never been promoted to.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "promote-baseline.sh")) as fh:
+            promoter = fh.read()
+        self.assertIn('"$STAGING/PROMOTED_AT"', promoter)
+        # And it is written INTO THE STAGING directory, so it lands by the same
+        # atomic rename as everything else -- not after it, where a reader could
+        # see a published baseline without one.
+        staging = promoter.index('mkdir -p "$STAGING"')
+        self.assertLess(promoter.index('"$STAGING/PROMOTED_AT"'),
+                        promoter.index('mv -T "$STAGING"'))
+        self.assertGreater(promoter.index('"$STAGING/PROMOTED_AT"'), staging)
+
+    def test_it_is_on_the_client_op_table_not_the_admin_one(self):
+        # Research picks a baseline; a listing behind qfadmin would mean asking
+        # an operator which hash to type.
+        self.assertIn("baselines", qfd.CLIENT_OPS)
+        self.assertNotIn("baselines", qfd.ADMIN_OPS)
+
+
+class TestABaselinePrefixResolvesInTheClient(unittest.TestCase):
+    """The same ergonomics as an extract prefix, over the same code: one
+    algorithm, two thin wrappers. Two copies would be two places for the
+    ambiguity refusal to drift out of, and an ambiguous baseline is worse than an
+    ambiguous extract -- a probe whose comparison shifted underneath it still
+    produces plausible numbers."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.mod = {}
+        with open(os.path.join(here, "qf")) as fh:
+            exec(compile(fh.read(), "qf", "exec"), self.mod)  # noqa: S102
+        self.calls = []
+
+        def fake_call(op, payload=None, **kw):
+            self.calls.append(op)
+            return {"ok": True, "baselines": [
+                {"baseline_hash": "1a2b3c4d5e6f" + "0" * 52},
+                {"baseline_hash": "9f8e7d6c5b4a" + "1" * 52},
+                {"baseline_hash": "9f8e7d6c5bff" + "2" * 52},
+            ]}
+
+        self.mod["call"] = fake_call
+
+    def test_a_full_hash_needs_no_lookup(self):
+        full = "a" * 64
+        self.assertEqual(self.mod["resolve_baseline"](full), full)
+        self.assertEqual(self.calls, [])
+
+    def test_a_unique_prefix_resolves_against_the_baselines_op(self):
+        self.assertEqual(self.mod["resolve_baseline"]("1a2b3c4d"),
+                         "1a2b3c4d5e6f" + "0" * 52)
+        # The BASELINES op, not `extracts`: a resolver reading the wrong listing
+        # would refuse every valid prefix and resolve none.
+        self.assertEqual(self.calls, ["baselines"])
+
+    def test_an_ambiguous_prefix_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.mod["resolve_baseline"]("9f8e7d6c")
+
+    def test_a_prefix_matching_nothing_names_the_promoter(self):
+        with self.assertRaises(SystemExit):
+            self.mod["resolve_baseline"]("deadbeef")
+
+    def test_non_hex_is_refused_before_any_call(self):
+        for bad in ("1a2b", "", "ZZZZZZZZ", "g" * 12, "1a2b-3c4d"):
+            with self.subTest(given=bad), self.assertRaises(SystemExit):
+                self.mod["resolve_baseline"](bad)
+        self.assertEqual(self.calls, [])
+
+    def test_the_two_resolvers_share_one_implementation(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            source = code_only(fh.read())
+        for name in ("resolve_extract", "resolve_baseline"):
+            body = source[source.index(f"def {name}(given):"):]
+            body = body[:body.index("\ndef ")]
+            self.assertIn("_resolve_prefix(", body)
+
+    def test_the_listing_prints_the_flag_and_the_full_value(self):
+        # Same fix as `qf extracts`: printing only the short form made the
+        # natural copy-paste the value the validator refuses.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            source = fh.read()
+        body = source[source.index("def cmd_baselines"):]
+        body = body[:body.index("\ndef ")]
+        self.assertIn("--baseline {row.get('baseline_hash')}", body)
+
+    def test_probe_carries_the_baseline_only_when_one_was_given(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            body = code_only(fh.read())
+        probe = body[body.index("def cmd_probe(args):"):]
+        probe = probe[:probe.index("\ndef ")]
+        self.assertIn("if args.baseline:", probe)
+        self.assertIn("resolve_baseline(args.baseline)", probe)
+
+    def test_the_flag_is_optional_on_the_parser(self):
+        parser = self.mod["build_parser"](False)   # not admin_mode
+        ns = parser.parse_args(["probe", "--sha", "b" * 40, "--path",
+                                "research/experiments/x.py",
+                                "--extract", "c" * 64])
+        self.assertIsNone(ns.baseline)
+
+
+class TestNc19IsWiredAndItsClaimsAreEarned(unittest.TestCase):
+    """Task 16. NC19 is the baseline half of NC18's argument, and the same three
+    instrument rules apply: a canary gates the group, a negative claim names what
+    it observed, and nothing the suite breaks is left broken."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+        body = self.suite[self.suite.index("nc19() {"):]
+        self.nc19 = code_only(body[:body.index("\n}\n")])
+
+    def test_it_actually_runs(self):
+        # A clause nothing calls is a clause that passes for ever.
+        self.assertRegex(self.suite, r"\n  nc19\n")
+
+    def test_the_group_is_gated_on_a_baseline_promoting_at_all(self):
+        # Every refusal below is measured against a promotion that worked.
+        self.assertIn("NC19 canary: a baseline promotes", self.nc19)
+        canary = self.nc19.index("NC19 canary: the promoter published nothing")
+        first_claim = self.nc19.index("NC19 (a)")
+        self.assertLess(canary, first_claim)
+
+    def test_the_canary_failures_are_void_and_return(self):
+        for reason in ("the promoter published nothing",
+                       "no extract is published"):
+            i = self.nc19.index(reason)
+            window = self.nc19[i - 200:i + 200]
+            self.assertIn("void", window, reason)
+            self.assertIn("return", window, reason)
+
+    def test_double_promotion_is_asserted_on_bytes_not_only_on_a_message(self):
+        # "already published" is what the promoter SAYS. The artifact not having
+        # changed is what it DID, and only the second is the property.
+        self.assertIn("sha256sum", self.nc19)
+        self.assertIn('[ "$before" = "$after" ]', self.nc19)
+
+    def test_the_edited_baseline_clause_leaves_the_manifest_edit_alone(self):
+        # An edit that also rewrote `baseline_hash` would be caught by the
+        # cheaper directory-name check, so the clause would pass without ever
+        # exercising the recomputation it exists to prove.
+        self.assertIn("leaves baseline_hash", self.nc19)
+        self.assertNotIn('m["baseline_hash"]', self.nc19)
+
+    def test_it_restores_what_it_broke_and_checks_the_restore(self):
+        # A suite that leaves a baseline broken makes every later run fail for a
+        # reason this clause caused -- and NC15's disk flood taught that the
+        # check has to be asserted, not assumed.
+        self.assertIn("the store was left intact", self.nc19)
+        self.assertLess(self.nc19.index('cp -p "$saved" "$manifest"'),
+                        self.nc19.index("the store was left intact"))
+
+    def test_the_present_flag_is_asserted_in_both_directions(self):
+        # The fixture reports what it saw; the suite claims it against what it
+        # asked for. Asserting only the present=1 run would leave "a baseline
+        # must not be ambient" untested, which is the half a leak would show up
+        # in.
+        self.assertIn("present=1", self.nc19)
+        self.assertIn("present=0", self.nc19)
+
+    def test_the_summary_pattern_requires_zero_failures(self):
+        # `grep BASELINE-CONTRACT` alone matches a summary reporting failures.
+        for pattern in ("present=1 pass=[0-9]* fail=0",
+                        "present=0 pass=[0-9]* fail=0"):
+            self.assertIn(pattern, self.nc19)
+
+    def test_the_provenance_pins_are_asserted_not_just_the_state(self):
+        self.assertIn('pin_of "$rid" baseline_hash', self.nc19)
+        self.assertIn('pin_of "$rid" baseline', self.nc19)
+
+    def test_the_refusal_is_timed_against_the_build_it_must_precede(self):
+        self.assertIn("BUILD_SETTLE_S", self.nc19)
+
+    def test_the_pin_helper_has_one_implementation(self):
+        # NC18 carried two copies of the same six lines, and NC19 would have
+        # made four. A pin reader that disagrees with itself across clauses is
+        # how a missing pin comes to look like a different pin.
+        code = code_only(self.suite)
+        self.assertEqual(code.count("json.load(sys.stdin)['job'].get('pins')"), 1)
+
+
+class TestTheBaselineProbeFixtureObservesRatherThanAssumes(unittest.TestCase):
+    """The fixture cannot know whether its run asked for a baseline -- only the
+    submitter knows -- so it prints `present=` and the suite makes the claim."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-fixtures-phase2b.sh")) as fh:
+            gen = fh.read()
+        body = gen.split('cat > "$EXP/baseline_contract.py" <<\'EOF\'\n', 1)[1]
+        self.fixture = body.split("\nEOF\n", 1)[0]
+
+    def test_it_is_valid_python(self):
+        import ast
+        ast.parse(self.fixture)
+
+    def test_it_is_stdlib_only(self):
+        # It runs inside the sandbox with --network none against a read-only
+        # tree; a dependency would fail at import for a reason unrelated to the
+        # contract it is asserting.
+        imports = re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)",
+                             self.fixture, re.M)
+        for name in imports:
+            with self.subTest(module=name):
+                self.assertIn(name.split(".")[0],
+                              {"hashlib", "json", "os", "sys"})
+
+    def test_it_reports_what_it_saw_rather_than_what_it_expected(self):
+        self.assertIn("present={int(present)}", self.fixture)
+
+    def test_the_absent_case_is_a_pass_not_a_failure(self):
+        # A non-residual cohort reads no baseline; a fixture that failed on
+        # absence would make that legitimate probe unrunnable.
+        i = self.fixture.index("is absent, as it must be")
+        self.assertIn("ok(", self.fixture[i - 120:i])
+
+    def test_the_write_attempt_is_the_clause_that_matters(self):
+        self.assertIn(".probe-write", self.fixture)
+        i = self.fixture.index("is WRITABLE")
+        self.assertIn("bad(", self.fixture[i - 120:i])
+
+    def test_it_verifies_the_digests_not_only_the_sizes(self):
+        # The manifest carries a sha256 per file, and this is the only place it
+        # is ever checked against the bytes. A size check passes on a file of
+        # the right length and the wrong content.
+        self.assertIn("hashlib.sha256()", self.fixture)
+        self.assertIn('entry.get("sha256")', self.fixture)
+
+    def test_its_canonical_form_matches_the_trusted_module_byte_for_byte(self):
+        # A SECOND implementation, deliberately -- agent-authored code inside the
+        # sandbox cannot import the trusted module. Pinned here so a change to
+        # one is a failure rather than a silent divergence, which would surface
+        # as "the mounted baseline does not hash to its identity" on every probe.
+        import baseline as baseline_mod
+        namespace = {}
+        exec(compile(self.fixture.replace('sys.exit(main())', 'pass'),
+                     "baseline_contract.py", "exec"), namespace)  # noqa: S102
+        sample = {"schema": 1, "days": ["2026-08-01"], "ndjson_rows": 3,
+                  "files": {"x": {"sha256": "a" * 64}},
+                  "exclude_dates": [], "baseline_hash": "ignored"}
+        self.assertEqual(namespace["canonical"](sample),
+                         baseline_mod.canonical(
+                             {k: v for k, v in sample.items()
+                              if k != "baseline_hash"}))
+
+    def test_the_generator_tells_the_operator_to_add_it(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(os.path.dirname(here),
+                               "nc-fixtures-phase2b.sh")) as fh:
+            gen = fh.read()
+        # A fixture the operator never pushes is a clause that voids on a host
+        # where everything works.
+        self.assertIn("research/experiments/baseline_contract.py",
+                      gen[gen.index("git add"):])
+
+
+class TestQfdCannotWriteTheFrozenStores(unittest.TestCase):
+    """The read-only intent is enforced by the unit, not only by the code.
+
+    `_probe_baseline` and `_probe_extract` only read, and `promote-baseline.sh`
+    is the only writer -- but "only reads" is a property of today's code, and the
+    two stores are the inputs every recorded result cites. `ProtectSystem=strict`
+    plus a `ReadWritePaths=` that omits them makes a write impossible rather than
+    merely unintended, so a future bug in qfd cannot corrupt an artifact a
+    published comparison was measured against.
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf-dispatch.service")) as fh:
+            self.unit = fh.read()
+        self.rw = [line.split("=", 1)[1].split()
+                   for line in self.unit.splitlines()
+                   if line.startswith("ReadWritePaths=")]
+
+    def test_the_filesystem_is_read_only_by_default(self):
+        self.assertIn("ProtectSystem=strict", self.unit)
+
+    def test_neither_frozen_store_is_writable(self):
+        writable = {path for group in self.rw for path in group}
+        for store in ("/var/lib/qf-baselines", "/var/lib/qf-extracts"):
+            with self.subTest(store=store):
+                self.assertNotIn(store, writable)
+                # Nor via a parent: `/var/lib` in ReadWritePaths would grant both.
+                for granted in writable:
+                    self.assertFalse(
+                        store.startswith(granted.rstrip("/") + "/"),
+                        f"{granted} grants write access to {store}")
+
+    def test_the_paths_the_unit_names_are_the_ones_the_config_defaults_to(self):
+        # A hardening assertion about a path nothing reads proves nothing.
+        cfg = qfd.Config.from_env({"QFD_ADMIN_UID": "1001"})
+        self.assertEqual(cfg.baselines_dir, "/var/lib/qf-baselines")
+        self.assertEqual(cfg.extracts_dir, "/var/lib/qf-extracts")
+        for path in (cfg.baselines_dir, cfg.extracts_dir):
+            self.assertIn(f"={path}", self.unit)
+
+
+class TestFromEnvActuallyReadsTheEnvItWasGiven(unittest.TestCase):
+    """`from_env(env)` took an argument that its integer reads and three of its
+    string reads ignored -- they went straight to `os.environ`. A parameter that
+    looks like an injection point and is not is the same defect as an injected
+    clock nothing consults: it makes the object look testable and the test
+    meaningless, because the values under test came from the process."""
+
+    BASE = {"QFD_ADMIN_UID": "1001"}
+
+    def test_every_integer_knob_comes_from_the_mapping(self):
+        cfg = qfd.Config.from_env({**self.BASE, "QFD_DISK_FLOOR_GB": "77",
+                                   "QFD_LOG_CAP_MB": "3"})
+        self.assertEqual(cfg.disk_floor_gb, 77)
+        self.assertEqual(cfg.log_cap_mb, 3)
+
+    def test_every_path_knob_comes_from_the_mapping(self):
+        cfg = qfd.Config.from_env({**self.BASE,
+                                   "QFD_BASELINES_DIR": "/tmp/b",
+                                   "QFD_EXTRACTS_DIR": "/tmp/e",
+                                   "QFD_EXTRACT_SOCKET": "/tmp/s"})
+        self.assertEqual(cfg.baselines_dir, "/tmp/b")
+        self.assertEqual(cfg.extracts_dir, "/tmp/e")
+        self.assertEqual(cfg.extract_socket, "/tmp/s")
+
+    def test_the_process_environment_does_not_leak_in(self):
+        # The assertion that would have failed before: with the mapping silent
+        # about a knob, the value must be the DEFAULT, not whatever the process
+        # happens to carry.
+        with mock.patch.dict(os.environ, {"QFD_BASELINES_DIR": "/leaked",
+                                          "QFD_DISK_FLOOR_GB": "999"}):
+            cfg = qfd.Config.from_env(self.BASE)
+        self.assertEqual(cfg.baselines_dir, "/var/lib/qf-baselines")
+        self.assertEqual(cfg.disk_floor_gb, 20)
+
+    def test_a_missing_required_knob_still_refuses(self):
+        # Threading the mapping must not turn a fatal missing value into a
+        # silent default: every one of these is a control whose absence is quiet.
+        with self.assertRaises(qfd.ConfigError) as cm:
+            qfd.Config.from_env({})
+        self.assertIn("QFD_ADMIN_UID", str(cm.exception))
+
+    def test_no_read_inside_from_env_bypasses_the_mapping(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        body = source[source.index("    def from_env(cls, env=None):"):]
+        body = code_only(body[:body.index("        cfg.check_deadline_chain()")])
+        # Exactly one: the `env if env is not None else os.environ` default.
+        self.assertEqual(body.count("os.environ"), 1, body)

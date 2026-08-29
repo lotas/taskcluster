@@ -34,6 +34,13 @@ ARTIFACTS_DEST = "/artifacts"
 # no path refactor inside `qf-research`.
 EXTRACT_DEST = "/extract"
 
+# Phase 2b-3. The promoted baseline, read-only for the same reason /extract is:
+# a promoted baseline is immutable, and a run that could write to it would change
+# what a recorded comparison was measured against -- silently, because the
+# baseline hash a probe pins is computed at promotion and never recomputed on
+# read.
+BASELINE_DEST = "/baseline"
+
 # `SRC_DEST + "/trainer/data"`, and the extra level is not a typo.
 #
 # The mounted tree is the qf-research WORKTREE ROOT, and that repository puts the
@@ -82,6 +89,10 @@ def _check_mount_source(path, what):
 #              invisibly: the manifest's digests describe what was extracted and
 #              nothing re-checks them before a later read.
 #
+#   /baseline  is the same argument about the other input. Its hash is a CONTENT
+#              key computed once at promotion, so a writable mount would leave
+#              every probe that cites that hash citing bytes it never saw.
+#
 #   /app/trainer/data  is the opposite. The tree around it is read-only and the
 #              trainer must still write its cache and its model output, so a
 #              read-only mount here fails at the first cache write -- deep inside
@@ -90,7 +101,7 @@ def _check_mount_source(path, what):
 # `/artifacts` and `/trusted/*` keep their existing latitude. Tightening them
 # would be a change to an evidenced path with no demonstrated need, and this
 # table is about adding two destinations rather than revisiting two others.
-_RO_ONLY_DESTS = (EXTRACT_DEST,)
+_RO_ONLY_DESTS = (EXTRACT_DEST, BASELINE_DEST)
 _RW_ONLY_DESTS = (DATA_DEST,)
 
 
@@ -104,9 +115,9 @@ def _check_extra_dest(dest, *, writable):
     if dest in _RO_ONLY_DESTS:
         if writable:
             raise SandboxError(
-                f"{dest} may only be mounted read-only: a published extract is"
-                f" immutable, and a run that could write to it would change the"
-                f" input to results that already cite it")
+                f"{dest} may only be mounted read-only: a published extract or"
+                f" baseline is immutable, and a run that could write to it would"
+                f" change the input to results that already cite it")
         return
     if dest in _RW_ONLY_DESTS:
         if not writable:
@@ -122,7 +133,8 @@ def _check_extra_dest(dest, *, writable):
         return
     raise SandboxError(
         f"mount destination {dest!r} is not allowlisted; extras may only be"
-        f" {ARTIFACTS_DEST}, {EXTRACT_DEST}, {DATA_DEST}, or a path under"
+        f" {ARTIFACTS_DEST}, {EXTRACT_DEST}, {BASELINE_DEST}, {DATA_DEST}, or"
+        f" a path under"
         f" {TRUSTED_MOUNT_PREFIX}")
 
 

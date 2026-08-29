@@ -458,3 +458,54 @@ class TestTheProbeEntrypoint(unittest.TestCase):
         argv = sandbox.entrypoint_for(eff)
         self.assertFalse(any("a" * 64 in part for part in argv))
         self.assertFalse(any(part.startswith("/extract") for part in argv))
+
+
+class TestTheProbeBaselineIsOptionalAndTyped(unittest.TestCase):
+    """`args.baseline` is the one probe input with a legitimate absence: a
+    non-residual cohort reads none. Optional is not the same as lax -- there is
+    no default and no "latest", because a comparison whose baseline was chosen
+    for it cannot say what it was measured against."""
+
+    def a_probe(self, **args_over):
+        args = {"path": "research/experiments/cohort.py", "extract": "c" * 64}
+        args.update(args_over)
+        return spec.normalize({"schema": 1, "kind": "probe",
+                               "source_sha": "b" * 40, "args": args})
+
+    def test_absent_is_accepted_and_stays_absent(self):
+        effective = self.a_probe()
+        self.assertNotIn("baseline", effective["args"])
+
+    def test_a_full_hash_is_accepted_unchanged(self):
+        effective = self.a_probe(baseline="a" * 64)
+        self.assertEqual(effective["args"]["baseline"], "a" * 64)
+
+    def test_anything_that_is_not_64_lowercase_hex_is_refused(self):
+        for bad in ("a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 32,
+                    "../etc/passwd", "", " " + "a" * 63):
+            with self.subTest(bad=bad), self.assertRaises(spec.SpecError) as cm:
+                self.a_probe(baseline=bad)
+            self.assertIn("args.baseline", str(cm.exception))
+
+    def test_a_non_string_is_refused_by_type_not_by_regex(self):
+        # `_HASH64_RE.match(5)` is a TypeError, which would escape the typed
+        # refusal -- the same shape as the extract spec's P1.
+        for bad in (5, 5.0, True, None if False else [], {}, ["a" * 64]):
+            with self.subTest(bad=bad), self.assertRaises(spec.SpecError):
+                self.a_probe(baseline=bad)
+
+    def test_an_explicit_null_means_absent_rather_than_invalid(self):
+        # A client that always sends the key is ordinary; refusing an explicit
+        # null would make the wire shape stricter than the semantics.
+        effective = self.a_probe(baseline=None)
+        self.assertNotIn("baseline", effective["args"])
+
+    def test_an_unknown_args_key_is_still_refused(self):
+        # Adding an optional key must not open the object up.
+        with self.assertRaises(spec.SpecError):
+            self.a_probe(baselines="a" * 64)
+
+    def test_one_pattern_serves_both_identities(self):
+        # Two copies of "64 lowercase hex" are two things that can drift.
+        self.assertTrue(spec._HASH64_RE.match("a" * 64))
+        self.assertIsNone(spec._HASH64_RE.match("A" * 64))

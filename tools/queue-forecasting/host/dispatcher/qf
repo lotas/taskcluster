@@ -167,37 +167,53 @@ def cmd_extract(args):
             raise SystemExit(0 if job["state"] == "SUCCEEDED" else 1)
 
 
-def resolve_extract(given):
-    """A unique prefix becomes the full request hash. Resolved IN THE CLIENT.
+def _resolve_prefix(given, *, flag, op, key, listing, publisher):
+    """A unique prefix becomes the full hash. Resolved IN THE CLIENT.
 
-    The ergonomics belong here and the strictness belongs at the boundary: the
-    dispatcher still receives 64 lowercase hex and still refuses anything else,
-    and it still does not enumerate the extracts directory -- that listing is
-    relayed from the service that owns it, which is the same `extracts` op a human
-    would run.
+    ONE function for extracts and baselines, because it is one algorithm: the
+    ergonomics belong here and the strictness belongs at the boundary. The
+    dispatcher still receives 64 lowercase hex and still refuses anything else.
 
     Ambiguity is a refusal that PRINTS the candidates. Picking the first match
-    would mean a two-character-shorter prefix silently probing different data.
+    would mean a two-character-shorter prefix silently reading different data --
+    and for a baseline that is worse than for an extract, because a probe whose
+    comparison shifted underneath it still produces plausible numbers.
     """
     if _HEX64_RE.match(given or ""):
         return given
     if not _PREFIX_RE.match(given or ""):
-        die(f"--extract {given!r} is neither a request hash nor a prefix of one"
-            f" (8-64 lowercase hex). `qf extracts` lists what is published.")
+        die(f"{flag} {given!r} is neither a hash nor a prefix of one"
+            f" (8-64 lowercase hex). `{listing}` lists what is published.")
 
-    resp = call("extracts")
+    resp = call(op)
     if not resp.get("ok"):
-        die(resp.get("error", "cannot list extracts to resolve a prefix"))
-    matches = sorted({row.get("request_hash") for row in resp.get("extracts", [])
-                      if (row.get("request_hash") or "").startswith(given)})
+        die(resp.get("error", f"cannot list {op} to resolve a prefix"))
+    matches = sorted({row.get(key) for row in resp.get(op, [])
+                      if (row.get(key) or "").startswith(given)})
     if not matches:
-        die(f"no published extract starts with {given!r}."
-            f" `qf extracts` lists what is published; `qf extract` publishes one.")
+        die(f"nothing published starts with {given!r}."
+            f" `{listing}` lists what is published; {publisher} publishes one.")
     if len(matches) > 1:
         lines = "\n  ".join(matches)
-        die(f"{given!r} matches {len(matches)} published extracts, so it is"
-            f" ambiguous. Use more characters:\n  {lines}")
+        die(f"{given!r} matches {len(matches)} published, so it is ambiguous."
+            f" Use more characters:\n  {lines}")
     return matches[0]
+
+
+def resolve_extract(given):
+    """The extracts listing is RELAYED from the service that owns the directory,
+    which is the same `extracts` op a human would run."""
+    return _resolve_prefix(given, flag="--extract", op="extracts",
+                           key="request_hash", listing="qf extracts",
+                           publisher="`qf extract`")
+
+
+def resolve_baseline(given):
+    """The baselines listing is read by the dispatcher: the store has no service
+    of its own, and qfd already reads it to resolve a mount."""
+    return _resolve_prefix(given, flag="--baseline", op="baselines",
+                           key="baseline_hash", listing="qf baselines",
+                           publisher="`promote-baseline.sh`")
 
 
 def cmd_probe(args):
@@ -214,6 +230,11 @@ def cmd_probe(args):
         "source_sha": args.sha,
         "args": {"path": args.path, "extract": resolve_extract(args.extract)},
     }
+    # OPTIONAL. A non-residual cohort reads no baseline, and there is no
+    # "latest": a comparison whose baseline was chosen for it cannot say what it
+    # was measured against.
+    if args.baseline:
+        spec_body["args"]["baseline"] = resolve_baseline(args.baseline)
     for name, value in (("mem_limit", args.mem), ("cpus", args.cpus),
                         ("timeout_s", args.timeout), ("note", args.note)):
         if value is not None:
@@ -278,6 +299,48 @@ def cmd_extracts(args):
         if rows_by_file:
             print("    rows=" + " ".join(
                 f"{k}={v}" for k, v in sorted(rows_by_file.items())))
+
+
+def cmd_baselines(args):
+    """What has been promoted: identity, day coverage and promotion time.
+
+    Read by the dispatcher, not relayed: the baseline store has no service of its
+    own, and qfd already reads it to resolve a probe's mount.
+    """
+    resp = call("baselines")
+    if args.json:
+        show(resp, True)
+        return
+    if not resp.get("ok"):
+        die(resp.get("error", "baselines failed"))
+    rows = resp.get("baselines") or []
+    if not rows:
+        print(f"no promoted baselines in {resp.get('store')}")
+        return
+    for row in rows:
+        broken = row.get("broken")
+        print(f"{(row.get('baseline_hash') or '?')[:12]}"
+              f"  days={row.get('days')}"
+              f"  rows={row.get('ndjson_rows')}"
+              f"  {row.get('pending_at_min')}..{row.get('pending_at_max')}"
+              f"  promoted={row.get('promoted_at') or 'unknown'}")
+        # THE FULL HASH, on its own line and labelled with the flag it goes to --
+        # the same reason as `qf extracts`: the short form is for reading, and
+        # printing only that made the natural copy-paste the value the validator
+        # refuses.
+        print(f"    --baseline {row.get('baseline_hash')}")
+        excluded = row.get("exclude_dates") or []
+        if excluded:
+            # DECLARED at promotion and not derivable from the files, so a
+            # listing that hid it would present a choice as if it had none.
+            print(f"    exclude_dates={','.join(excluded)}")
+        if broken:
+            # Reported, not omitted: a half-promoted directory has to be visible
+            # to the command an operator runs to find out why a probe refused.
+            print(f"    BROKEN: {broken}", file=sys.stderr)
+    if resp.get("truncated"):
+        print(f"  ({resp.get('published')} promoted; showing {len(rows)})",
+              file=sys.stderr)
 
 
 def cmd_status(args):
@@ -448,6 +511,11 @@ def build_parser(admin_mode):
     pr.add_argument("--extract", required=True, metavar="REQUEST_HASH",
                     help="an already-published extract, or any unique prefix of"
                          " one (8+ hex); see `qf extracts`")
+    pr.add_argument("--baseline", metavar="BASELINE_HASH",
+                    help="a promoted baseline to mount read-only at /baseline,"
+                         " or any unique prefix of one (8+ hex); see"
+                         " `qf baselines`. Omit it for a cohort that reads no"
+                         " baseline")
     pr.add_argument("--mem", help="default 8g, which derives the heavy lane")
     pr.add_argument("--cpus", type=float)
     pr.add_argument("--timeout", type=int)
@@ -458,6 +526,10 @@ def build_parser(admin_mode):
     sub.add_parser("extracts",
                    help="list published extracts with hashes and watermarks"
                    ).set_defaults(func=cmd_extracts)
+
+    sub.add_parser("baselines",
+                   help="list promoted baselines with hashes and day coverage"
+                   ).set_defaults(func=cmd_baselines)
 
     st = sub.add_parser("status")
     st.add_argument("run_id")

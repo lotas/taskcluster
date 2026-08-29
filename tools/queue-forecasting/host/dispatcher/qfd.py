@@ -41,6 +41,7 @@ import sys
 import threading
 import time
 
+import baseline as baseline_mod
 import image as image_mod
 import sandbox as sandbox_mod
 import source as source_mod
@@ -57,10 +58,22 @@ DOCKER_CALL_TIMEOUT_S = 60
 SCHEMA_VERSION = spec_mod.SCHEMA_VERSION
 FORCE_RELEASE_FLAG = "i_have_verified_nothing_is_running"
 
+# The smallest reservation any kind can ask for. `ping` reports the resource
+# gate at THIS size, so "resource" answers the strongest available form of the
+# question: if even the cheapest job cannot be admitted, nothing can.
+SMALLEST_MEM_LIMIT = min((k["mem_limit"] for k in spec_mod.KINDS.values()),
+                         key=spec_mod.mem_mb)
+
+# The shape of every frozen-input identity: an extract's request hash, an
+# extract_hash, a baseline's content hash. Module level because two classes read
+# it now -- `Runner` validates a relay's reply, `Dispatcher` filters the baseline
+# store -- and a second copy is a second thing that can drift.
+HEX64_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
 # The client socket's op table. `force-release` is deliberately ABSENT: the
 # group on this socket contains `research` (revision 8's regression).
 CLIENT_OPS = ("ping", "submit", "status", "list", "cancel", "verify-chain",
-              "trusted-paths", "extracts")
+              "trusted-paths", "extracts", "baselines")
 ADMIN_OPS = ("force-release",)
 
 # Trusted files whose realpath and digest `trusted-paths` reports -- the live
@@ -82,8 +95,13 @@ def utcnow():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _int_env(name, default=None):
-    raw = os.environ.get(name)
+def _int_env(name, default=None, env=None):
+    """An integer from the environment. `env` is threaded through from
+    `Config.from_env` rather than read off `os.environ` here, because a
+    parameter nothing consults is a claim nothing backs -- `from_env` took an
+    `env` argument that its integer reads and three of its string reads ignored,
+    so it could not be exercised without mutating the process."""
+    raw = (os.environ if env is None else env).get(name)
     if raw is None or raw == "":
         if default is None:
             raise ConfigError(f"{name} is unset")
@@ -113,6 +131,7 @@ class Config:
         "QFD_ADMITTED_MEM_BUDGET_MB", "QFD_TIMEOUT_MAX_S", "QFD_LOCK_WAIT_S",
         "QFD_IMAGE_BUILD_MEM_MB", "QFD_LIGHT_WORKERS", "QFD_LOG_CAP_MB",
         "QFD_EXTRACT_SOCKET", "QFD_SETTLEMENT_LAG_S", "QFD_EXTRACTS_DIR",
+        "QFD_BASELINES_DIR",
         "QFD_ARTIFACT_CAP_MB", "QFD_HANDOFF_TIMEOUT_S", "QFD_DISK_FLOOR_GB",
         "QFD_QUEUED_CAP_PER_UID", "QFD_LEASE_S",
     )
@@ -125,49 +144,59 @@ class Config:
     def from_env(cls, env=None):
         env = env if env is not None else os.environ
         get = env.get
+
+        def _env_int(name, default=None):
+            return _int_env(name, default, env=env)
+
         cfg = cls(
             trusted_dir=get("QFD_TRUSTED_DIR", ""),
             state_dir=get("QFD_STATE_DIR", ""),
             runs_dir=get("QFD_RUNS_DIR", ""),
             socket_path=get("QFD_SOCKET", ""),
             admin_socket_path=get("QFD_ADMIN_SOCKET", ""),
-            admin_uid=_int_env("QFD_ADMIN_UID"),
+            admin_uid=_env_int("QFD_ADMIN_UID"),
             remote=get("QFD_REMOTE", ""),
             token_file=get("QFD_TOKEN_FILE", ""),
             lock_file=get("QFD_LOCK_FILE", ""),
             intent_dir=get("QFD_INTENT_DIR", ""),
             build_lock=get("QFD_BUILD_LOCK", ""),
-            build_timeout_s=_int_env("QFD_BUILD_TIMEOUT_S", 1800),
-            build_lock_wait_s=_int_env("QFD_BUILD_LOCK_WAIT_S", 900),
-            build_settle_s=_int_env("QFD_BUILD_SETTLE_S", 30),
-            job_hold_deadline_s=_int_env("QFD_JOB_HOLD_DEADLINE_S", 7800),
-            kill_confirm_s=_int_env("QFD_KILL_CONFIRM_S", 300),
-            stop_timeout_s=_int_env("QFD_STOP_TIMEOUT_S", 10),
-            reap_interval_s=_int_env("QFD_REAP_INTERVAL_S", 60),
+            build_timeout_s=_env_int("QFD_BUILD_TIMEOUT_S", 1800),
+            build_lock_wait_s=_env_int("QFD_BUILD_LOCK_WAIT_S", 900),
+            build_settle_s=_env_int("QFD_BUILD_SETTLE_S", 30),
+            job_hold_deadline_s=_env_int("QFD_JOB_HOLD_DEADLINE_S", 7800),
+            kill_confirm_s=_env_int("QFD_KILL_CONFIRM_S", 300),
+            stop_timeout_s=_env_int("QFD_STOP_TIMEOUT_S", 10),
+            reap_interval_s=_env_int("QFD_REAP_INTERVAL_S", 60),
             setup_teardown_allowance_s=_int_env(
                 "QFD_SETUP_TEARDOWN_ALLOWANCE_S", 600),
-            marker_stale_margin_s=_int_env("QFD_MARKER_STALE_MARGIN_S", 900),
+            marker_stale_margin_s=_env_int("QFD_MARKER_STALE_MARGIN_S", 900),
             lock_migrated_marker=get("QFD_LOCK_MIGRATED_MARKER", ""),
-            mem_budget_mb=_int_env("QFD_ADMITTED_MEM_BUDGET_MB", 22528),
-            timeout_max_s=_int_env("QFD_TIMEOUT_MAX_S", 3600),
-            lock_wait_s=_int_env("QFD_LOCK_WAIT_S", 9000),
-            image_build_mem_mb=_int_env("QFD_IMAGE_BUILD_MEM_MB", 2048),
-            light_workers=_int_env("QFD_LIGHT_WORKERS", 2),
-            log_cap_mb=_int_env("QFD_LOG_CAP_MB", 16),
-            extract_socket=os.environ.get("QFD_EXTRACT_SOCKET",
+            mem_budget_mb=_env_int("QFD_ADMITTED_MEM_BUDGET_MB", 22528),
+            timeout_max_s=_env_int("QFD_TIMEOUT_MAX_S", 3600),
+            lock_wait_s=_env_int("QFD_LOCK_WAIT_S", 9000),
+            image_build_mem_mb=_env_int("QFD_IMAGE_BUILD_MEM_MB", 2048),
+            light_workers=_env_int("QFD_LIGHT_WORKERS", 2),
+            log_cap_mb=_env_int("QFD_LOG_CAP_MB", 16),
+            extract_socket=get("QFD_EXTRACT_SOCKET",
                                           "/run/qf-extract/sock"),
             # READ-ONLY to the dispatcher, and only to resolve a probe's mount:
             # the directory belongs to qfextract, and `qf extracts` is relayed
             # rather than walked for exactly that reason. Mounting requires a
             # path, so this is the one place qfd needs to know the layout.
-            extracts_dir=os.environ.get("QFD_EXTRACTS_DIR",
+            extracts_dir=get("QFD_EXTRACTS_DIR",
                                         "/var/lib/qf-extracts"),
-            settlement_lag_s=_int_env("QFD_SETTLEMENT_LAG_S", 48 * 3600),
-            artifact_cap_mb=_int_env("QFD_ARTIFACT_CAP_MB", 2048),
-            handoff_timeout_s=_int_env("QFD_HANDOFF_TIMEOUT_S", 120),
-            disk_floor_gb=_int_env("QFD_DISK_FLOOR_GB", 20),
-            queued_cap_per_uid=_int_env("QFD_QUEUED_CAP_PER_UID", 20),
-            lease_s=_int_env("QFD_LEASE_S", 300),
+            # Likewise read-only, and for a stronger reason: the store is owned
+            # by root and written only by `promote-baseline.sh`, run by a human.
+            # qfd resolves a hash to a path so it can mount it, and does nothing
+            # else with the directory -- it cannot publish, and must not.
+            baselines_dir=get("QFD_BASELINES_DIR",
+                                         "/var/lib/qf-baselines"),
+            settlement_lag_s=_env_int("QFD_SETTLEMENT_LAG_S", 48 * 3600),
+            artifact_cap_mb=_env_int("QFD_ARTIFACT_CAP_MB", 2048),
+            handoff_timeout_s=_env_int("QFD_HANDOFF_TIMEOUT_S", 120),
+            disk_floor_gb=_env_int("QFD_DISK_FLOOR_GB", 20),
+            queued_cap_per_uid=_env_int("QFD_QUEUED_CAP_PER_UID", 20),
+            lease_s=_env_int("QFD_LEASE_S", 300),
         )
         cfg.check_deadline_chain()
         return cfg
@@ -899,15 +928,24 @@ class Docker:
 
 
 # --- run ids -------------------------------------------------------------
-class ProbeExtractMissing(Exception):
-    """A probe named an extract that is not published.
+class ProbeInputMissing(Exception):
+    """A probe named a frozen input that is not published.
 
-    Its own class, and its own `error_class`, because "the extract is not there"
-    and "the extraction failed" send an operator to different places -- one is a
-    request to fix, the other is a subsystem to look at.
+    Its own class per input, and its own `error_class`, because "the extract is
+    not there" and "the extraction failed" send an operator to different places
+    -- one is a request to fix, the other is a subsystem to look at. A baseline
+    is a third place again: nothing automated publishes one.
     """
 
+    error_class = "probe_input_not_published"
+
+
+class ProbeExtractMissing(ProbeInputMissing):
     error_class = "extract_not_published"
+
+
+class ProbeBaselineMissing(ProbeInputMissing):
+    error_class = "baseline_not_published"
 
 
 class ExtractRelayError(Exception):
@@ -1236,8 +1274,25 @@ class Dispatcher:
         # A queue that is not moving is the likeliest question to ask this
         # endpoint, and it could not answer it.
         may, reason = self.may_admit()
+        # The RESOURCE gate, separately from `admit`. `may_admit` covers the
+        # cleanup stall and the nightly intent gate only -- the aggregate memory
+        # budget and the disk floor are read inside `try_one`, one step later --
+        # so the two commonest answers to "why is my job still QUEUED" were the
+        # two this endpoint could not give. It reported `free_disk_mb` without
+        # the floor to compare it against, which reads like an answer and is not
+        # one.
+        #
+        # Asked at SMALLEST_MEM_LIMIT so a false "ok" is impossible: a bigger
+        # reservation could be refused while a small one is admitted, and this
+        # field must not say "resources are fine" when the queue is frozen.
+        res_ok, res_why = self.db.call(
+            "admit", SMALLEST_MEM_LIMIT,
+            free_disk_mb=free_disk_mb(self.cfg.runs_dir))
         return {
             "admit": "ok" if may else reason,
+            "resource": "ok" if res_ok else res_why,
+            "resource_at": SMALLEST_MEM_LIMIT,
+            "disk_floor_mb": self.cfg.disk_floor_gb * 1024,
             "mutex": probe_mutex(self.cfg.lock_file),
             "queued": len(self.db.call("list", state="QUEUED", limit=500)),
             "commit": self.commit,
@@ -1328,6 +1383,83 @@ class Dispatcher:
         if not reply.get("ok"):
             raise Refused(reply.get("error", "the extractor refused"))
         return {"extracts": reply.get("extracts", [])}
+
+    # A listing cap. Not silent: `truncated` is reported, because a listing that
+    # quietly stops is how a prefix resolves to "no match" for a baseline that is
+    # right there.
+    BASELINES_LIMIT = 200
+
+    def _op_baselines(self, payload, uid):
+        """What has been promoted to the baseline store.
+
+        READ HERE, not relayed, and the asymmetry with `extracts` is deliberate.
+        The extracts directory belongs to another privilege domain, so walking it
+        from here would put the layout in two places. The baseline store has no
+        service: it is root-owned and written by a human running
+        `promote-baseline.sh`. qfd is already the only process that reads it --
+        it resolves a hash to a mount -- so this is not a second reader.
+
+        A directory whose manifest is missing, unreadable or does not hash to its
+        own name is reported as `broken` rather than omitted. Omitting it would
+        make a half-promoted directory invisible to the one command an operator
+        would use to find out why a probe was refused.
+        """
+        root = self.cfg.baselines_dir
+        try:
+            names = sorted(os.listdir(root))
+        except FileNotFoundError:
+            return {"baselines": [], "store": root, "truncated": False}
+        except OSError as e:
+            raise Refused(f"the baseline store at {root} is unreadable: {e}") \
+                from None
+
+        rows, seen = [], 0
+        for name in names:
+            if not HEX64_RE.match(name):
+                # `.staging.*` and anything else: the store's own scratch, or
+                # something that is not a baseline. Not an error, not a row.
+                continue
+            seen += 1
+            if len(rows) >= self.BASELINES_LIMIT:
+                continue
+            path = os.path.join(root, name)
+            row = {"baseline_hash": name}
+            try:
+                with open(os.path.join(path, "MANIFEST.json")) as fh:
+                    manifest = json.load(fh)
+                if not isinstance(manifest, dict):
+                    raise ValueError("manifest is not an object")
+                row["days"] = len(manifest.get("days") or [])
+                row["ndjson_rows"] = manifest.get("ndjson_rows")
+                row["pending_at_min"] = manifest.get("pending_at_min")
+                row["pending_at_max"] = manifest.get("pending_at_max")
+                row["exclude_dates"] = manifest.get("exclude_dates") or []
+                if baseline_mod.baseline_hash(manifest) != name:
+                    row["broken"] = "the manifest does not hash to its own name"
+            except (OSError, ValueError, TypeError) as e:
+                row["broken"] = f"the manifest is unreadable ({e})"
+            row["promoted_at"] = self._promoted_at(path)
+            rows.append(row)
+        rows.sort(key=lambda r: (r.get("promoted_at") or "", r["baseline_hash"]))
+        return {"baselines": rows, "store": root,
+                "truncated": seen > len(rows), "published": seen}
+
+    @staticmethod
+    def _promoted_at(path):
+        """When this baseline was published, from the sidecar the promoter wrote.
+
+        A SIDECAR rather than a manifest field, because the manifest IS the
+        identity: a `promoted_at` inside it would make every promotion of the
+        same bytes a different artifact, which is what a content key exists to
+        prevent. And a sidecar rather than the directory mtime, because an mtime
+        survives a filesystem copy as a confident wrong answer.
+        """
+        try:
+            with open(os.path.join(path, "PROMOTED_AT")) as fh:
+                value = fh.read(64).strip()
+        except OSError:
+            return None
+        return value or None
 
     def _op_list(self, payload, uid):
         limit = payload.get("limit", 20)
@@ -2045,10 +2177,11 @@ class Runner:
             # `qf status`; the work itself happens in another privilege domain
             # (D15), and all this side does is ask and record what came back.
             if effective["kind"] == "probe":
-                # BEFORE the worktree and the image build. A bad extract
-                # reference then costs seconds rather than minutes, and the
-                # provenance is recorded even if the run fails later.
+                # BEFORE the worktree and the image build. A bad extract or
+                # baseline reference then costs seconds rather than minutes, and
+                # the provenance is recorded even if the run fails later.
                 self._pin_probe_extract(hold, effective)
+                self._pin_probe_baseline(hold, effective)
             if effective["kind"] == "extract":
                 # LEASED -> RUNNING FIRST, and this is not bookkeeping.
                 #
@@ -2115,7 +2248,7 @@ class Runner:
             log.error("%s: %s", run_id, e)
             outcome = ("FAILED", {"error_class": "source_timeout",
                                   "finished_at": utcnow()})
-        except ProbeExtractMissing as e:
+        except ProbeInputMissing as e:
             log.error("%s: %s", run_id, e)
             outcome = ("FAILED", {"error_class": e.error_class,
                                   "finished_at": utcnow()})
@@ -2239,8 +2372,6 @@ class Runner:
                                   "finished_at": now})
         return ("SUCCEEDED", {"exit_code": 0, "finished_at": now})
 
-    _HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
-
     def _extract_reply_problem(self, reply, manifest, request, effective):
         """Why this reply cannot be recorded as an extract, or None.
 
@@ -2253,7 +2384,7 @@ class Runner:
 
         for field in ("request_hash", "extract_hash"):
             value = manifest.get(field)
-            if not isinstance(value, str) or not self._HEX64.match(value):
+            if not isinstance(value, str) or not HEX64_RE.match(value):
                 return f"{field} is {value!r}, not a sha256"
 
         # THE REQUEST HASH MUST BE THE ONE WE ASKED FOR. Otherwise a reply about
@@ -2675,7 +2806,7 @@ class Runner:
                 f" {request_hash[:12]}: the directory and its manifest disagree"
                 f" about which extract this is")
         extract_hash = manifest.get("extract_hash")
-        if not isinstance(extract_hash, str) or not self._HEX64.match(
+        if not isinstance(extract_hash, str) or not HEX64_RE.match(
                 extract_hash):
             raise ProbeExtractMissing(
                 f"the manifest for {request_hash[:12]} carries no valid"
@@ -2685,6 +2816,104 @@ class Runner:
             raise ProbeExtractMissing(
                 f"the manifest for {request_hash[:12]} lists no files")
         return path, manifest
+
+    def _probe_baseline(self, effective):
+        """Resolve, VALIDATE and return `(path, manifest)` for a probe's
+        baseline, or `(None, None)` when the probe declared none.
+
+        ABSENT IS LEGITIMATE. A non-residual cohort reads no baseline, so this is
+        the one probe input with a "not asked for" case -- and it is distinct
+        from "asked for and missing", which is a refusal. Collapsing them would
+        make a typo in a hash silently produce a run with no comparison.
+
+        Otherwise the same shape as `_probe_extract`, for the same reasons: the
+        path is DERIVED from trusted config plus a 64-hex hash, so no spec can
+        name a directory; and the manifest is READ AND CHECKED rather than merely
+        found, because `MANIFEST.json` existing is not evidence that the
+        directory holds the baseline whose hash this run is about to record.
+
+        The hash is RECOMPUTED from the manifest body. It is a content key, so
+        this is the one input whose declared identity can be verified rather than
+        trusted -- and a promoted directory whose manifest does not hash to its
+        own name is either corrupt or hand-edited. Skipping the check would mean
+        the pinned `baseline_hash` proves only that somebody wrote it down.
+        """
+        baseline_hash = effective["args"].get("baseline")
+        if baseline_hash is None:
+            return None, None
+        path = os.path.join(self.cfg.baselines_dir, baseline_hash)
+        manifest_path = os.path.join(path, "MANIFEST.json")
+        try:
+            with open(manifest_path) as fh:
+                manifest = json.load(fh)
+        except FileNotFoundError:
+            raise ProbeBaselineMissing(
+                f"no promoted baseline {baseline_hash[:12]}: a probe reads a"
+                f" baseline that already exists. `qf baselines` lists what is"
+                f" promoted; promote-baseline.sh promotes one."
+            ) from None
+        except (OSError, ValueError) as e:
+            raise ProbeBaselineMissing(
+                f"the manifest for baseline {baseline_hash[:12]} is unreadable"
+                f" ({e}): refusing rather than mounting a baseline whose"
+                f" provenance cannot be read"
+            ) from None
+
+        if not isinstance(manifest, dict):
+            raise ProbeBaselineMissing(
+                f"the manifest for baseline {baseline_hash[:12]} is not an"
+                f" object")
+        if manifest.get("baseline_hash") != baseline_hash:
+            raise ProbeBaselineMissing(
+                f"the manifest in {path} says baseline_hash"
+                f" {str(manifest.get('baseline_hash'))[:12]}, not"
+                f" {baseline_hash[:12]}: the directory and its manifest disagree"
+                f" about which baseline this is")
+        try:
+            recomputed = baseline_mod.baseline_hash(manifest)
+        except Exception as e:                       # a malformed manifest body
+            raise ProbeBaselineMissing(
+                f"the manifest for baseline {baseline_hash[:12]} cannot be"
+                f" hashed ({e}): its identity is a content key, so a body that"
+                f" does not hash is not an identity") from None
+        if recomputed != baseline_hash:
+            raise ProbeBaselineMissing(
+                f"baseline {baseline_hash[:12]} does not hash to its own name"
+                f" (its body hashes to {recomputed[:12]}): the directory has"
+                f" been edited since promotion, and a content key that does not"
+                f" match its content records nothing")
+        if not manifest.get("files"):
+            raise ProbeBaselineMissing(
+                f"the manifest for baseline {baseline_hash[:12]} lists no files")
+        return path, manifest
+
+    def _pin_probe_baseline(self, hold, effective):
+        """Record WHICH BASELINE this probe saw -- or that it declared none.
+
+        `baseline: none` is PINNED, not left absent. An absent pin is two
+        different facts at once: this probe read no baseline, or this probe ran
+        before baselines were pinned at all. A comparison across a version
+        boundary cannot tell those apart, and the whole reason to record
+        provenance is so a later reader does not have to guess.
+        """
+        path, manifest = self._probe_baseline(effective)
+        now = utcnow()
+        if manifest is None:
+            self.db.call("set_pin", hold.run_id, "baseline", "none", now=now)
+            return None
+        for key, value in (
+                ("baseline_hash", manifest.get("baseline_hash")),
+                ("baseline_dir", path),
+                ("baseline_days", str(len(manifest.get("days") or []))),
+                ("baseline_pending_at_min", manifest.get("pending_at_min")),
+                ("baseline_pending_at_max", manifest.get("pending_at_max")),
+        ):
+            if value is not None:
+                self.db.call("set_pin", hold.run_id, key, str(value), now=now)
+        log.info("%s: probing baseline %s (%d days) at %s", hold.run_id,
+                 manifest["baseline_hash"][:12],
+                 len(manifest.get("days") or []), path)
+        return manifest
 
     def _pin_probe_extract(self, hold, effective):
         """Record WHICH DATA this probe saw, before any expensive setup.
@@ -2716,11 +2945,16 @@ class Runner:
         return manifest
 
     def _probe_ro_mounts(self, effective):
-        """The frozen extract, read-only, at a fixed path."""
+        """The frozen extract and, when declared, the promoted baseline --
+        read-only, at fixed paths."""
         if effective["kind"] != "probe":
             return ()
         path, _manifest = self._probe_extract(effective)
-        return ((path, sandbox_mod.EXTRACT_DEST),)
+        mounts = [(path, sandbox_mod.EXTRACT_DEST)]
+        baseline_path, _bm = self._probe_baseline(effective)
+        if baseline_path is not None:
+            mounts.append((baseline_path, sandbox_mod.BASELINE_DEST))
+        return tuple(mounts)
 
     def _ensure_probe_mountpoint(self, paths):
         """Create the nested mount's directory IN THE BIND SOURCE, before launch.

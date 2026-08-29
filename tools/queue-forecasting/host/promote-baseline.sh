@@ -132,6 +132,13 @@ for name in sorted(json.load(sys.stdin)["files"]):
   cp -p "$SRC/$name" "$STAGING/$name"
 done
 printf '%s\n' "$MANIFEST_JSON" > "$STAGING/MANIFEST.json"
+# OUTSIDE the manifest, deliberately. The manifest IS the identity, so a
+# promotion time inside it would make every promotion of the same bytes a
+# different artifact -- exactly what a content key exists to prevent. It is still
+# worth recording: "which of these is newest" is the first question anyone asks a
+# listing, and a directory mtime answers it with something that survives a
+# filesystem copy as a confident wrong answer.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGING/PROMOTED_AT"
 # Readable by the sandbox uid, which is a different user entirely -- the same
 # reasoning as the extract store's 0755.
 chmod 0755 "$STAGING"
