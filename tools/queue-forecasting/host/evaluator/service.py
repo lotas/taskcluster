@@ -328,11 +328,22 @@ class Handler:
             # An opaque reference, never the exception's own words: a
             # dependency's future error prose is not a control, and this reply
             # crosses a trust boundary in the direction that matters.
+            #
+            # `evaluator_internal`, NOT `internal`. An error class is a routing
+            # decision, and `internal` is what `qfd` records when an exception
+            # escapes its OWN execute path -- so an unexpected failure here
+            # arrived in the job row indistinguishable from a dispatcher bug, and
+            # the first thing an operator does with it is read the wrong journal.
+            # Which is what happened: NC11's first live run recorded `FAILED
+            # internal` for a `PermissionError` raised in this process, and the
+            # dispatcher's log had only unrelated tracebacks in it.
             ref = os.urandom(4).hex()
             log.exception("evaluate failed [%s]", ref)
             return {"ok": False,
-                    "error": f"the evaluator failed; journal reference {ref}",
-                    "error_class": "internal"}
+                    "error": f"the evaluator failed; journal reference {ref}."
+                             f" It is in THIS domain: journalctl -u qf-eval"
+                             f" --grep {ref}",
+                    "error_class": "evaluator_internal"}
 
 
 class Listener:

@@ -2669,6 +2669,34 @@ class Runner:
         """
         if self.qfeval_gid is None:
             return                   # 2c is not installed; the relay will say so
+        # THE PATH, THEN THE FILE. `open()` needs `x` on every directory above
+        # it, and the inbox's mode is the one thing here that comes from the
+        # unit's umask rather than from a chmod: it is left alone precisely so it
+        # keeps its inherited setgid bit. systemd's default umask gives 0755, but
+        # a `UMask=0077` added to qf-dispatch.service one day would make it 0700
+        # and the handover would fail on traversal -- with the file itself
+        # perfectly readable, which is the version of this bug that would take
+        # longest to find.
+        inbox = os.path.dirname(target)
+        for path, needed in ((os.path.dirname(inbox), stat.S_IXGRP),
+                             (inbox, stat.S_IRGRP | stat.S_IXGRP)):
+            mode = os.stat(path).st_mode
+            if mode & needed != needed:
+                raise EvaluateStagingDenied(
+                    f"{path} is mode {stat.S_IMODE(mode):04o}: the evaluator's"
+                    f" group cannot traverse it, so it cannot reach the staged"
+                    f" prediction set however readable the file itself is. The"
+                    f" inbox takes its mode from this service's umask -- check"
+                    f" UMask= in qf-dispatch.service, which must leave group"
+                    f" r-x.")
+        if not os.stat(inbox).st_mode & stat.S_ISGID:
+            raise EvaluateStagingDenied(
+                f"{inbox} has no setgid bit, so nothing staged into it lands in"
+                f" the evaluator's group. It inherits the bit from"
+                f" {self.cfg.eval_dir}, which must be `2770 qfd:qfeval`"
+                f" (`phase2c-setup.sh discover` reports it) -- and nothing may"
+                f" chmod the inbox afterwards, because a chmod by a non-member of"
+                f" the group silently strips setgid.")
         info = os.stat(target)
         if info.st_gid != self.qfeval_gid:
             raise EvaluateStagingDenied(

@@ -848,11 +848,23 @@ This completes **2c-2**.
   the real inheritance chain, and one that patches `os.chown` to succeed without
   changing anything -- which is what the failure looks like from inside qfd.
 
-  The `FAILED internal` itself is still unexplained: it is the generic
-  `except Exception: log.exception("%s: run failed", run_id)` handler, so the
-  traceback is in the journal, and the two spec-derived pins added earlier make
-  the bisect cheap -- `predictions_sha256` present means staging completed and the
-  fault is in the relay or the reply.
+  **The journal confirmed it exactly**: `PermissionError: [Errno 13] Permission
+  denied: '/var/lib/qf-eval/evaluate-.../in/predictions.parquet'`, raised in the
+  EVALUATOR. And the job's pins carried `predictions_sha256`, so staging had
+  reported success while handing over a file in group `qfd` -- which is the
+  failure `_check_the_evaluator_can_read` now refuses, in the dispatcher, naming
+  the staging root, before the relay.
+
+  **A diagnostic defect cost a round of guessing and is fixed too.** The
+  evaluator's opaque unexpected-failure path returned `error_class: "internal"` --
+  the same class `qfd` records when an exception escapes its OWN execute path. So
+  a `PermissionError` raised in one privilege domain arrived in the job row
+  indistinguishable from a dispatcher bug, and the first thing anybody does with
+  it is read the wrong journal (the dispatcher's had only unrelated docker-build
+  tracebacks from hours earlier). It is `evaluator_internal` now, and the reply
+  names the journal to read: `journalctl -u qf-eval --grep <ref>`. An error class
+  is a routing decision, which this programme has written down twice before --
+  once for `source_unavailable` and once for `contract_not_trusted`.
 
 - **NC11's subject discovery would have voided the group the moment the fixtures
   landed.** Clauses (a) and (b) need a prediction set that CAN be scored -- (a) is

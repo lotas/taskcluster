@@ -2128,6 +2128,41 @@ class TestTheEvaluateRelay(EvaluateCase):
         self.assertIn("phase2c-setup.sh", message)
         self.assertEqual(caught.exception.error_class, "eval_staging_denied")
 
+    def test_an_inbox_the_evaluator_cannot_traverse_is_refused(self):
+        """The version of this bug that would take longest to find: the file is
+        perfectly readable and the directory above it is not traversable.
+
+        Simulated by the thing that would actually cause it -- a tighter umask,
+        which is what `UMask=0077` in qf-dispatch.service would produce, since the
+        inbox's mode comes from the umask and not from a chmod (it is left alone
+        so it keeps its inherited setgid bit).
+        """
+        self.runner.qfeval_gid = os.stat(self.eval_dir).st_gid
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        previous = os.umask(0o077)
+        try:
+            with self.assertRaises(qfd.EvaluateStagingDenied) as caught:
+                self.stage(effective)
+        finally:
+            os.umask(previous)
+        message = str(caught.exception)
+        self.assertIn("traverse", message)
+        self.assertIn("UMask", message)
+
+    def test_an_inbox_without_setgid_is_refused_before_the_relay(self):
+        # The staging root not being 2770, or somebody having chmodded the inbox.
+        # Reached by taking the bit off the ROOT, which is where it comes from.
+        os.chmod(self.eval_dir, 0o770)
+        self.runner.qfeval_gid = os.stat(self.eval_dir).st_gid
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        with self.assertRaises(qfd.EvaluateStagingDenied) as caught:
+            self.stage(effective)
+        message = str(caught.exception)
+        self.assertIn("setgid", message)
+        self.assertIn(self.eval_dir, message)
+
     def test_nothing_chmods_the_inbox(self):
         # Structural, and narrow: the bit cannot be re-applied by a non-member,
         # so the only way to keep it is not to touch the directory. A future

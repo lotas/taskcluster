@@ -503,9 +503,17 @@ class TestTheRefusalClassReachesTheDispatcher(ServiceCase):
         def raiser(_cfg, _req, _name):
             raise RuntimeError("pyarrow internal detail with a path in it")
         reply = self._reply(raiser)
-        self.assertEqual(reply["error_class"], "internal")
+        # `evaluator_internal`, and the distinction is a routing decision rather
+        # than a label: `internal` is what `qfd` records when an exception escapes
+        # its OWN execute path, so this class arriving as `internal` sent an
+        # operator to read the dispatcher's journal for a PermissionError raised
+        # in this process. NC11's first live run cost exactly that.
+        self.assertEqual(reply["error_class"], "evaluator_internal")
+        self.assertNotEqual(reply["error_class"], "internal")
         self.assertNotIn("pyarrow", reply["error"])
         self.assertIn("journal reference", reply["error"])
+        # And it says WHICH journal, because the reference alone does not.
+        self.assertIn("qf-eval", reply["error"])
 
     def test_a_verdict_reaches_the_reply(self):
         # THE CANARY: without it every clause above could hold because the
