@@ -3355,6 +3355,61 @@ class TestNc9IsWiredAndGated(unittest.TestCase):
                          "evaluate_input_missing")
         self.assertIn("evaluate_input_missing", self.nc9)
 
+class TestNc11PicksASubjectItCanCanaryWith(unittest.TestCase):
+    """Clause (a) is the canary for the whole NC11 group, so the prediction set
+    it scores must be one that CAN be scored.
+
+    The four violating fixtures succeed as probes -- emitting an unscorable row
+    set is their job -- and they are the newest probes on the host in the minutes
+    after they are submitted. "The first SUCCEEDED probe with an artifact" would
+    therefore have handed the canary a set that is refused by design and voided
+    every clause below it, including the four that the fixtures exist to prove.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        host = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        with open(os.path.join(host, "nc-suite-phase2.sh")) as fh:
+            suite = fh.read()
+        cls.nc11 = suite[suite.index("nc11() {"):]
+        cls.nc11 = cls.nc11[:cls.nc11.index("\n}\n")]
+        cls.fixtures = os.path.join(host, "nc-fixtures-phase2c.sh")
+
+    def test_the_violating_fixtures_are_skipped_when_choosing_a_subject(self):
+        # NAMING THEM IS NOT SKIPPING THEM. A first version of this test only
+        # checked that the four names appeared in the discovery block -- which
+        # they do in the comment explaining why they are skipped, so deleting the
+        # `continue` that acts on it left the test green. What is checkable is the
+        # mechanism: the flag is raised on a match and the loop moves on.
+        discovery = self.nc11[:self.nc11.index("NC11 subject")]
+        for name in ("nc11_relabelled", "nc11_ghost_row",
+                     "nc11_cherry_picked", "nc11_easy_days"):
+            with self.subTest(fixture=name):
+                self.assertIn(name, discovery)
+        loop = discovery[discovery.index("for rid in $(succeeded_probes)"):]
+        self.assertRegex(loop, r"unscorable=1")
+        self.assertRegex(loop, r"unscorable\D{0,12}=\D{0,4}1\D{0,8}continue")
+
+    def test_the_honest_one_is_not_skipped(self):
+        # It is a scorable set and exists to be one: skipping it would leave the
+        # canary with nothing on a host whose only probes are these fixtures.
+        skip = self.nc11[self.nc11.index('local skip='):]
+        skip = skip[:skip.index("\n")]
+        self.assertNotIn("nc11_honest", skip)
+
+    def test_the_skip_list_matches_the_generator(self):
+        # A sixth fixture added to the generator and not here would become the
+        # canary's subject the first time it ran.
+        with open(self.fixtures) as fh:
+            generated = set(re.findall(r"nc11_[a-z_]+", fh.read()))
+        generated.discard("nc11_honest")
+        generated.discard("nc11_rowset")          # the branch name
+        skip = self.nc11[self.nc11.index('local skip='):]
+        skip = set(re.findall(r"nc11_[a-z_]+", skip[:skip.index("\n")]))
+        self.assertEqual(generated, skip)
+
+
 class TestEveryScriptedQfInvocationMatchesTheClient(unittest.TestCase):
     """A command the client rejects is not a command. Task 24 / NC11.
 

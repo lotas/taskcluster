@@ -1093,14 +1093,33 @@ nc11() {
   # `--kind probe`, exited 2 with "unrecognized arguments", read nothing, and
   # voided with a message blaming the absence of a probe. A filter the client
   # rejects is not a filter; the kind is the run id's own prefix.
+  #
+  # AND NOT ONE OF CLAUSE (c)'s DELIBERATELY UNSCORABLE FIXTURES. Clauses (a) and
+  # (b) need a prediction set that CAN be scored: (a) is the canary for the whole
+  # group and (b) compares a mutation against it. The four violating fixtures
+  # succeed as probes -- emitting an unscorable set is their job -- and they are
+  # the newest probes on the host right after they are submitted, so taking "the
+  # first SUCCEEDED probe with an artifact" would hand the canary a prediction set
+  # that is refused by design and void everything. `nc11_honest` is fine: it is a
+  # scorable set and exists precisely to be one.
+  local skip="nc11_relabelled nc11_ghost_row nc11_cherry_picked nc11_easy_days"
+  local paths unscorable name
   for rid in $(succeeded_probes); do
-    if [ -f "$RUNS_DIR/$rid/artifacts/predictions.parquet" ]; then
-      probe="$rid"; break
-    fi
+    [ -f "$RUNS_DIR/$rid/artifacts/predictions.parquet" ] || continue
+    paths="$(spec_paths_of "$rid")"
+    unscorable=0
+    for name in $skip; do
+      case "$paths" in *"$name.py"*) unscorable=1 ;; esac
+    done
+    [ "$unscorable" = 1 ] && continue
+    probe="$rid"; break
   done
   if [ -z "$probe" ]; then
-    void "NC11 no SUCCEEDED probe recorded an artifacts/predictions.parquet, so
-  there is no prediction set to judge. Run one 2b-2 cohort first."
+    void "NC11 no SUCCEEDED probe recorded a scorable artifacts/predictions.parquet,
+  so there is no prediction set to judge. Run one 2b-2 cohort, or nc11_honest from
+  nc-fixtures-phase2c.sh. (The four violating fixtures are skipped here on
+  purpose: clause (a) is a canary and cannot be one against a set that is refused
+  by design.)"
     return
   fi
   ok "NC11 subject: $probe"

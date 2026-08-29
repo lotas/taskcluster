@@ -813,6 +813,20 @@ This completes **2c-2**.
   does not, because a version writing only the spec pins would satisfy the other
   two.
 
+- **NC11's subject discovery would have voided the group the moment the fixtures
+  landed.** Clauses (a) and (b) need a prediction set that CAN be scored -- (a) is
+  the canary and (b) compares a mutation against it -- and the discovery took "the
+  first SUCCEEDED probe with a recorded artifact". The four violating fixtures
+  SUCCEED as probes (emitting an unscorable row set is their job) and are the
+  newest probes on the host in the minutes after they are submitted, so the canary
+  would have been handed a set that is refused by design. They are skipped by name
+  now; `nc11_honest` deliberately is not. Three tests, and the first version of
+  one of them was itself the weak kind: it checked only that the four names
+  appeared in the discovery block -- which they do in the comment explaining the
+  skip -- so deleting the `continue` left it green. It now asserts the mechanism,
+  and a third test pins the skip list to the generator's fixture list so a sixth
+  fixture cannot quietly become the canary's subject.
+
 - **The fixture probes must pin the promoted baseline**, and the generated
   instructions did not say so. None of the five scripts reads `/baseline`, but the
   evaluator refuses a judged run that recorded no `baseline_hash` (a bar stated
