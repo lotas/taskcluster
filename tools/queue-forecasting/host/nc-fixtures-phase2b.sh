@@ -217,10 +217,10 @@ Next, in the qf-research checkout, with the AGENT's credential:
 
 Then, on the host, with an extract already published:
 
-  sudo -H -u research qf extracts           # copy a request hash
-  sudo -H -u research qf probe --sha <that sha> \
+  sudo -H -u research qf extracts     # copy the `--extract <hash>` line it prints
+  sudo -H -u research qf probe --sha <the qf-research sha> \
       --path research/experiments/extract_contract.py \
-      --extract <request hash> --wait
+      --extract <hash, or any unique 8+ hex prefix> --wait
 
 Expect `== EXTRACT-CONTRACT: pass=N fail=0 ==` in `qf logs`, and
 predictions.parquet in the run's artifacts/.

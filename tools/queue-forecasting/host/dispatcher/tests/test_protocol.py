@@ -2102,3 +2102,80 @@ class TestTheExtractorEnvironmentMustBeLocked(unittest.TestCase):
             self.skipTest("uv.lock is committed; the refusal is now the"
                           " uncommon path")
         self.assertFalse(os.path.isfile(lock))
+
+
+class TestAnExtractPrefixResolvesInTheClient(unittest.TestCase):
+    """`qf extracts` printed the truncated hash prominently and the full one only
+    inside `dir=`, so the natural copy-paste was the value the validator refuses:
+
+        $ qf probe --extract 8e94d833d4c6 ...
+        qf: args.extract must be an extract request hash (64 lowercase hex)
+
+    Fixed in two ways at once, and the split is the point. The LISTING now prints
+    the full hash on its own line labelled with the flag it goes to; and a unique
+    PREFIX resolves -- in the client. Ergonomics belong in the client, strictness
+    belongs at the boundary: the dispatcher still receives 64 hex and still does
+    not enumerate the extracts directory."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.mod = {}
+        with open(os.path.join(here, "qf")) as fh:
+            exec(compile(fh.read(), "qf", "exec"), self.mod)  # noqa: S102
+        self.calls = []
+
+        def fake_call(op, payload=None, **kw):
+            self.calls.append(op)
+            return {"ok": True, "extracts": [
+                {"request_hash": "8e94d833d4c6" + "0" * 52},
+                {"request_hash": "c179c7f5b961" + "1" * 52},
+                {"request_hash": "c179c7f5b9ff" + "2" * 52},
+            ]}
+
+        self.mod["call"] = fake_call
+
+    def test_a_full_hash_needs_no_lookup(self):
+        full = "a" * 64
+        self.assertEqual(self.mod["resolve_extract"](full), full)
+        self.assertEqual(self.calls, [], "a full hash opened a socket")
+
+    def test_a_unique_prefix_resolves(self):
+        self.assertEqual(self.mod["resolve_extract"]("8e94d833"),
+                         "8e94d833d4c6" + "0" * 52)
+        self.assertEqual(self.calls, ["extracts"])
+
+    def test_an_ambiguous_prefix_is_refused_and_lists_the_candidates(self):
+        # Picking the first match would mean a two-character-shorter prefix
+        # silently probing different data.
+        with self.assertRaises(SystemExit):
+            self.mod["resolve_extract"]("c179c7f5")
+
+    def test_a_prefix_matching_nothing_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.mod["resolve_extract"]("deadbeef")
+
+    def test_something_that_is_not_hex_is_refused_before_any_call(self):
+        for bad in ("8e94", "", "ZZZZZZZZ", "g" * 12, "8e94-d833"):
+            with self.subTest(given=bad):
+                with self.assertRaises(SystemExit):
+                    self.mod["resolve_extract"](bad)
+        self.assertEqual(self.calls, [])
+
+    def test_the_listing_prints_the_flag_and_the_full_value(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            source = fh.read()
+        body = source[source.index("def cmd_extracts"):]
+        body = body[:body.index("\ndef ")]
+        self.assertIn("--extract {row.get('request_hash')}", body)
+
+    def test_the_dispatcher_still_receives_a_full_hash(self):
+        # The strictness did not move. `spec._check_probe_args` refuses anything
+        # that is not 64 hex, and this is what keeps that true after the client
+        # got friendlier.
+        import spec
+        with self.assertRaises(spec.SpecError):
+            spec.normalize({"schema": 1, "kind": "probe",
+                            "source_sha": "b" * 40,
+                            "args": {"path": "research/experiments/x.py",
+                                     "extract": "8e94d833"}})

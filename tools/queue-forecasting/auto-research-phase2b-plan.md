@@ -5,6 +5,33 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 12, 2026-08-29: **the immutability rule was necessary, observed.** Two
+extracts of the SAME window now exist (generation 1 and 2), and their contents
+differ:
+
+    8e94d833d4c6  gen=1  ... worker_pools=758
+    c179c7f5b961  gen=2  ... worker_pools=760
+
+Same `train_start`, same `as_of_date`, same watermark on every run column -- and
+two more rows in the worker-pool dimension table, which the collector refreshes
+independently of the window. So "the same request, later" really does produce
+different data, and the watermark really cannot detect it: every watermark field
+is identical between the two.
+
+That is D20's whole argument, and it is now a measurement rather than an
+inference. Reuse keyed on `request_hash` returns the first artifact; a deliberate
+`generation` produces a second; and nothing that cited the first has changed.
+
+Also fixed: `qf extracts` printed the TRUNCATED hash prominently and the full one
+only inside `dir=`, so the natural copy-paste was the value the validator refuses
+(`qf: args.extract must be an extract request hash (64 lowercase hex)`). The
+listing now prints `--extract <full hash>` on its own line, and a unique prefix
+resolves **in the client** -- ergonomics in the client, strictness at the
+boundary: the dispatcher still receives 64 hex and still does not enumerate the
+extracts directory. An ambiguous prefix is a refusal that prints the candidates,
+because picking the first match would mean a two-character-shorter prefix
+silently probing different data.
+
 Revision 10, 2026-08-28: the extract's SIZE and its per-statement TIMING both
 say the 120-day ceiling was unsupported. Measured, not extrapolated from nothing:
 

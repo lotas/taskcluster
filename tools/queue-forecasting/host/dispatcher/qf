@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import socket
 import sys
@@ -166,6 +167,39 @@ def cmd_extract(args):
             raise SystemExit(0 if job["state"] == "SUCCEEDED" else 1)
 
 
+def resolve_extract(given):
+    """A unique prefix becomes the full request hash. Resolved IN THE CLIENT.
+
+    The ergonomics belong here and the strictness belongs at the boundary: the
+    dispatcher still receives 64 lowercase hex and still refuses anything else,
+    and it still does not enumerate the extracts directory -- that listing is
+    relayed from the service that owns it, which is the same `extracts` op a human
+    would run.
+
+    Ambiguity is a refusal that PRINTS the candidates. Picking the first match
+    would mean a two-character-shorter prefix silently probing different data.
+    """
+    if _HEX64_RE.match(given or ""):
+        return given
+    if not _PREFIX_RE.match(given or ""):
+        die(f"--extract {given!r} is neither a request hash nor a prefix of one"
+            f" (8-64 lowercase hex). `qf extracts` lists what is published.")
+
+    resp = call("extracts")
+    if not resp.get("ok"):
+        die(resp.get("error", "cannot list extracts to resolve a prefix"))
+    matches = sorted({row.get("request_hash") for row in resp.get("extracts", [])
+                      if (row.get("request_hash") or "").startswith(given)})
+    if not matches:
+        die(f"no published extract starts with {given!r}."
+            f" `qf extracts` lists what is published; `qf extract` publishes one.")
+    if len(matches) > 1:
+        lines = "\n  ".join(matches)
+        die(f"{given!r} matches {len(matches)} published extracts, so it is"
+            f" ambiguous. Use more characters:\n  {lines}")
+    return matches[0]
+
+
 def cmd_probe(args):
     """Run an agent-authored script against a published extract.
 
@@ -178,7 +212,7 @@ def cmd_probe(args):
         "schema": 1,
         "kind": "probe",
         "source_sha": args.sha,
-        "args": {"path": args.path, "extract": args.extract},
+        "args": {"path": args.path, "extract": resolve_extract(args.extract)},
     }
     for name, value in (("mem_limit", args.mem), ("cpus", args.cpus),
                         ("timeout_s", args.timeout), ("note", args.note)):
@@ -231,6 +265,11 @@ def cmd_extracts(args):
               f"  {row.get('target')}"
               f"  {row.get('train_start')}..{row.get('as_of_date')}"
               f"  gen={row.get('generation')}")
+        # THE FULL HASH, on its own line and labelled with the flag it goes to.
+        # The short form above is for reading; this is for copying. Printing only
+        # the truncated one -- with the full value buried inside `dir=` -- made the
+        # natural copy-paste the value the validator refuses.
+        print(f"    --extract {row.get('request_hash')}")
         print(f"    dir={row.get('dir')}")
         if watermark:
             print("    watermark=" + " ".join(
@@ -331,6 +370,10 @@ def _allow_json_after_the_subcommand(sub):
                             help="raw JSON output")
 
 
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_PREFIX_RE = re.compile(r"^[0-9a-f]{8,64}$")
+
+
 def build_parser(admin_mode):
     p = argparse.ArgumentParser(
         prog="qfadmin" if admin_mode else "qf",
@@ -403,7 +446,8 @@ def build_parser(admin_mode):
                     metavar="research/experiments/x.py",
                     help="the script to run; must be under research/experiments/")
     pr.add_argument("--extract", required=True, metavar="REQUEST_HASH",
-                    help="an already-published extract; see `qf extracts`")
+                    help="an already-published extract, or any unique prefix of"
+                         " one (8+ hex); see `qf extracts`")
     pr.add_argument("--mem", help="default 8g, which derives the heavy lane")
     pr.add_argument("--cpus", type=float)
     pr.add_argument("--timeout", type=int)
