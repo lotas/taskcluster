@@ -167,8 +167,11 @@ class Config:
 
         if not os.path.isdir(self.eval_dir):
             problems.append(
-                f"{self.eval_dir} does not exist: it is created by"
-                f" StateDirectory=qf-eval in the unit")
+                f"{self.eval_dir} does not exist. It is provisioned `2770"
+                f" qfd:qfeval` by /etc/tmpfiles.d/qf-eval.conf, which"
+                f" `phase2c-setup.sh install` puts there -- NOT by"
+                f" StateDirectory=, which would create it owned by this service"
+                f" and leave the dispatcher unable to stage anything into it")
         elif not access(self.eval_dir, os.W_OK | os.X_OK):
             problems.append(f"{self.eval_dir} is not writable by this service"
                             f" (uid {os.getuid()})")

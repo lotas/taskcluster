@@ -43,8 +43,16 @@ Environment=QFE_CONTRACTS_DIR=/srv/queue-forecasting/tools/queue-forecasting/hos
 # dispatcher.
 Environment=QFE_CLIENT_UID=%%QFD_UID%%
 
-StateDirectory=qf-eval
-StateDirectoryMode=0750
+# NO StateDirectory=qf-eval, and its absence is the fix rather than an
+# omission. `StateDirectory=` creates the directory as this unit's own
+# User:Group -- `qfeval:qfeval 0750` -- and the process that has to create
+# `<run_id>/in/` inside it is `qfd`, which would have had no write access at
+# all. The gate would have reported every store correct and the first
+# evaluation would have failed in the DISPATCHER, on mkdir, one privilege
+# domain away from the cause. /var/lib/qf-eval is provisioned `2770 qfd:qfeval`
+# by `qf-eval.conf` in /etc/tmpfiles.d, which phase2c-setup.sh installs; the
+# setgid bit is what puts the staged prediction set in this service's group
+# without `qfd` being a member of it.
 
 # --- containment ---------------------------------------------------------
 # PrivateNetwork, which the EXTRACTOR cannot have -- it needs Postgres over TCP.

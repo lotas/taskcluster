@@ -10,11 +10,13 @@ import datetime
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 import os
 import re
@@ -1981,18 +1983,31 @@ class TestTheEvaluateRelay(EvaluateCase):
         for value in payload.values():
             self.assertNotIn("/", str(value))
 
+    def stage(self, effective):
+        """Stage as the relay does, and return the staged path.
+
+        THROUGH `_evaluate_source`, not around it: the recorded digest is the
+        argument `_stage_predictions` verifies against, so a test that passed its
+        own digest would be checking the copy against itself.
+
+        This seam exists because the relay REMOVES the staged copy when it is
+        done (see `_unstage_predictions`), so a claim about the staged bytes has
+        to be made where they are still there.
+        """
+        _job, _pins, source, recorded = self.runner._evaluate_source(effective)
+        staged, _digest = self.runner._stage_predictions(
+            "evaluate-stage-probe", source, recorded)
+        return staged
+
     def test_the_staged_digest_describes_what_the_evaluator_will_read(self):
         probe = self.a_probe_run(predictions=b"PAR1-payload")
         hold, effective = self.an_evaluate(probe)
+        staged = self.stage(effective)
+        self.assertEqual(open(staged, "rb").read(), b"PAR1-payload")
         self.replies.append({"ok": True, "verdict": "go"})
         self.runner._relay_evaluate(hold, effective)
-        staged = os.path.join(self.eval_dir, hold.run_id, "in",
-                              "predictions.parquet")
-        self.assertTrue(os.path.isfile(staged))
-        self.assertEqual(open(staged, "rb").read(), b"PAR1-payload")
         _sock, payload, _t = self.asked[0]
-        self.assertEqual(payload["predictions_sha256"],
-                         qfd.file_digest(staged))
+        self.assertEqual(payload["predictions_sha256"], qfd.file_digest(staged))
 
     def test_the_recorded_artifact_is_what_gets_staged(self):
         """NOT `out/`. The candidate's own output directory has no digest, is
@@ -2008,11 +2023,10 @@ class TestTheEvaluateRelay(EvaluateCase):
             fh.write(b"PAR1-tampered-after-success")
         hold, effective = self.an_evaluate(probe)
         self.replies.append({"ok": True, "verdict": "go"})
+        self.assertEqual(open(self.stage(effective), "rb").read(),
+                         b"PAR1-recorded")
         state, _fields = self.runner._relay_evaluate(hold, effective)
         self.assertEqual(state, "SUCCEEDED")
-        staged = os.path.join(self.eval_dir, hold.run_id, "in",
-                              "predictions.parquet")
-        self.assertEqual(open(staged, "rb").read(), b"PAR1-recorded")
         _sock, payload, _t = self.asked[0]
         recorded = self.db.call("artifact", probe, "predictions.parquet")
         self.assertEqual(payload["predictions_sha256"], recorded["sha256"])
@@ -2066,6 +2080,130 @@ class TestTheEvaluateRelay(EvaluateCase):
             self.assertNotIn('"out"', call, call)
         self.assertIn('self.db.call("artifact"', source)
         self.assertIn('"artifacts"', source)
+
+    def test_the_inbox_keeps_its_setgid_bit_so_the_file_is_handed_over(self):
+        """The defect this replaces, in one sentence: the staged file would have
+        been in the wrong group.
+
+        The first version chmodded the three directories to 0750/0750/0770 and
+        chowned their GROUP to qfeval, and then created `predictions.parquet`
+        inside the inbox. A file created in a directory takes that DIRECTORY's
+        group only if the setgid bit is set, and the chmod had just cleared it --
+        so the staged prediction set would have been `qfd:qfd` inside a directory
+        the evaluator could traverse, and the one file the whole staging path
+        exists to hand over is the one thing it could not read. `qfd` never
+        chowns the file itself, and every test here runs as one uid, so nothing
+        could see it.
+
+        The MODE is the checkable half of that on any host. The group half is
+        checked below with a gid this process does not hold.
+        """
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        staged = self.stage(effective)
+        inbox = os.path.dirname(staged)
+        base = os.path.dirname(inbox)
+        outbox = os.path.join(base, "out")
+        self.assertEqual(stat.S_IMODE(os.stat(base).st_mode), 0o2750)
+        self.assertEqual(stat.S_IMODE(os.stat(inbox).st_mode), 0o2750)
+        self.assertEqual(stat.S_IMODE(os.stat(outbox).st_mode), 0o2770)
+        # And the file itself is group-readable, which is the other half of the
+        # handover: setgid puts it in the right group, 0640 lets that group read.
+        self.assertEqual(stat.S_IMODE(os.stat(staged).st_mode), 0o640)
+
+    def test_a_group_that_is_already_right_needs_no_chown(self):
+        # Which is the ONLY case that occurs on a correctly provisioned host:
+        # /var/lib/qf-eval is 2770 qfd:qfeval, so everything created under it is
+        # already in the evaluator's group. Linux permits chown(-1, gid) only for
+        # a member of gid, and qfd is deliberately not a member -- so if this
+        # path called chown it would fail on the host and pass in every test.
+        self.runner.qfeval_gid = os.stat(self.eval_dir).st_gid
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        with mock.patch("os.chown",
+                        side_effect=AssertionError("chown was called")):
+            staged = self.stage(effective)
+        self.assertTrue(os.path.isfile(staged))
+
+    def test_a_group_it_cannot_set_is_refused_naming_the_install_step(self):
+        # The failure this turns into a refusal: staging a file into a group the
+        # evaluator is not in, so the evaluation fails one privilege domain away
+        # from the cause, as "the evaluator cannot read the prediction set".
+        self.runner.qfeval_gid = os.stat(self.eval_dir).st_gid + 4242
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        with mock.patch("os.chown", side_effect=PermissionError(1, "denied")):
+            with self.assertRaises(qfd.EvaluateStagingDenied) as caught:
+                self.stage(effective)
+        message = str(caught.exception)
+        self.assertIn("2770", message)
+        self.assertIn("phase2c-setup.sh", message)
+        self.assertEqual(caught.exception.error_class, "eval_staging_denied")
+
+    def test_that_refusal_reaches_the_job_record_as_its_own_class(self):
+        # A subclass of EvaluateInputMissing so the relay's one guard covers it,
+        # with its own class because the remedy is an install step rather than a
+        # resubmission.
+        self.runner.qfeval_gid = os.stat(self.eval_dir).st_gid + 4242
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        with mock.patch("os.chown", side_effect=PermissionError(1, "denied")):
+            state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        self.assertEqual(fields["error_class"], "eval_staging_denied")
+        self.assertEqual(self.asked, [])
+
+    def test_the_staged_copy_does_not_survive_the_relay(self):
+        """Nothing else was going to remove it.
+
+        `qf-runs-prune` is scoped to /var/lib/qf-runs -- its unit's
+        ReadWritePaths= says so -- and no timer touches /var/lib/qf-eval at all.
+        So a copy per evaluation would accumulate forever, on the filesystem
+        whose last 20GiB the dispatcher's own admission floor reserves.
+
+        It is also the copy that can be deleted without losing anything: the same
+        bytes are in the run's `artifacts/`, digest-recorded, and the verdict
+        pins that digest.
+        """
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "go"})
+        state, _fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "SUCCEEDED")
+        staged = os.path.join(self.eval_dir, hold.run_id, "in",
+                              "predictions.parquet")
+        self.assertFalse(os.path.exists(staged))
+        # THE OUTBOX SURVIVES, and that is the other half of the policy: the
+        # verdict and eval.parquet are the record, and a record deleted while the
+        # job row still cites it is a dangling reference.
+        self.assertTrue(os.path.isdir(os.path.join(self.eval_dir, hold.run_id,
+                                                   "out")))
+
+    def test_it_is_removed_when_the_evaluator_refuses_too(self):
+        # The case that would accumulate fastest is the failure that repeats.
+        for reply in ({"ok": False, "error": "no", "error_class": "nope"},
+                      qfd.EvalRelayError("down", "evaluator_unreachable")):
+            with self.subTest(reply=type(reply).__name__):
+                probe = self.a_probe_run()
+                hold, effective = self.an_evaluate(probe)
+                self.replies.append(reply)
+                state, _fields = self.runner._relay_evaluate(hold, effective)
+                self.assertEqual(state, "FAILED")
+                staged = os.path.join(self.eval_dir, hold.run_id, "in",
+                                      "predictions.parquet")
+                self.assertFalse(os.path.exists(staged))
+
+    def test_an_unremovable_copy_does_not_fail_a_recorded_verdict(self):
+        # The verdict has already been decided and pinned. Turning a cleanup
+        # problem into a job failure would misattribute an outcome that is known.
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "no-go"})
+        with mock.patch("os.unlink", side_effect=OSError(16, "busy")):
+            state, _fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "SUCCEEDED")
+        self.assertEqual(
+            self.db.call("pins_for", hold.run_id).get("verdict"), "no-go")
 
     def test_the_staged_copy_is_published_by_rename(self):
         # A partial file under the final name is one the evaluator could read

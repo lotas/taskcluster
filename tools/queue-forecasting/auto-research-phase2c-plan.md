@@ -612,17 +612,87 @@ Four of the five fixes were red-green verified by reverting them; the fifth
 
 This completes **2c-2**.
 
-- **Task 24 — the 2c install step. NOT STARTED, and NC11 says so.** The units
-  (`qf-eval.socket`, `qf-eval.service`), the closure (`evaluator/env/uv.lock`)
-  and the contracts directory exist in the checkout, and **nothing syncs them to
-  the host**: there is no `phase2c-setup.sh`. NC11 and NC9 (e)/(f) void until
-  there is. Named as its own task rather than folded into "deployment", because
-  an install step that does not exist is exactly the gap 2b-1's P1 came from --
-  a unit naming an interpreter no step creates.
+- **Task 24 — the 2c install step. DONE 2026-08-29.** `host/phase2c-setup.sh`,
+  `discover`/`install` in the shape 2b-1 established: the `qfeval` user and the
+  group memberships it must NOT have, `/var/lib/qf-eval`, `uv sync --frozen` for
+  the closure, the two units with `%%QFD_UID%%` substituted, and a round trip
+  that is RUN rather than printed -- 2b-1 only printed those commands because
+  running them would have put the database DSN in a process argument, and this
+  domain holds no credential. 16 tests in a new
+  `host/tests/test_phase2c_setup.sh`, 17 in `evaluator/tests/test_service.py`
+  and 7 in `dispatcher/tests/test_runner.py`; 8 of the claims red-green verified
+  by reverting them one at a time.
 
-  Needs: the `qfeval` user and group, `/var/lib/qf-eval` with the mode `qfd`'s
-  staging expects, `uv sync --frozen` for the evaluator closure, the two units,
-  and `%%QFD_UID%%` substituted in `Environment=QFE_CLIENT_UID`.
+  **Writing it found a defect that would have made the first live evaluation
+  fail, and it is the same shape as everything else this phase has found: a
+  handover whose paperwork looked complete.** `_stage_predictions` chmodded the
+  three per-run directories to `0750/0750/0770` and chowned their GROUP to
+  `qfeval` -- then created `predictions.parquet` inside the inbox. A file created
+  in a directory takes that DIRECTORY's group only if the setgid bit is set, and
+  the chmod had just cleared it. So the staged prediction set would have been
+  `0640 qfd:qfd` inside a directory the evaluator could traverse: **the one file
+  the entire staging path exists to hand over would have been the only thing it
+  could not read**, and `qfd` never chowns the file. Nothing in 866 dispatcher
+  tests could see it, because every test runs as one uid.
+
+  The fix is `2750/2750/2770` on the per-run directories and `2770 qfd:qfeval` on
+  the staging root, so the group is inherited rather than assigned. That
+  inheritance is load-bearing for a second reason: Linux permits
+  `chown(-1, gid)` only for a member of `gid`, and `qfd` is deliberately not in
+  `qfeval` -- so without it the dispatcher could not have given the file away at
+  all. `_give_to_the_evaluator` therefore checks the STATE rather than the call
+  (already-correct is a no-op) and REFUSES with `eval_staging_denied` naming
+  `phase2c-setup.sh` when the group is wrong and it cannot fix it, instead of
+  staging a file the evaluator will fail to open one privilege domain away.
+
+  Three more, each an install-shaped trap rather than a coding error:
+
+  - **`StateDirectory=qf-eval` could not work and is removed.** It creates the
+    directory as the unit's own `User:Group` -- `qfeval:qfeval 0750` -- and the
+    process that must create `<run_id>/in/` inside it is `qfd`. The evaluator
+    would have started cleanly, its gate would have reported every store
+    correct, and the first evaluation would have failed in the DISPATCHER on
+    `mkdir`. Two uids meet in that directory, so neither unit can own it:
+    `evaluator/qf-eval.conf` provisions it through systemd-tmpfiles, like
+    `qf-locks`.
+  - **`ReadWritePaths=/var/lib/qf-eval` in `qf-dispatch.service` is now
+    `-`-prefixed.** A listed path that does not exist makes a unit fail to
+    START, so as written, installing 2c had become a prerequisite for the
+    dispatcher running at all -- the opposite of what the code says, where
+    `qfeval_gid` is `None` on such a host and staging tolerates it. And because
+    the namespace is built when the service starts, a directory provisioned
+    afterwards is READ-ONLY inside the running dispatcher: install can succeed,
+    `discover` can report `2770 qfd:qfeval`, and the first evaluation still
+    fails on `mkdir` with EROFS. So the script measures writability from inside
+    the running namespace with `nsenter` rather than printing "remember to
+    restart qfd", with a weaker timestamp inference where `nsenter` is absent --
+    and it says which of the two it did.
+  - **`discover` printed "installed and matches the checkout" without having
+    compared anything** when the extraction of `unit_matches` from
+    phase2-setup.sh failed to load. That is the exact claim `test_unit_drift.sh`
+    exists because somebody once believed, so an uncompared unit is now its own
+    warning, and a test drives the real script against a temp `UNIT_DIR` to
+    prove both that the comparison runs and that it detects an edit.
+
+  **Nothing pruned the staging root, and now something does -- partly.**
+  `qf-runs-prune` is scoped to `/var/lib/qf-runs` (its unit's `ReadWritePaths=`
+  says so) and no timer touches `/var/lib/qf-eval` at all, so every evaluation
+  left a full second copy of the prediction set there forever, on the filesystem
+  whose last 20GiB the dispatcher's own admission floor reserves. The relay now
+  removes the staged copy when it is done, on every path including a refusal:
+  those bytes are also in the run's `artifacts/`, digest-recorded, and the
+  verdict pins that digest, so it is the one thing here that can be deleted
+  without losing anything.
+
+  MEASURED at a real 162_000-row holdout: **staged predictions 4.9 MB,
+  `eval.parquet` 12.8 MB** per evaluation. So the copy that now goes was 28% of
+  it and the record that stays is the rest. **OPEN ITEM, not fixed here:** at ~20
+  evaluations a day that is ~250 MB/day retained, ~7.7 GB a month. `verdict.json`
+  is kilobytes and is the record; `eval.parquet` is the audit trail and is
+  reproducible from the extract, the predictions and the contract only for as
+  long as the predictions survive. A retention policy for
+  `/var/lib/qf-eval/<run_id>/out/` is somebody's decision, and deleting evidence
+  here to avoid asking for it would be the wrong answer to a full disk.
 
 **A ninth static-scan-matched-its-own-documentation instance produced a real
 fix.** `verdict.py`'s docstring says "nothing here writes to

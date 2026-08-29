@@ -124,7 +124,19 @@ PrivateDevices=yes
 # runs with qfrun as its primary gid, which would make the setgid bit redundant
 # and let this come back.
 RestrictSUIDSGID=no
-ReadWritePaths=/var/lib/qf-platform /var/lib/qf-runs /var/lib/qf-locks /var/lib/qf-eval
+# THE `-` ON qf-eval IS DELIBERATE. A path listed here that does not exist
+# makes the unit fail to START, and /var/lib/qf-eval is provisioned by
+# phase2c-setup.sh -- so without the prefix, installing 2c would have become a
+# prerequisite for running 2a, which is the opposite of what the code says
+# (`Dispatcher.qfeval_gid` is None on such a host and the staging step tolerates
+# it). With the prefix a 2a-only host starts, and an `evaluate` job fails at the
+# evaluator socket, which is where the absence of 2c belongs.
+#
+# A DIRECTORY CREATED AFTER THIS SERVICE STARTED IS NOT IN ITS NAMESPACE: the
+# mount is set up once, at start. So phase2c-setup.sh restarts the dispatcher
+# and then MEASURES writability from inside the running namespace rather than
+# telling somebody to remember.
+ReadWritePaths=/var/lib/qf-platform /var/lib/qf-runs /var/lib/qf-locks -/var/lib/qf-eval
 # Leave nothing behind on a clean stop: an orphaned heavy container would keep
 # 22g while its flock died with the process (design 4.2). Both roles carry
 # qf.run_id, so this covers the handoff as well as the candidate.

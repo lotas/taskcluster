@@ -559,6 +559,170 @@ class TestMainInjectsTheImplementation(unittest.TestCase):
 
 
 
+class TestTheInstallStepProvisionsWhatTheUnitsNeed(unittest.TestCase):
+    """Task 24. Every unit here is one an install step has to put on a host, and
+    2c-1 shipped them with no install step at all -- so NC11 and NC9 (e)/(f)
+    reported `void`, which is honest and also unbounded: a control that has never
+    run is not a control. These tests hold the script, the units and the tmpfiles
+    config to each other, which is the part that can be checked off the host.
+
+    The specific defect they exist to prevent is 2b-1's P1 generalised: a unit
+    that names something -- an interpreter, a directory, a uid -- which nothing
+    creates."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.here = EVALUATOR
+        with open(os.path.join(cls.here, "qf-eval.service")) as fh:
+            cls.svc = fh.read()
+        with open(os.path.join(cls.here, "qf-eval.socket")) as fh:
+            cls.sock = fh.read()
+        cls.setup_path = os.path.join(HOST, "phase2c-setup.sh")
+        with open(cls.setup_path) as fh:
+            cls.setup = fh.read()
+        with open(os.path.join(cls.here, "qf-eval.conf")) as fh:
+            cls.tmpfiles = fh.read()
+
+    def env_value(self, name):
+        prefix = f"Environment={name}="
+        values = [l[len(prefix):] for l in self.svc.splitlines()
+                  if l.startswith(prefix)]
+        self.assertEqual(len(values), 1, values)
+        return values[0]
+
+    def tmpfiles_entry(self):
+        for line in self.tmpfiles.splitlines():
+            if line.startswith("d") and "qf-eval" in line:
+                return line.split()
+        self.fail("qf-eval.conf declares no directory")
+
+    def test_the_install_step_exists_and_is_executable(self):
+        self.assertTrue(os.path.isfile(self.setup_path))
+        self.assertTrue(os.access(self.setup_path, os.X_OK))
+
+    def test_the_unit_does_not_create_the_staging_root_itself(self):
+        # StateDirectory= would create /var/lib/qf-eval owned by THIS unit's
+        # user, and the process that has to create <run_id>/in/ inside it is
+        # qfd. The gate would have reported every store correct and the first
+        # evaluation would have failed in the dispatcher, on mkdir, one
+        # privilege domain away from the cause.
+        self.assertNotIn("StateDirectory=", code_only(self.svc))
+        self.assertIn("StateDirectory", self.svc)     # the reason is written down
+
+    def test_the_staging_root_is_provisioned_by_tmpfiles_with_setgid(self):
+        _type, path, mode, owner, group = self.tmpfiles_entry()[:5]
+        self.assertEqual(path, self.env_value("QFE_EVAL_DIR"))
+        # TWO UIDS MEET HERE: qfd writes the inbox, qfeval reads it. And the
+        # setgid bit is the mechanism rather than tidiness -- a file created in a
+        # setgid directory takes the DIRECTORY's group, which is how the staged
+        # prediction set reaches the evaluator without qfd being a member of its
+        # group. Linux allows chown(-1, gid) only for a member of gid.
+        self.assertEqual(mode, "2770")
+        self.assertEqual(owner, "qfd")
+        self.assertEqual(group, "qfeval")
+
+    def test_the_setup_script_installs_that_config_and_runs_tmpfiles(self):
+        self.assertIn("qf-eval.conf", self.setup)
+        self.assertIn("systemd-tmpfiles --create", self.setup)
+
+    def test_the_setup_script_verifies_the_mode_it_provisioned(self):
+        # `systemd-tmpfiles` exiting 0 is not the directory being right, and the
+        # setgid bit is the part with no second chance.
+        self.assertIn("eval_dir_problem", self.setup)
+        self.assertIn("after tmpfiles ran", self.setup)
+
+    def test_every_placeholder_in_the_units_is_substituted_by_the_script(self):
+        import re as _re
+        placeholders = set(_re.findall(r"%%[A-Z_]+%%", self.svc + self.sock))
+        self.assertTrue(placeholders)
+        for name in sorted(placeholders):
+            with self.subTest(placeholder=name):
+                self.assertIn(f"s/{name}/", self.setup)
+
+    def test_the_script_refuses_a_placeholder_it_failed_to_substitute(self):
+        self.assertIn("unsubstituted", self.setup)
+
+    def test_every_directory_the_unit_names_is_known_to_the_script(self):
+        # A store the unit points at and the script never looks at is a store
+        # whose mode nobody checks -- and the gate refuses to start on a
+        # writable one, so the failure would arrive as a service that will not
+        # come up rather than as a directory that is wrong.
+        for knob in ("QFE_EVAL_DIR", "QFE_EXTRACTS_DIR", "QFE_BASELINES_DIR"):
+            with self.subTest(knob=knob):
+                self.assertIn(self.env_value(knob), self.setup)
+
+    def test_the_script_syncs_the_interpreter_the_unit_names(self):
+        exec_start = [l for l in self.svc.splitlines()
+                      if l.startswith("ExecStart=")][0]
+        self.assertIn("env/.venv/bin/python", exec_start)
+        self.assertIn("uv sync --frozen", self.setup)
+        self.assertIn("$envdir/.venv", self.setup)
+
+    def test_a_missing_lock_is_a_refusal_not_a_generated_one(self):
+        # 2b-1's rule, inherited: the warning was ignored twice, so it became a
+        # refusal. Two hosts installed a week apart with different pyarrow
+        # versions is a difference nobody can afterwards explain.
+        self.assertIn("ALLOW_UNLOCKED_ENV", self.setup)
+        self.assertIn("is missing and is not in the repository", self.setup)
+
+    def test_the_script_imports_the_evaluator_itself_not_just_pyarrow(self):
+        # `import pyarrow` says nothing about evaluate.py's own imports, and
+        # evaluate.py is the file that grew a dependency between 2c-1 and 2c-2.
+        self.assertIn("import evaluate, service", self.setup)
+
+    def test_it_enables_the_socket_and_not_the_service(self):
+        # Socket activation. Enabling the service would start a judge at boot
+        # whether or not anything ever asks it for a verdict.
+        self.assertIn("systemctl enable --now qf-eval.socket", self.setup)
+        self.assertNotIn("enable --now qf-eval.service", self.setup)
+
+    def test_it_asks_the_evaluator_whether_it_works(self):
+        # RUN, not printed. 2b-1 only printed the round-trip commands because
+        # running them would have put the database DSN in a process argument;
+        # this domain holds no credential, so there is nothing to leak and no
+        # excuse for reporting "installed" without asking.
+        self.assertIn("confirm_round_trip", self.setup)
+        self.assertIn("{'op': 'ping'}", self.setup)
+        self.assertIn("can_evaluate", self.setup)
+
+    def test_it_checks_the_boundary_from_the_candidates_side(self):
+        self.assertIn("RESEARCH_USER", self.setup)
+        self.assertIn("cannot open", self.setup)
+
+    def test_it_measures_the_dispatchers_view_rather_than_asking_for_a_restart(self):
+        # ReadWritePaths= is applied when the service STARTS, so a directory
+        # provisioned afterwards is read-only inside the running dispatcher's
+        # namespace: install can succeed, discover can report 2770 qfd:qfeval,
+        # and the first evaluation still fails on mkdir. "Remember to restart
+        # qfd" is not evidence.
+        self.assertIn("nsenter", self.setup)
+        self.assertIn("dispatcher_namespace_report", self.setup)
+
+    def test_the_forbidden_groups_are_read_from_the_gate_not_repeated(self):
+        # A second hand-maintained copy of that tuple would disagree with the
+        # gate silently, and in the direction of provisioning a membership the
+        # service then refuses to run with.
+        self.assertIn("FORBIDDEN_GROUPS", self.setup)
+        for group in service.FORBIDDEN_GROUPS:
+            with self.subTest(group=group):
+                # NAMED NOWHERE as a literal list: the script reads them.
+                self.assertNotIn(f'"{group}"', self.setup)
+
+    def test_the_dispatcher_tolerates_a_staging_root_that_is_not_there_yet(self):
+        # ReadWritePaths= on a path that does not exist makes the unit fail to
+        # START, so without the `-` prefix installing 2c would have become a
+        # prerequisite for running 2a -- the opposite of what the dispatcher's
+        # own code says, where `qfeval_gid` is None on such a host and the
+        # staging step tolerates it.
+        with open(os.path.join(HOST, "dispatcher",
+                               "qf-dispatch.service")) as fh:
+            dispatch = fh.read()
+        rw = [l for l in dispatch.splitlines()
+              if l.startswith("ReadWritePaths=")]
+        self.assertEqual(len(rw), 1, rw)
+        self.assertIn("-/var/lib/qf-eval", rw[0])
+
+
 if __name__ == "__main__":
     # AT THE END, deliberately. It used to sit two thirds of the way up with 160
     # lines of test classes after it, so `python tests/test_service.py` ran none

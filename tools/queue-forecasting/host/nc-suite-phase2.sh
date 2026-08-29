@@ -1025,9 +1025,11 @@ nc11() {
 
   local py="$TRUSTED/tools/queue-forecasting/host/evaluator/env/.venv/bin/python"
   if [ ! -x "$py" ]; then
-    void "NC11 the evaluator venv is not built at $py. There is no 2c install
-  step yet (Task 24): the units under host/evaluator/ and its uv.lock are in the
-  checkout, and nothing installs them. Until then this whole group is void."
+    void "NC11 the evaluator venv is not built at $py. The 2c install step
+  exists now (Task 24) and has not been run on this host:
+      sudo ./phase2c-setup.sh discover     # what is outstanding
+      sudo ./phase2c-setup.sh install
+  Until it has, this whole group is void."
     return
   fi
   local ch listing
@@ -1158,18 +1160,58 @@ pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
     fi
   done
 
-  # (d) NOTHING THE CANDIDATE OWNS IS IN THE STAGING ROOT (D28).
+  # (d) THE STAGING ROOT IS THE HANDOVER, so its exact state is the clause.
+  #
+  # Two uids meet in one directory (D28): `qfd` creates `<run_id>/in/` and copies
+  # the untrusted prediction set in, `qfeval` traverses in to read it. The
+  # required state is `2770 qfd:qfeval`, and each of the three parts fails
+  # somewhere different -- the owner stops the dispatcher creating the inbox, the
+  # group stops the evaluator reading it, and the SETGID BIT is the one whose
+  # absence looks like nothing at all: a file created in a setgid directory takes
+  # the DIRECTORY's group, which is how the staged file reaches the evaluator
+  # without `qfd` being in its group, and Linux permits `chown(-1, gid)` only for
+  # a member of that group. So 0770 qfd:qfeval reads as correct, lets both
+  # processes into the directory, and leaves the ONE FILE the directory exists for
+  # in the wrong group. The dispatcher refuses to stage rather than hand over a
+  # file the evaluator cannot open, and this is where that is checked on a host.
   local staged="${QFD_EVAL_DIR:-/var/lib/qf-eval}"
   if [ -d "$staged" ]; then
-    local owner; owner="$(stat -c %U "$staged")"
-    case "$owner" in
-      "$RESEARCH_USER") bad "NC11 (d) the eval staging root is owned by $owner" ;;
-      *) ok "NC11 (d) the staging root is owned by $owner, not the candidate" ;;
+    local state; state="$(stat -c '%a %U %G' "$staged")"
+    case "$state" in
+      "2770 qfd qfeval") ok "NC11 (d) the staging root is $state" ;;
+      "770 qfd qfeval"|"0770 qfd qfeval")
+        bad "NC11 (d) the staging root is $state -- the SETGID bit is missing, so
+  the staged prediction set lands in qfd's group and the evaluator cannot read
+  the one file this directory exists for. phase2c-setup.sh install fixes it." ;;
+      *) bad "NC11 (d) the staging root is $state, not 2770 qfd:qfeval:
+  phase2c-setup.sh discover names which part is wrong and why" ;;
     esac
     refuse_as "$RESEARCH_USER" "NC11 (d) research cannot read the staged input" \
       "ls $staged"
+    # AND A STAGED FILE, IF ONE IS THERE, IS ACTUALLY IN THE EVALUATOR'S GROUP.
+    # The mode above is the mechanism; this is the outcome, and the outcome is
+    # what the earlier version of the staging code got wrong while every mode it
+    # set looked deliberate.
+    local one; one="$(find "$staged" -mindepth 3 -maxdepth 3 -type f \
+      -name predictions.parquet 2>/dev/null | head -1)"
+    if [ -n "$one" ]; then
+      local fstate; fstate="$(stat -c '%a %U:%G' "$one")"
+      case "$fstate" in
+        *":qfeval") ok "NC11 (d) a staged prediction set is $fstate" ;;
+        *) bad "NC11 (d) a staged prediction set is $fstate: the evaluator reads
+  it by GROUP, so this one is unreadable to the process that must judge it" ;;
+      esac
+    else
+      # NOT A FAILURE. The relay removes the staged copy once it has a verdict --
+      # nothing prunes this tree, and the copy's bytes are already in the run's
+      # artifacts/, digest-recorded. So its absence after a completed evaluation
+      # is the policy working.
+      echo "note  NC11 (d) nothing staged in flight (the relay removes the
+  copy once it has a verdict; nothing prunes this tree and the same bytes are
+  in the run's artifacts/, digest-recorded)"
+    fi
   else
-    void "NC11 (d) $staged does not exist, so nothing was ever staged"
+    void "NC11 (d) $staged does not exist: run phase2c-setup.sh install"
   fi
 
   # (e) AND THE VERDICT IS RECOMPUTABLE. `eval.parquet` beside `verdict.json` is

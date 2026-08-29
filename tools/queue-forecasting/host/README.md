@@ -691,6 +691,29 @@ a dispatcher holding `LOCK_SH` means silently skipped nightly runs.
 `QFD_BUILD_SETTLE_S`. The documented response is to move building out of `qfd`
 (design D10) — *not* to raise the window.
 
+The later phases' domains have their own install steps, each `discover` before
+`install` and each idempotent:
+
+```sh
+sudo ./host/phase2b-setup.sh discover       # the extractor: qfextract, the DSN
+sudo ./host/phase2b-setup.sh install
+sudo ./host/phase2c-setup.sh discover       # the evaluator: qfeval, the staging root
+sudo ./host/phase2c-setup.sh install
+sudo systemctl restart qf-dispatch          # see below
+```
+
+**The dispatcher restart after 2c is not optional, and it is not a courtesy
+reload.** `qf-dispatch.service` lists `/var/lib/qf-eval` in `ReadWritePaths=`,
+and that namespace is built when the service STARTS — so a staging root
+provisioned afterwards is read-only inside the running dispatcher and every
+evaluation fails on `mkdir` with EROFS, while `phase2c-setup.sh discover` reports
+the directory as correct. It reports the *namespace* separately, measured with
+`nsenter` inside the running process, and says so when it could only infer.
+
+`phase2c-setup.sh` does not create the contracts. `instantiate-contract.sh` pins
+a template to a promoted `baseline_hash`, which means `promote-baseline.sh` comes
+first — and until at least one contract resolves, NC9 and NC11 report `void`.
+
 ## Two instruments that do NOT detect a leaked file handle
 
 Both were tried here and both reported success over a live leak:

@@ -999,6 +999,18 @@ class EvaluateInputMissing(ProbeInputMissing):
     error_class = "evaluate_input_missing"
 
 
+class EvaluateStagingDenied(EvaluateInputMissing):
+    """The staged inbox cannot be handed to the evaluator.
+
+    A HOST fault rather than the job's, and it is a subclass so that the relay's
+    one guard covers it -- but with its own class, because the remedy is an
+    install step and not a resubmission. `evaluate_input_missing` would send an
+    operator to look for a prediction set that is present and correct.
+    """
+
+    error_class = "eval_staging_denied"
+
+
 class ExtractRelayError(Exception):
     """The extractor could not be asked, or would not answer.
 
@@ -2536,6 +2548,42 @@ class Runner:
                 f" not emit these bytes.")
         return job, pins, path, recorded
 
+    def _give_to_the_evaluator(self, path):
+        """Put `path` in the `qfeval` group, or refuse and name the fix.
+
+        WHY THIS IS NOT A BARE `os.chown`. `qfd` is not in the `qfeval` group and
+        must not need to be: it is already root-equivalent through `docker`, so
+        the membership would not widen anything, but a domain that has to be
+        JOINED to hand over a file is one more thing an install step can forget
+        and no test can see. Instead `/var/lib/qf-eval` is `2770 qfd:qfeval`
+        (phase2c-setup.sh's tmpfiles config), so everything created under it is
+        already in the evaluator's group and there is nothing to change.
+
+        Linux permits `chown(-1, gid)` only for a member of `gid`, or root. So
+        the check is on the STATE rather than on the call: if the group is already
+        right there is nothing to do, and if it is not, this host cannot give the
+        evaluator its input and must say so here. Staging anyway would surface
+        one privilege domain away from the cause, as "the evaluator cannot read
+        the prediction set".
+        """
+        if self.qfeval_gid is None:
+            # 2c is not installed on this host. The relay will fail at the
+            # socket, which is the honest place for it -- refusing here would
+            # make installing 2c a prerequisite for running 2a.
+            return
+        if os.stat(path).st_gid == self.qfeval_gid:
+            return
+        try:
+            os.chown(path, -1, self.qfeval_gid)
+        except OSError as e:
+            raise EvaluateStagingDenied(
+                f"{path} is not in the qfeval group and this dispatcher cannot"
+                f" put it there ({e}). {self.cfg.eval_dir} must be 2770"
+                f" qfd:qfeval, so that everything staged under it is in the"
+                f" evaluator's group by inheritance: `sudo ./phase2c-setup.sh"
+                f" install` provisions exactly that. Refusing rather than"
+                f" staging a file the evaluator cannot open.") from None
+
     def _stage_predictions(self, run_id, source, recorded_sha256):
         """Copy the untrusted prediction set where the evaluator can read it.
 
@@ -2553,22 +2601,33 @@ class Runner:
         described, and a digest of the original would still verify if the copy
         were truncated.
         """
-        inbox = os.path.join(self.cfg.eval_dir, run_id, "in")
-        outbox = os.path.join(self.cfg.eval_dir, run_id, "out")
+        base = os.path.join(self.cfg.eval_dir, run_id)
+        inbox = os.path.join(base, "in")
+        outbox = os.path.join(base, "out")
         os.makedirs(inbox, exist_ok=True)
         os.makedirs(outbox, exist_ok=True)
-        # 0750 on the inbox: the evaluator's group reads it, nobody else sees it.
-        # The outbox belongs to the evaluator, so its mode is the unit's business
-        # (`UMask=0027`) and not ours -- we only have to create it, because a
-        # service with `ReadWritePaths=/var/lib/qf-eval` can write inside it but
-        # `StateDirectoryMode` does not make per-run subdirectories.
-        os.chmod(os.path.join(self.cfg.eval_dir, run_id), 0o750)
-        os.chmod(inbox, 0o750)
-        os.chmod(outbox, 0o770)
-        if self.qfeval_gid is not None:
-            for path in (os.path.join(self.cfg.eval_dir, run_id), inbox,
-                         outbox):
-                os.chown(path, -1, self.qfeval_gid)
+        # THE GROUP FIRST, THE MODE SECOND. The mode's setgid bit governs what
+        # CHILDREN inherit, so it is only worth anything once the group it would
+        # propagate is the right one.
+        for path in (base, inbox, outbox):
+            self._give_to_the_evaluator(path)
+        # SETGID ON THE INBOX IS THE WHOLE MECHANISM, and the version this
+        # replaces did not have it. It chmodded the three directories to
+        # 0750/0750/0770 and chowned their GROUP to qfeval, and then created
+        # `predictions.parquet` inside the inbox -- a file whose group comes from
+        # the parent directory's setgid bit, which had just been cleared. So the
+        # staged prediction set would have been `0640 qfd:qfd` inside a directory
+        # the evaluator could traverse: the one file this whole staging path
+        # exists to hand over would have been the one thing it could not read,
+        # and `qfd` never chowns the file itself. Nothing in the suite could see
+        # it, because every test runs as one uid.
+        #
+        # 2750 on the base and the inbox: the evaluator's group traverses and
+        # reads, nobody else sees anything. 2770 on the outbox, which is the only
+        # thing it writes.
+        os.chmod(base, 0o2750)
+        os.chmod(inbox, 0o2750)
+        os.chmod(outbox, 0o2770)
         target = os.path.join(inbox, self.PREDICTIONS_NAME)
         tmp = target + ".partial"
         with open(source, "rb") as src, open(tmp, "wb") as dst:
@@ -2590,6 +2649,33 @@ class Runner:
                 f" recorded. The artifact changed while it was being copied.")
         return target, digest
 
+    def _unstage_predictions(self, staged):
+        """Remove the staged copy once the relay is over, whatever it returned.
+
+        WHY THE COPY GOES AND THE VERDICT STAYS. The staged prediction set is a
+        second copy of bytes that already exist, digest-recorded, in the run's
+        `artifacts/` -- the one thing under /var/lib/qf-eval that can be deleted
+        without losing anything, and also the largest. NOTHING ELSE WAS GOING TO:
+        `qf-runs-prune` is scoped to /var/lib/qf-runs, its unit's
+        `ReadWritePaths=` says so, and no timer touches this tree at all.
+
+        The verdict and `eval.parquet` in `out/` STAY. They are the record, and a
+        record deleted by a timer while the job row still cites it is the dangling
+        reference this system spends its effort not creating. They accumulate --
+        see the plan's open item, with the arithmetic -- and the answer to that is
+        a retention policy somebody chooses, not deleting evidence here.
+
+        A failure to remove is logged, not raised: the evaluation has already
+        happened and its verdict is already recorded, so failing the job over
+        cleanup would misattribute an outcome that is already known.
+        """
+        try:
+            os.unlink(staged)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("could not remove the staged %s: %s", staged, e)
+
     def _relay_evaluate(self, hold, effective):
         """Ask the evaluator, record the verdict. Returns an outcome tuple.
 
@@ -2608,71 +2694,81 @@ class Runner:
             log.error("%s: %s", run_id, e)
             return ("FAILED", {"error_class": e.error_class,
                                "finished_at": utcnow()})
-        now = utcnow()
-        # PINNED BEFORE THE RELAY, so a failed evaluation still says what it was
-        # judging and what it was judging by. Provenance that exists only on the
-        # happy path is provenance a reader cannot rely on -- the same rule as a
-        # probe's `baseline: none`.
-        for key, value in (
-                ("judged_run", effective["args"]["run"]),
-                ("contract_hash", effective["args"]["contract"]),
-                ("request_hash", pins.get("request_hash")),
-                ("baseline_hash", pins.get("baseline_hash")),
-                ("baseline", pins.get("baseline")),
-                ("predictions_sha256", digest),
-        ):
-            if value is not None:
-                self.db.call("set_pin", run_id, key, str(value), now=now)
-
-        request = {
-            "op": "evaluate",
-            "run_id": run_id,
-            "contract": effective["args"]["contract"],
-            "request_hash": pins["request_hash"],
-            "predictions_sha256": digest,
-        }
-        if pins.get("baseline_hash"):
-            request["baseline_hash"] = pins["baseline_hash"]
-        budget = min(effective["timeout_s"], max(1, int(hold.remaining())))
-        log.info("%s: asking the evaluator to judge %s by contract %s"
-                 " (timeout %ss)", run_id, effective["args"]["run"],
-                 effective["args"]["contract"][:12], budget)
         try:
-            reply = self.eval_client(self.cfg.eval_socket, request, budget)
-        except EvalRelayError as e:
-            log.error("%s: evaluator: %s", run_id, e)
-            return ("FAILED", {"error_class": e.error_class,
-                               "finished_at": utcnow()})
+            now = utcnow()
+            # PINNED BEFORE THE RELAY, so a failed evaluation still says
+            # what it was judging and what it was judging by. Provenance that
+            # exists only on the happy path is provenance a reader cannot rely
+            # on -- the same rule as a probe's `baseline: none`.
+            for key, value in (
+                    ("judged_run", effective["args"]["run"]),
+                    ("contract_hash", effective["args"]["contract"]),
+                    ("request_hash", pins.get("request_hash")),
+                    ("baseline_hash", pins.get("baseline_hash")),
+                    ("baseline", pins.get("baseline")),
+                    ("predictions_sha256", digest),
+            ):
+                if value is not None:
+                    self.db.call("set_pin", run_id, key, str(value), now=now)
 
-        if not reply.get("ok"):
-            # The evaluator's own refusal text: it wrote it to be read, and its
-            # unexpected failures already arrive as an opaque journal reference,
-            # so nothing a dependency produced is passed through. The CLASS is
-            # taken from the reply when it names one -- `contract_not_trusted` is
-            # the NC9 outcome and must not be flattened into "refused".
-            klass = reply.get("error_class")
-            if not isinstance(klass, str) or not _ERROR_CLASS_RE.match(klass):
-                klass = "evaluate_refused"
-            log.error("%s: evaluator refused (%s): %s", run_id, klass,
-                      reply.get("error"))
-            return ("FAILED", {"error_class": klass, "finished_at": utcnow()})
+            request = {
+                "op": "evaluate",
+                "run_id": run_id,
+                "contract": effective["args"]["contract"],
+                "request_hash": pins["request_hash"],
+                "predictions_sha256": digest,
+            }
+            if pins.get("baseline_hash"):
+                request["baseline_hash"] = pins["baseline_hash"]
+            budget = min(effective["timeout_s"], max(1, int(hold.remaining())))
+            log.info("%s: asking the evaluator to judge %s by contract %s"
+                     " (timeout %ss)", run_id, effective["args"]["run"],
+                     effective["args"]["contract"][:12], budget)
+            try:
+                reply = self.eval_client(self.cfg.eval_socket, request, budget)
+            except EvalRelayError as e:
+                log.error("%s: evaluator: %s", run_id, e)
+                return ("FAILED", {"error_class": e.error_class,
+                                   "finished_at": utcnow()})
 
-        verdict = reply.get("verdict")
-        if verdict not in ("go", "no-go"):
-            # A REPLY THAT SAYS `ok` IS NOT A VERDICT. The extract relay learned
-            # this: `{"ok": true, "manifest": {}}` was recorded as a successful
-            # extract, and a test enshrined it as "does not crash".
-            log.error("%s: the evaluator's reply carries no verdict (%r)",
-                      run_id, verdict)
-            return ("FAILED", {"error_class": "evaluate_reply_invalid",
-                               "finished_at": utcnow()})
-        now = utcnow()
-        self.db.call("set_pin", run_id, "verdict", verdict, now=now)
-        if isinstance(reply.get("eval_hash"), str):
-            self.db.call("set_pin", run_id, "eval_hash", reply["eval_hash"],
-                         now=now)
-        log.info("%s: verdict %s", run_id, verdict)
-        return ("SUCCEEDED", {"exit_code": 0, "finished_at": utcnow()})
+            if not reply.get("ok"):
+                # The evaluator's own refusal text: it wrote it to be read,
+                # and its unexpected failures already arrive as an opaque
+                # journal reference, so nothing a dependency produced is passed
+                # through. The CLASS is taken from the reply when it names one
+                # -- `contract_not_trusted` is the NC9 outcome and must not be
+                # flattened into "refused".
+                klass = reply.get("error_class")
+                if (not isinstance(klass, str)
+                        or not _ERROR_CLASS_RE.match(klass)):
+                    klass = "evaluate_refused"
+                log.error("%s: evaluator refused (%s): %s", run_id, klass,
+                          reply.get("error"))
+                return ("FAILED", {"error_class": klass,
+                                   "finished_at": utcnow()})
+
+            verdict = reply.get("verdict")
+            if verdict not in ("go", "no-go"):
+                # A REPLY THAT SAYS `ok` IS NOT A VERDICT. The extract relay
+                # learned this: `{"ok": true, "manifest": {}}` was recorded as
+                # a successful extract, and a test enshrined it as "does not
+                # crash".
+                log.error("%s: the evaluator's reply carries no verdict (%r)",
+                          run_id, verdict)
+                return ("FAILED", {"error_class": "evaluate_reply_invalid",
+                                   "finished_at": utcnow()})
+            now = utcnow()
+            self.db.call("set_pin", run_id, "verdict", verdict, now=now)
+            if isinstance(reply.get("eval_hash"), str):
+                self.db.call("set_pin", run_id, "eval_hash",
+                             reply["eval_hash"], now=now)
+            log.info("%s: verdict %s", run_id, verdict)
+            return ("SUCCEEDED", {"exit_code": 0, "finished_at": utcnow()})
+        finally:
+            # WHATEVER HAPPENED. A refusal, a relay fault and an unexpected
+            # exception all leave a staged copy behind, and the one that
+            # would accumulate fastest is the failure that repeats.
+            self._unstage_predictions(staged)
 
     def _relay_extract(self, hold, effective):
         """Ask the extractor, record what came back. Returns an outcome tuple.
