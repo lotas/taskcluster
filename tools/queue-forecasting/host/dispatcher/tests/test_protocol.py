@@ -1660,10 +1660,40 @@ class TestTheExtractsListingIsRelayedNotWalked(unittest.TestCase):
             with self.subTest(walking=walking):
                 self.assertNotIn(walking, body)
 
-    def test_the_dispatcher_has_no_extracts_directory_setting(self):
-        # Nothing here should know where they live. If a config key for it ever
-        # appears, the layout is in two places again.
-        self.assertNotIn("QFD_EXTRACTS_DIR", qfd.Config.ENV_KEYS)
+    def test_the_dispatcher_knows_the_path_but_never_walks_it(self):
+        # REFINED IN 2b-2, and the refinement is a sharpening rather than a
+        # retreat. This asserted that `QFD_EXTRACTS_DIR` did not exist at all,
+        # on the reasoning that the layout must live in one place. Then Task 9
+        # needed to MOUNT an extract, and a bind mount takes a path -- so the
+        # dispatcher does have to know where they are.
+        #
+        # The rule that actually matters is not "must not know the path", it is
+        # **must not walk the directory**: `qf extracts` stays relayed to the
+        # service that owns it, so there is still one thing that decides what is
+        # published. Knowing a path and enumerating a directory are different
+        # amounts of knowledge.
+        self.assertIn("QFD_EXTRACTS_DIR", qfd.Config.ENV_KEYS)
+        body = self.source[self.source.index("def _op_extracts"):]
+        body = body[:body.index("\n    def ")]
+        for walking in ("listdir", "MANIFEST", "glob", "extracts_dir"):
+            with self.subTest(walking=walking):
+                self.assertNotIn(walking, body)
+
+    def test_the_only_use_of_the_path_is_a_probe_mount(self):
+        uses = [line.strip() for line in self.source.splitlines()
+                if "cfg.extracts_dir" in line]
+        self.assertEqual(len(uses), 1, uses)
+        # And it resolves a validated 64-hex hash, never a spec-supplied path.
+        # In `_probe_extract`, which is where the resolution moved when manifest
+        # VALIDATION was added -- the assertion is about what the resolution does,
+        # not which function holds it.
+        resolve = self.source[self.source.index("def _probe_extract"):]
+        resolve = resolve[:resolve.index("\n    def ")]
+        self.assertIn('effective["args"]["extract"]', resolve)
+        self.assertIn("os.path.join(self.cfg.extracts_dir", resolve)
+        # And the manifest is parsed, not merely found to exist.
+        self.assertIn("json.load", resolve)
+        self.assertIn("request_hash", resolve)
 
     def test_an_unreachable_extractor_is_a_refusal_not_a_traceback(self):
         body = self.source[self.source.index("def _op_extracts"):]
@@ -1935,3 +1965,140 @@ class TestClauseCSchedulesTheExitItMeasures(unittest.TestCase):
     def test_the_precondition_is_still_rechecked_afterwards(self):
         # Belt and braces: cancelling makes the race unlikely, not impossible.
         self.assertIn('state_of "$l2"', self.clause)
+
+
+class TestTheProbeCommandAndFixture(unittest.TestCase):
+    """Task 9's client half and Task 12's fixture. The distinction that matters:
+    `probe` takes a `--sha` because it runs code, and `extract` does not because
+    it does not."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        self.mod = {}
+        with open(os.path.join(here, "qf")) as fh:
+            exec(compile(fh.read(), "qf", "exec"), self.mod)  # noqa: S102
+
+    def parse(self, argv):
+        return self.mod["build_parser"](False).parse_args(argv)
+
+    def test_probe_requires_a_commit_and_extract_does_not(self):
+        base = ["probe", "--path", "research/experiments/x.py",
+                "--extract", "c" * 64]
+        with self.assertRaises(SystemExit):
+            self.parse(base)                      # no --sha
+        self.assertEqual(self.parse(base + ["--sha", "b" * 40]).sha, "b" * 40)
+        with self.assertRaises(SystemExit):
+            self.parse(["extract", "--target", "wait_time",
+                        "--train-start", "2026-07-01T00:00:00Z",
+                        "--as-of", "2026-08-01T00:00:00Z",
+                        "--sha", "b" * 40])
+
+    def test_the_extract_is_required(self):
+        # A probe with no extract fails inside the container with a
+        # FileNotFoundError about /extract; refusing here says what is wrong.
+        with self.assertRaises(SystemExit):
+            self.parse(["probe", "--sha", "b" * 40,
+                        "--path", "research/experiments/x.py"])
+
+    def test_the_help_points_at_where_to_find_one(self):
+        # `qf extracts` is the answer to "what can I probe", so the flag says so.
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.suppress(SystemExit), \
+                contextlib.redirect_stdout(buf):
+            self.parse(["probe", "--help"])
+        self.assertIn("qf extracts", buf.getvalue())
+
+    def test_the_fixture_generator_exists_and_is_executable(self):
+        script = os.path.join(self.host, "nc-fixtures-phase2b.sh")
+        self.assertTrue(os.path.isfile(script), script)
+        self.assertTrue(os.stat(script).st_mode & 0o111)
+
+    def test_the_embedded_fixture_is_valid_python(self):
+        # The NC17 probe shipped as `b'...' + b chr(10)`. A fixture that cannot
+        # run is worse than none, because its failure reads as the thing it was
+        # checking.
+        with open(os.path.join(self.host, "nc-fixtures-phase2b.sh")) as fh:
+            text = fh.read()
+        marker = "cat > \"$EXP/extract_contract.py\" <<'EOF'\n"
+        body = text[text.index(marker) + len(marker):]
+        body = body[:body.index("\nEOF\n")]
+        compile(body, "extract_contract.py", "exec")
+
+    def test_the_fixture_asserts_the_clauses_nc13_cannot(self):
+        # NC13 runs as a selftest, which has no extract -- so it asserts the
+        # ABSENCE of one, and the presence clauses live in the probe fixture.
+        with open(os.path.join(self.host, "nc-fixtures-phase2b.sh")) as fh:
+            text = fh.read()
+        for claim in ("is not writable", "DATABASE_URL is unset",
+                      "no outbound network", "predictions.parquet"):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, text)
+
+    def test_the_generator_never_commits_or_pushes(self):
+        # The branch is the operator's to publish with the agent's credential;
+        # the dispatcher's token is read-only and must stay so.
+        with open(os.path.join(self.host, "nc-fixtures-phase2b.sh")) as fh:
+            lines = [l for l in fh.read().splitlines()
+                     if not l.lstrip().startswith("#")]
+        code = "\n".join(lines)
+        # `git` appears only inside the printed instructions heredoc.
+        for verb in ("git commit", "git push"):
+            with self.subTest(verb=verb):
+                self.assertNotRegex(code, rf"^\s*{verb}", )
+
+    def test_nc13_asserts_the_data_plane_is_not_ambient(self):
+        with open(os.path.join(self.host, "dispatcher",
+                               "nc13-inside.sh")) as fh:
+            inside = fh.read()
+        self.assertIn("/extract is absent in a job that requested none", inside)
+        self.assertIn("the data plane is ambient", inside)
+
+
+class TestTheExtractorEnvironmentMustBeLocked(unittest.TestCase):
+    """The installer generated a lock, printed "now commit it", and the lock is
+    still not in the repository -- so that install path produced exactly the
+    situation it was warning about, twice, while reporting success.
+
+    A warning that has been ignored once is documentation; a refusal is a
+    control."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "phase2b-setup.sh")) as fh:
+            self.setup = fh.read()
+
+    def test_a_missing_lock_is_a_refusal_not_a_warning(self):
+        block = self.setup[self.setup.index("uv.lock"):]
+        block = block[:block.index("# THE ONE SUBSTITUTION")]
+        self.assertIn("die ", block)
+
+    def test_the_escape_hatch_exists_so_a_first_lock_can_be_made(self):
+        # Refusing outright would make the first lock impossible to create.
+        self.assertIn("ALLOW_UNLOCKED_ENV", self.setup)
+
+    def test_the_refusal_says_how_to_get_the_lock_into_the_repo(self):
+        block = self.setup[self.setup.index("uv.lock is missing"):]
+        block = block[:block.index('"\n')]
+        for step in ("ALLOW_UNLOCKED_ENV=1", "git add", "cp "):
+            with self.subTest(step=step):
+                self.assertIn(step, block)
+
+    def test_the_readme_no_longer_describes_the_old_warning(self):
+        with open(os.path.join(self.host, "extractor", "env",
+                               "README.md")) as fh:
+            readme = fh.read()
+        self.assertIn("REFUSES", readme)
+        self.assertNotIn("prints a reminder to commit", readme)
+
+    def test_the_lock_is_still_absent_so_this_test_still_matters(self):
+        # When the lock lands, this flips -- and the flip is the signal that the
+        # refusal can be relied on rather than merely present.
+        lock = os.path.join(self.host, "extractor", "env", "uv.lock")
+        if os.path.isfile(lock):
+            self.skipTest("uv.lock is committed; the refusal is now the"
+                          " uncommon path")
+        self.assertFalse(os.path.isfile(lock))

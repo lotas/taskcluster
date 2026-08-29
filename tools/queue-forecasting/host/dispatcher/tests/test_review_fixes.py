@@ -929,14 +929,19 @@ class TestRound2Defect1AllFourDirectoriesAreOwned(Base):
         gid = os.getgid()
         paths = self.runner.prepare_run_dir("r-own", qfrun_gid=gid,
                                             qfclient_gid=gid)
-        for key in ("base", "src", "out", "artifacts", "logs"):
+        for key in ("base", "src", "out", "data", "artifacts", "logs"):
             with self.subTest(part=key):
                 self.assertEqual(os.stat(paths[key]).st_gid, gid,
                                  f"{key} kept the service's primary group")
 
     def test_the_declared_ownership_covers_every_directory_created(self):
+        # `data` joined the set in 2b-2: the writable hole in the read-only
+        # source tree, for the trainer's module-relative CACHE_DIR. This
+        # assertion existing is why that addition could not be made without
+        # declaring its ownership -- which is the whole point of pinning the set.
         declared = {name for name, _g, _m in qfd.Runner.OWNERSHIP}
-        self.assertEqual(declared, {None, "src", "out", "artifacts", "logs"})
+        self.assertEqual(declared,
+                         {None, "src", "out", "data", "artifacts", "logs"})
 
     def test_source_and_out_belong_to_the_container_group(self):
         # The container runs as 10001:10001 (gid qfrun); it must traverse src/

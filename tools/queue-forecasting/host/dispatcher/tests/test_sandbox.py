@@ -300,3 +300,121 @@ class TestCreateThenStart(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheExtractAndDataMounts(unittest.TestCase):
+    """Phase 2b-2 Task 8. Two new mount destinations, and the direction each is
+    allowed in is not the same -- which is the part the plan's outline did not
+    say.
+
+    `/extract` is a PUBLISHED, IMMUTABLE artifact (D20). A candidate that could
+    write to it would corrupt the input to a recorded result, and the corruption
+    would be invisible: the manifest's digests describe what was extracted, and
+    nothing re-checks them before a later read. So it is read-only ONLY.
+
+    `/app/trainer/data` is the opposite: `CACHE_DIR` and the model output path are
+    computed relative to the module, so the trainer must be able to write there
+    even though the tree around it is read-only. So it is read-write ONLY -- a
+    read-only mount there would fail at the first cache write, deep inside pandas,
+    with an error about a path nobody chose.
+    """
+
+    def argv(self, **over):
+        kw = dict(image_ref="sha256:" + "a" * 64, run_id="r1",
+                  spec_hash="h", kind="probe", src_mount="/srv/src",
+                  out_mount="/srv/out",
+                  entrypoint_argv=["/opt/qfenv/bin/python", "-c", "pass"],
+                  mem_limit="4g", cpus=2.0)
+        kw.update(over)
+        return sandbox.docker_create_argv(**kw)
+
+    def mounts(self, argv):
+        return [argv[i + 1] for i, part in enumerate(argv) if part == "-v"]
+
+    def test_extract_mounts_read_only(self):
+        argv = self.argv(extra_ro_mounts=[("/var/lib/qf-extracts/abc",
+                                           sandbox.EXTRACT_DEST)])
+        self.assertIn(f"/var/lib/qf-extracts/abc:{sandbox.EXTRACT_DEST}:ro",
+                      self.mounts(argv))
+
+    def test_extract_cannot_be_mounted_read_write(self):
+        # The asymmetry that matters. A published extract is immutable, and a
+        # candidate writing into it would corrupt the input to a recorded result.
+        with self.assertRaises(sandbox.SandboxError) as cm:
+            self.argv(extra_rw_mounts=[("/var/lib/qf-extracts/abc",
+                                        sandbox.EXTRACT_DEST)])
+        self.assertIn("read-only", str(cm.exception))
+
+    def test_the_data_directory_mounts_read_write(self):
+        argv = self.argv(extra_rw_mounts=[("/var/lib/qf-runs/r1/data",
+                                           sandbox.DATA_DEST)])
+        self.assertIn(f"/var/lib/qf-runs/r1/data:{sandbox.DATA_DEST}:rw",
+                      self.mounts(argv))
+
+    def test_the_data_directory_cannot_be_mounted_read_only(self):
+        # It would fail at the first cache write, deep inside pandas, with an
+        # error about a path nobody chose.
+        with self.assertRaises(sandbox.SandboxError) as cm:
+            self.argv(extra_ro_mounts=[("/var/lib/qf-runs/r1/data",
+                                        sandbox.DATA_DEST)])
+        self.assertIn("read-write", str(cm.exception))
+
+    def test_the_data_mount_is_nested_inside_the_source_mount(self):
+        # This is WHY 2b needs no path refactor in qf-research: CACHE_DIR is
+        # module-relative, so the writable directory has to land inside the
+        # read-only tree rather than beside it.
+        self.assertTrue(sandbox.DATA_DEST.startswith(sandbox.SRC_DEST + "/"),
+                        f"{sandbox.DATA_DEST} is not inside {sandbox.SRC_DEST}")
+
+    def test_the_parent_mount_is_emitted_before_the_nested_one(self):
+        # Docker orders bind mounts by destination depth, so nesting works either
+        # way in practice. Emitting parent-first anyway means a reader does not
+        # have to know that, and a later edit that reordered the argv would not
+        # quietly depend on it.
+        argv = self.argv(extra_rw_mounts=[("/var/lib/qf-runs/r1/data",
+                                           sandbox.DATA_DEST)])
+        mounts = self.mounts(argv)
+        parent = [i for i, m in enumerate(mounts)
+                  if m.split(":")[1] == sandbox.SRC_DEST][0]
+        nested = [i for i, m in enumerate(mounts)
+                  if m.split(":")[1] == sandbox.DATA_DEST][0]
+        self.assertLess(parent, nested)
+
+    def test_both_mounts_together_still_carry_the_whole_boundary(self):
+        # A data plane that arrived by loosening the sandbox would be the
+        # failure, so the flags NC13 asserts are re-asserted with the new mounts
+        # present.
+        argv = self.argv(
+            extra_ro_mounts=[("/var/lib/qf-extracts/abc", sandbox.EXTRACT_DEST)],
+            extra_rw_mounts=[("/var/lib/qf-runs/r1/data", sandbox.DATA_DEST)])
+        for flag, value in (("--network", "none"), ("--cap-drop", "ALL"),
+                            ("--user", sandbox.DEFAULT_UID_GID)):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, argv)
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertIn("--read-only", argv)
+
+    def test_no_database_url_is_ever_passed_in(self):
+        # The candidate has no credential and the extract is how it gets data.
+        argv = self.argv(
+            extra_ro_mounts=[("/var/lib/qf-extracts/abc", sandbox.EXTRACT_DEST)],
+            extra_rw_mounts=[("/var/lib/qf-runs/r1/data", sandbox.DATA_DEST)])
+        self.assertNotIn("-e", argv)
+        self.assertNotIn("--env", argv)
+        for part in argv:
+            self.assertNotIn("DATABASE_URL", part)
+
+    def test_an_unallowlisted_destination_is_still_refused(self):
+        for dest in ("/opt/qfenv", "/etc", "/app/trainer", "/",
+                     "/extract/../etc", "/app/trainer/data/../.."):
+            with self.subTest(dest=dest):
+                with self.assertRaises(sandbox.SandboxError):
+                    self.argv(extra_rw_mounts=[("/srv/x", dest)])
+
+    def test_a_subdirectory_of_extract_is_not_allowlisted(self):
+        # Exact destinations, not prefixes: mounting over `/extract/runs.parquet`
+        # would replace one file of a manifest-described artifact and leave the
+        # digest describing something else.
+        with self.assertRaises(sandbox.SandboxError):
+            self.argv(extra_ro_mounts=[("/srv/x",
+                                        sandbox.EXTRACT_DEST + "/runs.parquet")])

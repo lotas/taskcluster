@@ -24,6 +24,17 @@ SRC_DEST = "/app/trainer"
 OUT_DEST = "/out"
 ARTIFACTS_DEST = "/artifacts"
 
+# Phase 2b-2. The frozen extract, and the one writable hole in the read-only
+# tree.
+#
+# `DATA_DEST` is NESTED INSIDE `SRC_DEST`, deliberately: `CACHE_DIR` and the
+# model output path are computed relative to the trainer module
+# (`trainer/src/data_loader.py:22`), so the writable directory has to land inside
+# the read-only tree rather than beside it. That nesting is the reason 2b needs
+# no path refactor inside `qf-research`.
+EXTRACT_DEST = "/extract"
+DATA_DEST = SRC_DEST + "/data"
+
 ROLES = ("candidate", "handoff")
 
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
@@ -45,16 +56,55 @@ def _check_mount_source(path, what):
         raise SandboxError(f"{what} must not contain ':': {path!r}")
 
 
-def _check_extra_dest(dest):
-    """Allowlist, not a denylist. A job mounting over /opt/qfenv would replace
-    the interpreter the entrypoint names."""
+# Destinations allowed in ONE direction only, and the asymmetry is the point.
+#
+#   /extract   is a PUBLISHED, IMMUTABLE artifact (D20). A candidate that could
+#              write to it would corrupt the input to a recorded result, and
+#              invisibly: the manifest's digests describe what was extracted and
+#              nothing re-checks them before a later read.
+#
+#   /app/trainer/data  is the opposite. The tree around it is read-only and the
+#              trainer must still write its cache and its model output, so a
+#              read-only mount here fails at the first cache write -- deep inside
+#              pandas, with an error naming a path nobody chose.
+#
+# `/artifacts` and `/trusted/*` keep their existing latitude. Tightening them
+# would be a change to an evidenced path with no demonstrated need, and this
+# table is about adding two destinations rather than revisiting two others.
+_RO_ONLY_DESTS = (EXTRACT_DEST,)
+_RW_ONLY_DESTS = (DATA_DEST,)
+
+
+def _check_extra_dest(dest, *, writable):
+    """Allowlist, not a denylist, and now direction-aware.
+
+    A job mounting over /opt/qfenv would replace the interpreter the entrypoint
+    names; a job mounting read-write over /extract would rewrite an artifact a
+    result already cites.
+    """
+    if dest in _RO_ONLY_DESTS:
+        if writable:
+            raise SandboxError(
+                f"{dest} may only be mounted read-only: a published extract is"
+                f" immutable, and a run that could write to it would change the"
+                f" input to results that already cite it")
+        return
+    if dest in _RW_ONLY_DESTS:
+        if not writable:
+            raise SandboxError(
+                f"{dest} may only be mounted read-write: the trainer computes"
+                f" CACHE_DIR relative to its module, so a read-only mount here"
+                f" fails at the first cache write inside a library, with an"
+                f" error naming a path nobody chose")
+        return
     if dest == ARTIFACTS_DEST:
         return
     if dest.startswith(TRUSTED_MOUNT_PREFIX) and ".." not in dest.split("/"):
         return
     raise SandboxError(
         f"mount destination {dest!r} is not allowlisted; extras may only be"
-        f" {ARTIFACTS_DEST} or a path under {TRUSTED_MOUNT_PREFIX}")
+        f" {ARTIFACTS_DEST}, {EXTRACT_DEST}, {DATA_DEST}, or a path under"
+        f" {TRUSTED_MOUNT_PREFIX}")
 
 
 def container_name(run_id, role):
@@ -188,13 +238,17 @@ def docker_create_argv(*, image_ref, run_id, spec_hash, kind, src_mount,
         "-v", f"{src_mount}:{SRC_DEST}:ro",
         "-v", f"{out_mount}:{OUT_DEST}:rw",
     ]
+    # Emitted AFTER the source mount, so a nested destination follows its
+    # parent. Docker orders bind mounts by destination depth, so nesting works
+    # either way in practice -- emitting parent-first means a reader does not have
+    # to know that, and a later reordering cannot come to depend on it silently.
     for src, dest in extra_ro_mounts:
         _check_mount_source(src, "extra_ro_mount source")
-        _check_extra_dest(dest)
+        _check_extra_dest(dest, writable=False)
         argv += ["-v", f"{src}:{dest}:ro"]
     for src, dest in extra_rw_mounts:
         _check_mount_source(src, "extra_rw_mount source")
-        _check_extra_dest(dest)
+        _check_extra_dest(dest, writable=True)
         argv += ["-v", f"{src}:{dest}:rw"]
 
     argv.append(image_ref)
@@ -221,6 +275,14 @@ def entrypoint_for(effective):
             argv += ["-k", args["k"]]
         argv += list(args["paths"])
         return argv
+    if kind == "probe":
+        # ONE SCRIPT, and the extract is NOT an argument.
+        #
+        # It is mounted at a fixed path (`EXTRACT_DEST`), so the script knows
+        # where to look without being told. A path passed as an argument is a
+        # path something has to validate twice, and the second validator would be
+        # inside the untrusted code.
+        return [VENV_PYTHON, effective["args"]["path"]]
     if kind == "selftest":
         # NC13 from inside the sandbox, read from the trusted checkout only.
         return ["/bin/sh", f"{TRUSTED_MOUNT_PREFIX}nc13-inside.sh"]

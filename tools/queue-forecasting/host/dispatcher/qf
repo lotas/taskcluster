@@ -166,6 +166,49 @@ def cmd_extract(args):
             raise SystemExit(0 if job["state"] == "SUCCEEDED" else 1)
 
 
+def cmd_probe(args):
+    """Run an agent-authored script against a published extract.
+
+    Unlike `extract`, a probe DOES take a `--sha`: it runs code, so the record
+    must say which code. The extract must ALREADY EXIST -- `qf extracts` lists
+    what is published -- because a probe that triggered an eleven-minute
+    extraction would put a surprise inside a job someone expected to be quick.
+    """
+    spec_body = {
+        "schema": 1,
+        "kind": "probe",
+        "source_sha": args.sha,
+        "args": {"path": args.path, "extract": args.extract},
+    }
+    for name, value in (("mem_limit", args.mem), ("cpus", args.cpus),
+                        ("timeout_s", args.timeout), ("note", args.note)):
+        if value is not None:
+            spec_body[name] = value
+
+    resp = call("submit", {"spec": spec_body})
+    if not resp.get("ok"):
+        die(resp.get("error", "submit refused"))
+    run_id = resp["run_id"]
+    print(run_id)
+    if not args.wait:
+        return
+    while True:
+        time.sleep(POLL_S)
+        st = call("status", {"run_id": run_id})
+        if not st.get("ok"):
+            die(st.get("error", "status failed"))
+        job = st["job"]
+        if job["state"] in TERMINAL:
+            print(f"{job['state']} exit_code={job['exit_code']}"
+                  f" error_class={job['error_class']}", file=sys.stderr)
+            pins = job.get("pins") or {}
+            for key in ("extract_hash", "extract_dir"):
+                if pins.get(key):
+                    print(f"{key}: {pins[key]}", file=sys.stderr)
+            code = job["exit_code"]
+            raise SystemExit(code if isinstance(code, int) else 1)
+
+
 def cmd_extracts(args):
     """What the extractor has published: identity, window and watermark.
 
@@ -351,6 +394,22 @@ def build_parser(admin_mode):
                     help="poll to a terminal state and print the extract's"
                          " identity")
     ex.set_defaults(func=cmd_extract)
+
+    pr = sub.add_parser("probe",
+                        help="run a research/experiments/ script against a"
+                             " published extract")
+    pr.add_argument("--sha", required=True, help="full 40-hex commit id")
+    pr.add_argument("--path", required=True,
+                    metavar="research/experiments/x.py",
+                    help="the script to run; must be under research/experiments/")
+    pr.add_argument("--extract", required=True, metavar="REQUEST_HASH",
+                    help="an already-published extract; see `qf extracts`")
+    pr.add_argument("--mem", help="default 8g, which derives the heavy lane")
+    pr.add_argument("--cpus", type=float)
+    pr.add_argument("--timeout", type=int)
+    pr.add_argument("--note")
+    pr.add_argument("--wait", action="store_true")
+    pr.set_defaults(func=cmd_probe)
 
     sub.add_parser("extracts",
                    help="list published extracts with hashes and watermarks"

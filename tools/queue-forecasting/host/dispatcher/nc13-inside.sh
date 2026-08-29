@@ -60,6 +60,34 @@ PY
 
 # Credentials
 [ -z "${DATABASE_URL:-}" ] && ok "DATABASE_URL unset" || bad "DATABASE_URL is set"
+
+# --- 2b-2: THE DATA PLANE IS NOT AMBIENT ---------------------------------
+#
+# This script runs as a SELFTEST, and a selftest asks for no extract. So the
+# assertion here is the ABSENCE of one -- which is a control the plan did not
+# have and is the stronger half of the pair.
+#
+# The plan called for "/extract present, readable, not writable" in NC13. Those
+# can only be asserted from a job that HAS an extract, i.e. a probe; and a probe
+# runs only agent-authored code under research/experiments/, so they live in the
+# 2b-2 cohort fixture instead. What belongs HERE is the other direction: a job
+# that did not request data must not find data lying around. If /extract were
+# mounted for every kind, every job would carry a read of the production dataset
+# it never asked for, and nothing would notice.
+if [ -e /extract ]; then
+  bad "/extract exists in a selftest, which requested no extract: the data plane is ambient"
+else
+  ok "/extract is absent in a job that requested none"
+fi
+# The writable hole is equally not ambient. `trainer/data` is a mount only for a
+# probe; here the tree is read-only all the way down, and a write that succeeded
+# would mean the source mount had lost its :ro.
+if [ -d /app/trainer/data ] && (: > /app/trainer/data/.nc13-probe) 2>/dev/null; then
+  bad "/app/trainer/data is writable in a selftest: the source mount is not read-only"
+  rm -f /app/trainer/data/.nc13-probe 2>/dev/null || true
+else
+  ok "/app/trainer/data is not writable in a job that requested no data mount"
+fi
 env | grep -qiE 'password|secret|token|pulse|taskcluster' \
   && bad "credential-shaped env var present" || ok "no credential-shaped env vars"
 find / -xdev -maxdepth 3 -name '.env' -readable 2>/dev/null | grep -q . \

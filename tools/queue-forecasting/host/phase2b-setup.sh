@@ -199,14 +199,39 @@ install_all() {
     if would "sync $envdir/.venv from the committed lock"; then
       ( cd "$envdir" && uv sync --frozen --no-dev )
     fi
-  else
-    warn "$envdir/uv.lock does not exist. Generating one -- and it MUST be"
-    warn "committed, or two hosts installed a week apart get different versions"
-    warn "of pyarrow and nobody can explain the difference."
+  elif [ "${ALLOW_UNLOCKED_ENV:-0}" = 1 ]; then
+    # The escape hatch, and it is deliberately awkward to reach. Generating a
+    # lock is how the FIRST one comes into existence; every install after that
+    # should be using the committed one.
+    warn "ALLOW_UNLOCKED_ENV=1: generating $envdir/uv.lock"
     if would "generate $envdir/uv.lock and sync"; then
       ( cd "$envdir" && uv lock && uv sync --frozen --no-dev )
-      warn "now commit $envdir/uv.lock"
+      warn "COMMIT $envdir/uv.lock NOW, or the next host gets different versions"
     fi
+  else
+    # REFUSED, not warned.
+    #
+    # The previous version generated a lock and printed "now commit it". It was
+    # generated on one host, the reminder was read, and the lock is still not in
+    # the repository -- so this install path had produced exactly the situation it
+    # was warning about, twice, while reporting success. A warning that has been
+    # ignored once is documentation; a refusal is a control.
+    #
+    # What is at stake is small and real: two hosts installed a week apart get
+    # different pyarrow versions, and their extracts differ in bytes for a reason
+    # nobody can reconstruct. Published extracts are immutable, so nothing already
+    # recorded changes -- but a difference nobody can explain is how an unexplained
+    # difference gets into a comparison.
+    die "$envdir/uv.lock is missing and is not in the repository.
+
+  Generate it once, commit it, and re-run:
+      sudo ALLOW_UNLOCKED_ENV=1 $0 install
+      cp $envdir/uv.lock <your checkout>/host/extractor/env/uv.lock
+      git add host/extractor/env/uv.lock && git commit
+
+  Refusing rather than generating silently: the previous version generated one
+  and asked for it to be committed, and it was not -- so the ask has become a
+  refusal."
   fi
   if [ "$DRY_RUN" != 1 ]; then
     # Positive confirmation that the interpreter the unit names can import what

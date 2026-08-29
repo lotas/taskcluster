@@ -1508,11 +1508,101 @@ NC18 — the request is closed-world and the extract is reproducible:
 
 Scoped, not specified. Detail lands when 2b-1 is evidenced.
 
-**2b-2.** `sandbox.py` gains the `/extract` read-only mount and the nested
-writable `data/`; `probe` kind restricted to `research/experiments/`;
-`predictions.parquet` validated against §4.6's frozen types with duplicates and
-NaN as refusals; NC13 extended with the three `/extract` clauses. Acceptance: one
-cohort reproduces from a frozen extract with `--network none`.
+**2b-2, now that 2b-1 is evidenced.** Two things the outline did not say, both
+found by reading the code rather than the plan:
+
+**(i) The acceptance depends on code in `qf-research`.** `data_loader.py` reads
+`os.environ["DATABASE_URL"]` in **six** places, so with `--network none` and no
+credential the trainer does not fail to find data -- it raises `KeyError` before
+it starts. Something has to teach a cohort to read `/extract`, and that something
+lives in the research repo, not here.
+
+The cheapest honest route is a **fixture in `research/experiments/`**, which is
+exactly what the `probe` kind is restricted to: a self-contained script that reads
+`/extract`, builds features, trains and writes `predictions.parquet`. It needs no
+surgery on the trainer's loader, and a proper `--from-extract` mode for
+`data_loader.py` can follow in 2d when the sweep needs it.
+
+Written here as a generator script (the `nc-fixtures-phase2.sh` pattern) and
+pushed by the operator with the AGENT's credential: the dispatcher's token is
+read-only by design and this session cannot push to `qf-research`.
+
+**(ii) The dispatcher cannot validate `predictions.parquet`.** D6 keeps `qfd`
+stdlib-only, and reading Parquet needs `pyarrow`. So 2b-2 widens the artifact
+allowlist to carry the file and **defers validation to 2c's evaluator**, which has
+the dependency and is where §4.6 puts scoring anyway. The frozen types are still
+written down in 2b-2 so 2c implements rather than invents them. Worth stating
+plainly rather than discovering: a "predictions-only contract" in 2b-2 is a
+contract *declared*, not a contract *enforced*.
+
+Tasks:
+
+- **Task 8 — the mount layout in `sandbox.py`.** `/extract` read-only from
+  `<extracts_dir>/<request_hash>`; a run-private writable directory over
+  `/app/trainer/data`, because `CACHE_DIR` is module-relative. The nested pair is
+  order-sensitive: the read-only source mount must be declared before the
+  writable one that lands inside it. `--network none` and the absent
+  `DATABASE_URL` are unchanged and re-asserted.
+- **Task 9 — the `probe` kind.** Paths restricted to `research/experiments/`. A
+  probe DOES run code, so it takes a real `source_sha` (unlike `extract`). It
+  names its extract by `request_hash`, and **the extract must already exist**: a
+  probe that triggered an eleven-minute extraction would put a surprise inside a
+  job someone expected to be quick, and the reuse path already makes "extract
+  first, probe often" cheap. `extract_hash` is pinned on the probe's run so the
+  record says which data it saw.
+- **Task 10 — the artifact allowlist** widened from `result.json` to include
+  `predictions.parquet`, with the frozen types recorded and validation deferred
+  per (ii).
+- **Task 11 — NC13 extended**, not relaxed: `/extract` present, readable, and
+  **not writable**; `MANIFEST.json` readable from inside; `DATABASE_URL` still
+  absent. A data plane that arrived by loosening the sandbox would be the failure.
+- **Task 12 — the probe fixture.** `host/nc-fixtures-phase2b.sh` writes
+  `research/experiments/extract_contract.py`, sixteen assertions run from inside
+  the sandbox. Operator pushes it with the agent's credential.
+
+**Tasks 8-12 delivered 2026-08-29** (host verification outstanding). Four things
+worth recording, three of which changed the plan:
+
+1. **The mount allowlist is ASYMMETRIC, which the outline did not say.**
+   `/extract` may be mounted read-only ONLY: it is a published, immutable artifact
+   (D20), and a run that could write to it would change the input to results that
+   already cite it -- invisibly, since the manifest's digests describe what was
+   extracted and nothing re-checks them before a later read.
+   `/app/trainer/data` may be mounted read-write ONLY: a read-only mount there
+   fails at the first cache write, deep inside pandas, naming a path nobody chose.
+   Both directions are tested; reverting either fails.
+2. **NC13's "/extract present, readable, not writable" clauses cannot live in
+   NC13.** That script runs as a SELFTEST, which requests no extract -- so what
+   belongs there is the OTHER direction, and it is the stronger half: **a job that
+   requested no data must not find data lying around.** If `/extract` were mounted
+   for every kind, every job would carry a read of the production dataset it never
+   asked for and nothing would notice. The presence clauses moved to the probe
+   fixture, because only a probe has an extract and a probe runs only
+   agent-authored code.
+3. **The dispatcher does need to know the extracts path after all.** An earlier
+   test asserted `QFD_EXTRACTS_DIR` must not exist, on the reasoning that the
+   layout belongs in one place. Then a bind mount needed a path. The rule is
+   sharpened rather than dropped: qfd may **know** the path, and must not **walk**
+   the directory -- `qf extracts` stays relayed, so one thing still decides what is
+   published. Knowing a path and enumerating a directory are different amounts of
+   knowledge.
+4. **The fixture does NOT train a model, and the plan's acceptance said it
+   would.** Reproducing a cohort needs a loader that builds the trainer's frame
+   from parquet (`data_loader.py` reads `DATABASE_URL` in six places and raises
+   `KeyError` before it starts), the feature pipeline, the model, and a comparison
+   against a recorded result. All four are changes to the trainer's **data path**,
+   not to the dispatcher's plumbing -- and a change to the trainer's data path
+   should not be smuggled in as a test fixture.
+
+   So 2b-2's acceptance splits, and the split is named rather than quietly
+   narrowed:
+
+   - **Delivered:** the plumbing. Mount layout, probe kind, read path, writable
+     cache hole, artifact allowlist, predictions contract -- all provable by the
+     fixture, all provable today.
+   - **NOT delivered:** "one cohort reproduces". That needs a `--from-extract`
+     loader in `qf-research`, and it is the honest boundary of 2b-2 rather than
+     an oversight in it.
 
 **2b-3.** Trusted baseline production via the Node predictor, mounted at a fixed
 name; `query` kind; `resolve_baseline_file` reduced to a boolean choice in
@@ -1531,7 +1621,9 @@ name; `query` kind; `resolve_baseline_file` reduced to a boolean choice in
 4. Fault gates still 32/0 and the rest of the suite still passes — 2b-1 adds a
    domain and must not perturb the spine.
 5. A real extract exists for a real window, its manifest carries a watermark and
-   a snapshot, and re-requesting it is a cache hit. **DONE** — request
+   a snapshot, and re-requesting it is a cache hit. **DONE**, including the
+   `NC_SLOW=1` generation clause: 111/0 on 2026-08-28 with
+   `NC18 (slow) the new generation is a SEPARATE artifact`. — request
    `8e94d833d4c6`, extract `bfb0ae0330f4`, 36 days in 688s, and NC18 asserts the
    re-request serves the same bytes with no second artifact.
 
@@ -1542,17 +1634,19 @@ name; `query` kind; `resolve_baseline_file` reduced to a boolean choice in
    bumping `generation` publishes a separate artifact, which is NC18's `NC_SLOW=1`
    clause and **has not been run**.
 6. Evidence appended to `host/nc-evidence-phase2a.txt`, citing a commit on
-   `main`. **NOT DONE, and the gap is larger than the phase.** The suite writes to
-   `nc-evidence-phase2a.txt` -- one file for one suite, which is right, since
-   splitting one run's output by phase would leave neither file a complete record
-   -- but that file **has never been committed**: the repository holds
-   `nc-evidence-phase0.txt` and `nc-evidence-phase1.txt` and nothing since. Every
-   2a and 2b run has appended to a file in a working checkout, so there is no
-   committed record of any of them, including the 32/0 and 109/0 runs.
+   `main`. **PARTLY DONE.** The file is committed (`3ca4ffc4ce`) and carries the
+   whole arc -- 107/2, 107/2, 109/0, 111/0 -- with the commit each run was made
+   against, which is a better record than a single clean run would have been.
 
-   Two things are needed: commit the file, and produce a run that cites a
-   mainline commit rather than a branch, since a branch commit can be rewritten
-   and the evidence would then name nothing.
+   *An earlier revision of this list said the file "has never been committed".
+   That was true when written and stopped being true, and it stayed on the page:
+   a status note is a claim with a timestamp, and this one had none.*
+
+   What remains is accurate: every run cites a **feature-branch** commit. A branch
+   commit can be rewritten, and evidence naming a rewritten commit names nothing.
+   Either confirm the cited commit is an ancestor of `main`
+   (`git merge-base --is-ancestor <sha> main`), which a merge makes true
+   retroactively, or produce one run after merging.
 
 ## 8. Deferred from 2b
 

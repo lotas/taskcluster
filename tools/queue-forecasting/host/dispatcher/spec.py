@@ -20,6 +20,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 _MEM_RE = re.compile(r"^([1-9][0-9]{0,4})([mg])\Z")
 _PATH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./:-]{0,199}\Z")
 _K_RE = re.compile(r"^[A-Za-z0-9_ ()\[\].:-]{1,200}\Z")
+_EXTRACT_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _NOTE_RE = re.compile(r"^[\x20-\x7e]{0,500}\Z")
 
 # An allowlist, not a pattern. `--pdb` on an unattended runner is a wedged slot;
@@ -59,6 +60,13 @@ KINDS = {
     # and the window ceiling is 60 (auto-research-phase2b-plan.md revision 10). A
     # timeout under the measured time would kill work the extractor had finished.
     "extract":  dict(timeout_s=3600, mem_limit="256m", cpus=1.0),
+    # A probe runs agent-authored code against a frozen extract. 8g puts it
+    # ABOVE the light ceiling, so the lane derives to heavy (D10) -- which is
+    # correct rather than incidental: a cohort trains, so it competes with the
+    # nightly for the same host and must serialise against it. Nothing about the
+    # kind forces that; the memory does, and a probe that only reads a manifest
+    # can ask for 1g and stay light.
+    "probe":    dict(timeout_s=3600, mem_limit="8g", cpus=4.0),
 }
 
 # The lane is DERIVED from mem_limit, never requested (design D10). A job at or
@@ -127,6 +135,12 @@ def _check_paths(paths):
 
 # Relative to the worktree root, which is the mount point.
 DEFAULT_TEST_PATHS = ["trainer/tests"]
+
+# Where a probe's script must live. The `probe` kind exists to run agent-authored
+# code, and this prefix is the whole of what "agent-authored" is allowed to mean:
+# a script under `research/experiments/` cannot be a patched `trainer/src` module
+# masquerading as an experiment.
+PROBE_PREFIX = "research/experiments/"
 
 
 def _check_test_args(args):
@@ -201,13 +215,50 @@ def _extract_identity(effective_args):
     return (extract_spec.request_hash(effective_args), EXTRACT_SOURCE_REF)
 
 
+def _check_probe_args(args):
+    """One script under `research/experiments/`, and the extract it reads.
+
+    `path` singular, not `paths`: a probe is one script, and a list would invite
+    the pytest shape into a kind that runs no pytest.
+    """
+    if not isinstance(args, dict):
+        _err("args must be an object")
+    unknown = set(args) - {"path", "extract"}
+    if unknown:
+        _err(f"unknown args key(s) for kind probe: {sorted(unknown)}")
+
+    path = args.get("path")
+    if not isinstance(path, str) or not _PATH_RE.match(path):
+        _err(f"args.path must be a relative path, got {path!r}")
+    if ".." in path.split("/") or path.startswith("/"):
+        _err(f"args.path escapes the worktree: {path!r}")
+    if not path.startswith(PROBE_PREFIX):
+        _err(f"args.path must be under {PROBE_PREFIX}, got {path!r}:"
+             f" a probe runs agent-authored code, and that prefix is the whole"
+             f" of what agent-authored is allowed to mean")
+    if not path.endswith(".py") or path == PROBE_PREFIX:
+        _err(f"args.path must name a .py file, got {path!r}: the entrypoint runs"
+             f" it with the venv interpreter, so anything else fails inside the"
+             f" container instead of here")
+
+    extract = args.get("extract")
+    if not isinstance(extract, str) or not _EXTRACT_RE.match(extract):
+        _err(f"args.extract must be an extract request hash (64 lowercase hex),"
+             f" got {extract!r}. The extract must already exist: `qf extracts`"
+             f" lists what is published, and `qf extract` publishes one")
+
+    return {"path": path, "extract": extract}
+
+
 def _check_selftest_args(args):
     if args not in ({}, None):
         _err("kind selftest takes no args")
     return {}
 
 
-_ARG_CHECKS = {"test": _check_test_args, "selftest": _check_selftest_args}
+_ARG_CHECKS = {"test": _check_test_args,
+               "selftest": _check_selftest_args,
+               "probe": _check_probe_args}
 
 
 def normalize(raw, *, now=None, settlement_lag_s=None):

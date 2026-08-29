@@ -46,6 +46,11 @@ Environment=QFD_ADMIN_SOCKET=/run/qf-dispatch/admin/sock
 # 0660 root:qfd, so this membership is what lets the dispatcher connect --
 # and `research`, which is in qfclient but not in qfd, cannot reach it at all.
 Environment=QFD_EXTRACT_SOCKET=/run/qf-extract/sock
+# Read-only, and ONLY to resolve a probe's `/extract` mount. `qf extracts` is
+# relayed to the extractor rather than walked here, because that directory
+# belongs to qfextract -- but mounting needs a path, so this is the one place the
+# dispatcher has to know the layout. It never writes here.
+Environment=QFD_EXTRACTS_DIR=/var/lib/qf-extracts
 # A SECOND copy of the settlement lag, and the duplication is deliberate (D17).
 # The EXTRACTOR's value is authoritative and it validates every request again;
 # this copy exists only so a request naming an unsettled window is refused at

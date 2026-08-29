@@ -1229,3 +1229,319 @@ class TestTheOutQuotaSamplerIsFastEnoughToMeanSomething(RunnerCase):
         # enforced -- there is nothing to be late for, and 0.5s of it would be
         # cost with no return.
         self.assertGreaterEqual(self.runner.mem_sample_interval_s, 2)
+
+
+class TestTheRunPrivateDataDirectory(RunnerCase):
+    """Phase 2b-2 Task 8, the half that is not in `sandbox.py`. The writable
+    mount needs somewhere to point: a run-private `data/` that the sandbox uid can
+    write, created with the same care as `out/` -- chown before chmod, because
+    chown clears the setgid bit."""
+
+    def test_data_is_created_with_the_run_directory(self):
+        paths = self.runner.prepare_run_dir("r-data", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        self.assertIn("data", paths)
+        self.assertTrue(os.path.isdir(paths["data"]))
+
+    def test_it_is_writable_by_the_group_the_sandbox_runs_as(self):
+        paths = self.runner.prepare_run_dir("r-data2", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        mode = os.stat(paths["data"]).st_mode & 0o7777
+        self.assertTrue(mode & 0o070, oct(mode))
+
+    def test_it_matches_out_rather_than_inventing_a_third_shape(self):
+        # `out/` is 2770 qfrun. Nothing reads `data/` today, so the setgid bit is
+        # not load-bearing here -- but a second shape is something a reader has to
+        # have explained, and uniformity costs nothing.
+        table = dict((name, (group, mode))
+                     for name, group, mode in type(self.runner).OWNERSHIP
+                     if name)
+        self.assertEqual(table["data"], table["out"])
+
+    def test_it_is_run_private(self):
+        # Not shared between runs: `CACHE_DIR` would otherwise let one job's
+        # cache decide another job's input, which is exactly the contamination
+        # the frozen extract exists to remove.
+        first = self.runner.prepare_run_dir("r-a", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        second = self.runner.prepare_run_dir("r-b", qfrun_gid=os.getgid(),
+                                             qfclient_gid=os.getgid())
+        self.assertNotEqual(first["data"], second["data"])
+
+    def test_the_directory_it_will_be_mounted_over_is_the_declared_one(self):
+        # `sandbox.DATA_DEST` and this directory are two halves of one mount; if
+        # they disagreed the trainer would write into the read-only tree.
+        import sandbox
+        self.assertTrue(sandbox.DATA_DEST.endswith("/data"))
+
+
+class TestTheProbeMounts(RunnerCase):
+    """Task 9's runner half. The extract is resolved from trusted config plus a
+    validated 64-hex hash, so the only path it can produce is a direct child of
+    the extracts directory -- never a path the spec supplied."""
+
+    def setUp(self):
+        super().setUp()
+        self.extracts = os.path.join(self.root if hasattr(self, "root")
+                                     else tempfile.mkdtemp(), "qf-extracts")
+        os.makedirs(self.extracts, exist_ok=True)
+        self.cfg.extracts_dir = self.extracts
+        self.request_hash = "c" * 64
+
+    def publish(self, request_hash=None, **manifest_over):
+        """A REAL manifest. The first version of this fixture wrote `{}`, which
+        is precisely the gap it should have been closing: an empty manifest
+        satisfied the old existence check, so a probe could mount an extract
+        whose provenance could not be read -- and the tests licensed it."""
+        request_hash = request_hash or self.request_hash
+        path = os.path.join(self.extracts, request_hash)
+        os.makedirs(path, exist_ok=True)
+        manifest = {
+            "request_hash": request_hash,
+            "extract_hash": "d" * 64,
+            "watermark": {"pending_at": "2026-08-25T23:59:59+00:00"},
+            "files": {"runs": {"file": "runs.parquet", "sha256": "e" * 64,
+                               "rows": 10}},
+        }
+        manifest.update(manifest_over)
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump(manifest, fh)
+        return path
+
+    def a_probe(self, **over):
+        args = {"path": "research/experiments/cohort.py",
+                "extract": self.request_hash}
+        args.update(over.pop("args", {}))
+        eff = dict(spec.normalize({"schema": 1, "kind": "probe",
+                                   "source_sha": "b" * 40, "args": args}))
+        eff.update(over)
+        return eff
+
+    def test_a_published_extract_mounts_read_only_at_the_fixed_path(self):
+        published = self.publish()
+        mounts = self.runner._probe_ro_mounts(self.a_probe())
+        self.assertEqual(mounts, ((published, "/extract"),))
+
+    def test_a_missing_extract_is_refused_before_anything_starts(self):
+        with self.assertRaises(qfd.ProbeExtractMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe())
+        msg = str(cm.exception)
+        # The refusal names both commands that fix it, because "not published" is
+        # a request to correct rather than a subsystem to investigate.
+        self.assertIn("qf extracts", msg)
+        self.assertIn("qf extract", msg)
+
+    def test_a_directory_without_a_manifest_is_not_an_extract(self):
+        # Only a complete artifact counts -- the same rule the extractor's own
+        # `published_dir` uses. Mounting a bare directory would give the probe an
+        # /extract with nothing in it.
+        os.makedirs(os.path.join(self.extracts, self.request_hash),
+                    exist_ok=True)
+        with self.assertRaises(qfd.ProbeExtractMissing):
+            self.runner._probe_ro_mounts(self.a_probe())
+
+    def test_a_manifest_that_says_nothing_is_not_an_extract(self):
+        # THE GAP. The old check was `os.path.isfile(MANIFEST.json)`, so `{}`
+        # passed -- and a probe would then produce predictions whose provenance
+        # cannot be established, which is the entire point of pinning it.
+        self.publish()
+        with open(os.path.join(self.extracts, self.request_hash,
+                               "MANIFEST.json"), "w") as fh:
+            fh.write("{}")
+        with self.assertRaises(qfd.ProbeExtractMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe())
+        self.assertIn("request_hash", str(cm.exception))
+
+    def test_an_unparseable_manifest_is_refused(self):
+        self.publish()
+        with open(os.path.join(self.extracts, self.request_hash,
+                               "MANIFEST.json"), "w") as fh:
+            fh.write("{not json")
+        with self.assertRaises(qfd.ProbeExtractMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe())
+        self.assertIn("unreadable", str(cm.exception))
+
+    def test_a_manifest_describing_a_different_request_is_refused(self):
+        # The one field capable of pointing this run at somebody else's data.
+        self.publish(request_hash=self.request_hash)
+        path = os.path.join(self.extracts, self.request_hash, "MANIFEST.json")
+        with open(path) as fh:
+            manifest = json.load(fh)
+        manifest["request_hash"] = "f" * 64
+        with open(path, "w") as fh:
+            json.dump(manifest, fh)
+        with self.assertRaises(qfd.ProbeExtractMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe())
+        self.assertIn("disagree", str(cm.exception))
+
+    def test_a_manifest_without_an_extract_hash_is_refused(self):
+        # That is the identity every member of a comparison must share.
+        self.publish(extract_hash=None)
+        with self.assertRaises(qfd.ProbeExtractMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe())
+        self.assertIn("extract_hash", str(cm.exception))
+
+    def test_a_manifest_listing_no_files_is_refused(self):
+        self.publish(files={})
+        with self.assertRaises(qfd.ProbeExtractMissing) as cm:
+            self.runner._probe_ro_mounts(self.a_probe())
+        self.assertIn("no files", str(cm.exception))
+
+    def test_its_error_class_distinguishes_it_from_a_failed_extraction(self):
+        # "The extract is not there" and "the extraction failed" send an operator
+        # to different places.
+        self.assertEqual(qfd.ProbeExtractMissing.error_class,
+                         "extract_not_published")
+
+    def test_only_a_probe_gets_the_mounts(self):
+        for kind, raw in (
+                ("test", {"schema": 1, "kind": "test", "source_sha": "b" * 40}),
+                ("selftest", {"schema": 1, "kind": "selftest",
+                              "source_sha": "b" * 40})):
+            with self.subTest(kind=kind):
+                eff = spec.normalize(raw)
+                self.assertEqual(self.runner._probe_ro_mounts(eff), ())
+                self.assertEqual(
+                    self.runner._probe_rw_mounts(eff, {"data": "/x"}), ())
+
+    def test_the_writable_data_mount_is_the_runs_own(self):
+        paths = self.runner.prepare_run_dir("r-probe", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        mounts = self.runner._probe_rw_mounts(self.a_probe(), paths)
+        self.assertEqual(mounts, ((paths["data"], "/app/trainer/data"),))
+
+    def test_the_resolved_path_cannot_escape_the_extracts_directory(self):
+        # Belt and braces on top of the 64-hex validation: if `extract` could
+        # ever carry a separator, this is the assertion that would catch it.
+        eff = self.a_probe()
+        for hostile in ("../../etc", "a/../../etc", "/etc"):
+            with self.subTest(extract=hostile):
+                eff["args"]["extract"] = hostile
+                with self.assertRaises(Exception):
+                    mounts = self.runner._probe_ro_mounts(eff)
+                    src = mounts[0][0]
+                    self.assertTrue(
+                        os.path.realpath(src).startswith(
+                            os.path.realpath(self.extracts) + os.sep),
+                        f"{src} escaped the extracts directory")
+
+
+class TestThePredictionsArtifact(RunnerCase):
+    """Phase 2b-2 Task 10. The allowlist widens by ONE name, and the frozen types
+    are recorded rather than enforced -- which is worth stating plainly.
+
+    `qfd` is stdlib-only by D6 and reading Parquet needs `pyarrow`, so this side
+    CANNOT validate the file. Validation belongs to 2c's evaluator, which has the
+    dependency and is where design §8.5 puts scoring anyway. So a
+    "predictions-only contract" in 2b-2 is a contract DECLARED, not a contract
+    ENFORCED, and a reader should not have to infer that."""
+
+    def test_predictions_parquet_is_collected_when_present(self):
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        for name in ("predictions.parquet", "result.json"):
+            with open(os.path.join(out, name), "wb") as fh:
+                fh.write(b"x")
+        self.assertEqual(sorted(self.runner._artifact_allowlist(out)),
+                         ["predictions.parquet", "result.json"])
+
+    def test_nothing_else_is_collected(self):
+        # Not a glob over whatever the candidate wrote. A model file, a log, a
+        # core dump: none of them are scoring inputs, and collecting them would
+        # make the artifacts directory a place things accumulate.
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        for name in ("model.txt", "predictions.csv", "notes.md",
+                     "predictions.parquet.tmp", "core"):
+            with open(os.path.join(out, name), "wb") as fh:
+                fh.write(b"x")
+        self.assertEqual(self.runner._artifact_allowlist(out), [])
+
+    def test_an_absent_file_is_simply_not_collected(self):
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        self.assertEqual(self.runner._artifact_allowlist(out), [])
+
+    def test_the_dispatcher_does_not_pretend_to_validate_it(self):
+        # The honest half. If this side ever grows a parquet reader, D6 has been
+        # broken -- so the assertion is on the import surface, not on prose.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        for forbidden in ("import pyarrow", "import pandas", "read_parquet"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_the_frozen_types_are_written_down_for_2c(self):
+        # Declared here so 2c implements rather than invents them.
+        self.assertEqual(
+            qfd.Runner.PREDICTION_COLUMNS,
+            ("task_id", "run_id", "row_id", "p50", "p90_raw"))
+
+
+class TestAProbeRecordsWhichDataItSaw(ExtractRelayCase):
+    """The plan promised `extract_hash` pinned on a probe's run, and the runner
+    only checked that a manifest existed -- so the CLI printed pins that could
+    never be there, and "every member of a comparison shares an extract_hash"
+    was unverifiable.
+
+    Provenance that is promised and not recorded is worse than provenance that is
+    absent: the record LOOKS complete."""
+
+    def setUp(self):
+        super().setUp()
+        self.extracts = os.path.join(os.path.dirname(self.runs), "qf-extracts")
+        os.makedirs(self.extracts, exist_ok=True)
+        self.cfg.extracts_dir = self.extracts
+        self.request_hash = "c" * 64
+        path = os.path.join(self.extracts, self.request_hash)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "MANIFEST.json"), "w") as fh:
+            json.dump({"request_hash": self.request_hash,
+                       "extract_hash": "d" * 64,
+                       "watermark": {"pending_at": "2026-08-25T23:59:59+00:00"},
+                       "files": {"runs": {"sha256": "e" * 64, "rows": 10}}}, fh)
+
+    def a_probe_job(self):
+        return dict(spec.normalize(
+            {"schema": 1, "kind": "probe", "source_sha": "b" * 40,
+             "args": {"path": "research/experiments/cohort.py",
+                      "extract": self.request_hash}}))
+
+    def _hold_for(self, effective):
+        run_id = "probe-20260829T000000Z-" + effective["source_sha"][:12] + "-1"
+        self.db.call("submit", effective, run_id=run_id, uid=1001,
+                     now="2026-08-29T00:00:00Z")
+        job = self.db.call("get", run_id)
+        return types.SimpleNamespace(run_id=run_id, job=job)
+
+    def test_it_pins_the_identity_and_the_watermark(self):
+        effective = self.a_probe_job()
+        hold = self._hold_for(effective)
+        self.runner._pin_probe_extract(hold, effective)
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["request_hash"], self.request_hash)
+        self.assertEqual(pins["extract_hash"], "d" * 64)
+        self.assertTrue(pins["extract_dir"].endswith(self.request_hash))
+        self.assertIn("pending_at", pins["extract_watermark"])
+
+    def test_the_pins_are_the_same_keys_an_extract_job_records(self):
+        # 2c joins across both kinds. Two names for one identity would make that
+        # join a special case per kind.
+        effective = self.a_probe_job()
+        hold = self._hold_for(effective)
+        self.runner._pin_probe_extract(hold, effective)
+        pins = set(self.db.call("pins_for", hold.run_id))
+        self.assertTrue({"request_hash", "extract_hash", "extract_dir",
+                         "extract_watermark"} <= pins)
+
+    def test_it_happens_before_the_worktree_and_the_image(self):
+        # A bad reference should cost seconds, not an image build -- and the
+        # provenance should exist even if the run fails later.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            source = fh.read()
+        body = source[source.index("def execute(self, hold):"):]
+        body = body[:body.index("\n    def ")]
+        self.assertLess(body.index("_pin_probe_extract"),
+                        body.index("prepare_run_dir"))

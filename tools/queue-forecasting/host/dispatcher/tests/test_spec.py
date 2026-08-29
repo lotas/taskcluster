@@ -320,3 +320,138 @@ class TestTheExtractKind(unittest.TestCase):
         ok = spec.normalize({"schema": 1, "kind": "test", "source_sha": "b" * 40})
         self.assertEqual(ok["source_sha"], "b" * 40)
         self.assertIsNone(ok.get("source_ref"))
+
+
+class TestTheProbeKind(unittest.TestCase):
+    """Phase 2b-2 Task 9. A probe runs agent-authored code against a frozen
+    extract, so unlike `extract` it DOES take a real commit -- and unlike `test`
+    it is confined to `research/experiments/`.
+
+    It names its extract and the extract must ALREADY EXIST. A probe that
+    triggered an eleven-minute extraction would put a surprise inside a job
+    somebody expected to be quick, and reuse already makes "extract once, probe
+    often" cheap."""
+
+    EXTRACT = "a" * 64
+
+    def a_raw(self, **over):
+        args = {"path": "research/experiments/cohort.py", "extract": self.EXTRACT}
+        args.update(over.pop("args", {}))
+        raw = {"schema": 1, "kind": "probe", "source_sha": "b" * 40,
+               "args": args}
+        raw.update(over)
+        return raw
+
+    def test_a_valid_probe_normalises(self):
+        eff = spec.normalize(self.a_raw())
+        self.assertEqual(eff["kind"], "probe")
+        self.assertEqual(eff["args"]["path"], "research/experiments/cohort.py")
+        self.assertEqual(eff["args"]["extract"], self.EXTRACT)
+
+    def test_it_requires_a_real_commit(self):
+        # It runs code, so the record must say WHICH code. This is the opposite
+        # of `extract`, whose identity is its request.
+        with self.assertRaises(spec.SpecError):
+            raw = self.a_raw()
+            del raw["source_sha"]
+            spec.normalize(raw)
+
+    def test_a_relative_path_outside_the_prefix_names_the_prefix(self):
+        for bad in ("trainer/tests/test_x.py", "research/x.py",
+                    "trainer/src/model.py"):
+            with self.subTest(path=bad):
+                with self.assertRaises(spec.SpecError) as cm:
+                    spec.normalize(self.a_raw(args={"path": bad}))
+                self.assertIn("research/experiments", str(cm.exception))
+
+    def test_an_escaping_path_is_refused_for_the_more_precise_reason(self):
+        # These are refused BEFORE the prefix check, and the earlier message is
+        # the better one: "must be a relative path" and "escapes the worktree"
+        # say what is wrong, where "must be under research/experiments" would
+        # invite someone to prepend the prefix to an absolute path.
+        for bad, expected in (("/etc/passwd", "relative path"),
+                              ("../research/experiments/x.py", "relative path"),
+                              ("research/experiments/../../trainer/src/m.py",
+                               "escapes the worktree")):
+            with self.subTest(path=bad):
+                with self.assertRaises(spec.SpecError) as cm:
+                    spec.normalize(self.a_raw(args={"path": bad}))
+                self.assertIn(expected, str(cm.exception))
+
+    def test_the_path_must_be_a_python_file(self):
+        # The entrypoint runs it with the venv interpreter, so a directory or a
+        # shell script would fail inside the container rather than here.
+        for bad in ("research/experiments/", "research/experiments/x.sh",
+                    "research/experiments/x"):
+            with self.subTest(path=bad):
+                with self.assertRaises(spec.SpecError):
+                    spec.normalize(self.a_raw(args={"path": bad}))
+
+    def test_exactly_one_path(self):
+        # A probe is one script, not a set of test paths: `paths` would invite
+        # the pytest shape and there is no pytest here.
+        with self.assertRaises(spec.SpecError):
+            spec.normalize(self.a_raw(args={"paths": ["research/experiments/x.py"]}))
+
+    def test_the_extract_must_look_like_a_request_hash(self):
+        for bad in ("", "short", "A" * 64, "g" * 64, 7, None):
+            with self.subTest(extract=bad):
+                with self.assertRaises(spec.SpecError) as cm:
+                    spec.normalize(self.a_raw(args={"extract": bad}))
+                self.assertIn("extract", str(cm.exception))
+
+    def test_the_extract_is_required(self):
+        # A probe with no extract is a probe with no data, and it would fail
+        # inside the container with a FileNotFoundError about /extract.
+        raw = self.a_raw()
+        del raw["args"]["extract"]
+        with self.assertRaises(spec.SpecError):
+            spec.normalize(raw)
+
+    def test_an_unknown_arg_is_refused(self):
+        with self.assertRaises(spec.SpecError):
+            spec.normalize(self.a_raw(args={"pytest_args": ["-q"]}))
+
+    def test_it_is_heavy_by_derivation_not_by_request(self):
+        # A cohort trains, so it competes with the nightly for the same host --
+        # and the lane is DERIVED from memory (D10), never requested. The default
+        # is above the light ceiling, which is correct rather than incidental.
+        eff = spec.normalize(self.a_raw())
+        self.assertEqual(eff["lane"], "heavy")
+        self.assertGreater(spec.mem_mb(eff["mem_limit"]),
+                           spec.LIGHT_MEM_CEILING_MB)
+
+    def test_a_small_probe_may_still_be_light(self):
+        # Nothing about the KIND forces heavy; the memory does. A probe that only
+        # reads the manifest has no business holding the training mutex.
+        eff = spec.normalize(self.a_raw(mem_limit="1g"))
+        self.assertEqual(eff["lane"], "light")
+
+    def test_its_timeout_covers_a_training_run(self):
+        eff = spec.normalize(self.a_raw())
+        self.assertGreaterEqual(eff["timeout_s"], 1800)
+
+
+class TestTheProbeEntrypoint(unittest.TestCase):
+    def test_it_runs_the_script_with_the_venv_interpreter(self):
+        import sandbox
+        eff = spec.normalize({"schema": 1, "kind": "probe",
+                              "source_sha": "b" * 40,
+                              "args": {"path": "research/experiments/cohort.py",
+                                       "extract": "a" * 64}})
+        argv = sandbox.entrypoint_for(eff)
+        self.assertEqual(argv, [sandbox.VENV_PYTHON,
+                                "research/experiments/cohort.py"])
+
+    def test_the_extract_is_not_passed_as_an_argument(self):
+        # It is mounted at a fixed path. A path passed as an argument is a path
+        # something has to validate twice, and the second validator is inside
+        # untrusted code.
+        import sandbox
+        eff = spec.normalize({"schema": 1, "kind": "probe",
+                              "source_sha": "b" * 40,
+                              "args": {"path": "research/experiments/cohort.py",
+                                       "extract": "a" * 64}})
+        argv = sandbox.entrypoint_for(eff)
+        self.assertFalse(any("a" * 64 in part for part in argv))
+        self.assertFalse(any(part.startswith("/extract") for part in argv))

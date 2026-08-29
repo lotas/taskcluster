@@ -112,7 +112,7 @@ class Config:
         "QFD_MARKER_STALE_MARGIN_S", "QFD_LOCK_MIGRATED_MARKER",
         "QFD_ADMITTED_MEM_BUDGET_MB", "QFD_TIMEOUT_MAX_S", "QFD_LOCK_WAIT_S",
         "QFD_IMAGE_BUILD_MEM_MB", "QFD_LIGHT_WORKERS", "QFD_LOG_CAP_MB",
-        "QFD_EXTRACT_SOCKET", "QFD_SETTLEMENT_LAG_S",
+        "QFD_EXTRACT_SOCKET", "QFD_SETTLEMENT_LAG_S", "QFD_EXTRACTS_DIR",
         "QFD_ARTIFACT_CAP_MB", "QFD_HANDOFF_TIMEOUT_S", "QFD_DISK_FLOOR_GB",
         "QFD_QUEUED_CAP_PER_UID", "QFD_LEASE_S",
     )
@@ -156,6 +156,12 @@ class Config:
             log_cap_mb=_int_env("QFD_LOG_CAP_MB", 16),
             extract_socket=os.environ.get("QFD_EXTRACT_SOCKET",
                                           "/run/qf-extract/sock"),
+            # READ-ONLY to the dispatcher, and only to resolve a probe's mount:
+            # the directory belongs to qfextract, and `qf extracts` is relayed
+            # rather than walked for exactly that reason. Mounting requires a
+            # path, so this is the one place qfd needs to know the layout.
+            extracts_dir=os.environ.get("QFD_EXTRACTS_DIR",
+                                        "/var/lib/qf-extracts"),
             settlement_lag_s=_int_env("QFD_SETTLEMENT_LAG_S", 48 * 3600),
             artifact_cap_mb=_int_env("QFD_ARTIFACT_CAP_MB", 2048),
             handoff_timeout_s=_int_env("QFD_HANDOFF_TIMEOUT_S", 120),
@@ -893,6 +899,17 @@ class Docker:
 
 
 # --- run ids -------------------------------------------------------------
+class ProbeExtractMissing(Exception):
+    """A probe named an extract that is not published.
+
+    Its own class, and its own `error_class`, because "the extract is not there"
+    and "the extraction failed" send an operator to different places -- one is a
+    request to fix, the other is a subsystem to look at.
+    """
+
+    error_class = "extract_not_published"
+
+
 class ExtractRelayError(Exception):
     """The extractor could not be asked, or would not answer.
 
@@ -1961,6 +1978,17 @@ class Runner:
         (None,        "qfclient", 0o750),   # traversable by clients
         ("src",       "qfrun",    0o750),   # the container must read this
         ("out",       "qfrun",    0o2770),  # ...and write this; setgid keeps it
+        # Phase 2b-2: the one writable hole in the read-only source tree. The
+        # trainer computes CACHE_DIR and its model output path relative to its
+        # own module, so `/app/trainer/data` must be writable even though
+        # `/app/trainer` is mounted read-only -- and it must be RUN-PRIVATE, or
+        # one job's cache would decide another job's input, which is exactly the
+        # contamination a frozen extract exists to remove.
+        #
+        # Same shape as `out/` deliberately. Nothing reads this directory today,
+        # so the setgid bit is not load-bearing here as it is there; a second
+        # shape would just be something a reader has to have explained.
+        ("data",      "qfrun",    0o2770),
         ("artifacts", "qfclient", 0o750),   # the only thing a client reads
         ("logs",      "qfclient", 0o750),   # `qf logs` reads the file directly
     )
@@ -2016,6 +2044,11 @@ class Runner:
             # job so that it gets the state machine, the event chain and
             # `qf status`; the work itself happens in another privilege domain
             # (D15), and all this side does is ask and record what came back.
+            if effective["kind"] == "probe":
+                # BEFORE the worktree and the image build. A bad extract
+                # reference then costs seconds rather than minutes, and the
+                # provenance is recorded even if the run fails later.
+                self._pin_probe_extract(hold, effective)
             if effective["kind"] == "extract":
                 # LEASED -> RUNNING FIRST, and this is not bookkeeping.
                 #
@@ -2081,6 +2114,10 @@ class Runner:
             # budget it consumed was the mutex's.
             log.error("%s: %s", run_id, e)
             outcome = ("FAILED", {"error_class": "source_timeout",
+                                  "finished_at": utcnow()})
+        except ProbeExtractMissing as e:
+            log.error("%s: %s", run_id, e)
+            outcome = ("FAILED", {"error_class": e.error_class,
                                   "finished_at": utcnow()})
         except source_mod.NotPublished as e:
             log.error("%s: %s", run_id, e)
@@ -2359,7 +2396,9 @@ class Runner:
             entrypoint_argv=sandbox_mod.entrypoint_for(effective),
             mem_limit=effective["mem_limit"], cpus=effective["cpus"],
             role="candidate",
-            extra_ro_mounts=self._selftest_mounts(effective))
+            extra_ro_mounts=(self._selftest_mounts(effective)
+                             + self._probe_ro_mounts(effective)),
+            extra_rw_mounts=self._probe_rw_mounts(effective, paths))
 
         # The effective timeout is the SMALLER of the job's own and what is left
         # of the outer hold budget (design D10a). `max(1, ...)` used to floor it,
@@ -2590,6 +2629,109 @@ class Runner:
         script = os.path.join(os.path.realpath(self.cfg.trusted_dir),
                               "nc13-inside.sh")
         return ((script, "/trusted/nc13-inside.sh"),)
+
+    def _probe_extract(self, effective):
+        """Resolve, VALIDATE and return `(path, manifest)` for a probe's extract.
+
+        RESOLVED from trusted config plus a validated request hash -- never from a
+        path the spec supplied. `args.extract` is 64 hex characters and nothing
+        else, so the only path this can produce is a direct child of the extracts
+        directory.
+
+        The extract MUST ALREADY EXIST. A probe that triggered an eleven-minute
+        extraction would put a surprise inside a job somebody expected to be
+        quick, and reuse already makes "extract once, probe often" cheap.
+
+        AND THE MANIFEST MUST DESCRIBE THE EXTRACT WE ASKED FOR. An earlier
+        version checked only that `MANIFEST.json` existed, which is the same
+        mistake the relay made: a file saying nothing is not an extract, and a
+        probe mounted against one would produce predictions whose provenance
+        cannot be established -- which is the entire point of pinning it.
+        """
+        request_hash = effective["args"]["extract"]
+        path = os.path.join(self.cfg.extracts_dir, request_hash)
+        manifest_path = os.path.join(path, "MANIFEST.json")
+        try:
+            with open(manifest_path) as fh:
+                manifest = json.load(fh)
+        except FileNotFoundError:
+            raise ProbeExtractMissing(
+                f"no published extract {request_hash[:12]}: a probe reads an"
+                f" extract that already exists. `qf extracts` lists what is"
+                f" published; `qf extract` publishes one."
+            ) from None
+        except (OSError, ValueError) as e:
+            raise ProbeExtractMissing(
+                f"the manifest for {request_hash[:12]} is unreadable ({e}):"
+                f" refusing rather than mounting an extract whose provenance"
+                f" cannot be read"
+            ) from None
+
+        if manifest.get("request_hash") != request_hash:
+            # The one field capable of pointing this run at somebody else's data.
+            raise ProbeExtractMissing(
+                f"the manifest in {path} says request_hash"
+                f" {str(manifest.get('request_hash'))[:12]}, not"
+                f" {request_hash[:12]}: the directory and its manifest disagree"
+                f" about which extract this is")
+        extract_hash = manifest.get("extract_hash")
+        if not isinstance(extract_hash, str) or not self._HEX64.match(
+                extract_hash):
+            raise ProbeExtractMissing(
+                f"the manifest for {request_hash[:12]} carries no valid"
+                f" extract_hash ({extract_hash!r}): that is the identity every"
+                f" member of a comparison must share (design 4.6)")
+        if not manifest.get("files"):
+            raise ProbeExtractMissing(
+                f"the manifest for {request_hash[:12]} lists no files")
+        return path, manifest
+
+    def _pin_probe_extract(self, hold, effective):
+        """Record WHICH DATA this probe saw, before any expensive setup.
+
+        Early on purpose, twice over: validation happens before the worktree and
+        the image build, so a bad reference costs seconds rather than minutes;
+        and the pins exist even if the run fails later, so a failed probe still
+        says what it was reading.
+
+        Pins, never columns (design 4.6). Without these a probe's predictions
+        have no provenance, and "every member of a comparison shares an
+        extract_hash" becomes unverifiable -- which is the whole reason the
+        identity is recorded rather than inferred.
+        """
+        path, manifest = self._probe_extract(effective)
+        now = utcnow()
+        for key, value in (
+                ("request_hash", manifest.get("request_hash")),
+                ("extract_hash", manifest.get("extract_hash")),
+                ("extract_dir", path),
+                ("extract_watermark",
+                 json.dumps(manifest.get("watermark") or {}, sort_keys=True)),
+        ):
+            if value is not None:
+                self.db.call("set_pin", hold.run_id, key, value, now=now)
+        log.info("%s: probing extract %s (%s) at %s", hold.run_id,
+                 manifest["extract_hash"][:12],
+                 manifest.get("watermark"), path)
+        return manifest
+
+    def _probe_ro_mounts(self, effective):
+        """The frozen extract, read-only, at a fixed path."""
+        if effective["kind"] != "probe":
+            return ()
+        path, _manifest = self._probe_extract(effective)
+        return ((path, sandbox_mod.EXTRACT_DEST),)
+
+    def _probe_rw_mounts(self, effective, paths):
+        """The run-private writable directory, nested inside the read-only tree.
+
+        Only for a probe: a `test` job's pytest run has no business writing into
+        `trainer/data`, and mounting it for every kind would hand every job a
+        writable hole it did not ask for.
+        """
+        if effective["kind"] != "probe":
+            return ()
+        return ((paths["data"], sandbox_mod.DATA_DEST),)
 
     def _pump(self, proc, out_w, err_w):
         def pump(stream, writer):
@@ -3166,12 +3308,35 @@ class Runner:
             os.chmod(dest, 0o640)
         return None
 
+    # The prediction file's columns, frozen by design §4.6 and recorded HERE so
+    # 2c's evaluator implements them rather than inventing them:
+    #
+    #   task_id   string  non-null      run_id   int32  non-null
+    #   row_id    string  non-null      -- the canonical f"{task_id}:{run_id}"
+    #   p50       double  non-null, finite
+    #   p90_raw   double  non-null, finite
+    #
+    # Duplicated `row_id` is a REFUSAL, not a dedup: silently keeping one of two
+    # is how a candidate would drop rows it scores badly on.
+    #
+    # NONE OF WHICH IS CHECKED HERE, and that is not an omission. `qfd` is
+    # stdlib-only (D6) and reading Parquet needs `pyarrow`, so this side collects
+    # the file and 2c's evaluator -- which has the dependency, and is where §8.5
+    # puts scoring -- validates it. A "predictions-only contract" in 2b-2 is a
+    # contract DECLARED, not a contract ENFORCED, and a reader should not have to
+    # work that out.
+    PREDICTION_COLUMNS = ("task_id", "run_id", "row_id", "p50", "p90_raw")
+
     @staticmethod
     def _artifact_allowlist(out_dir):
-        """2a collects only what trusted code names. `result.json` is the whole
-        allowlist for now; 2b widens it with typed contracts, not with a glob
-        over whatever the candidate happened to write."""
-        candidates = ("result.json",)
+        """Only what trusted code NAMES, never a glob over what the candidate
+        happened to write.
+
+        2b-2 adds `predictions.parquet` -- one name, because the allowlist is the
+        thing that keeps the artifacts directory from becoming a place where
+        model files and core dumps accumulate.
+        """
+        candidates = ("result.json", "predictions.parquet")
         return [n for n in candidates
                 if os.path.exists(os.path.join(out_dir, n))]
 
