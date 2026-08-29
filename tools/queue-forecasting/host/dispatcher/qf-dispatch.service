@@ -56,6 +56,17 @@ Environment=QFD_EXTRACTS_DIR=/var/lib/qf-extracts
 # human on the deployment host. qfd resolves a baseline_hash to a path so it can
 # mount it read-only at /baseline, and has no way to publish one.
 Environment=QFD_BASELINES_DIR=/var/lib/qf-baselines
+# Phase 2c. The contracts the evaluator judges by, in the trusted checkout and
+# root-owned. qfd READS this only to turn a submitted contract hash into a
+# legible refusal at submit time; the evaluator resolves it again and its answer
+# is authoritative -- the same relationship as the settlement lag (D17). It is
+# outside ReadWritePaths, so qfd cannot edit a rule it is judged by.
+Environment=QFD_CONTRACTS_DIR=/srv/queue-forecasting/tools/queue-forecasting/host/contracts
+Environment=QFD_EVAL_SOCKET=/run/qf-eval/sock
+# Where the untrusted prediction set is staged for the evaluator (D28): qfd
+# writes `<run_id>/in/`, the evaluator writes `<run_id>/out/` and nothing else.
+# This one IS writable -- see ReadWritePaths below.
+Environment=QFD_EVAL_DIR=/var/lib/qf-eval
 # A SECOND copy of the settlement lag, and the duplication is deliberate (D17).
 # The EXTRACTOR's value is authoritative and it validates every request again;
 # this copy exists only so a request naming an unsettled window is refused at
@@ -113,7 +124,7 @@ PrivateDevices=yes
 # runs with qfrun as its primary gid, which would make the setgid bit redundant
 # and let this come back.
 RestrictSUIDSGID=no
-ReadWritePaths=/var/lib/qf-platform /var/lib/qf-runs /var/lib/qf-locks
+ReadWritePaths=/var/lib/qf-platform /var/lib/qf-runs /var/lib/qf-locks /var/lib/qf-eval
 # Leave nothing behind on a clean stop: an orphaned heavy container would keep
 # 22g while its flock died with the process (design 4.2). Both roles carry
 # qf.run_id, so this covers the handoff as well as the candidate.

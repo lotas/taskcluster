@@ -24,6 +24,13 @@ _K_RE = re.compile(r"^[A-Za-z0-9_ ()\[\].:-]{1,200}\Z")
 # baseline's content hash. "64 lowercase hex" is the same claim either way, and
 # two copies of it are two things that can drift.
 _HASH64_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+# `<kind>-<YYYYmmddTHHMMSSZ>-<sha[:12]>-<seq>`, as `qfd.make_run_id` mints it.
+# MATCHED, not sanitised: an evaluate job's `args.run` is looked up in the job
+# table and its run directory is read, so "contains no separator" is necessary
+# and not sufficient (`..x` contains none either).
+_RUN_ID_RE = re.compile(r"^[a-z][a-z0-9]{0,15}-[0-9]{8}T[0-9]{6}Z"
+                        r"-[0-9a-f]{7,40}-[0-9]{1,12}\Z")
 _NOTE_RE = re.compile(r"^[\x20-\x7e]{0,500}\Z")
 
 # An allowlist, not a pattern. `--pdb` on an unattended runner is a wedged slot;
@@ -70,6 +77,19 @@ KINDS = {
     # kind forces that; the memory does, and a probe that only reads a manifest
     # can ask for 1g and stay light.
     "probe":    dict(timeout_s=3600, mem_limit="8g", cpus=4.0),
+    # An evaluation runs in the trusted evaluator (D24), in its own privilege
+    # domain, so -- like `extract` -- none of these numbers describes a
+    # container. `mem_limit` is a slot reservation: 512m keeps it in the LIGHT
+    # lane, which is load-bearing rather than incidental. A judge must never take
+    # the training mutex, or scoring a finished experiment could block the
+    # nightly; and the evaluator's own MemoryMax is 4G, which is the number that
+    # actually bounds it.
+    #
+    # `timeout_s` is 900: the evaluator reads one prediction set and the extract
+    # columns it needs, in one pass, with no model and no database. If this ever
+    # approaches the ceiling, something is wrong with the evaluator rather than
+    # slow about the data.
+    "evaluate": dict(timeout_s=900, mem_limit="512m", cpus=1.0),
 }
 
 # The lane is DERIVED from mem_limit, never requested (design D10). A job at or
@@ -87,7 +107,10 @@ _TOP_OPTIONAL = ("args", "timeout_s", "mem_limit", "cpus", "note")
 _TOP_REQUIRED = ("schema", "kind", "source_sha")
 
 # Kinds whose identity is NOT a commit. See `_extract_identity`.
-_NO_SOURCE_SHA = ("extract",)
+# Neither kind runs candidate code, so a commit would record a dependency it
+# does not have. An `evaluate` job's identity is the RUN it judges plus the
+# CONTRACT it judges by -- and both are recorded as args, so nothing is lost.
+_NO_SOURCE_SHA = ("extract", "evaluate")
 
 # Written into `source_ref` for an extract job. `source_sha TEXT NOT NULL` holds
 # sixteen hundred live rows, so rather than migrate the column an extract stores
@@ -97,6 +120,12 @@ _NO_SOURCE_SHA = ("extract",)
 # and joining on it -- the value looks exactly like a sha, so the record has to
 # say otherwise itself.
 EXTRACT_SOURCE_REF = "extract-request (not a commit)"
+
+# The same device for an evaluation, and the same warning label. An evaluate
+# job's identity is the pair (run judged, contract judged by): re-submitting the
+# identical evaluation is the same work and gets the same identity, while
+# re-judging the same run under a NEW contract is different work and says so.
+EVALUATE_SOURCE_REF = "evaluate-request (not a commit)"
 
 
 class SpecError(ValueError):
@@ -266,6 +295,52 @@ def _check_probe_args(args):
     return out
 
 
+def _evaluate_identity(effective_args):
+    """`(source_sha, source_ref)` for an evaluate job.
+
+    sha256 over the canonical pair, not over the contract alone: judging two
+    different runs by one contract is two different pieces of work, and an
+    identity that collapsed them would make the second look like a duplicate of
+    the first.
+    """
+    body = json.dumps({"run": effective_args["run"],
+                       "contract": effective_args["contract"]},
+                      sort_keys=True, separators=(",", ":")).encode()
+    return (hashlib.sha256(body).hexdigest(), EVALUATE_SOURCE_REF)
+
+
+def _check_evaluate_args(args):
+    """The run to judge, and the contract to judge it by. IDS ONLY.
+
+    No path, no metric list, no threshold. Everything about HOW a result is
+    judged lives in the contract, in the trusted checkout, which is the whole of
+    what NC9 asserts: a caller that could pass a bar could pass its own bar.
+
+    `run` is the probe whose predictions are being judged. The extract and
+    baseline identities are NOT accepted here -- they are read from that run's
+    own pins, so a job cannot claim to have evaluated cohort A's predictions
+    against cohort B's data.
+    """
+    if not isinstance(args, dict):
+        _err("args must be an object")
+    unknown = set(args) - {"run", "contract"}
+    if unknown:
+        _err(f"unknown args key(s) for kind evaluate: {sorted(unknown)}")
+
+    run = args.get("run")
+    if not isinstance(run, str) or not _RUN_ID_RE.match(run):
+        _err(f"args.run must be the run id of a probe to judge, got {run!r}")
+
+    contract = args.get("contract")
+    if not isinstance(contract, str) or not _HASH64_RE.match(contract):
+        _err(f"args.contract must be a contract_hash (64 lowercase hex), got"
+             f" {contract!r}. `qf contracts` lists what the trusted checkout"
+             f" carries. A contract NAME would let the caller choose which rule"
+             f" judges it; a hash is resolved against the checkout and refused"
+             f" if absent.")
+    return {"run": run, "contract": contract}
+
+
 def _check_selftest_args(args):
     if args not in ({}, None):
         _err("kind selftest takes no args")
@@ -273,6 +348,7 @@ def _check_selftest_args(args):
 
 
 _ARG_CHECKS = {"test": _check_test_args,
+               "evaluate": _check_evaluate_args,
                "selftest": _check_selftest_args,
                "probe": _check_probe_args}
 
@@ -343,6 +419,10 @@ def normalize(raw, *, now=None, settlement_lag_s=None):
         sha, source_ref = _extract_identity(args)
     else:
         args = _ARG_CHECKS[kind](raw.get("args", {}))
+        if kind == "evaluate":
+            # `source_sha TEXT NOT NULL`: a kind with no commit still has to put
+            # something there, and it must be the identity of what this job ran.
+            sha, source_ref = _evaluate_identity(args)
 
     return {
         "schema": SCHEMA_VERSION,

@@ -351,11 +351,61 @@ Each ends where a control can fail closed, and none needs the next to be useful.
   rather than the trainer's path twice (D26), and leaving pandas out keeps this
   environment off the trainer's dependency bump cycle.
 
-- **Task 20 — the `evaluate` kind, and NC9.** `args.contract` is a 64-hex hash
-  resolved and verified against the trusted checkout; a job naming a contract
-  that is not there, or whose body does not hash to its name, is refused before
-  anything starts. NC9 asserts the refusal *and* that a valid contract still
-  works, so a broken resolver cannot pass by refusing everything.
+- **Task 20 — the `evaluate` kind, and NC9. DONE (2026-08-29)**, 46 tests.
+  `args.contract` is a 64-hex hash resolved and verified against the trusted
+  checkout; a job naming a contract that is not there, or whose body does not
+  hash to its name, is refused before anything starts. NC9 asserts the refusal
+  *and* that a valid contract still works, so a broken resolver cannot pass by
+  refusing everything.
+
+  Shape as built:
+
+  - **`args` is exactly `{run, contract}`.** No baseline, no bar, no metric, no
+    extract. A caller that could pass a threshold could pass its own threshold,
+    and NC9 (c) probes six policy field names **over the socket rather than
+    through the client**, because argparse would refuse an unknown flag and the
+    clause would be testing argparse.
+  - **Every identity comes from the JUDGED RUN's pins**, never from the evaluate
+    job's args. A caller that could name the extract could claim to have
+    evaluated cohort A's predictions against cohort B's data, and the verdict
+    would look exactly like a real one.
+  - **`RELAYED_KINDS`** replaces three separate `kind == "extract"` branches --
+    which lock is taken, which relay runs, whether a run directory is prepared.
+    Three copies is how the fourth gets forgotten. `evaluate` takes an
+    `ExtractSlot`, never the training mutex: scoring a finished experiment has
+    no business making the nightly wait.
+  - **`source_sha` is `sha256(run, contract)`** with
+    `EVALUATE_SOURCE_REF = "evaluate-request (not a commit)"`. The column is
+    `NOT NULL` and its role is "the immutable identity of what this job ran";
+    hashing the pair rather than the contract alone means judging two runs by one
+    rule is two pieces of work rather than a duplicate.
+  - **An `error_class` arriving from another domain is constrained**, not
+    trusted: it becomes a column operators grep and the suite asserts on, so a
+    reply cannot put a sentence or an empty string where consumers expect a
+    token. `contract_not_trusted` IS carried through, because flattening the
+    NC9 outcome into "refused" would make the control's own signal invisible.
+  - **Provenance is pinned before the relay**, so a failed evaluation still says
+    what it was judging and by what rule -- the same rule as a probe's
+    `baseline: none`.
+  - **A reply that says `ok` is not a verdict.** Checked, because the extract
+    relay's P1 was `{"ok": true, "manifest": {}}` recorded as a success with a
+    test enshrining it as "does not crash".
+
+  Four controls red-green verified by reverting them: the verdict check, the
+  submit-time contract resolution, the error-class guard, and the requirement
+  that the judged run SUCCEEDED.
+
+  Also `qf contracts` and `qf evaluate`, the third user of the one prefix
+  resolver. Its empty listing names the likeliest cause -- a `.json.in` template
+  carries no pinned baseline, so it judges against nothing -- because that is the
+  expected state until a baseline is promoted, and "no contracts" alone would
+  send somebody hunting for a resolver bug.
+
+  **NC9 voids rather than fails until a contract is instantiated**, which is the
+  honest state: the group is gated on a contract resolving, and the void names
+  `instantiate-contract.sh` as the remedy.
+
+This completes **2c-1**.
 
 ## 5. Open questions for 2c-2 and 2c-3
 

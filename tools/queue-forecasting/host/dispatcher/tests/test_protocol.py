@@ -3065,3 +3065,251 @@ class TestNc18GenerationClauseIsRerunnable(unittest.TestCase):
                                     settlement_lag_s=48 * 3600)
         self.assertNotEqual(extract_spec.request_hash(one),
                             extract_spec.request_hash(two))
+
+
+class TestTheContractsListingAndClient(ProtocolCase):
+    """Task 20. `qf contracts`, and `--contract` resolving a prefix the same way
+    `--extract` and `--baseline` do."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = os.path.join(self.tmp.name, "contracts")
+        os.makedirs(self.dir)
+        self.cfg.contracts_dir = self.dir
+
+    def write(self, name="wait_time.v1.json", **over):
+        import contract as contract_mod
+        body = {"schema": 1, "name": "wait_time_v1", "target": "wait_time",
+                "baseline_hash": "a" * 64,
+                "primary_slice": {"reason_resolved": ["completed"]},
+                "metrics": {"mae": {"direction": "lower_is_better",
+                                    "bar": {"kind": "relative_improvement",
+                                            "value": 0.15}}},
+                "consistency": {"days_required": 3}, "holdout_days": 5}
+        body.update(over)
+        body = contract_mod.validate(body)
+        digest = contract_mod.contract_hash(body)
+        body["contract_hash"] = digest
+        with open(os.path.join(self.dir, name), "w") as fh:
+            json.dump(body, fh)
+        return digest
+
+    def test_it_lists_a_contract_with_its_file(self):
+        digest = self.write()
+        resp = self.do("contracts")
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["contracts"],
+                         [{"contract_hash": digest, "file": "wait_time.v1.json"}])
+
+    def test_an_empty_directory_is_not_an_error(self):
+        resp = self.do("contracts")
+        self.assertEqual(resp["contracts"], [])
+
+    def test_it_is_a_client_op_not_an_admin_one(self):
+        # Research picks a contract to be judged by; behind qfadmin it would
+        # mean asking an operator which hash to type.
+        self.assertIn("contracts", qfd.CLIENT_OPS)
+        self.assertNotIn("contracts", qfd.ADMIN_OPS)
+
+    def test_the_client_prints_the_full_hash_on_its_own_line(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            body = fh.read()
+        cmd = body[body.index("def cmd_contracts"):]
+        cmd = cmd[:cmd.index("\ndef ")]
+        self.assertIn("--contract {row.get('contract_hash')}", cmd)
+
+    def test_the_empty_listing_explains_that_a_template_is_not_a_contract(self):
+        # The likeliest reason the list is empty, and the one an operator cannot
+        # guess: a `.json.in` carries no pinned baseline, so it judges nothing.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            body = fh.read()
+        cmd = body[body.index("def cmd_contracts"):]
+        cmd = cmd[:cmd.index("\ndef ")]
+        self.assertIn("instantiate-contract.sh", cmd)
+
+    def test_a_contract_prefix_resolves_through_the_shared_resolver(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        mod = {}
+        with open(os.path.join(here, "qf")) as fh:
+            exec(compile(fh.read(), "qf", "exec"), mod)      # noqa: S102
+        calls = []
+
+        def fake_call(op, payload=None, **kw):
+            calls.append(op)
+            return {"ok": True, "contracts": [
+                {"contract_hash": "1234abcd" + "0" * 56},
+                {"contract_hash": "9999beef" + "1" * 56},
+                {"contract_hash": "9999beef" + "2" * 56}]}
+        mod["call"] = fake_call
+        self.assertEqual(mod["resolve_contract"]("1234abcd"),
+                         "1234abcd" + "0" * 56)
+        self.assertEqual(calls, ["contracts"])
+        # Ambiguity is a refusal, not a guess: a shorter prefix silently
+        # selecting a different RULE is the worst of the three resolvers to get
+        # wrong, because the verdict still looks like a verdict.
+        with self.assertRaises(SystemExit):
+            mod["resolve_contract"]("9999beef")
+
+    def test_evaluate_sends_no_bar_and_no_baseline(self):
+        # Everything about HOW a result is judged lives in the contract. A
+        # caller that could pass a bar could pass its own bar.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            body = code_only(fh.read())
+        cmd = body[body.index("def cmd_evaluate"):]
+        cmd = cmd[:cmd.index("\ndef ")]
+        spec_body = cmd[cmd.index('"args"'):cmd.index("}")]
+        for forbidden in ("baseline", "mae", "bar", "threshold", "extract"):
+            self.assertNotIn(forbidden, spec_body, forbidden)
+
+    def test_evaluate_prints_the_verdict_with_the_rule_that_produced_it(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qf")) as fh:
+            body = fh.read()
+        cmd = body[body.index("def cmd_evaluate"):]
+        cmd = cmd[:cmd.index("\ndef cmd_status")]
+        # A verdict with no contract hash beside it is a number whose rule
+        # nobody can look up.
+        for key in ("verdict", "contract_hash", "judged_run"):
+            self.assertIn(f'"{key}"', cmd)
+
+
+class TestTheEvaluateKindTakesNoPolicy(unittest.TestCase):
+    """The spec half of NC9: the only things an `evaluate` job can say are WHICH
+    run and WHICH contract."""
+
+    def a_spec(self, **args_over):
+        args = {"run": "probe-20260829T123756Z-9d54e39271d7-4290",
+                "contract": "a" * 64}
+        args.update(args_over)
+        return {"schema": 1, "kind": "evaluate", "args": args}
+
+    def test_the_accepted_args_are_exactly_run_and_contract(self):
+        effective = spec.normalize(self.a_spec())
+        self.assertEqual(set(effective["args"]), {"run", "contract"})
+
+    def test_no_policy_field_is_accepted(self):
+        for extra in ("baseline", "bar", "mae", "threshold", "metrics",
+                      "holdout_days", "primary_slice", "extract"):
+            with self.subTest(field=extra):
+                with self.assertRaises(spec.SpecError) as cm:
+                    spec.normalize(self.a_spec(**{extra: "x"}))
+                self.assertIn(extra, str(cm.exception))
+
+    def test_a_contract_name_is_refused_in_favour_of_a_hash(self):
+        with self.assertRaises(spec.SpecError) as cm:
+            spec.normalize(self.a_spec(contract="wait_time.v1.json"))
+        self.assertIn("contract_hash", str(cm.exception))
+
+    def test_it_takes_no_source_sha(self):
+        # It runs no candidate code, so a commit would record a dependency it
+        # does not have.
+        body = self.a_spec()
+        body["source_sha"] = "b" * 40
+        with self.assertRaises(spec.SpecError):
+            spec.normalize(body)
+
+    def test_its_identity_is_the_pair_it_judges(self):
+        one = spec.normalize(self.a_spec())
+        again = spec.normalize(self.a_spec())
+        self.assertEqual(one["source_sha"], again["source_sha"])
+        self.assertEqual(one["source_ref"], spec.EVALUATE_SOURCE_REF)
+        other_run = spec.normalize(
+            self.a_spec(run="probe-20260829T123756Z-9d54e39271d7-1"))
+        other_rule = spec.normalize(self.a_spec(contract="b" * 64))
+        # Judging two runs by one contract is two pieces of work; an identity
+        # that collapsed them would make the second look like a duplicate.
+        self.assertNotEqual(one["source_sha"], other_run["source_sha"])
+        self.assertNotEqual(one["source_sha"], other_rule["source_sha"])
+
+    def test_the_source_ref_says_it_is_not_a_commit(self):
+        # The value looks exactly like a sha, so the record has to say otherwise
+        # itself or a reader will join on it.
+        self.assertIn("not a commit", spec.EVALUATE_SOURCE_REF)
+
+    def test_it_lands_in_the_light_lane(self):
+        # A judge must never take the training mutex: scoring a finished
+        # experiment has no business making the nightly wait.
+        self.assertEqual(spec.normalize(self.a_spec())["lane"], "light")
+        self.assertIn("evaluate", qfd.RELAYED_KINDS)
+
+
+class TestNc9IsWiredAndGated(unittest.TestCase):
+    """Design negative control 9, deferred from 2a to 2c because it needs a
+    contract to exist. Same three instrument rules as NC18/NC19: a canary gates
+    the group, the positive case is asserted alongside the refusals, and nothing
+    the suite claims rests on something it did not observe."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "nc-suite-phase2.sh")) as fh:
+            self.suite = fh.read()
+        body = self.suite[self.suite.index("nc9() {"):]
+        self.nc9 = code_only(body[:body.index("\n}\n")])
+
+    def test_it_actually_runs(self):
+        self.assertRegex(self.suite, r"\n  nc9\n")
+
+    def test_the_group_is_gated_on_a_contract_resolving(self):
+        # Without this, a resolver returning nothing satisfies every refusal.
+        canary = self.nc9.index("no contract resolves")
+        for claim in ("NC9 (a)", "NC9 (b)", "NC9 (c)", "NC9 (d)"):
+            self.assertLess(canary, self.nc9.index(claim), claim)
+        branch = self.nc9[canary:self.nc9.index("\n  fi", canary)]
+        self.assertIn("return", branch)
+
+    def test_the_canary_explains_the_likeliest_reason_it_failed(self):
+        # An empty contracts directory is the expected state until a baseline is
+        # promoted, and "no contract resolves" alone would send somebody hunting
+        # for a bug in the resolver.
+        self.assertIn("instantiate-contract.sh", self.nc9)
+        self.assertIn("unpinned baseline", self.nc9)
+
+    def test_the_positive_case_is_asserted_next_to_the_refusals(self):
+        # A submit path that refused EVERY evaluate job would pass (b) and (c).
+        self.assertIn("a trusted contract is accepted at submit", self.nc9)
+        self.assertIn("evaluate_input_missing", self.nc9)
+
+    def test_the_untrusted_contract_refusal_checks_the_list_too(self):
+        self.assertIn("lists what the checkout carries", self.nc9)
+
+    def test_no_policy_field_is_probed_through_the_client(self):
+        # The CLIENT cannot send an unknown args key -- argparse would refuse the
+        # flag -- so this has to go over the socket directly, or the clause would
+        # be testing argparse.
+        # Sliced from the loop header, not from a byte offset before the first
+        # claim: the field names live in `for field in ...`, which sits further
+        # back than a fixed window reaches.
+        policy = self.nc9[self.nc9.index("for field in "):]
+        policy = policy[:policy.index("NC9 (d)")]
+        self.assertIn("socket.AF_UNIX", policy)
+        for field in ("baseline", "bar", "mae", "threshold", "metrics",
+                      "holdout_days"):
+            self.assertIn(field, policy, field)
+
+    def test_the_independent_resolution_is_asserted_from_outside(self):
+        # qfd's check is for legibility; a control enforced only by the process
+        # in the `docker` group is not a control.
+        self.assertIn("cannot reach the evaluator socket", self.nc9)
+
+    def test_the_evaluator_units_read_write_paths_are_checked(self):
+        self.assertIn("ReadWritePaths=", self.nc9)
+        for store in ("qf-extracts", "qf-baselines", "contracts"):
+            self.assertIn(store, self.nc9, store)
+
+    def test_it_uses_the_shape_check_not_a_run_directory(self):
+        # The defect NC19's canary shipped with: a submitted job is QUEUED and
+        # has no directory until it is leased.
+        self.assertIn("is_run_id", self.nc9)
+        self.assertNotIn('[ -d "$RUNS_DIR/$rid" ]', self.nc9)
+
+    def test_the_error_class_it_expects_is_one_the_dispatcher_produces(self):
+        # Pinned to the source of the vocabulary, the same way NC16's clause is
+        # pinned to EXIT_CLASSES: a clause asserting a class nothing emits fails
+        # for a reason unrelated to the control.
+        self.assertEqual(qfd.EvaluateInputMissing.error_class,
+                         "evaluate_input_missing")
+        self.assertIn("evaluate_input_missing", self.nc9)

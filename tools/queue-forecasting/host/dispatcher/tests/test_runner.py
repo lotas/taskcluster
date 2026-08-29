@@ -1042,7 +1042,16 @@ class TestAnExtractDoesNotHoldTheTrainingMutex(ExtractRelayCase):
         step3 = source[source.index("try:                                                    # 3"):]
         step3 = step3[:step3.index("except MutexUnusable")]
         self.assertIn("ExtractSlot", step3)
-        self.assertIn("is_extract", step3)
+        # The PROPERTY, not the variable name: `is_extract` became
+        # `is_relayed` when `evaluate` joined `extract` in needing a slot rather
+        # than the training mutex, and a test pinned to the identifier fails on
+        # a rename while saying nothing about the behaviour.
+        self.assertRegex(step3, r"if is_\w+:")
+        # And the decision is driven by the kind SET, so a third relayed kind
+        # cannot be added without joining it.
+        decision = source[:source.index(
+            "try:                                                    # 3")]
+        self.assertIn("RELAYED_KINDS", decision[-600:])
 
     def test_the_training_lock_is_free_while_an_extract_runs(self):
         # The property, measured rather than argued: an exclusive acquisition
@@ -1801,3 +1810,322 @@ class TestAProbeRecordsWhichBaselineItSaw(BaselineProbeCase):
         hold = self._hold_for(effective)
         with self.assertRaises(qfd.ProbeBaselineMissing):
             self.runner._pin_probe_baseline(hold, effective)
+
+
+class EvaluateCase(RunnerCase):
+    """Task 20. The `evaluate` kind: a relayed judgement of a finished probe."""
+
+    def setUp(self):
+        super().setUp()
+        base = os.path.dirname(self.runs)
+        self.contracts = os.path.join(base, "contracts")
+        self.eval_dir = os.path.join(base, "qf-eval")
+        os.makedirs(self.contracts, exist_ok=True)
+        os.makedirs(self.eval_dir, exist_ok=True)
+        self.cfg.contracts_dir = self.contracts
+        self.cfg.eval_dir = self.eval_dir
+        self.cfg.eval_socket = os.path.join(base, "eval.sock")
+        self.runner.qfeval_gid = None      # no such group in the test env
+        self.contract_hash = self.write_contract()
+        self.replies = []
+        self.asked = []
+        self._minted = 0
+
+        def fake_client(socket_path, payload, timeout):
+            self.asked.append((socket_path, payload, timeout))
+            if not self.replies:
+                raise AssertionError("the relay asked more times than expected")
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        self.runner.eval_client = fake_client
+
+    def write_contract(self, name="wait_time.v1.json", **over):
+        import contract as contract_mod
+        body = {"schema": 1, "name": "wait_time_v1", "target": "wait_time",
+                "baseline_hash": "a" * 64,
+                "primary_slice": {"reason_resolved": ["completed"]},
+                "metrics": {"mae": {"direction": "lower_is_better",
+                                    "bar": {"kind": "relative_improvement",
+                                            "value": 0.15}}},
+                "consistency": {"days_required": 3}, "holdout_days": 5}
+        body.update(over)
+        body = contract_mod.validate(body)
+        digest = contract_mod.contract_hash(body)
+        body["contract_hash"] = digest
+        with open(os.path.join(self.contracts, name), "w") as fh:
+            json.dump(body, fh)
+        return digest
+
+    def a_probe_run(self, *, state="SUCCEEDED", kind="probe", predictions=b"PAR1",
+                    pins=("request_hash", "extract_hash")):
+        """A finished probe in the job table, with a run directory."""
+        effective = dict(spec.normalize(
+            {"schema": 1, "kind": "probe", "source_sha": "b" * 40,
+             "args": {"path": "research/experiments/c.py",
+                      "extract": "c" * 64}})) if kind == "probe" else \
+            dict(spec.normalize({"schema": 1, "kind": "test",
+                                 "source_sha": "b" * 40}))
+        self._minted += 1
+        run_id = f"{kind}-20260829T000000Z-{'b' * 12}-{700 + self._minted}"
+        self.db.call("submit", effective, run_id=run_id, uid=1001,
+                     now="2026-08-29T00:00:00Z")
+        now = qfd.utcnow()
+        for key in pins:
+            self.db.call("set_pin", run_id, key,
+                         ("c" * 64) if key == "request_hash" else ("d" * 64),
+                         now=now)
+        out = os.path.join(self.runs, run_id, "out")
+        os.makedirs(out, exist_ok=True)
+        if predictions is not None:
+            with open(os.path.join(out, "predictions.parquet"), "wb") as fh:
+                fh.write(predictions)
+        if state != "QUEUED":
+            # `dequeue` leases the LANE HEAD, not a named run, so a leftover
+            # QUEUED probe from an earlier subtest gets leased instead and the
+            # transition below fails on the wrong row. Lease until ours is the
+            # one that came out.
+            for _ in range(16):
+                leased = self.db.call(
+                    "dequeue", effective["lane"], owner="w1", now=now,
+                    lease_expires_at="2026-08-30T00:00:00Z",
+                    hold_deadline_at="2026-08-30T00:00:00Z", max_running=64)
+                if leased is None or leased["run_id"] == run_id:
+                    break
+            else:
+                raise AssertionError(f"never leased {run_id}")
+            self.db.call("transition", run_id, "RUNNING", now=now)
+            if state != "RUNNING":
+                self.db.call("transition", run_id, state, now=now,
+                             fields={"exit_code": 0, "finished_at": now})
+        return run_id
+
+    def an_evaluate(self, run_id, contract=None):
+        effective = dict(spec.normalize(
+            {"schema": 1, "kind": "evaluate",
+             "args": {"run": run_id,
+                      "contract": contract or self.contract_hash}}))
+        eval_id = f"evaluate-20260829T010000Z-{effective['source_sha'][:12]}-800"
+        self.db.call("submit", effective, run_id=eval_id, uid=1001,
+                     now="2026-08-29T01:00:00Z")
+        hold = types.SimpleNamespace(
+            run_id=eval_id, job=self.db.call("get", eval_id),
+            remaining=lambda: 900.0)
+        return hold, effective
+
+
+class TestTheEvaluateRelay(EvaluateCase):
+    def test_a_verdict_is_recorded_and_the_job_succeeds(self):
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "no-go",
+                             "eval_hash": "f" * 64})
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "SUCCEEDED")
+        self.assertEqual(fields["exit_code"], 0)
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["verdict"], "no-go")
+        self.assertEqual(pins["eval_hash"], "f" * 64)
+
+    def test_the_provenance_is_pinned_before_the_relay(self):
+        # A failed evaluation must still say what it was judging and by what
+        # rule. Provenance that exists only on the happy path is provenance a
+        # reader cannot rely on.
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append(qfd.EvalRelayError("no socket"))
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins["judged_run"], probe)
+        self.assertEqual(pins["contract_hash"], self.contract_hash)
+        self.assertEqual(pins["request_hash"], "c" * 64)
+        self.assertIn("predictions_sha256", pins)
+        self.assertNotIn("verdict", pins)
+
+    def test_the_identities_come_from_the_judged_run_not_the_request(self):
+        # A caller that could name the extract could claim to have evaluated
+        # cohort A's predictions against cohort B's data.
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "go"})
+        self.runner._relay_evaluate(hold, effective)
+        _sock, payload, _timeout = self.asked[0]
+        self.assertEqual(payload["request_hash"], "c" * 64)
+        self.assertNotIn("extract_dir", payload)
+        for value in payload.values():
+            self.assertNotIn("/", str(value))
+
+    def test_the_staged_digest_describes_what_the_evaluator_will_read(self):
+        probe = self.a_probe_run(predictions=b"PAR1-payload")
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "go"})
+        self.runner._relay_evaluate(hold, effective)
+        staged = os.path.join(self.eval_dir, hold.run_id, "in",
+                              "predictions.parquet")
+        self.assertTrue(os.path.isfile(staged))
+        self.assertEqual(open(staged, "rb").read(), b"PAR1-payload")
+        _sock, payload, _t = self.asked[0]
+        self.assertEqual(payload["predictions_sha256"],
+                         qfd.file_digest(staged))
+
+    def test_the_staged_copy_is_published_by_rename(self):
+        # A partial file under the final name is one the evaluator could read
+        # and digest-verify against a value taken from the whole.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            body = fh.read()
+        stage = body[body.index("def _stage_predictions"):]
+        stage = stage[:stage.index("\n    def ")]
+        self.assertIn("os.replace(", stage)
+        self.assertIn(".partial", stage)
+
+    def test_a_reply_with_no_verdict_is_not_recorded_as_one(self):
+        # The extract relay's P1: `{"ok": true, "manifest": {}}` was recorded as
+        # a successful extract, and a test enshrined it as "does not crash".
+        for reply in ({"ok": True}, {"ok": True, "verdict": None},
+                      {"ok": True, "verdict": "maybe"},
+                      {"ok": True, "verdict": ""}):
+            with self.subTest(reply=reply):
+                probe = self.a_probe_run()
+                hold, effective = self.an_evaluate(probe)
+                self.replies.append(reply)
+                state, fields = self.runner._relay_evaluate(hold, effective)
+                self.assertEqual(state, "FAILED")
+                self.assertEqual(fields["error_class"],
+                                 "evaluate_reply_invalid")
+                self.assertNotIn("verdict",
+                                 self.db.call("pins_for", hold.run_id))
+
+    def test_the_evaluators_error_class_is_carried_not_flattened(self):
+        # `contract_not_trusted` is the NC9 outcome; recording it as "refused"
+        # would make the control's own signal invisible to the suite.
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": False, "error": "no such contract",
+                             "error_class": "contract_not_trusted"})
+        _state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(fields["error_class"], "contract_not_trusted")
+
+    def test_a_hostile_error_class_from_the_reply_is_replaced(self):
+        # It becomes a column value that operators grep and the suite asserts
+        # on, so it is constrained rather than trusted.
+        for klass in ("", "Not A Class", "x" * 200, 5, None, ["a"],
+                      "contract not trusted"):
+            with self.subTest(klass=klass):
+                probe = self.a_probe_run()
+                hold, effective = self.an_evaluate(probe)
+                self.replies.append({"ok": False, "error": "x",
+                                     "error_class": klass})
+                _state, fields = self.runner._relay_evaluate(hold, effective)
+                self.assertEqual(fields["error_class"], "evaluate_refused")
+
+
+class TestWhatCannotBeJudged(EvaluateCase):
+    def check(self, run_id, expect="evaluate_input_missing"):
+        hold, effective = self.an_evaluate(run_id)
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        self.assertEqual(fields["error_class"], expect)
+        self.assertEqual(self.asked, [], "it relayed anyway")
+        return fields
+
+    def test_a_run_that_does_not_exist(self):
+        self.check("probe-20260829T000000Z-" + "0" * 12 + "-1")
+
+    def test_a_run_that_is_not_a_probe(self):
+        # Only a probe produces a prediction set.
+        self.check(self.a_probe_run(kind="test"))
+
+    def test_a_probe_that_did_not_succeed(self):
+        # Judging a partial prediction set would score it as the whole one.
+        for state in ("FAILED", "RUNNING", "QUEUED", "CANCELLED"):
+            with self.subTest(state=state):
+                self.asked.clear()
+                self.check(self.a_probe_run(state=state))
+
+    def test_a_probe_that_wrote_no_predictions(self):
+        self.check(self.a_probe_run(predictions=None))
+
+    def test_a_probe_whose_predictions_are_empty(self):
+        # An empty set joins to nothing, which yields a verdict over zero rows
+        # rather than an error.
+        self.check(self.a_probe_run(predictions=b""))
+
+    def test_a_probe_with_no_request_hash(self):
+        # Without it there is no way to know which extract the predictions were
+        # made against, so the verdict is attributable to no data at all.
+        self.check(self.a_probe_run(pins=()))
+
+
+class TestContractResolutionAtSubmit(EvaluateCase):
+    """NC9's legible half. The evaluator refuses authoritatively; this exists so
+    a typo costs a message rather than a queued job that fails minutes later."""
+
+    def test_a_valid_contract_resolves(self):
+        # THE CANARY. Without it every refusal below could be passing because
+        # the resolver returns nothing.
+        self.assertIn(self.contract_hash,
+                      self.runner.disp.available_contracts())
+
+    def test_a_template_is_not_offered(self):
+        with open(os.path.join(self.contracts, "x.v1.json.in"), "w") as fh:
+            json.dump({"schema": 1, "baseline_hash": "@BASELINE_HASH@"}, fh)
+        self.assertEqual(list(self.runner.disp.available_contracts()),
+                         [self.contract_hash])
+
+    def test_a_contract_edited_since_it_was_written_is_not_offered(self):
+        path = os.path.join(self.contracts, "wait_time.v1.json")
+        with open(path) as fh:
+            body = json.load(fh)
+        body["metrics"]["mae"]["bar"]["value"] = 0.01   # hash left alone
+        with open(path, "w") as fh:
+            json.dump(body, fh)
+        self.assertEqual(self.runner.disp.available_contracts(), {})
+
+    def test_an_unset_contracts_dir_resolves_nothing_rather_than_raising(self):
+        self.cfg.contracts_dir = ""
+        self.assertEqual(self.runner.disp.available_contracts(), {})
+
+    def test_submitting_an_unknown_contract_is_refused_before_a_job_exists(self):
+        probe = self.a_probe_run()
+        before = len(self.db.call("list", limit=500))
+        # `handle` CATCHES Refused and returns it: never raises to the socket
+        # layer, because an unhandled exception there is a one-line denial of
+        # service. So the refusal is read off the reply.
+        resp = self.runner.disp.handle(
+            "submit",
+            {"spec": {"schema": 1, "kind": "evaluate",
+                      "args": {"run": probe, "contract": "f" * 64}}},
+            1001)
+        self.assertFalse(resp["ok"], resp)
+        self.assertIn("trusted checkout", resp["error"])
+        self.assertEqual(len(self.db.call("list", limit=500)), before,
+                         "a refused submit created a job row")
+
+    def test_the_refusal_lists_what_is_available(self):
+        # "unknown contract" with no list is unactionable.
+        resp = self.runner.disp.handle(
+            "submit",
+            {"spec": {"schema": 1, "kind": "evaluate",
+                      "args": {"run": self.a_probe_run(),
+                               "contract": "f" * 64}}},
+            1001)
+        self.assertFalse(resp["ok"], resp)
+        self.assertIn(self.contract_hash[:12], resp["error"])
+        self.assertIn("wait_time.v1.json", resp["error"])
+        self.assertIn("qf contracts", resp["error"])
+
+    def test_a_known_contract_is_accepted(self):
+        # The canary for the two above, at the SUBMIT boundary rather than the
+        # resolver: a submit path that refused every evaluate job would satisfy
+        # both of them.
+        resp = self.runner.disp.handle(
+            "submit",
+            {"spec": {"schema": 1, "kind": "evaluate",
+                      "args": {"run": self.a_probe_run(),
+                               "contract": self.contract_hash}}},
+            1001)
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["state"], "QUEUED")

@@ -42,6 +42,7 @@ import threading
 import time
 
 import baseline as baseline_mod
+import contract as contract_mod
 import image as image_mod
 import sandbox as sandbox_mod
 import source as source_mod
@@ -61,6 +62,19 @@ FORCE_RELEASE_FLAG = "i_have_verified_nothing_is_running"
 # The smallest reservation any kind can ask for. `ping` reports the resource
 # gate at THIS size, so "resource" answers the strongest available form of the
 # question: if even the cheapest job cannot be admitted, nothing can.
+# An `error_class` is written into a column that operators grep and the NC suite
+# asserts on. When one arrives from ANOTHER privilege domain it is constrained to
+# this shape rather than trusted: a reply could otherwise put a sentence, or an
+# empty string, where every consumer expects a token.
+_ERROR_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
+
+# Kinds whose work happens in ANOTHER privilege domain, so the dispatcher relays
+# a request and records a reply rather than running a container. Named as a set
+# because three separate places branch on it -- which lock to take, which relay
+# to call, and whether a run directory is prepared at all -- and three copies of
+# `kind == "extract" or kind == "evaluate"` is how the fourth one gets forgotten.
+RELAYED_KINDS = ("extract", "evaluate")
+
 SMALLEST_MEM_LIMIT = min((k["mem_limit"] for k in spec_mod.KINDS.values()),
                          key=spec_mod.mem_mb)
 
@@ -73,7 +87,7 @@ HEX64_RE = re.compile(r"^[0-9a-f]{64}\Z")
 # The client socket's op table. `force-release` is deliberately ABSENT: the
 # group on this socket contains `research` (revision 8's regression).
 CLIENT_OPS = ("ping", "submit", "status", "list", "cancel", "verify-chain",
-              "trusted-paths", "extracts", "baselines")
+              "trusted-paths", "extracts", "baselines", "contracts")
 ADMIN_OPS = ("force-release",)
 
 # Trusted files whose realpath and digest `trusted-paths` reports -- the live
@@ -131,7 +145,8 @@ class Config:
         "QFD_ADMITTED_MEM_BUDGET_MB", "QFD_TIMEOUT_MAX_S", "QFD_LOCK_WAIT_S",
         "QFD_IMAGE_BUILD_MEM_MB", "QFD_LIGHT_WORKERS", "QFD_LOG_CAP_MB",
         "QFD_EXTRACT_SOCKET", "QFD_SETTLEMENT_LAG_S", "QFD_EXTRACTS_DIR",
-        "QFD_BASELINES_DIR",
+        "QFD_BASELINES_DIR", "QFD_CONTRACTS_DIR", "QFD_EVAL_SOCKET",
+        "QFD_EVAL_DIR",
         "QFD_ARTIFACT_CAP_MB", "QFD_HANDOFF_TIMEOUT_S", "QFD_DISK_FLOOR_GB",
         "QFD_QUEUED_CAP_PER_UID", "QFD_LEASE_S",
     )
@@ -189,8 +204,18 @@ class Config:
             # by root and written only by `promote-baseline.sh`, run by a human.
             # qfd resolves a hash to a path so it can mount it, and does nothing
             # else with the directory -- it cannot publish, and must not.
-            baselines_dir=get("QFD_BASELINES_DIR",
-                                         "/var/lib/qf-baselines"),
+            baselines_dir=get("QFD_BASELINES_DIR", "/var/lib/qf-baselines"),
+            # Phase 2c. The contracts directory is READ here only to resolve a
+            # submitted contract hash into a legible refusal at submit time; the
+            # EVALUATOR resolves it again and its answer is authoritative -- the
+            # same relationship as the settlement lag (D17). qfd cannot write
+            # here: the directory is in the trusted checkout, root-owned.
+            contracts_dir=get("QFD_CONTRACTS_DIR", ""),
+            eval_socket=get("QFD_EVAL_SOCKET", "/run/qf-eval/sock"),
+            # Where the untrusted prediction set is STAGED for the evaluator
+            # (D28). qfd writes `<run_id>/in/`; the evaluator writes
+            # `<run_id>/out/` and nothing else.
+            eval_dir=get("QFD_EVAL_DIR", "/var/lib/qf-eval"),
             settlement_lag_s=_env_int("QFD_SETTLEMENT_LAG_S", 48 * 3600),
             artifact_cap_mb=_env_int("QFD_ARTIFACT_CAP_MB", 2048),
             handoff_timeout_s=_env_int("QFD_HANDOFF_TIMEOUT_S", 120),
@@ -948,6 +973,32 @@ class ProbeBaselineMissing(ProbeInputMissing):
     error_class = "baseline_not_published"
 
 
+class EvalRelayError(Exception):
+    """The evaluator could not be asked, or would not answer.
+
+    Its own class rather than a reuse of `ExtractRelayError`, because the two
+    name different subsystems and an error class is a routing decision: an
+    operator sent to the extractor for a fault in the evaluator loses an
+    afternoon.
+    """
+
+    def __init__(self, message, error_class="evaluator_unreachable"):
+        super().__init__(message)
+        self.error_class = error_class
+
+
+class EvaluateInputMissing(ProbeInputMissing):
+    """The run an evaluation names cannot be judged: it does not exist, it is not
+    a probe, it did not succeed, or it produced no predictions.
+
+    A subclass of `ProbeInputMissing` so the one handler that records
+    `e.error_class` covers it, and so "a frozen input this job named is not
+    there" stays one concept across kinds.
+    """
+
+    error_class = "evaluate_input_missing"
+
+
 class ExtractRelayError(Exception):
     """The extractor could not be asked, or would not answer.
 
@@ -959,6 +1010,51 @@ class ExtractRelayError(Exception):
     def __init__(self, message, error_class):
         super().__init__(message)
         self.error_class = error_class
+
+
+def eval_request(socket_path, payload, timeout):
+    """One request, one reply, over the evaluator's socket.
+
+    Deliberately a SEPARATE function from `extract_request` rather than a shared
+    one parameterised by socket: the two carry different error classes, and the
+    single thing this function exists to get right is that a fault in the
+    evaluator is reported as a fault in the evaluator. A shared helper would
+    either lose that or grow a flag that decides it.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(socket_path)
+            sock.sendall(json.dumps(payload).encode() + b"\n")
+            buf = bytearray()
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+    except FileNotFoundError:
+        raise EvalRelayError(
+            f"no evaluator socket at {socket_path}: qf-eval.socket is not"
+            f" listening") from None
+    except PermissionError:
+        raise EvalRelayError(
+            f"permission denied on {socket_path}: the dispatcher must be able to"
+            f" connect (the socket is 0660 root:qfd)") from None
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        raise EvalRelayError(f"cannot talk to the evaluator: {e}") from None
+    if not buf:
+        raise EvalRelayError(
+            "the evaluator closed the connection without replying",
+            "evaluator_no_reply")
+    try:
+        reply = json.loads(bytes(buf).split(b"\n")[0])
+    except ValueError as e:
+        raise EvalRelayError(f"the evaluator's reply is not JSON: {e}",
+                             "evaluator_bad_reply") from None
+    if not isinstance(reply, dict):
+        raise EvalRelayError("the evaluator's reply is not an object",
+                             "evaluator_bad_reply")
+    return reply
 
 
 def extract_request(socket_path, payload, timeout):
@@ -1326,6 +1422,23 @@ class Dispatcher:
                                                 datetime.timezone.utc),
             settlement_lag_s=self.cfg.settlement_lag_s)
 
+        # NC9's LEGIBLE HALF. Refused at submit, before a job exists, when the
+        # named contract is not in the trusted checkout -- so a typo costs a
+        # message rather than a queued job that fails minutes later. The
+        # EVALUATOR refuses authoritatively; this cannot be the only check,
+        # because qfd is in the `docker` group and a control enforced only by the
+        # most privileged process in the loop is not a control.
+        if effective["kind"] == "evaluate":
+            contracts = self.available_contracts()
+            if effective["args"]["contract"] not in contracts:
+                raise Refused(
+                    f"no contract {effective['args']['contract'][:12]} in the"
+                    f" trusted checkout. Available: "
+                    + (", ".join(f"{h[:12]} ({n})"
+                                 for h, n in sorted(contracts.items()))
+                       or "none")
+                    + ". `qf contracts` lists them.")
+
         queued = self.db.call("queued_count_for_uid", uid)
         if queued >= self.cfg.queued_cap_per_uid:
             raise Refused(
@@ -1388,6 +1501,56 @@ class Dispatcher:
     # quietly stops is how a prefix resolves to "no match" for a baseline that is
     # right there.
     BASELINES_LIMIT = 200
+
+    def available_contracts(self):
+        """`{contract_hash: name}` from the trusted checkout.
+
+        THE SAME RESOLUTION THE EVALUATOR DOES, and deliberately duplicated
+        rather than relayed -- the same decision as the settlement lag (D17).
+        Both read the same root-owned directory, so they cannot disagree unless
+        the checkout moved between submit and run; the EVALUATOR's answer is
+        authoritative, and this copy exists so a job naming an unknown contract
+        is refused at submit time with a legible message instead of after being
+        queued, leased and relayed.
+
+        A file that does not validate is omitted, not offered: `contract.load`
+        rehashes, so a contract edited since it was written resolves to nothing
+        and the job is refused for naming an unknown rule -- which is the honest
+        answer, because a rule whose content no longer matches its identity is
+        not the rule the caller asked for.
+        """
+        out = {}
+        root = self.cfg.contracts_dir
+        if not root:
+            return out
+        try:
+            names = sorted(os.listdir(root))
+        except OSError as e:
+            log.error("cannot list the contracts directory %s: %s", root, e)
+            return out
+        for name in names:
+            # `.json.in` templates carry an unpinned baseline; the validator
+            # refuses them, and offering one would be offering a rule that
+            # judges against nothing.
+            if not name.endswith(".json"):
+                continue
+            try:
+                _body, digest = contract_mod.load(os.path.join(root, name))
+            except contract_mod.ContractError as e:
+                log.error("ignoring contract %s: %s", name, e)
+                continue
+            out.setdefault(digest, name)
+        return out
+
+    def _op_contracts(self, payload, uid):
+        """What the trusted checkout carries. Read here, like `baselines`: the
+        directory is root-owned and qfd cannot write it, so reading it is not a
+        second writer."""
+        contracts = self.available_contracts()
+        return {"contracts": [{"contract_hash": h, "file": n}
+                              for h, n in sorted(contracts.items(),
+                                                 key=lambda kv: kv[1])],
+                "dir": self.cfg.contracts_dir}
 
     def _op_baselines(self, payload, uid):
         """What has been promoted to the baseline store.
@@ -1970,6 +2133,11 @@ class Runner:
         self._extract_slot = threading.Semaphore(1)
         self.qfrun_gid = _gid("qfrun")
         self.qfclient_gid = _gid("qfclient")
+        # The evaluator's group, for the staged inbox (D28). `None` on a host
+        # where 2c is not installed, and the staging step tolerates that: a
+        # dispatcher that refused to start because a LATER phase's group is
+        # absent would make installing 2c a prerequisite for running 2a.
+        self.qfeval_gid = _gid("qfeval")
         # Injectable so the whole execute path is testable without a docker
         # binary. It was a bare `subprocess.Popen` call, which is a large part of
         # why this path shipped both unwired and with a None image reference.
@@ -2034,11 +2202,13 @@ class Runner:
             return False
 
         # THE KIND IS KNOWN HERE -- `peek` returned the row -- and it decides
-        # WHICH lock is taken. An extraction must not hold the training mutex:
-        # see `ExtractSlot`.
-        is_extract = head["kind"] == "extract"
+        # WHICH lock is taken. Work that happens in ANOTHER privilege domain must
+        # not hold the training mutex: see `ExtractSlot`. `evaluate` joins
+        # `extract` for the same reason and one more -- scoring an experiment
+        # that has already finished has no business making the nightly wait.
+        is_relayed = head["kind"] in RELAYED_KINDS
         try:                                                    # 3
-            if is_extract:
+            if is_relayed:
                 lock = ExtractSlot(self._extract_slot, lane).acquire()
             else:
                 lock = TrainingLock(self.cfg.lock_file, lane).acquire()
@@ -2182,7 +2352,7 @@ class Runner:
                 # the provenance is recorded even if the run fails later.
                 self._pin_probe_extract(hold, effective)
                 self._pin_probe_baseline(hold, effective)
-            if effective["kind"] == "extract":
+            if effective["kind"] in RELAYED_KINDS:
                 # LEASED -> RUNNING FIRST, and this is not bookkeeping.
                 #
                 # `finish` returns whatever the relay returned, and the state
@@ -2196,7 +2366,9 @@ class Runner:
                 # the extraction genuinely is running, in another process.
                 self.db.call("transition", hold.run_id, "RUNNING",
                              now=utcnow())
-                outcome = self._relay_extract(hold, effective)
+                outcome = (self._relay_extract(hold, effective)
+                           if effective["kind"] == "extract"
+                           else self._relay_evaluate(hold, effective))
                 return
             paths = self.prepare_run_dir(run_id, qfrun_gid=self.qfrun_gid,
                                          qfclient_gid=self.qfclient_gid)
@@ -2280,6 +2452,174 @@ class Runner:
     # Injectable so the relay is testable without a listening socket. The
     # default is the real transport.
     extract_client = staticmethod(extract_request)
+    eval_client = staticmethod(eval_request)
+
+    PREDICTIONS_NAME = "predictions.parquet"
+
+    def _evaluate_source(self, effective):
+        """The run being judged, checked. Returns `(job, pins, predictions path)`.
+
+        EVERY IDENTITY COMES FROM THE JUDGED RUN'S OWN PINS, never from the
+        evaluate job's args. A caller that could name the extract would be able
+        to claim it had evaluated cohort A's predictions against cohort B's data,
+        and the verdict would look exactly like a real one.
+        """
+        run_id = effective["args"]["run"]
+        job = self.db.call("get", run_id)
+        if job is None:
+            raise EvaluateInputMissing(
+                f"no run {run_id}: an evaluation judges a probe that has already"
+                f" finished. `qf list` shows what exists.")
+        if job["kind"] != "probe":
+            raise EvaluateInputMissing(
+                f"{run_id} is a {job['kind']} job, not a probe. Only a probe"
+                f" produces a prediction set to judge.")
+        if job["state"] != "SUCCEEDED":
+            raise EvaluateInputMissing(
+                f"{run_id} is {job['state']}, not SUCCEEDED: judging a run that"
+                f" did not finish would score a partial prediction set as though"
+                f" it were the whole one")
+        pins = self.db.call("pins_for", run_id)
+        if not pins.get("request_hash"):
+            raise EvaluateInputMissing(
+                f"{run_id} records no request_hash, so there is no way to know"
+                f" which extract its predictions were made against. A verdict"
+                f" without that is not attributable to any data.")
+        path = os.path.join(self.run_dir(run_id), "out", self.PREDICTIONS_NAME)
+        if not os.path.isfile(path):
+            raise EvaluateInputMissing(
+                f"{run_id} produced no {self.PREDICTIONS_NAME}: it succeeded"
+                f" without writing the prediction set the contract judges")
+        if os.path.getsize(path) == 0:
+            raise EvaluateInputMissing(
+                f"{run_id}'s {self.PREDICTIONS_NAME} is empty. An empty"
+                f" prediction set joins to nothing, which produces a verdict"
+                f" over zero rows rather than an error.")
+        return job, pins, path
+
+    def _stage_predictions(self, run_id, source):
+        """Copy the untrusted prediction set where the evaluator can read it.
+
+        WHY A COPY AT ALL (D28). The base run directory is `0750 qfd:qfclient`,
+        so reaching `out/` needs `qfclient` -- the group that lets `research`
+        read logs and artifacts. Putting the evaluator in it to reach one file
+        would hand the narrowest domain in the system the client surface too, and
+        a directory carries one group, which is already taken.
+
+        So the ONE untrusted input is copied to a place the candidate cannot
+        reach, and the immutable content-hashed stores are read where they lie.
+
+        Published by RENAME, and the digest is taken from the STAGED bytes rather
+        than from the source: what the evaluator will read is what must be
+        described, and a digest of the original would still verify if the copy
+        were truncated.
+        """
+        inbox = os.path.join(self.cfg.eval_dir, run_id, "in")
+        outbox = os.path.join(self.cfg.eval_dir, run_id, "out")
+        os.makedirs(inbox, exist_ok=True)
+        os.makedirs(outbox, exist_ok=True)
+        # 0750 on the inbox: the evaluator's group reads it, nobody else sees it.
+        # The outbox belongs to the evaluator, so its mode is the unit's business
+        # (`UMask=0027`) and not ours -- we only have to create it, because a
+        # service with `ReadWritePaths=/var/lib/qf-eval` can write inside it but
+        # `StateDirectoryMode` does not make per-run subdirectories.
+        os.chmod(os.path.join(self.cfg.eval_dir, run_id), 0o750)
+        os.chmod(inbox, 0o750)
+        os.chmod(outbox, 0o770)
+        if self.qfeval_gid is not None:
+            for path in (os.path.join(self.cfg.eval_dir, run_id), inbox,
+                         outbox):
+                os.chown(path, -1, self.qfeval_gid)
+        target = os.path.join(inbox, self.PREDICTIONS_NAME)
+        tmp = target + ".partial"
+        with open(source, "rb") as src, open(tmp, "wb") as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                dst.write(chunk)
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, target)
+        return target, file_digest(target)
+
+    def _relay_evaluate(self, hold, effective):
+        """Ask the evaluator, record the verdict. Returns an outcome tuple.
+
+        Same shape as `_relay_extract`, including the part that took a P1 to
+        learn: the state machine has no `LEASED -> SUCCEEDED` edge, so the caller
+        transitions to RUNNING before this is reached.
+        """
+        run_id = hold.run_id
+        try:
+            _job, pins, source = self._evaluate_source(effective)
+        except EvaluateInputMissing as e:
+            log.error("%s: %s", run_id, e)
+            return ("FAILED", {"error_class": e.error_class,
+                               "finished_at": utcnow()})
+
+        staged, digest = self._stage_predictions(run_id, source)
+        now = utcnow()
+        # PINNED BEFORE THE RELAY, so a failed evaluation still says what it was
+        # judging and what it was judging by. Provenance that exists only on the
+        # happy path is provenance a reader cannot rely on -- the same rule as a
+        # probe's `baseline: none`.
+        for key, value in (
+                ("judged_run", effective["args"]["run"]),
+                ("contract_hash", effective["args"]["contract"]),
+                ("request_hash", pins.get("request_hash")),
+                ("baseline_hash", pins.get("baseline_hash")),
+                ("baseline", pins.get("baseline")),
+                ("predictions_sha256", digest),
+        ):
+            if value is not None:
+                self.db.call("set_pin", run_id, key, str(value), now=now)
+
+        request = {
+            "op": "evaluate",
+            "run_id": run_id,
+            "contract": effective["args"]["contract"],
+            "request_hash": pins["request_hash"],
+            "predictions_sha256": digest,
+        }
+        if pins.get("baseline_hash"):
+            request["baseline_hash"] = pins["baseline_hash"]
+        budget = min(effective["timeout_s"], max(1, int(hold.remaining())))
+        log.info("%s: asking the evaluator to judge %s by contract %s"
+                 " (timeout %ss)", run_id, effective["args"]["run"],
+                 effective["args"]["contract"][:12], budget)
+        try:
+            reply = self.eval_client(self.cfg.eval_socket, request, budget)
+        except EvalRelayError as e:
+            log.error("%s: evaluator: %s", run_id, e)
+            return ("FAILED", {"error_class": e.error_class,
+                               "finished_at": utcnow()})
+
+        if not reply.get("ok"):
+            # The evaluator's own refusal text: it wrote it to be read, and its
+            # unexpected failures already arrive as an opaque journal reference,
+            # so nothing a dependency produced is passed through. The CLASS is
+            # taken from the reply when it names one -- `contract_not_trusted` is
+            # the NC9 outcome and must not be flattened into "refused".
+            klass = reply.get("error_class")
+            if not isinstance(klass, str) or not _ERROR_CLASS_RE.match(klass):
+                klass = "evaluate_refused"
+            log.error("%s: evaluator refused (%s): %s", run_id, klass,
+                      reply.get("error"))
+            return ("FAILED", {"error_class": klass, "finished_at": utcnow()})
+
+        verdict = reply.get("verdict")
+        if verdict not in ("go", "no-go"):
+            # A REPLY THAT SAYS `ok` IS NOT A VERDICT. The extract relay learned
+            # this: `{"ok": true, "manifest": {}}` was recorded as a successful
+            # extract, and a test enshrined it as "does not crash".
+            log.error("%s: the evaluator's reply carries no verdict (%r)",
+                      run_id, verdict)
+            return ("FAILED", {"error_class": "evaluate_reply_invalid",
+                               "finished_at": utcnow()})
+        now = utcnow()
+        self.db.call("set_pin", run_id, "verdict", verdict, now=now)
+        if isinstance(reply.get("eval_hash"), str):
+            self.db.call("set_pin", run_id, "eval_hash", reply["eval_hash"],
+                         now=now)
+        log.info("%s: verdict %s", run_id, verdict)
+        return ("SUCCEEDED", {"exit_code": 0, "finished_at": utcnow()})
 
     def _relay_extract(self, hold, effective):
         """Ask the extractor, record what came back. Returns an outcome tuple.

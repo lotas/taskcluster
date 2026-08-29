@@ -1998,6 +1998,138 @@ print(sum(1 for r in rows if r.get('broken')))" 2>/dev/null)"
 
   rm -rf "$src"
 }
+
+# =========================================================================
+# NC9: the rule a result is judged by lives in the trusted checkout.
+#
+# Design negative control 9, deferred from 2a to 2c because it needs a contract
+# to exist. The property: a job cannot choose the bar it clears. Everything about
+# HOW a result is judged -- the slice, the metrics, the thresholds, the baseline
+# -- lives in a root-owned file the candidate cannot edit, named by a content
+# hash that both qfd and the evaluator resolve independently.
+# =========================================================================
+nc9() {
+  echo
+  echo "== NC9: the evaluation contract is trusted, not supplied =="
+
+  local contracts_dir="${QFD_CONTRACTS_DIR:-$TRUSTED/tools/queue-forecasting/host/contracts}"
+
+  # CANARY: at least one contract resolves. Every refusal below is measured
+  # against a contract that works -- without this, a resolver that returned
+  # nothing would satisfy all of them.
+  local listing ch
+  listing="$(as "$RESEARCH_USER" "qf contracts" 2>&1)"
+  ch="$(printf '%s' "$listing" | sed -n 's/^ *--contract \([0-9a-f]\{64\}\)$/\1/p' \
+    | head -1)"
+  if [ -z "$ch" ]; then
+    void "NC9 canary: no contract resolves. Templates in $contracts_dir carry an
+  unpinned baseline and are refused by design -- run instantiate-contract.sh
+  against a promoted baseline and commit the result. Listing was:
+  $(printf '%s' "$listing" | tr '\n' ' ' | cut -c1-200)"
+    return
+  fi
+  ok "NC9 canary: a contract resolves ($(printf '%s' "$ch" | cut -c1-12))"
+
+  # (a) THE STORE IS NOT WRITABLE by either non-root domain. A rule the
+  # candidate can edit is not a rule, and this is the layer beneath the hash.
+  refuse_as "$RESEARCH_USER" "NC9 (a) research cannot add a contract" \
+    "touch $contracts_dir/nc9.json"
+  refuse_as "$RESEARCH_USER" "NC9 (a) research cannot edit a contract" \
+    "printf x >> $contracts_dir/$(cd "$contracts_dir" && ls *.json 2>/dev/null | head -1)"
+  refuse_as "$DEPLOY_USER" "NC9 (a) the nightly user cannot add a contract" \
+    "touch $contracts_dir/nc9-deploy.json"
+
+  # (b) A CONTRACT THAT IS NOT IN THE CHECKOUT IS REFUSED AT SUBMIT, before a
+  # job exists. The client resolves a prefix, so a full unknown hash is what
+  # reaches the dispatcher.
+  local out
+  out="$(as "$RESEARCH_USER" "qf evaluate --run probe-20260829T000000Z-000000000000-1 \
+      --contract $(printf 'f%.0s' $(seq 64))" 2>&1 || true)"
+  if printf '%s' "$out" | grep -qi 'trusted checkout'; then
+    ok "NC9 (b) an untrusted contract hash is refused at submit"
+  else
+    bad "NC9 (b) an untrusted contract was not refused by name: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+  fi
+  # And it names what IS available, because "unknown contract" with no list is
+  # unactionable.
+  printf '%s' "$out" | grep -q "$(printf '%s' "$ch" | cut -c1-12)" \
+    && ok "NC9 (b) the refusal lists what the checkout carries" \
+    || bad "NC9 (b) the refusal did not list the available contracts"
+
+  # (c) NO POLICY CROSSES THE WIRE. A caller that could pass a bar could pass
+  # its own bar, so the spec accepts exactly `run` and `contract`.
+  for field in baseline bar mae threshold metrics holdout_days; do
+    out="$(as "$RESEARCH_USER" "python3 - <<'EOF'
+import json, socket
+s = socket.socket(socket.AF_UNIX); s.connect('$CLIENT_SOCK')
+spec = {'schema': 1, 'kind': 'evaluate',
+        'args': {'run': 'probe-20260829T000000Z-000000000000-1',
+                 'contract': '$ch', '$field': 1}}
+s.sendall(json.dumps({'op': 'submit', 'payload': {'spec': spec}}).encode() + b'\n')
+print(s.recv(65536).decode())
+EOF" 2>&1 || true)"
+    if printf '%s' "$out" | grep -q "$field"; then
+      ok "NC9 (c) args.$field is refused by name"
+    else
+      bad "NC9 (c) args.$field was not refused: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+    fi
+  done
+
+  # (d) A TRUSTED CONTRACT IS ACCEPTED. The canary for (b) and (c) at the submit
+  # boundary rather than at the resolver: a submit path that refused every
+  # evaluate job would pass both of them. The job is expected to FAIL -- the run
+  # it names does not exist -- and the point is WHICH failure.
+  local rid
+  rid="$(as "$RESEARCH_USER" "qf evaluate \
+      --run probe-20260829T000000Z-000000000000-1 --contract $ch" 2>&1 | tail -1)"
+  if ! is_run_id "$rid"; then
+    bad "NC9 (d) a trusted contract was refused at submit: $(printf '%s' "$rid" | cut -c1-160)"
+  else
+    ok "NC9 (d) a trusted contract is accepted at submit"
+    local final; final="$(wait_terminal "$rid" 600)"
+    assert_eq "NC9 (d) and the job fails on the RUN, not the contract" \
+      "evaluate_input_missing" "$(field_of "$rid" error_class)"
+    assert_eq "NC9 (d) the job reached a terminal state" "FAILED" "$final"
+    # THE CONTRACT IS PINNED even on a failure: a verdict-less run still has to
+    # say what rule it was going to be judged by, or the record cannot be read.
+    assert_eq "NC9 (d) the contract is pinned regardless" "$ch" \
+      "$(pin_of "$rid" contract_hash)"
+  fi
+
+  # (e) THE EVALUATOR RESOLVES IT INDEPENDENTLY. qfd's check is for legibility;
+  # the authoritative one is in the other domain, and a control enforced only by
+  # the process in the `docker` group is not a control.
+  out="$(as "$DEPLOY_USER" "python3 - <<'EOF'
+import json, socket
+try:
+    s = socket.socket(socket.AF_UNIX); s.connect('/run/qf-eval/sock')
+    s.sendall(json.dumps({'op': 'ping'}).encode() + b'\n')
+    print(s.recv(65536).decode())
+except Exception as e:
+    print('UNREACHABLE', e)
+EOF" 2>&1 || true)"
+  if printf '%s' "$out" | grep -q 'UNREACHABLE\|permission denied\|Permission denied'; then
+    ok "NC9 (e) the nightly user cannot reach the evaluator socket"
+  else
+    bad "NC9 (e) a non-dispatcher uid reached the evaluator: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  fi
+  refuse_as "$RESEARCH_USER" "NC9 (e) research cannot reach the evaluator socket" \
+    "python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect('/run/qf-eval/sock')\""
+
+  # (f) THE EVALUATOR CANNOT WRITE WHAT IT JUDGES BY. Asserted from outside, as
+  # the unit's ReadWritePaths and the store's mode together.
+  local unit=/etc/systemd/system/qf-eval.service
+  if [ -f "$unit" ]; then
+    local rw; rw="$(grep '^ReadWritePaths=' "$unit" | head -1)"
+    case "$rw" in
+      *qf-extracts*|*qf-baselines*|*contracts*)
+        bad "NC9 (f) qf-eval.service can write an input it judges by: $rw" ;;
+      *) ok "NC9 (f) qf-eval.service writes only its own output ($rw)" ;;
+    esac
+  else
+    void "NC9 (f) qf-eval.service is not installed"
+  fi
+}
 # =========================================================================
 main() {
   [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 2; }
@@ -2015,6 +2147,7 @@ main() {
   echo "lock=$LOCK intent=$INTENT_DIR"
 
   nc8
+  nc9
   nc10
   nc12
   nc13

@@ -208,6 +208,14 @@ def resolve_extract(given):
                            publisher="`qf extract`")
 
 
+def resolve_contract(given):
+    """The contracts listing is read by the dispatcher from the trusted
+    checkout, which is also where the evaluator reads it."""
+    return _resolve_prefix(given, flag="--contract", op="contracts",
+                           key="contract_hash", listing="qf contracts",
+                           publisher="`instantiate-contract.sh`")
+
+
 def resolve_baseline(given):
     """The baselines listing is read by the dispatcher: the store has no service
     of its own, and qfd already reads it to resolve a mount."""
@@ -341,6 +349,74 @@ def cmd_baselines(args):
     if resp.get("truncated"):
         print(f"  ({resp.get('published')} promoted; showing {len(rows)})",
               file=sys.stderr)
+
+
+def cmd_contracts(args):
+    """The rules the trusted checkout carries.
+
+    A contract is named by HASH everywhere, so this is how a human gets one --
+    the same shape as `qf extracts` and `qf baselines`, and for the same reason:
+    printing only a truncated identity makes the natural copy-paste the value the
+    validator refuses.
+    """
+    resp = call("contracts")
+    if args.json:
+        show(resp, True)
+        return
+    if not resp.get("ok"):
+        die(resp.get("error", "contracts failed"))
+    rows = resp.get("contracts") or []
+    if not rows:
+        print(f"no contracts in {resp.get('dir') or '<unset>'}")
+        print("  (a .json.in template is not a contract: it carries no pinned")
+        print("   baseline, so it judges against nothing. See")
+        print("   instantiate-contract.sh)")
+        return
+    for row in rows:
+        print(f"{(row.get('contract_hash') or '?')[:12]}  {row.get('file')}")
+        print(f"    --contract {row.get('contract_hash')}")
+
+
+def cmd_evaluate(args):
+    """Judge a finished probe by a contract in the trusted checkout.
+
+    No `--sha`: an evaluation runs no candidate code. No metric, no threshold and
+    no baseline either -- all three live in the contract, and a caller that could
+    pass a bar could pass its own bar.
+    """
+    spec_body = {
+        "schema": 1,
+        "kind": "evaluate",
+        "args": {"run": args.run, "contract": resolve_contract(args.contract)},
+    }
+    for name, value in (("timeout_s", args.timeout), ("note", args.note)):
+        if value is not None:
+            spec_body[name] = value
+
+    resp = call("submit", {"spec": spec_body})
+    if not resp.get("ok"):
+        die(resp.get("error", "submit refused"))
+    run_id = resp["run_id"]
+    print(run_id)
+    if not args.wait:
+        return
+    while True:
+        time.sleep(POLL_S)
+        st = call("status", {"run_id": run_id})
+        if not st.get("ok"):
+            die(st.get("error", "status failed"))
+        job = st["job"]
+        if job["state"] in TERMINAL:
+            pins = job.get("pins") or {}
+            print(f"{job['state']} error_class={job['error_class']}",
+                  file=sys.stderr)
+            # THE VERDICT AND WHAT PRODUCED IT. A verdict with no contract hash
+            # beside it is a number whose rule nobody can look up.
+            for key in ("verdict", "contract_hash", "judged_run",
+                        "request_hash", "baseline_hash", "predictions_sha256"):
+                if pins.get(key):
+                    print(f"{key}: {pins[key]}", file=sys.stderr)
+            raise SystemExit(0 if job["state"] == "SUCCEEDED" else 1)
 
 
 def cmd_status(args):
@@ -530,6 +606,22 @@ def build_parser(admin_mode):
     sub.add_parser("baselines",
                    help="list promoted baselines with hashes and day coverage"
                    ).set_defaults(func=cmd_baselines)
+
+    sub.add_parser("contracts",
+                   help="list the evaluation contracts the trusted checkout"
+                        " carries").set_defaults(func=cmd_contracts)
+
+    ev = sub.add_parser("evaluate",
+                        help="judge a finished probe by a trusted contract")
+    ev.add_argument("--run", required=True, metavar="RUN_ID",
+                    help="the probe whose predictions to judge")
+    ev.add_argument("--contract", required=True, metavar="CONTRACT_HASH",
+                    help="a contract in the trusted checkout, or any unique"
+                         " prefix of one (8+ hex); see `qf contracts`")
+    ev.add_argument("--timeout", type=int)
+    ev.add_argument("--note")
+    ev.add_argument("--wait", action="store_true")
+    ev.set_defaults(func=cmd_evaluate)
 
     st = sub.add_parser("status")
     st.add_argument("run_id")
