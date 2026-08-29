@@ -79,6 +79,29 @@ expect match "the substituted VALUE may differ"
 variant 's/^Environment=QFD_ADMIN_UID=999/Environment=QFD_ADMIN_UID=1/; s|^Environment=PYTHONPATH=.*|Environment=PYTHONPATH=/old|'
 expect drift "one substituted env line does not excuse the others"
 
+# --- EVERY unit is in the drift list --------------------------------------
+# WHY THIS IS A TEST AND NOT A READING. `assert_units_current` is what stops
+# `mirror-refresh` restarting the daemon into configuration from an older commit,
+# and it works off a HAND-WRITTEN list. A phase that adds a unit and forgets the
+# list gets exactly the failure the function exists to prevent -- silently, and
+# one phase later, which is what happened: the evaluator's two units were absent
+# from it until this test was written.
+LIST="$(sed -n '/^assert_units_current()/,/^}/p' "$SETUP")"
+missing=0
+while IFS= read -r unit; do
+  rel="${unit#"$HERE"/../}"
+  if printf '%s' "$LIST" | grep -q "$rel"; then
+    ok "$rel is in the drift list"
+  else
+    bad "$rel is NOT in assert_units_current's list: mirror-refresh would
+     restart into a stale copy of it without saying so"
+    missing=$((missing + 1))
+  fi
+done < <(find "$HERE/.." -mindepth 2 -maxdepth 2 \
+              \( -name '*.service' -o -name '*.socket' -o -name '*.timer' \) \
+         | sort)
+[ "$missing" -eq 0 ] || echo "  (remedy: add them, with the setup script that installs each)"
+
 echo
 echo "unit-drift: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

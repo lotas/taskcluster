@@ -37,6 +37,32 @@ SHA = "3f1c" + "0" * 36
 DEPLOY_UID = 4242
 
 
+def assert_clause_runs(case, suite, name):
+    """A negative-control group that nothing invokes is a group that passes for
+    ever, so three test classes assert that each of theirs is wired.
+
+    IT USED TO BE A BARE CALL LINE (`\n  nc9\n`) matched in `main`. The suite now
+    takes group names on the command line -- the whole thing submits real jobs
+    and waits on real deadlines, so re-running nineteen groups to look at one was
+    the alternative, and what that produces is nobody re-running it -- and `main`
+    dispatches through a loop. That refactor silently emptied this check on three
+    clauses at once, which is why it is one function now: the wiring is TWO
+    lists, and a clause has to be in both to be reachable.
+    """
+    default = re.search(r"groups=\(nc8[^)]*\)", suite)
+    case.assertIsNotNone(default, "the default group set is not where it was")
+    # `findall`, not `split`: splitting on whitespace leaves `groups=(nc8` and
+    # `nc19)` as tokens, so the first and last group in the list would each read
+    # as absent -- a check that fails on exactly the two entries it is least
+    # likely to be doubted about.
+    case.assertIn(name, re.findall(r"nc\d+", default.group(0)),
+                  f"{name} is not in the set `main` runs by default")
+    accepted = re.search(r"^ *nc8\|nc9\|[a-z0-9|]*\)", suite, re.M)
+    case.assertIsNotNone(accepted, "the group-name validator is not where it was")
+    case.assertIn(name, re.findall(r"nc\d+", accepted.group(0)),
+                  f"{name} cannot be asked for by name on the command line")
+
+
 def base_spec(**over):
     d = {"schema": 1, "kind": "test", "source_sha": SHA}
     d.update(over)
@@ -1958,12 +1984,9 @@ class TestNc17AndNc18AreWiredAndHonest(unittest.TestCase):
         return body[:body.index("\n}\n")]
 
     def test_both_clauses_are_called_from_main(self):
-        main = self.suite[self.suite.index("main() {"):]
         for name in ("nc17", "nc18"):
             with self.subTest(clause=name):
-                # re.M, or `^` anchors to the start of the whole string and the
-                # test fails on a correctly wired suite.
-                self.assertRegex(main, re.compile(rf"^\s+{name}$", re.M))
+                assert_clause_runs(self, self.suite, name)
 
     def test_nc17_gates_on_its_canary(self):
         # A canary that reports without gating is decoration -- the lesson from
@@ -2724,7 +2747,7 @@ class TestNc19IsWiredAndItsClaimsAreEarned(unittest.TestCase):
 
     def test_it_actually_runs(self):
         # A clause nothing calls is a clause that passes for ever.
-        self.assertRegex(self.suite, r"\n  nc19\n")
+        assert_clause_runs(self, self.suite, "nc19")
 
     def test_the_group_is_gated_on_a_baseline_promoting_at_all(self):
         # Every refusal below is measured against a promotion that worked.
@@ -3269,7 +3292,7 @@ class TestNc9IsWiredAndGated(unittest.TestCase):
         self.nc9 = code_only(body[:body.index("\n}\n")])
 
     def test_it_actually_runs(self):
-        self.assertRegex(self.suite, r"\n  nc9\n")
+        assert_clause_runs(self, self.suite, "nc9")
 
     def test_the_group_is_gated_on_a_contract_resolving(self):
         # Without this, a resolver returning nothing satisfies every refusal.
@@ -3331,6 +3354,152 @@ class TestNc9IsWiredAndGated(unittest.TestCase):
         self.assertEqual(qfd.EvaluateInputMissing.error_class,
                          "evaluate_input_missing")
         self.assertIn("evaluate_input_missing", self.nc9)
+
+class TestEveryScriptedQfInvocationMatchesTheClient(unittest.TestCase):
+    """A command the client rejects is not a command. Task 24 / NC11.
+
+    THE DEFECT THIS EXISTS FOR, twice in two days. Two NC11 clauses ran
+    `qf list --state SUCCEEDED --kind probe`; `list` takes `--state` and
+    `--limit` and nothing else, so every invocation exited 2 with "unrecognized
+    arguments", read nothing, and the clause voided with a message blaming the
+    absence of the probe it never looked for. And the 2c fixture generator told
+    the operator to run `qf submit --kind probe ... --extract <hash>`, which is
+    three impossibilities in one line: `submit --kind` accepts only test and
+    selftest, `submit` has no `--extract`, and probes have their own subcommand.
+
+    Neither could be caught by running the suite on a healthy host: argparse
+    exits 2, the helper discards stderr, and the clause reports its subject
+    missing. So the flags are checked against the client's own parser instead.
+    """
+
+    HOST = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    # Every flag argparse defines on the TOP-LEVEL parser, which is legal after
+    # any subcommand.
+    GLOBAL = {"--json", "--help", "-h"}
+
+    # Scanned scripts: everything that tells somebody, or something, to run the
+    # client. Add a script here when it starts issuing `qf` commands.
+    SCRIPTS = ("nc-suite-phase2.sh", "nc-fixtures-phase2b.sh",
+               "nc-fixtures-phase2c.sh", "phase2c-setup.sh",
+               "phase2b-setup.sh", "phase2-setup.sh")
+    # NOT README.md, and that is a property of the file rather than laziness: it
+    # documents invocations that were WRONG, as lessons -- "`qf status <rid>
+    # --json` was never valid" is a sentence this test would have to be taught to
+    # disbelieve. Every `qf` in a SCRIPT is meant to run.
+
+    # `qf` in a COMMAND POSITION, not `qf` in a sentence. These anchors are what
+    # separate `sudo -H -u research qf probe ...` from "install /usr/local/bin/qf
+    # and /usr/local/sbin/qfadmin", which is prose inside a shell string.
+    AT_COMMAND = r"""(?:^[ \t]*|["'`]|\$\(|\|[ \t]*|;[ \t]*|&&[ \t]*|sudo |-u \w+ )"""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(cls.HOST, "dispatcher", "qf")) as fh:
+            cls.client = fh.read()
+        cls.commands = cls.parse_parser(cls.client)
+
+    @staticmethod
+    def parse_parser(source):
+        """`{subcommand: {flags}}`, read off `add_parser`/`add_argument`.
+
+        A PARSE OF THE REAL FILE rather than a list written here: a hand-kept
+        copy of the client's interface is the thing that was wrong in the first
+        place.
+        """
+        named = {}                      # variable -> subcommand
+        commands = {}
+        for line in source.splitlines():
+            line = line.strip()
+            m = re.match(r'(?:(\w+)\s*=\s*)?sub\.add_parser\("([a-z-]+)"',
+                         line)
+            if m:
+                variable, name = m.group(1), m.group(2)
+                commands.setdefault(name, set())
+                if variable:
+                    named[variable] = name
+                continue
+            m = re.match(r'(\w+)\.add_argument\("(-[^"]+)"', line)
+            if m and m.group(1) in named:
+                commands[named[m.group(1)]].add(m.group(2))
+        return commands
+
+    def invocations(self):
+        """Every `qf <sub> [--flags]` written in a scanned script."""
+        for name in self.SCRIPTS:
+            path = os.path.join(self.HOST, name)
+            if not os.path.isfile(path):
+                continue
+            with open(path) as fh:
+                text = fh.read()
+            for line in text.splitlines():
+                m = re.search(self.AT_COMMAND + r"qf ([a-z][a-z-]*)(.*)$", line)
+                if not m:
+                    continue
+                sub, rest = m.group(1), m.group(2)
+                # CUT AT THE COMMENT. `qf extracts   # copy the `--extract
+                # <hash>` line it prints` is one invocation and one instruction,
+                # and reading the second as a flag of the first reported a
+                # defect that was not there.
+                rest = rest.split("#", 1)[0]
+                yield name, sub, re.findall(r"--[a-z][a-z-]*", rest)
+
+    def test_the_parse_found_the_clients_real_interface(self):
+        # THE CANARY. A regex that matched nothing would make every assertion
+        # below pass, which is the shape of failure this file has already fixed
+        # six times.
+        self.assertIn("list", self.commands)
+        self.assertIn("--state", self.commands["list"])
+        self.assertIn("--limit", self.commands["list"])
+        self.assertIn("probe", self.commands)
+        self.assertIn("--extract", self.commands["probe"])
+        self.assertNotIn("--extract", self.commands["submit"])
+        self.assertGreaterEqual(len(self.commands), 10)
+
+    def test_every_scripted_subcommand_exists(self):
+        seen = 0
+        for script, sub, _flags in self.invocations():
+            if sub not in self.commands:
+                # Only flag it when it LOOKS like a subcommand slot: prose says
+                # "qf status shows what exists", and `status` is real, so the
+                # unknown ones are what matter.
+                self.fail(f"{script} runs `qf {sub}`, which the client has no"
+                          f" subcommand for. Known: {sorted(self.commands)}")
+            seen += 1
+        self.assertGreater(seen, 10, "the scan found almost nothing")
+
+    def test_every_scripted_flag_exists_on_that_subcommand(self):
+        for script, sub, flags in self.invocations():
+            for flag in flags:
+                if flag in self.GLOBAL:
+                    continue
+                with self.subTest(script=script, sub=sub, flag=flag):
+                    self.assertIn(
+                        flag, self.commands.get(sub, set()),
+                        f"{script} runs `qf {sub} {flag}`; that subcommand"
+                        f" accepts {sorted(self.commands.get(sub, set()))}."
+                        f" argparse exits 2 on an unknown flag, and a clause"
+                        f" that cannot ask reports its subject missing.")
+
+    def test_no_script_asks_submit_for_a_kind_it_refuses(self):
+        # `submit --kind` is `test|selftest`: extract, probe and evaluate have
+        # their own subcommands, and the generator told an operator otherwise.
+        kinds = re.search(r'add_argument\("--kind", required=True,'
+                          r' choices=\(([^)]*)\)', self.client)
+        self.assertIsNotNone(kinds)
+        allowed = set(re.findall(r'"([a-z]+)"', kinds.group(1)))
+        self.assertEqual(allowed, {"test", "selftest"})
+        for script in self.SCRIPTS:
+            path = os.path.join(self.HOST, script)
+            if not os.path.isfile(path):
+                continue
+            with open(path) as fh:
+                text = fh.read()
+            for m in re.finditer(r"qf submit[^\n]*--kind\s+([a-z]+)", text):
+                with self.subTest(script=script, kind=m.group(1)):
+                    self.assertIn(m.group(1), allowed)
+
 
 if __name__ == "__main__":
     # AT THE END. This guard had drifted into the middle of the file as classes

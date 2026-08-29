@@ -443,9 +443,10 @@ Then, on the host, ONE PROBE PER SCRIPT against the same extract -- the suite
 finds them by reading each SUCCEEDED probe's own spec, so the order does not
 matter, but they must all judge the same data to be comparable:
 
+  sudo -H -u research qf extracts     # copy the `--extract <hash>` line it prints
   for f in nc11_honest nc11_relabelled nc11_ghost_row nc11_cherry_picked \
            nc11_easy_days; do
-    qf submit --kind probe --sha <fixture sha> \
+    sudo -H -u research qf probe --sha <the qf-research sha> \
       --path research/experiments/$f.py --extract <request_hash>
   done
 

@@ -750,6 +750,8 @@ assert_units_current() {
       "dispatcher/qf-runs-prune.timer:phase2-setup.sh install" \
       "extractor/qf-extract.service:phase2b-setup.sh install" \
       "extractor/qf-extract.socket:phase2b-setup.sh install" \
+      "evaluator/qf-eval.service:phase2c-setup.sh install" \
+      "evaluator/qf-eval.socket:phase2c-setup.sh install" \
   ; do
     src="$here/${spec%%:*}"
     unit="$(basename "$src")"

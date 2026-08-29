@@ -332,6 +332,52 @@ else
 fi
 MODE=good
 
+echo "== every control group defined is a group that RUNS =="
+# THREE hand-written lists have to agree: the `ncN()` functions, the default set
+# `main` iterates, and the `case` that validates a name from the command line. A
+# group defined but not listed is a control that exists and never executes --
+# indistinguishable, in an evidence file, from one that passed. A group listed but
+# not accepted by the validator cannot be asked for by name.
+#
+# THE FIRST VERSION OF THIS CLAUSE PASSED WHEN IT SHOULD NOT HAVE, and the reason
+# is worth keeping: it read the default list with `sed -n '/groups=(nc8/,/)/p'`,
+# and in sed a range whose end pattern matches the START line does not close
+# there -- it runs on to the NEXT line containing `)`, which is the validating
+# `case` a few lines below. So removing nc11 from the default list still showed
+# nc11, because the clause was reading the other list. A check that quietly reads
+# a different subject is the failure this whole file exists for.
+defined="$(grep -oE '^nc[0-9]+\(\)' "$SUITE" | tr -d '()' | sort -u)"
+listed="$(grep -oE 'groups=\(nc8[^)]*\)' "$SUITE" | grep -oE 'nc[0-9]+' | sort -u)"
+accepted="$(grep -oE '^ *nc8\|nc9\|[a-z0-9|]*\)' "$SUITE" | grep -oE 'nc[0-9]+' \
+  | sort -u)"
+if [ -z "$defined" ] || [ -z "$listed" ] || [ -z "$accepted" ]; then
+  HBAD "could not read one of the three lists: defined='$(echo $defined)' listed='$(echo $listed)' accepted='$(echo $accepted)'"
+else
+  n="$(printf '%s\n' "$defined" | grep -c .)"
+  if [ "$defined" = "$listed" ]; then
+    HOK "all $n defined groups are in the default set that runs"
+  else
+    HBAD "defined vs default set: $(comm -3 <(printf '%s\n' "$defined") <(printf '%s\n' "$listed") | tr '\n' ' ')"
+  fi
+  if [ "$defined" = "$accepted" ]; then
+    HOK "all $n defined groups can be asked for by name"
+  else
+    HBAD "defined vs accepted names: $(comm -3 <(printf '%s\n' "$defined") <(printf '%s\n' "$accepted") | tr '\n' ' ')"
+  fi
+fi
+
+if grep -q "unknown group" "$SUITE"; then
+  HOK "an unknown group name is refused rather than silently running nothing"
+else
+  HBAD "a mistyped group name would run no controls and report pass=0 fail=0"
+fi
+
+if grep -q "PARTIAL RUN" "$SUITE"; then
+  HOK "a partial run labels itself in the totals and the evidence file"
+else
+  HBAD "a partial run would write totals that read like a full clean run"
+fi
+
 echo
 echo "harness: pass=$hpass fail=$hfail"
 [ "$hfail" -eq 0 ]

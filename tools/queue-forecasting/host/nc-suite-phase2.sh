@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Negative-control suite, Phase 2a (auto-research-phase2a-plan.md Task 8).
 #
-# Run as root:  sudo ./host/nc-suite-phase2.sh
+# Run as root:  sudo ./host/nc-suite-phase2.sh              # every group
+#               sudo ./host/nc-suite-phase2.sh nc9 nc11    # only these
+#
+# A PARTIAL RUN SAYS SO, in the totals line and in the evidence file: `pass=12
+# fail=0` from two groups is indistinguishable from a full clean run once it is
+# in a file.
 #
 # Semantics are carried unchanged from nc-suite.sh, and the reason matters more
 # here than anywhere else: a refusal is only meaningful if the action was
@@ -78,6 +83,7 @@ NC18_AS_OF="${NC18_AS_OF:-2026-08-26T00:00:00Z}"
 pass=0
 fail=0
 declare -a FAILED_NAMES=()
+SELECTION=all
 
 ok()   { echo "ok    $1"; pass=$((pass + 1)); }
 bad()  { echo "FAIL  $1"; fail=$((fail + 1)); FAILED_NAMES+=("$1"); }
@@ -2477,21 +2483,42 @@ main() {
   preflight
   echo "lock=$LOCK intent=$INTENT_DIR"
 
-  nc8
-  nc9
-  nc10
-  nc11
-  nc12
-  nc13
-  nc14
-  nc15
-  nc16
-  nc17
-  nc18
-  nc19
+  # WHICH GROUPS. Named on the command line, all of them by default. The suite
+  # takes the better part of an hour -- it submits real jobs and waits on real
+  # deadlines -- and the groups that gate a phase get re-run several times while
+  # a host is being brought up. Re-running all nineteen to look at one of them
+  # was the alternative, and what that actually produces is nobody re-running it.
+  #
+  # A PARTIAL RUN IS LABELLED AS ONE, in the evidence file and in the totals. An
+  # evidence line reading `pass=12 fail=0` from three groups is indistinguishable
+  # from a full clean run once it is in a file, and that is exactly the kind of
+  # artifact this project keeps deleting.
+  local -a groups=("$@")
+  if [ "${#groups[@]}" -eq 0 ]; then
+    groups=(nc8 nc9 nc10 nc11 nc12 nc13 nc14 nc15 nc16 nc17 nc18 nc19)
+    SELECTION="all"
+  else
+    SELECTION="${groups[*]}"
+  fi
+  local group
+  for group in "${groups[@]}"; do
+    case "$group" in
+      nc8|nc9|nc10|nc11|nc12|nc13|nc14|nc15|nc16|nc17|nc18|nc19) ;;
+      *) echo "unknown group '$group'. Known: nc8 nc9 nc10 nc11 nc12 nc13 nc14" >&2
+         echo "nc15 nc16 nc17 nc18 nc19. With no argument, all of them run." >&2
+         exit 2 ;;
+    esac
+  done
+  for group in "${groups[@]}"; do
+    "$group"
+  done
 
   echo
-  echo "== totals: pass=$pass fail=$fail =="
+  if [ "$SELECTION" = all ]; then
+    echo "== totals: pass=$pass fail=$fail =="
+  else
+    echo "== PARTIAL RUN ($SELECTION): pass=$pass fail=$fail -- not a suite result =="
+  fi
   if [ "$fail" -gt 0 ]; then
     printf 'failed: %s\n' "${FAILED_NAMES[@]}"
   fi
@@ -2518,6 +2545,10 @@ main() {
       echo "VOID RUN: the state instrument failed $blind time(s); totals below are"
       echo "  not evidence. Distinct reasons:"
       sort -u "$BLIND_FILE" | sed 's/^/    /'
+    fi
+    if [ "$SELECTION" != all ]; then
+      echo "PARTIAL RUN: only $SELECTION ran. The counts below cover those"
+      echo "  groups and nothing else."
     fi
     echo "pass=$pass fail=$fail"
     [ "$fail" -gt 0 ] && printf 'failed: %s\n' "${FAILED_NAMES[@]}"

@@ -312,10 +312,18 @@ discover() {
     fi
   fi
 
-  if [ -f "$TMPFILES_DIR/qf-eval.conf" ]; then
-    ok "$TMPFILES_DIR/qf-eval.conf installed"
-  else
+  if [ ! -f "$TMPFILES_DIR/qf-eval.conf" ]; then
     info "$TMPFILES_DIR/qf-eval.conf is not installed"
+    problems=$((problems + 1))
+  elif cmp -s "$EVALUATOR/qf-eval.conf" "$TMPFILES_DIR/qf-eval.conf"; then
+    ok "$TMPFILES_DIR/qf-eval.conf installed and matches the checkout"
+  else
+    # SAME RULE AS A UNIT, and the consequence is worse than it looks: this file
+    # is what systemd-tmpfiles applies AT EVERY BOOT, so a stale copy does not
+    # merely describe the wrong state -- it restores it.
+    warn "$TMPFILES_DIR/qf-eval.conf differs from the checkout. It is applied at"
+    warn "every boot, so a stale copy will RESET the staging root to whatever it"
+    warn "says; install reinstalls it."
     problems=$((problems + 1))
   fi
 

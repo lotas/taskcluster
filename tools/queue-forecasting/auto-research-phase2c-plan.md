@@ -754,7 +754,58 @@ This completes **2c-2**.
 
   **What is left is the operator's:** push the fixture branch, then one probe per
   script against the same extract. Until then clause (c) voids, naming the
-  generator and the submit lines.
+  generator and the probe lines.
+
+- **A command the client rejects is not a command, and it happened twice in two
+  days.** The `--kind` above is one; the other was in the 2c generator's own
+  instructions, which told the operator to run `qf submit --kind probe ...
+  --extract <hash>` -- three impossibilities in one line, since `submit --kind`
+  accepts only `test|selftest`, `submit` has no `--extract`, and a probe has its
+  own subcommand. Neither is catchable by running the suite on a healthy host:
+  argparse exits 2, the helper discards stderr, and the clause reports its
+  subject missing.
+
+  So `test_protocol.py` now PARSES the client's own argparse definitions and
+  checks every `qf` invocation written in every host script against them --
+  subcommand exists, flag exists on that subcommand, `submit --kind` gets a kind
+  it accepts. It anchors on command position so prose is not scanned, cuts each
+  line at `#` so an instruction in a comment is not read as a flag, and carries a
+  canary that fails if the parse found nothing. `README.md` is deliberately NOT
+  scanned: it documents invocations that were wrong, as lessons. Three
+  red-green verifications: reintroducing `--kind`, restoring the bad `submit`
+  line, and inventing a subcommand each fail it.
+
+- **The suite takes group names now**, because the operator is about to run NC9
+  and NC11 several times while bringing a host up and the whole suite submits real
+  jobs against real deadlines. `sudo ./nc-suite-phase2.sh nc9 nc11` runs those
+  two; no argument runs all twelve. **A partial run labels itself** in the totals
+  line and in the evidence file: `pass=12 fail=0` from two groups is
+  indistinguishable from a full clean run once it is in a file.
+
+  That refactor silently emptied three tests -- `nc9`, `nc17`/`nc18` and `nc19`
+  each asserted their wiring by matching a bare call line in `main`, which no
+  longer exists -- so the wiring assertion is now one shared helper checking BOTH
+  hand-written lists (the default set and the validating `case`), and the harness
+  enumerates every `ncN()` definition against both. Two mistakes of mine in
+  writing those checks, both the same species as everything else here: a `sed`
+  range whose end pattern matched its own start line, so it ran on to the NEXT
+  `)` -- the validating `case` -- and reported the group present after I had
+  deleted it from the default set; and a `split()` that left `groups=(nc8` and
+  `nc19)` as tokens, so the first and last group in the list would each have read
+  as absent. Both found by red-green, which is the only reason either is written
+  down as a fixed thing rather than a live one.
+
+- **The unit-drift list had not grown with the phases.** `assert_units_current`
+  is what stops `mirror-refresh` restarting the daemon into configuration from an
+  older commit, and it works off a hand-written list of five units -- the
+  evaluator's two were not in it, so a refresh would have restarted `qf-eval`
+  under a stale unit silently, which is the exact failure that function exists to
+  make loud. Added, plus a test in `test_unit_drift.sh` that ENUMERATES every
+  `.service`/`.socket`/`.timer` in `host/*/` and requires each to be named in the
+  list, so the next phase cannot forget either. `phase2c-setup.sh discover` also
+  compares the installed `qf-eval.conf` against the checkout now: tmpfiles is
+  applied at every boot, so a stale copy does not merely describe the wrong
+  staging root, it restores it.
 
 **A ninth static-scan-matched-its-own-documentation instance produced a real
 fix.** `verdict.py`'s docstring says "nothing here writes to
