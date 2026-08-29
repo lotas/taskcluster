@@ -2702,13 +2702,29 @@ class TestNc19IsWiredAndItsClaimsAreEarned(unittest.TestCase):
         first_claim = self.nc19.index("NC19 (a)")
         self.assertLess(canary, first_claim)
 
+    def test_the_fixture_is_canaried_before_any_claim(self):
+        # If `baseline_contract.py` is not on the fixture branch, every probe
+        # below fails for that reason -- and the clauses would report it as the
+        # baseline mount being broken. A control blamed for a fixture nobody
+        # pushed costs an investigation into working code.
+        canary = self.nc19.index("printed no BASELINE-CONTRACT summary")
+        for claim in ("NC19 (a)", "NC19 (b)", "NC19 (c)", "NC19 (d)"):
+            self.assertLess(canary, self.nc19.index(claim), claim)
+        # And it names the remedy, because "void" without one is a dead end.
+        window = self.nc19[canary:canary + 400]
+        self.assertIn("nc-fixtures-phase2b.sh", window)
+
     def test_the_canary_failures_are_void_and_return(self):
         for reason in ("the promoter published nothing",
-                       "no extract is published"):
+                       "no extract is published",
+                       "printed no BASELINE-CONTRACT summary"):
             i = self.nc19.index(reason)
-            window = self.nc19[i - 200:i + 200]
-            self.assertIn("void", window, reason)
-            self.assertIn("return", window, reason)
+            # Scoped to the enclosing branch rather than a byte window: the
+            # multi-line void messages pushed `return` past a fixed +200, so a
+            # window would have to grow every time a message did.
+            branch = self.nc19[i:self.nc19.index("\n  fi", i)]
+            self.assertIn("void", self.nc19[i - 200:i], reason)
+            self.assertIn("return", branch, reason)
 
     def test_double_promotion_is_asserted_on_bytes_not_only_on_a_message(self):
         # "already published" is what the promoter SAYS. The artifact not having

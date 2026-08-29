@@ -1727,6 +1727,50 @@ print(rows[0]['request_hash'] if rows else '')" 2>/dev/null)"
     return
   fi
 
+  # CANARY: THE FIXTURE IS DEPLOYED, and this doubles as clause (e).
+  #
+  # It runs FIRST, before anything is promoted, because if
+  # `baseline_contract.py` is not on the fixture branch every probe below fails
+  # for that reason -- and the clauses would report it as the baseline mount
+  # being broken. A control blamed for a fixture nobody pushed is the same
+  # false-failure shape as the mutex probe's sixteen unrelated voids, and the
+  # cost is an investigation into working code.
+  #
+  # The no-baseline run is the right canary because it needs nothing this group
+  # sets up: no promotion, no hash. And it is a clause in its own right --
+  # absence is a control too, since a baseline must not be AMBIENT, or a cohort
+  # could compare against data its record does not name.
+  local rid final log
+  rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
+      --path research/experiments/baseline_contract.py --extract $ex" 2>&1 \
+      | tail -1)"
+  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
+    void "NC19 canary: the no-baseline probe produced no run id: $rid"
+    return
+  fi
+  final="$(wait_terminal "$rid" 3600)"
+  log="$(cat "$RUNS_DIR/$rid/logs/"* 2>/dev/null)"
+  if ! printf '%s' "$log" | grep -q "== BASELINE-CONTRACT:"; then
+    # NO SUMMARY AT ALL means the script never ran to completion -- almost
+    # always because the fixture branch does not carry it. Named as such, with
+    # the remedy, rather than reported as a failed control.
+    void "NC19 canary: the probe printed no BASELINE-CONTRACT summary (state
+  $final). If research/experiments/baseline_contract.py is not on the fixture
+  branch, re-run host/nc-fixtures-phase2b.sh, push it, and update
+  $NC12_SHA_FILE."
+    printf '%s\n' "$log" | tail -5 | sed 's/^/    /'
+    return
+  fi
+  assert_eq "NC19 (e) a probe without a baseline SUCCEEDS" "SUCCEEDED" "$final"
+  if printf '%s' "$log" | grep -q "BASELINE-CONTRACT: present=0 pass=[0-9]* fail=0 "; then
+    ok "NC19 (e) no baseline was mounted, and none was lying around"
+  else
+    bad "NC19 (e) a probe that asked for no baseline saw one, or failed a clause"
+    printf '%s\n' "$log" | grep -E '^(FAIL|== BASELINE)' | sed 's/^/    /'
+  fi
+  assert_eq "NC19 (e) and it is pinned as none, not left absent" "none" \
+    "$(pin_of "$rid" baseline)"
+
   # --- promote a small baseline ------------------------------------------
   # SYNTHESISED rather than taken from the nightly's output, and the reason is
   # scope: the promoter's own suite already validates real-shaped sets against
@@ -1804,7 +1848,6 @@ PYEOF
   # asserts that against what it ASKED FOR, which is why the fixture prints
   # `present=`. A fixture that assumed a baseline would pass for the wrong
   # reason on the run that asks for none.
-  local rid final log
   rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
       --path research/experiments/baseline_contract.py \
       --extract $ex --baseline $full" 2>&1 | tail -1)"
@@ -1828,28 +1871,6 @@ PYEOF
     [ "$pdir" = "$store/$full" ] \
       && ok "NC19 (d) and the directory it was mounted from" \
       || bad "NC19 (d) baseline_dir is '$pdir', not $store/$full"
-  fi
-
-  # (e) A PROBE WITHOUT ONE. Absence is a control too: a baseline must not be
-  # ambient, or a cohort could compare against data its record does not name.
-  rid="$(as "$RESEARCH_USER" "qf probe --sha $fx \
-      --path research/experiments/baseline_contract.py --extract $ex" 2>&1 \
-      | tail -1)"
-  if [ -z "$rid" ] || ! [ -d "$RUNS_DIR/$rid" ]; then
-    void "NC19 (e) the no-baseline probe produced no run id: $rid"
-  else
-    final="$(wait_terminal "$rid" 3600)"
-    assert_eq "NC19 (e) a probe without a baseline still SUCCEEDS" "SUCCEEDED" \
-      "$final"
-    log="$(cat "$RUNS_DIR/$rid/logs/"* 2>/dev/null)"
-    if printf '%s' "$log" | grep -q "BASELINE-CONTRACT: present=0 pass=[0-9]* fail=0 "; then
-      ok "NC19 (e) no baseline was mounted, and none was lying around"
-    else
-      bad "NC19 (e) a probe that asked for no baseline saw one, or failed"
-      printf '%s\n' "$log" | grep -E '^(FAIL|== BASELINE)' | sed 's/^/    /'
-    fi
-    assert_eq "NC19 (e) and it is pinned as none, not left absent" "none" \
-      "$(pin_of "$rid" baseline)"
   fi
 
   # (f) AN UNPROMOTED BASELINE IS REFUSED BEFORE ANYTHING STARTS. Its own error
