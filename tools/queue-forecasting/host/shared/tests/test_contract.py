@@ -1,6 +1,7 @@
 """Phase 2c Task 17. `contract.py` -- the identity of an evaluation contract."""
 import json
 import os
+import re
 import tempfile
 import unittest
 
@@ -335,3 +336,139 @@ class TestItStaysImportableByQfd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheShippedContractsTranscribeTheSpec(unittest.TestCase):
+    """Task 18. The bars are transcribed from `trainer-spec.md` and the tail gate
+    from `trainer-phase2-decision.md`. Checked against the spec TEXT rather than
+    read over, because a bar that quietly disagrees with the document everyone
+    cites is a rule nobody agreed to -- and it would look authoritative."""
+
+    @classmethod
+    def setUpClass(cls):
+        # tests/ -> shared/ -> host/ -> queue-forecasting/
+        cls.host = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+        cls.qf = os.path.dirname(cls.host)
+        with open(os.path.join(cls.qf, "trainer-spec.md")) as fh:
+            cls.spec = fh.read()
+
+    def load_template(self, name):
+        path = os.path.join(self.host, "contracts", f"{name}.v1.json.in")
+        with open(path) as fh:
+            raw = json.load(fh)
+        raw["baseline_hash"] = "a" * 64      # the placeholder is not 64 hex
+        return contract.validate(raw)
+
+    def test_the_templates_do_not_validate_until_a_baseline_is_pinned(self):
+        # The incompleteness is a REFUSAL, not a note. A contract shipped with a
+        # plausible-looking placeholder hash would validate and judge against
+        # nothing.
+        for name in ("wait_time", "run_duration"):
+            with self.subTest(name=name):
+                path = os.path.join(self.host, "contracts",
+                                    f"{name}.v1.json.in")
+                with open(path) as fh:
+                    raw = json.load(fh)
+                self.assertEqual(raw["baseline_hash"], "@BASELINE_HASH@")
+                with self.assertRaises(contract.ContractError):
+                    contract.validate(raw)
+
+    def test_the_wait_mae_bar_is_the_15_percent_the_spec_states(self):
+        self.assertIn("MAE improves by ≥15%", self.spec)
+        c = self.load_template("wait_time")
+        self.assertEqual(c["metrics"]["mae"]["bar"],
+                         {"kind": "relative_improvement", "value": 0.15})
+
+    def test_the_wait_within_2x_bar_is_the_5pp_the_spec_states(self):
+        self.assertIn("within-2x improves by ≥5pp", self.spec)
+        c = self.load_template("wait_time")
+        # ABSOLUTE improvement, not relative: "pp" is percentage points, and
+        # reading it as 5% relative would be a materially looser bar.
+        self.assertEqual(c["metrics"]["within_2x"]["bar"],
+                         {"kind": "absolute_improvement", "value": 0.05})
+
+    def test_the_run_duration_mae_bar_is_5_percent_not_15(self):
+        self.assertIn("MAE improves by ≥5%", self.spec)
+        c = self.load_template("run_duration")
+        self.assertEqual(c["metrics"]["mae"]["bar"]["value"], 0.05)
+
+    def test_the_p90_band_is_the_spec_band_for_both_targets(self):
+        self.assertIn("p90 coverage is within [85%, 95%]", self.spec)
+        for name in ("wait_time", "run_duration"):
+            with self.subTest(name=name):
+                bar = self.load_template(name)["metrics"]["p90_coverage"]["bar"]
+                self.assertEqual(bar, {"kind": "band", "low": 0.85,
+                                       "high": 0.95})
+
+    def test_the_consistency_rule_is_3_of_5(self):
+        self.assertIn("consistent across at least 3 of the 5 holdout days",
+                      self.spec)
+        for name in ("wait_time", "run_duration"):
+            with self.subTest(name=name):
+                c = self.load_template(name)
+                self.assertEqual(c["consistency"]["days_required"], 3)
+                self.assertEqual(c["holdout_days"], 5)
+
+    def test_the_primary_slice_is_the_one_evaluate_py_uses(self):
+        # `evaluate.py:327` -- reason_resolved in ["completed"]. The go/no-go
+        # slice is part of the rule: changing the population at the same time as
+        # the model makes "did it improve?" unanswerable.
+        # The spec wraps this line, so match it whitespace-insensitively rather
+        # than pretending to normalise it.
+        self.assertRegex(self.spec,
+                         r"reason_resolved\s*=\s*\n?'completed'")
+        for name in ("wait_time", "run_duration"):
+            with self.subTest(name=name):
+                c = self.load_template(name)
+                self.assertEqual(c["primary_slice"]["reason_resolved"],
+                                 ["completed"])
+                self.assertEqual(c["primary_slice"]["anchor"], "pending_at")
+
+    def test_the_tail_gate_is_the_30m_bucket_at_30_percent(self):
+        # From trainer-phase2-decision.md: "<35% experimental, <30% broad". The
+        # BROAD figure is the bar, because a contract is what a result has to
+        # clear to be believed, not what an exploratory run hopes for.
+        with open(os.path.join(self.qf,
+                               "trainer-phase2-decision.md")) as fh:
+            decision = fh.read()
+        self.assertIn("<30% broad", decision)
+        tail = self.load_template("wait_time")["metrics"]["p90_miss_tail"]
+        self.assertEqual(tail["bar"], {"kind": "absolute", "value": 0.30})
+        self.assertEqual(tail["direction"], "lower_is_better")
+        self.assertEqual(tail["bucket"], "30m+")
+
+    def test_the_tail_bucket_name_is_one_the_evaluator_actually_has(self):
+        # `contract.py` deliberately does not validate bucket names -- that
+        # vocabulary lives in `evaluate.WAIT_BUCKETS` and importing it would put
+        # pandas in qfd's import path. So the agreement is checked HERE, against
+        # the source of the vocabulary.
+        with open(os.path.join(self.qf, "trainer", "src",
+                               "evaluate.py")) as fh:
+            buckets = re.findall(r'\("([^"]+)",\s*[\d.]+,',
+                                 fh.read().split("WAIT_BUCKETS")[1])
+        self.assertIn("30m+", buckets)
+        tail = self.load_template("wait_time")["metrics"]["p90_miss_tail"]
+        self.assertIn(tail["bucket"], buckets)
+
+    def test_run_duration_has_no_wait_only_metrics(self):
+        # WAIT_BUCKETS is a wait vocabulary, and the spec states no within-2x
+        # bar for run_duration. Inventing either would be a rule nobody agreed
+        # to, wearing the authority of a committed contract.
+        c = self.load_template("run_duration")
+        self.assertNotIn("within_2x", c["metrics"])
+        for spec in c["metrics"].values():
+            self.assertNotIn("bucket", spec)
+
+    def test_the_two_contracts_are_different_rules(self):
+        self.assertNotEqual(
+            contract.contract_hash(self.load_template("wait_time")),
+            contract.contract_hash(self.load_template("run_duration")))
+
+    def test_every_target_has_a_contract(self):
+        # A target with no contract cannot be judged at all, which would be
+        # discovered as a refusal at evaluation time rather than here.
+        for target in contract.TARGETS:
+            with self.subTest(target=target):
+                self.assertTrue(os.path.isfile(os.path.join(
+                    self.host, "contracts", f"{target}.v1.json.in")))

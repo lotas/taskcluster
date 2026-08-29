@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "run_duration_v1",
+  "target": "run_duration",
+  "baseline_hash": "@BASELINE_HASH@",
+  "note": "Transcribed from trainer-spec.md 'Go/no-go'. The MAE bar is 5% rather than wait's 15% because the run_duration baseline is strong; no within-2x bar and no tail gate, because the spec states neither for this target and inventing one here would be a rule nobody agreed to. No bucket metrics: WAIT_BUCKETS is a wait-target vocabulary.",
+  "primary_slice": {
+    "reason_resolved": ["completed"],
+    "anchor": "pending_at"
+  },
+  "holdout_days": 5,
+  "consistency": {
+    "days_required": 3
+  },
+  "metrics": {
+    "mae": {
+      "direction": "lower_is_better",
+      "bar": {"kind": "relative_improvement", "value": 0.05}
+    },
+    "p90_coverage": {
+      "direction": "band",
+      "bar": {"kind": "band", "low": 0.85, "high": 0.95}
+    }
+  }
+}

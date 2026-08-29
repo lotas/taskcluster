@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "name": "wait_time_v1",
+  "target": "wait_time",
+  "baseline_hash": "@BASELINE_HASH@",
+  "note": "Transcribed from trainer-spec.md 'Go/no-go' plus the tail gate in trainer-phase2-decision.md. Judged on the primary slice only: changing the population at the same time as the model makes 'did it improve?' unanswerable.",
+  "primary_slice": {
+    "reason_resolved": ["completed"],
+    "anchor": "pending_at"
+  },
+  "holdout_days": 5,
+  "consistency": {
+    "days_required": 3
+  },
+  "metrics": {
+    "mae": {
+      "direction": "lower_is_better",
+      "bar": {"kind": "relative_improvement", "value": 0.15}
+    },
+    "within_2x": {
+      "direction": "higher_is_better",
+      "bar": {"kind": "absolute_improvement", "value": 0.05}
+    },
+    "p90_coverage": {
+      "direction": "band",
+      "bar": {"kind": "band", "low": 0.85, "high": 0.95}
+    },
+    "p90_miss_tail": {
+      "direction": "lower_is_better",
+      "bucket": "30m+",
+      "bar": {"kind": "absolute", "value": 0.30}
+    }
+  }
+}

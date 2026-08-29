@@ -80,6 +80,40 @@ Consequences, stated so they are checkable:
 - The contracts live in the **trusted checkout**, not in `qf-research`. That is
   the whole of NC9: a contract the candidate can edit is not a contract.
 
+### D28 — the evaluator reads immutable stores in place and the candidate's output from a staged inbox
+
+`qfeval` cannot reach a run directory, and the gap is one step worse than a group
+on `out/` would fix: the **base** run directory is `0750 qfd:qfclient`
+(`Runner.OWNERSHIP`), so traversal itself needs `qfclient` -- and `qfeval` must
+not be in `qfclient`. A directory carries one group, and that group is already
+`qfclient` because it is what lets `research` reach `logs/` and `artifacts/`.
+
+The two candidate remedies were a shared non-capability I/O group, or staging.
+**Staging wins, and the deciding argument is that the two inputs have different
+trust:**
+
+- `/var/lib/qf-extracts/<request_hash>/` and `/var/lib/qf-baselines/<hash>/` are
+  already `0755`, immutable, and content-hashed. `qfeval` reads them **in place**
+  and verifies the digests it was given. Copying them would double 1.4 GiB to
+  gain nothing -- the reason they are world-readable is precisely that a
+  different uid has to read them.
+- `out/predictions.parquet` is the one **untrusted** input: written by
+  agent-authored code inside the sandbox. `qfd` stages it into
+  `/var/lib/qf-eval/<run_id>/in/`, owned `qfd:qfeval` `0750`, and the evaluator's
+  own output directory `/var/lib/qf-eval/<run_id>/out/` is `qfeval:qfeval` --
+  the only thing it can write.
+
+So the untrusted artifact is copied to somewhere the candidate cannot reach, and
+the trusted immutable ones are read where they lie. The alternative -- an I/O
+group on the base run directory -- would need either a second group on a
+directory that can only have one, or POSIX ACLs. ACLs were rejected on evidence:
+this phase already spent three attempts on a credential check that was wrong
+because a DAC-based assertion cannot describe an ACL-protected file, and the
+run-directory permission model is what NC10 and NC15's evidence rests on.
+
+The cost is one copy of the predictions per evaluation, which is the prediction
+set only (2b-2's frozen five columns), not the extract.
+
 ### D25 — the contract is a file in the trusted checkout, and its hash is content
 
 Same shape as `baseline_hash` (2b-3) and for the same reason: an identity that
@@ -194,15 +228,82 @@ Each ends where a control can fail closed, and none needs the next to be useful.
   accepted **non-finite** bars: every comparison against NaN is False, so a NaN
   bar fails every run while looking like a threshold, and an infinite one decides
   every run by its sign. Neither announces itself.
-- **Task 18 — the first two contracts.** `wait_time.v1.json` and
-  `run_duration.v1.json`, transcribing `trainer-spec.md`'s bars plus the tail
-  gate, each pinning a `baseline_hash`. Transcription is checked by a test
-  against the spec text, not by eye.
+- **Task 18 — the first two contracts. DONE (2026-08-29)**, 12 transcription
+  tests + 19 shell clauses. `contracts/wait_time.v1.json.in` and
+  `run_duration.v1.json.in`, transcribing `trainer-spec.md`'s bars plus the tail
+  gate. Transcription is checked **against the spec text**, not by eye: a bar
+  that quietly disagrees with the document everyone cites is a rule nobody
+  agreed to, wearing the authority of a committed contract. The tests also pin
+  the tail bucket name against `evaluate.WAIT_BUCKETS`, since `contract.py`
+  deliberately does not own that vocabulary.
+
+  **They ship as `.json.in` TEMPLATES, and that is a finding rather than a
+  convenience.** A contract must name its `baseline_hash` (D25), which is the
+  content key of a directory that has to be promoted first -- so these cannot be
+  written complete until the baseline behind the reference result
+  (`wait_time_residual_throughput_filtered_baseline`) is promoted on the host. A
+  contract shipped with a plausible-looking placeholder hash would validate and
+  judge against nothing, so the placeholder is `@BASELINE_HASH@`, which
+  `contract.validate` refuses because it is not 64 hex. The incompleteness is
+  enforced by the validator and visible in `ls`.
+
+  `instantiate-contract.sh` pins one: it verifies the named baseline is promoted
+  **and that its manifest still hashes to its own name** (the same check
+  `_probe_baseline` makes), substitutes, validates, writes the declared
+  `contract_hash` into the file, and publishes by rename. Re-instantiating an
+  existing contract is refused naming versioning -- bump v1 to v2, because
+  repointing a contract makes every result that cited its hash unreadable. The
+  output is **committed**: the control NC9 asserts is that the file is in the
+  trusted checkout, and a file that exists only on the host is a rule with no
+  provenance.
+
+  Two transcription decisions worth naming. `within_2x` is
+  `absolute_improvement` 0.05, because "5pp" is percentage points and reading it
+  as 5% relative would be a materially looser bar. The tail gate takes the
+  **broad** figure (`<30%`) rather than the experimental one (`<35%`), because a
+  contract is what a result must clear to be believed, not what an exploratory
+  run hopes for. `run_duration` gets no within-2x bar and no bucket metrics --
+  the spec states neither, and inventing them here would be a rule nobody agreed
+  to.
+
+  **Blocked on an operator step:** promoting the reference baseline, so the two
+  contracts can be instantiated and committed.
 - **Task 19 — the `qfeval` domain.** User, socket unit, service unit, startup
-  refusals for forbidden group membership, `ping`. Mechanically the
-  `qf-extract` pattern with less authority -- and per 2b-1's lesson, `main()`
-  **serves** refusals rather than exiting, because under socket activation
-  exiting non-zero is a hang.
+  refusals, `ping`. Mechanically the `qf-extract` pattern with less authority --
+  and per 2b-1's lesson, `main()` **serves** refusals rather than exiting,
+  because under socket activation exiting non-zero is a hang.
+
+  "Root-owned evaluator" means root-owned **code, environment, units and
+  policy**, not a process running as root. Six properties, each enforced rather
+  than documented, and each with a stated way it is checked:
+
+  1. **The socket peer is `qfd` and nothing else.** `SO_PEERCRED`, compared
+     against a uid resolved at start-up -- not group membership on the socket,
+     which is how `research` came to be able to reach a channel in revision 8.
+     The socket is `0600 root:qfeval`, so there is no group to be added to.
+  2. **No Docker, no credential, no network, not `qfheavy`, not `qfclient`.**
+     `Config.check_startup` refuses on membership, naming
+     `SupplementaryGroups=`, the same shape as `qfextract`'s -- with `qfclient`
+     in the forbidden list for a second reason here: it is the group that would
+     have let it read a run directory, which D28 exists to avoid needing.
+     `PrivateNetwork=yes`, which `qfextract` cannot have and this can.
+  3. **Root-owned code, contracts and a locked environment.** The service runs
+     from the trusted checkout with `uv.lock` frozen -- a refusal, not a
+     warning, per 2b-1 -- and the contracts directory is root-owned and
+     read-only to it.
+  4. **IDs and hashes over the protocol, never caller-selected paths.** The
+     request carries `run_id`, `contract_hash`, `request_hash`, `baseline_hash`
+     and the staged input's digest. Every path is derived from the evaluator's
+     own trusted roots, exactly as `_probe_extract` derives a mount from a
+     64-hex hash. A path on the wire would make the peer check the only control.
+  5. **Read-only inputs, digests verified.** The extract and baseline are
+     opened read-only and their manifests rehashed; the staged predictions are
+     digested and compared against the value `qfd` sent. A digest that is
+     carried and not checked is provenance that looks complete.
+  6. **One writable directory, atomic publication.** Only
+     `/var/lib/qf-eval/<run_id>/out/`. `eval.parquet` and `verdict.json` are
+     written to a temporary name and renamed -- the same single-act discipline as
+     D20 and the baseline promoter, so a reader never sees a partial verdict.
 - **Task 20 — the `evaluate` kind, and NC9.** `args.contract` is a 64-hex hash
   resolved and verified against the trusted checkout; a job naming a contract
   that is not there, or whose body does not hash to its name, is refused before
