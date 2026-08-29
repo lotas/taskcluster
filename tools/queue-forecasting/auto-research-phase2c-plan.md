@@ -775,6 +775,19 @@ This completes **2c-2**.
   red-green verifications: reintroducing `--kind`, restoring the bad `submit`
   line, and inventing a subcommand each fail it.
 
+- **The pipeline's own baseline directory is not promotable, by design, and the
+  refusal now says what to do.** `ensure_baseline_ndjson.sh` writes a coverage
+  sidecar (`baseline_predictions.ndjson.meta.json`) beside the aggregate, and
+  `trainer/data/baseline_filtered/` keeps per-day files from every earlier cohort
+  of that policy. `baseline.describe` is closed-world, so it refuses both -- which
+  is right twice over: the sidecar is not part of the identity, and those older
+  days would otherwise be recorded as part of THIS baseline while the declared
+  `exclude_dates` describe only the latest regeneration. `promote-baseline.sh`'s
+  own header example pointed straight at that directory, so the documented
+  command could not have worked. It now shows the staging recipe, and on a refusal
+  the script lists the offending files and prints the fix. Three new clauses in
+  `test_promote_baseline.sh` (23 total), red-green verified.
+
 - **The suite takes group names now**, because the operator is about to run NC9
   and NC11 several times while bringing a host up and the whole suite submits real
   jobs against real deadlines. `sudo ./nc-suite-phase2.sh nc9 nc11` runs those

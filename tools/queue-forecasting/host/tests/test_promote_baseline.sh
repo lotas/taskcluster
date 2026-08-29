@@ -44,6 +44,39 @@ fi
 published="$(find "$QF_BASELINE_STORE" -mindepth 1 -maxdepth 1 -type d | wc -l)"
 [ "$published" = 1 ] && ok "exactly one artifact" || bad "$published artifacts"
 
+# --- the sidecar the pipeline actually writes -----------------------------
+# THE FAILURE AN OPERATOR HITS FIRST. `ensure_baseline_ndjson.sh` writes a
+# coverage sidecar next to the NDJSON, and the trainer's cache keeps per-day
+# files from every earlier cohort of the same policy -- so the directory the
+# pipeline produces is never promotable as-is. The refusal is correct (the store
+# is closed-world), and what matters is that it names the fix rather than leaving
+# somebody to work out why one file is unacceptable.
+make_source "$TMP/sidecar"
+echo '{"from":"2026-08-01","to":"2026-08-27"}' \
+  > "$TMP/sidecar/baseline_predictions.ndjson.meta.json"
+before="$(find "$QF_BASELINE_STORE" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+out="$(run "$TMP/sidecar")"
+if printf '%s' "$out" | grep -q "not part of a baseline set"; then
+  ok "the coverage sidecar is refused rather than published"
+else
+  bad "the sidecar was accepted or refused for another reason: $out"
+fi
+if printf '%s' "$out" | grep -q "meta.json" \
+   && printf '%s' "$out" | grep -q "mktemp -d"; then
+  ok "the refusal names the offending file and the staging remedy"
+else
+  bad "the refusal did not name the file and the fix: $out"
+fi
+# AND IT PUBLISHED NOTHING. A hint printed on the way past would be worse than
+# no hint at all. Counted against the store as it was a moment ago, not against
+# a literal: earlier clauses in this file have already published sets.
+after="$(find "$QF_BASELINE_STORE" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+if [ "$before" = "$after" ]; then
+  ok "the refused set was not published"
+else
+  bad "a refused set reached the store ($before -> $after)"
+fi
+
 hash_dir="$(find "$QF_BASELINE_STORE" -mindepth 1 -maxdepth 1 -type d)"
 for name in MANIFEST.json baseline_predictions.ndjson 2026-08-20.json \
             2026-08-21.json; do

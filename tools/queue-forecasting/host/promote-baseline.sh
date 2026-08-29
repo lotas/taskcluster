@@ -3,9 +3,22 @@
 #
 #   sudo ./promote-baseline.sh <source dir> [--exclude YYYY-MM-DD,...]
 #
-# e.g.
-#   sudo ./promote-baseline.sh ~/dev/taskcluster/tools/queue-forecasting/trainer/data/baseline_filtered \
-#        --exclude 2026-07-04,2026-07-05
+# THE SOURCE IS A STAGED DIRECTORY, not the pipeline's own cache. The store is
+# closed-world (`baseline.describe`): the aggregate NDJSON and `<YYYY-MM-DD>.json`
+# and NOTHING else. The trainer's cache legitimately holds more than that -- a
+# `baseline_predictions.ndjson.meta.json` coverage sidecar, and per-day files
+# from every earlier cohort of the same policy -- so promoting it directly is
+# refused, and would be wrong if it were not: those other days would be recorded
+# as part of THIS baseline's identity while the declared `exclude_dates` describe
+# only the latest regeneration.
+#
+# e.g., after `run_training.sh` printed its holdout days:
+#   S="$(mktemp -d)"
+#   cp trainer/data/baseline_filtered/baseline_predictions.ndjson "$S"/
+#   for d in 2026-08-22 2026-08-23 2026-08-24 2026-08-25 2026-08-26; do
+#     cp "trainer/data/baseline_filtered/$d.json" "$S"/
+#   done
+#   sudo ./promote-baseline.sh "$S" --exclude 2026-07-04,2026-07-05
 #
 # WHY A SEPARATE, PRIVILEGED STEP.
 #
@@ -93,7 +106,25 @@ except baseline.BaselineError as e:
 manifest["baseline_hash"] = baseline.baseline_hash(manifest)
 print(json.dumps(manifest, sort_keys=True, indent=2))
 PY
-)" || die "the source directory is not a promotable baseline set (see above)"
+)" || {
+  # THE LIKELIEST CAUSE, NAMED. The refusal above says which file is wrong; this
+  # says why it is there and what to do, because the file that triggers it is one
+  # the pipeline writes on purpose. Computed after the failure, so a working
+  # promotion pays nothing for it.
+  extra="$(find "$SRC" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+    | grep -vE '^baseline_predictions\.ndjson$|^[0-9]{4}-[0-9]{2}-[0-9]{2}\.json$' \
+    | head -5 | tr '\n' ' ')"
+  if [ -n "$extra" ]; then
+    warn "$SRC also holds: $extra"
+    warn "The store is closed-world -- the aggregate NDJSON and <YYYY-MM-DD>.json"
+    warn "and nothing else -- so stage exactly the window you are promoting:"
+    warn "  S=\$(mktemp -d)"
+    warn "  cp $SRC/baseline_predictions.ndjson \$S/"
+    warn "  cp $SRC/<each holdout day>.json \$S/"
+    warn "  sudo $0 \$S [--exclude ...]"
+  fi
+  die "the source directory is not a promotable baseline set (see above)"
+}
 
 HASH="$(printf '%s' "$MANIFEST_JSON" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["baseline_hash"])')"
