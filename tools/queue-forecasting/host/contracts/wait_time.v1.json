@@ -1,0 +1,50 @@
+{
+  "baseline_hash": "e51a321057ca884977edc357c3c2c254dcefb01ed700f9009f5d92b412ec9a27",
+  "consistency": {
+    "days_required": 3
+  },
+  "contract_hash": "f740716d32b8ddef20bd2e42ede873fd0b59486f752c8d077293ebc440997173",
+  "holdout_days": 5,
+  "metrics": {
+    "mae": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.15
+      },
+      "direction": "lower_is_better"
+    },
+    "p90_coverage": {
+      "bar": {
+        "high": 0.95,
+        "kind": "band",
+        "low": 0.85
+      },
+      "direction": "band"
+    },
+    "p90_miss_tail": {
+      "bar": {
+        "kind": "absolute",
+        "value": 0.3
+      },
+      "bucket": "30m+",
+      "direction": "lower_is_better"
+    },
+    "within_2x": {
+      "bar": {
+        "kind": "absolute_improvement",
+        "value": 0.05
+      },
+      "direction": "higher_is_better"
+    }
+  },
+  "name": "wait_time_v1",
+  "note": "Transcribed from trainer-spec.md 'Go/no-go' plus the tail gate in trainer-phase2-decision.md. Judged on the primary slice only: changing the population at the same time as the model makes 'did it improve?' unanswerable.",
+  "primary_slice": {
+    "anchor": "pending_at",
+    "reason_resolved": [
+      "completed"
+    ]
+  },
+  "schema": 1,
+  "target": "wait_time"
+}

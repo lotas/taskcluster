@@ -5,3 +5,17 @@ pass=32 fail=0
   sigkill: build client gone after 0s (settle window 30s)
   systemctl_stop: build client gone after 0s (settle window 30s)
 
+=== 2026-08-29T11:20:16Z fault-gates-phase2.sh ===
+host=queue-forecasting settle_window=30s
+pass=32 fail=0
+  build_timeout: build client gone after 0s (settle window 30s)
+  sigkill: build client gone after 0s (settle window 30s)
+  systemctl_stop: build client gone after 0s (settle window 30s)
+
+=== 2026-08-29T12:49:43Z fault-gates-phase2.sh ===
+host=queue-forecasting settle_window=30s
+pass=32 fail=0
+  build_timeout: build client gone after 0s (settle window 30s)
+  sigkill: build client gone after 0s (settle window 30s)
+  systemctl_stop: build client gone after 1s (settle window 30s)
+

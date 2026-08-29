@@ -22,3 +22,16 @@ host=queue-forecasting trusted=/srv/queue-forecasting
 dispatcher commit: commit: 6fd766b4feb995f1a7490a004cbc5601845dddd3
 pass=111 fail=0
 
+=== 2026-08-29T11:07:35Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: d0494116e7bd36faa5d139b94c0c1d15e860ae1c
+pass=108 fail=1
+failed: NC15 a job was admitted below the disk floor
+
+=== 2026-08-29T12:37:56Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 90815604cde2bb7a15311801cc8a041dfdae9374
+pass=110 fail=2
+failed: NC18 (slow) generation 2 did not publish a separate artifact
+failed: VOID:NC19 canary: the no-baseline probe produced no run id: probe-20260829T123756Z-9d54e39271d7-4290
+
