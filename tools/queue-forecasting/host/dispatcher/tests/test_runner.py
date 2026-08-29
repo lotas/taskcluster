@@ -1407,8 +1407,11 @@ class TestTheProbeMounts(RunnerCase):
     def test_the_writable_data_mount_is_the_runs_own(self):
         paths = self.runner.prepare_run_dir("r-probe", qfrun_gid=os.getgid(),
                                             qfclient_gid=os.getgid())
+        import sandbox
         mounts = self.runner._probe_rw_mounts(self.a_probe(), paths)
-        self.assertEqual(mounts, ((paths["data"], "/app/trainer/data"),))
+        # Against the CONSTANT, not a copied-out literal. This test hardcoded
+        # "/app/trainer/data" and so agreed with the bug rather than the trainer.
+        self.assertEqual(mounts, ((paths["data"], sandbox.DATA_DEST),))
 
     def test_the_resolved_path_cannot_escape_the_extracts_directory(self):
         # Belt and braces on top of the 64-hex validation: if `extract` could
@@ -1545,3 +1548,58 @@ class TestAProbeRecordsWhichDataItSaw(ExtractRelayCase):
         body = body[:body.index("\n    def ")]
         self.assertLess(body.index("_pin_probe_extract"),
                         body.index("prepare_run_dir"))
+
+
+class TestTheNestedMountpointIsCreatedBeforeLaunch(RunnerCase):
+    """`--read-only` means runc cannot create a bind mount's mountpoint, and for
+    a NESTED mount the parent is itself a read-only bind -- so it cannot create it
+    there either. `trainer/data` has no tracked files in `qf-research` (git does
+    not track empty directories), so a fresh worktree lacks it.
+
+    It has to exist in the bind SOURCE, created on the host where the worktree is
+    still writable."""
+
+    def test_it_creates_the_directory_in_the_worktree(self):
+        paths = self.runner.prepare_run_dir("r-mp", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        target = self.runner._ensure_probe_mountpoint(paths)
+        self.assertTrue(os.path.isdir(target))
+        self.assertTrue(target.startswith(paths["src"]))
+
+    def test_the_path_is_derived_from_the_mount_destination(self):
+        # Not a second literal. Two literals for one location is how the mount
+        # and the directory came to disagree in the first place.
+        import sandbox
+        paths = self.runner.prepare_run_dir("r-mp2", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        target = self.runner._ensure_probe_mountpoint(paths)
+        relative = sandbox.DATA_DEST[len(sandbox.SRC_DEST):].lstrip("/")
+        self.assertEqual(target, os.path.join(paths["src"], relative))
+
+    def test_it_is_idempotent(self):
+        paths = self.runner.prepare_run_dir("r-mp3", qfrun_gid=os.getgid(),
+                                            qfclient_gid=os.getgid())
+        first = self.runner._ensure_probe_mountpoint(paths)
+        second = self.runner._ensure_probe_mountpoint(paths)
+        self.assertEqual(first, second)
+
+    def test_asking_for_the_probe_mounts_creates_it(self):
+        # The two are coupled on purpose: a mount returned without its
+        # mountpoint existing is a container that will not start.
+        import sandbox
+        extracts = os.path.join(os.path.dirname(self.runs), "qf-extracts-mp")
+        os.makedirs(os.path.join(extracts, "c" * 64), exist_ok=True)
+        with open(os.path.join(extracts, "c" * 64, "MANIFEST.json"), "w") as fh:
+            json.dump({"request_hash": "c" * 64, "extract_hash": "d" * 64,
+                       "files": {"runs": {"rows": 1}}}, fh)
+        self.cfg.extracts_dir = extracts
+        effective = dict(spec.normalize(
+            {"schema": 1, "kind": "probe", "source_sha": "b" * 40,
+             "args": {"path": "research/experiments/x.py",
+                      "extract": "c" * 64}}))
+        paths = self.runner.prepare_run_dir("r-mp4", qfrun_gid=os.getgid(),
+                                           qfclient_gid=os.getgid())
+        mounts = self.runner._probe_rw_mounts(effective, paths)
+        self.assertEqual(mounts, ((paths["data"], sandbox.DATA_DEST),))
+        relative = sandbox.DATA_DEST[len(sandbox.SRC_DEST):].lstrip("/")
+        self.assertTrue(os.path.isdir(os.path.join(paths["src"], relative)))

@@ -33,7 +33,26 @@ ARTIFACTS_DEST = "/artifacts"
 # the read-only tree rather than beside it. That nesting is the reason 2b needs
 # no path refactor inside `qf-research`.
 EXTRACT_DEST = "/extract"
-DATA_DEST = SRC_DEST + "/data"
+
+# `SRC_DEST + "/trainer/data"`, and the extra level is not a typo.
+#
+# The mounted tree is the qf-research WORKTREE ROOT, and that repository puts the
+# trainer package one level down -- `extract-qf-research.sh` renames
+# `tools/queue-forecasting/trainer/` to `trainer/`. So inside the container the
+# module is at `/app/trainer/trainer/src/`, which is also why a `test` job's
+# default path is `trainer/tests` rather than `tests`.
+#
+# `CACHE_DIR` is `<module>/../data` (`trainer/src/data_loader.py:22`), i.e.
+# `trainer/data` in that layout. An earlier version of this constant said
+# `/app/trainer/data`, one level short, and the container refused to start:
+#
+#   error mounting ".../data" to rootfs at "/app/trainer/data": create
+#   mountpoint for /app/trainer/data mount: mkdirat ...: read-only file system
+#
+# Two things were wrong at once and the error named only the second: the path was
+# not where the trainer writes, AND the mountpoint did not exist to mount onto.
+# See `Runner._ensure_probe_mountpoint` for that half.
+DATA_DEST = SRC_DEST + "/trainer/data"
 
 ROLES = ("candidate", "handoff")
 
@@ -282,7 +301,13 @@ def entrypoint_for(effective):
         # where to look without being told. A path passed as an argument is a
         # path something has to validate twice, and the second validator would be
         # inside the untrusted code.
-        return [VENV_PYTHON, effective["args"]["path"]]
+        #
+        # ABSOLUTE, not relative. A relative path resolves against the image's
+        # WORKDIR, which is a property of a Dockerfile in another repository, so
+        # a probe would break if that WORKDIR ever moved -- and break with
+        # `can't open file` rather than with anything about mounts. The worktree
+        # root is mounted at SRC_DEST, and that is knowledge this module has.
+        return [VENV_PYTHON, SRC_DEST + "/" + effective["args"]["path"]]
     if kind == "selftest":
         # NC13 from inside the sandbox, read from the trusted checkout only.
         return ["/bin/sh", f"{TRUSTED_MOUNT_PREFIX}nc13-inside.sh"]

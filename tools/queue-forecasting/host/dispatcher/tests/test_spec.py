@@ -440,8 +440,11 @@ class TestTheProbeEntrypoint(unittest.TestCase):
                               "args": {"path": "research/experiments/cohort.py",
                                        "extract": "a" * 64}})
         argv = sandbox.entrypoint_for(eff)
+        # ABSOLUTE, built from SRC_DEST: a relative path resolves against the
+        # image's WORKDIR, which is a Dockerfile in another repository.
         self.assertEqual(argv, [sandbox.VENV_PYTHON,
-                                "research/experiments/cohort.py"])
+                                sandbox.SRC_DEST
+                                + "/research/experiments/cohort.py"])
 
     def test_the_extract_is_not_passed_as_an_argument(self):
         # It is mounted at a fixed path. A path passed as an argument is a path

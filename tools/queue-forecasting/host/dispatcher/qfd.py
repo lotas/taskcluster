@@ -2722,6 +2722,31 @@ class Runner:
         path, _manifest = self._probe_extract(effective)
         return ((path, sandbox_mod.EXTRACT_DEST),)
 
+    def _ensure_probe_mountpoint(self, paths):
+        """Create the nested mount's directory IN THE BIND SOURCE, before launch.
+
+        WHY THIS IS NEEDED AT ALL. `--read-only` makes the container's rootfs
+        read-only, and a bind mount needs its mountpoint to exist. For a NESTED
+        mount the parent is itself a read-only bind, so runc cannot create it
+        either -- it fails with, verbatim:
+
+            create mountpoint for /app/trainer/trainer/data mount:
+            mkdirat ...: read-only file system
+
+        `trainer/data` has no tracked files in `qf-research` (git does not track
+        empty directories), so a fresh worktree does not contain it. The fix is to
+        create it on the HOST side, where the worktree is writable, before the
+        container that will see it read-only starts.
+
+        THE PATH IS DERIVED FROM `DATA_DEST`, not written out a second time. Two
+        literals for one location is how the mount and the directory come to
+        disagree -- which is precisely the failure above, in its other half.
+        """
+        relative = sandbox_mod.DATA_DEST[len(sandbox_mod.SRC_DEST):].lstrip("/")
+        target = os.path.join(paths["src"], relative)
+        os.makedirs(target, exist_ok=True)
+        return target
+
     def _probe_rw_mounts(self, effective, paths):
         """The run-private writable directory, nested inside the read-only tree.
 
@@ -2731,6 +2756,8 @@ class Runner:
         """
         if effective["kind"] != "probe":
             return ()
+        # The mountpoint must exist in the worktree before the container starts.
+        self._ensure_probe_mountpoint(paths)
         return ((paths["data"], sandbox_mod.DATA_DEST),)
 
     def _pump(self, proc, out_w, err_w):

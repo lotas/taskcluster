@@ -5,6 +5,46 @@ Parent: `auto-research-loop-design.md` §3.4, §7, §8.5. Predecessor:
 `auto-research-phase2a-plan.md` (the spine this builds on, delivered and
 evidenced at fault-gates 32/0 and nc-suite 86/0).
 
+Revision 13, 2026-08-29: the first probe could not start, and the Docker error
+named one of the two defects behind it:
+
+    error mounting ".../data" to rootfs at "/app/trainer/data": create
+    mountpoint for /app/trainer/data mount: mkdirat ...: read-only file system
+
+**Defect 1: `DATA_DEST` was one level short.** `extract-qf-research.sh` renames
+`tools/queue-forecasting/trainer/` to `trainer/`, and the dispatcher mounts the
+worktree ROOT at `/app/trainer` -- which is also why a `test` job's default path
+is `trainer/tests` and not `tests`. `CACHE_DIR` is `<module>/../data`, so it
+resolves to `/app/trainer/trainer/data`. I wrote `/app/trainer/data`, which is
+not where the trainer writes and does not exist in the image. **The fact was
+already in the tree**: `DEFAULT_TEST_PATHS = ["trainer/tests"]` carries a comment
+saying exactly why the extra level is there, and I did not read across to it.
+There is now a test asserting both facts come from the same layout.
+
+**Defect 2: a nested mountpoint must exist in the bind SOURCE.** `--read-only`
+stops runc creating a bind mount's mountpoint, and for a NESTED mount the parent
+is itself a read-only bind, so it cannot create it there either. `trainer/data`
+has no tracked files in `qf-research` (git does not track empty directories), so
+a fresh worktree lacks it. `Runner._ensure_probe_mountpoint` creates it on the
+HOST, where the worktree is still writable, before the container that will see it
+read-only starts -- and **derives the subpath from `DATA_DEST`** rather than
+writing it out again, because two literals for one location is how the mount and
+the directory came to disagree in the first place.
+
+Also fixed while there: the probe entrypoint was a RELATIVE path, resolved
+against the image's `WORKDIR` -- a property of a Dockerfile in another repository.
+It is now built from `SRC_DEST`. Nothing had failed on it yet; a probe would have
+broken with `can't open file` and nothing about mounts.
+
+The fixture carried the same wrong path and needs regenerating and re-pushing.
+`nc-fixtures-phase2b.sh` says so at the top of its instructions, and a test pins
+the fixture's `DATA`/`EXTRACT` literals to the dispatcher's constants.
+
+Two of my own tests had hardcoded `/app/trainer/data` and so **agreed with the
+bug rather than with the trainer**. Both now assert against the constant -- the
+same lesson as the trailing-lookback test earlier in this phase: a test that
+copies out a constant tests the copy.
+
 Revision 12, 2026-08-29: **the immutability rule was necessary, observed.** Two
 extracts of the SAME window now exist (generation 1 and 2), and their contents
 differ:

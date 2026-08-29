@@ -418,3 +418,50 @@ class TestTheExtractAndDataMounts(unittest.TestCase):
         with self.assertRaises(sandbox.SandboxError):
             self.argv(extra_ro_mounts=[("/srv/x",
                                         sandbox.EXTRACT_DEST + "/runs.parquet")])
+
+
+class TestTheDataMountLandsWhereTheTrainerActuallyWrites(unittest.TestCase):
+    """The container refused to start, verbatim:
+
+        error mounting ".../data" to rootfs at "/app/trainer/data": create
+        mountpoint for /app/trainer/data mount: mkdirat ...: read-only file system
+
+    TWO defects, and the error named only the second. `DATA_DEST` was
+    `/app/trainer/data`, one level short of where the trainer writes; and the
+    mountpoint did not exist to mount onto.
+
+    The layout: `extract-qf-research.sh` renames
+    `tools/queue-forecasting/trainer/` to `trainer/`, and the WORKTREE ROOT is
+    mounted at `SRC_DEST` -- which is why a `test` job's default path is
+    `trainer/tests` and not `tests`. `CACHE_DIR` is `<module>/../data`, so it
+    resolves to `SRC_DEST/trainer/data`."""
+
+    def test_it_is_two_levels_down_not_one(self):
+        self.assertEqual(sandbox.DATA_DEST, sandbox.SRC_DEST + "/trainer/data")
+
+    def test_it_agrees_with_the_test_kinds_default_path(self):
+        # Both facts come from the same layout: if the trainer package were at
+        # the root, `trainer/tests` would be wrong too.
+        import spec
+        self.assertTrue(spec.DEFAULT_TEST_PATHS[0].startswith("trainer/"))
+        self.assertTrue(
+            sandbox.DATA_DEST[len(sandbox.SRC_DEST):].lstrip("/")
+            .startswith("trainer/"))
+
+    def test_the_relative_form_is_derivable_for_the_host_side(self):
+        # The runner creates this directory in the worktree, and derives the
+        # subpath from THIS constant rather than writing it out again -- two
+        # literals for one location is how the mount and the directory came to
+        # disagree.
+        relative = sandbox.DATA_DEST[len(sandbox.SRC_DEST):].lstrip("/")
+        self.assertEqual(relative, "trainer/data")
+
+    def test_the_probe_entrypoint_is_absolute(self):
+        # A relative path resolves against the image's WORKDIR -- a property of a
+        # Dockerfile in another repository. If it moved, a probe would fail with
+        # `can't open file` and nothing about mounts.
+        argv = sandbox.entrypoint_for(
+            {"kind": "probe",
+             "args": {"path": "research/experiments/x.py", "extract": "a" * 64}})
+        self.assertEqual(argv[1], sandbox.SRC_DEST + "/research/experiments/x.py")
+        self.assertTrue(argv[1].startswith("/"))

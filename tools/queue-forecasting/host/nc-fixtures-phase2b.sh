@@ -62,7 +62,15 @@ import socket
 import sys
 
 EXTRACT = "/extract"
-DATA = "/app/trainer/data"
+# TWO LEVELS DOWN, and the first version of this fixture said one.
+#
+# `extract-qf-research.sh` renames `tools/queue-forecasting/trainer/` to
+# `trainer/`, and the dispatcher mounts the WORKTREE ROOT at `/app/trainer` --
+# which is also why a `test` job's default path is `trainer/tests`. `CACHE_DIR`
+# is `<module>/../data`, so it lands here. Mounting one level short made the
+# container refuse to start with a read-only-filesystem error about a mountpoint,
+# naming neither the wrong path nor the missing directory.
+DATA = "/app/trainer/trainer/data"
 OUT = "/out"
 
 _pass = 0
@@ -207,7 +215,10 @@ echo "wrote research/experiments/extract_contract.py"
 
 cat <<'NEXT'
 
-Next, in the qf-research checkout, with the AGENT's credential:
+Next, in the qf-research checkout, with the AGENT's credential. RE-RUN THIS
+GENERATOR AND RE-PUSH if you pushed an earlier revision: the fixture's `DATA`
+path was one level short (`/app/trainer/data` rather than
+`/app/trainer/trainer/data`), which is the same defect the dispatcher had.
 
   git checkout -b probe-extract-contract    # or commit to the fixture branch
   git add research/experiments/extract_contract.py

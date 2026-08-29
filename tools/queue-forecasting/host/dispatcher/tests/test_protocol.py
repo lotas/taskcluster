@@ -2179,3 +2179,28 @@ class TestAnExtractPrefixResolvesInTheClient(unittest.TestCase):
                             "source_sha": "b" * 40,
                             "args": {"path": "research/experiments/x.py",
                                      "extract": "8e94d833"}})
+
+
+class TestTheFixtureAgreesWithTheMountConstants(unittest.TestCase):
+    """The fixture asserts `/app/trainer/trainer/data` is writable, and the
+    dispatcher mounts it there. Two literals for one location is how they came to
+    disagree the first time, so a test holds them together."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.host = os.path.dirname(here)
+        with open(os.path.join(self.host, "nc-fixtures-phase2b.sh")) as fh:
+            self.gen = fh.read()
+
+    def test_the_fixtures_data_path_is_the_declared_destination(self):
+        import sandbox
+        self.assertIn(f'DATA = "{sandbox.DATA_DEST}"', self.gen)
+
+    def test_the_fixtures_extract_path_is_the_declared_destination(self):
+        import sandbox
+        self.assertIn(f'EXTRACT = "{sandbox.EXTRACT_DEST}"', self.gen)
+
+    def test_the_generator_says_an_earlier_push_must_be_replaced(self):
+        # A fixture already pushed with the wrong path would keep failing, and
+        # the failure would look like a dispatcher bug.
+        self.assertIn("RE-RUN THIS", self.gen)
