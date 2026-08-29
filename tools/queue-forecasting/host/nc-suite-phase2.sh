@@ -1047,6 +1047,23 @@ sys.exit(0 if r.get('ok') else 1)\""
 # =========================================================================
 # NC10 -- trusted paths resolve only from the trusted checkout.
 # =========================================================================
+nc11_restore() {  # nc11_restore <scratch> <artifact> <out copy>
+  # IDEMPOTENT AND SELF-DISARMING, because a RETURN trap outlives the function
+  # that set it: it fires again for the caller, and a second firing must be a
+  # no-op rather than an error. `trap - RETURN` first, so even a failure below
+  # cannot repeat.
+  local scratch="$1" art="$2" out_copy="$3"
+  trap - RETURN
+  if [ -f "$scratch/artifact.parquet" ]; then
+    cp -p "$scratch/artifact.parquet" "$art"
+    chown qfd "$art" 2>/dev/null || true
+  fi
+  if [ -f "$scratch/out.parquet" ] && [ -n "$out_copy" ]; then
+    cp -p "$scratch/out.parquet" "$out_copy"
+  fi
+  rm -rf "$scratch"
+}
+
 nc11() {
   echo
   echo "== NC11: a prediction set that is not a scorable row set is refused =="
@@ -1132,10 +1149,18 @@ nc11() {
   # RESTORED ON EVERY PATH, including a `return` from a failed clause. A mutated
   # artifact left behind would make every later evaluation of this probe fail for
   # a reason the suite caused.
+  #
+  # THROUGH A FUNCTION, AND IT DISARMS ITSELF. A RETURN trap set inside a
+  # function is NOT scoped to that function: it fires when this clause returns
+  # and then AGAIN when its caller returns. The first version was an inline
+  # command list ending in `rm -rf "$scratch"`, so the second firing found the
+  # copies gone and printed
+  #   cp: cannot stat '/tmp/tmp.XXXX/artifact.parquet': No such file or directory
+  # AFTER the suite's totals -- a restore that had in fact already happened,
+  # reported as a failure of the thing that cleans up after failures. Measured
+  # rather than guessed: a five-line script reproduces both firings.
   # shellcheck disable=SC2064
-  trap "cp -p '$scratch/artifact.parquet' '$art'; chown qfd '$art' 2>/dev/null || true;
-        [ -f '$scratch/out.parquet' ] && cp -p '$scratch/out.parquet' '$out_copy';
-        rm -rf '$scratch'" RETURN
+  trap "nc11_restore '$scratch' '$art' '$out_copy'" RETURN
 
   _nc11_eval_of() {  # _nc11_eval_of <probe> -> "<state> <error_class> <verdict>"
     local subject="$1" r st

@@ -35,6 +35,7 @@ import os
 import queue
 import re
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -2611,23 +2612,25 @@ class Runner:
         # propagate is the right one.
         for path in (base, inbox, outbox):
             self._give_to_the_evaluator(path)
-        # SETGID ON THE INBOX IS THE WHOLE MECHANISM, and the version this
-        # replaces did not have it. It chmodded the three directories to
-        # 0750/0750/0770 and chowned their GROUP to qfeval, and then created
-        # `predictions.parquet` inside the inbox -- a file whose group comes from
-        # the parent directory's setgid bit, which had just been cleared. So the
-        # staged prediction set would have been `0640 qfd:qfd` inside a directory
-        # the evaluator could traverse: the one file this whole staging path
-        # exists to hand over would have been the one thing it could not read,
-        # and `qfd` never chowns the file itself. Nothing in the suite could see
-        # it, because every test runs as one uid.
+        # THE INBOX IS NOT CHMODDED, AND THAT IS THE FIX. Both earlier versions
+        # chmodded it, and both were wrong in the same place.
         #
-        # 2750 on the base and the inbox: the evaluator's group traverses and
-        # reads, nobody else sees anything. 2770 on the outbox, which is the only
-        # thing it writes.
-        os.chmod(base, 0o2750)
-        os.chmod(inbox, 0o2750)
-        os.chmod(outbox, 0o2770)
+        # The staged file's group comes from the inbox's SETGID bit, which the
+        # inbox inherits from `/var/lib/qf-eval` (2770 qfd:qfeval) when it is
+        # created. And Linux STRIPS `S_ISGID` from any chmod requested by a
+        # process that is not in the file's group -- `setattr_prepare` clears it
+        # unless `in_group_or_capable`. `qfd` is deliberately not in `qfeval`, so
+        # every chmod here took the bit away, silently and successfully: the first
+        # version asked for `0750` and lost it, the second asked for `2750` and
+        # lost it too, for a reason nothing in the call shows.
+        #
+        # So the inbox keeps what it inherited -- `0755` under systemd's default
+        # umask, group r-x, and `other` cannot reach it because the ROOT is
+        # `2770` -- and the only directories chmodded are the two with nothing
+        # created in them afterwards: the base, tightened against `other`, and the
+        # outbox, which the evaluator writes.
+        os.chmod(base, 0o750)
+        os.chmod(outbox, 0o770)
         target = os.path.join(inbox, self.PREDICTIONS_NAME)
         tmp = target + ".partial"
         with open(source, "rb") as src, open(tmp, "wb") as dst:
@@ -2647,7 +2650,42 @@ class Runner:
                 f"the staged copy of {run_id}'s {self.PREDICTIONS_NAME} digests"
                 f" to {digest[:12]}, not the {recorded_sha256[:12]} the run"
                 f" recorded. The artifact changed while it was being copied.")
+        self._check_the_evaluator_can_read(target)
         return target, digest
+
+    def _check_the_evaluator_can_read(self, target):
+        """The OUTCOME, asserted -- not the mechanism meant to produce it.
+
+        Everything above is DAC subtlety: a group that arrives by inheritance, a
+        setgid bit that chmod silently strips for a non-member, a mode that comes
+        from the unit's umask. Each has been wrong once already, and each fails
+        the same way -- a file copied, digested, handed over, and unopenable by the
+        only process that needs it, which surfaces one privilege domain away as
+        the evaluator refusing for reasons of its own.
+
+        So the last thing staging does is check what has to be true. The refusal
+        names the staging root, because that is where every one of those causes is
+        actually fixed.
+        """
+        if self.qfeval_gid is None:
+            return                   # 2c is not installed; the relay will say so
+        info = os.stat(target)
+        if info.st_gid != self.qfeval_gid:
+            raise EvaluateStagingDenied(
+                f"the staged prediction set is group {info.st_gid}, not the"
+                f" evaluator's {self.qfeval_gid}, so the evaluator cannot read"
+                f" it. A staged file takes its group from the inbox's setgid bit,"
+                f" which the inbox inherits from {self.cfg.eval_dir} -- so either"
+                f" that directory is not `2770 qfd:qfeval`, or something has"
+                f" chmodded the inbox since (Linux strips setgid from a chmod by"
+                f" a non-member). `sudo ./phase2c-setup.sh discover` reports the"
+                f" root's state.")
+        if not info.st_mode & stat.S_IRGRP:
+            raise EvaluateStagingDenied(
+                f"the staged prediction set is mode"
+                f" {stat.S_IMODE(info.st_mode):04o}: the evaluator's group cannot"
+                f" read it, so the handover would fail on open() one privilege"
+                f" domain away from here.")
 
     def _unstage_predictions(self, staged):
         """Remove the staged copy once the relay is over, whatever it returned.

@@ -344,6 +344,48 @@ else
 fi
 MODE=good
 
+echo "== the NC11 restore fires once and is a no-op the second time =="
+# WHY THIS IS A UNIT TEST. A RETURN trap set inside a function is not scoped to
+# it: it fires when the clause returns and AGAIN when its caller returns. The
+# first version of NC11's cleanup was an inline command list ending in `rm -rf
+# "$scratch"`, so the second firing printed
+#   cp: cannot stat '/tmp/tmp.XXXX/artifact.parquet': No such file or directory
+# after the suite's totals -- a restore that HAD happened, reported as a failure
+# of the code that cleans up after failures. On a host, with a mutated artifact
+# in play, "did the restore run?" is not a question to answer by reading.
+# shellcheck disable=SC1090
+source <(sed -n '/^nc11_restore()/,/^}/p' "$SUITE")
+if declare -F nc11_restore >/dev/null; then
+  RTMP="$(mktemp -d)"
+  mkdir -p "$RTMP/scratch" "$RTMP/run"
+  printf 'original\n' > "$RTMP/scratch/artifact.parquet"
+  printf 'original\n' > "$RTMP/scratch/out.parquet"
+  printf 'MUTATED\n'  > "$RTMP/run/artifact"
+  printf 'MUTATED\n'  > "$RTMP/run/out"
+  err="$(nc11_restore "$RTMP/scratch" "$RTMP/run/artifact" "$RTMP/run/out" 2>&1)"
+  if [ "$(cat "$RTMP/run/artifact")" = original ] \
+     && [ "$(cat "$RTMP/run/out")" = original ]; then
+    HOK "nc11_restore puts both files back"
+  else
+    HBAD "nc11_restore did not restore: artifact='$(cat "$RTMP/run/artifact")' out='$(cat "$RTMP/run/out")'"
+  fi
+  [ -z "$err" ] && HOK "and says nothing on the happy path" \
+    || HBAD "nc11_restore printed: $err"
+  [ ! -d "$RTMP/scratch" ] && HOK "and removes its scratch directory" \
+    || HBAD "the scratch directory survived"
+  # THE SECOND FIRING. Silent, and it must not report a failure for work that
+  # has already been done.
+  err="$(nc11_restore "$RTMP/scratch" "$RTMP/run/artifact" "$RTMP/run/out" 2>&1)"
+  if [ -z "$err" ]; then
+    HOK "a second firing is silent rather than an error about a missing copy"
+  else
+    HBAD "the second firing printed: $err"
+  fi
+  rm -rf "$RTMP"
+else
+  HBAD "extraction missed nc11_restore()"
+fi
+
 echo "== every control group defined is a group that RUNS =="
 # THREE hand-written lists have to agree: the `ncN()` functions, the default set
 # `main` iterates, and the `case` that validates a name from the command line. A

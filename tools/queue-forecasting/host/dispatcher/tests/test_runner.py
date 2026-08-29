@@ -1824,6 +1824,11 @@ class EvaluateCase(RunnerCase):
         os.makedirs(self.eval_dir, exist_ok=True)
         self.cfg.contracts_dir = self.contracts
         self.cfg.eval_dir = self.eval_dir
+        # SETGID ON THE STAGING ROOT, as `qf-eval.conf` provisions it (2770
+        # qfd:qfeval). With it the per-run directories and the staged file
+        # inherit their group here exactly as they do on a host -- which is the
+        # only reason a one-uid test can see the mechanism at all.
+        os.chmod(self.eval_dir, 0o2770)
         self.cfg.eval_socket = os.path.join(base, "eval.sock")
         self.runner.qfeval_gid = None      # no such group in the test env
         self.contract_hash = self.write_contract()
@@ -2081,22 +2086,77 @@ class TestTheEvaluateRelay(EvaluateCase):
         self.assertIn('self.db.call("artifact"', source)
         self.assertIn('"artifacts"', source)
 
-    def test_the_inbox_keeps_its_setgid_bit_so_the_file_is_handed_over(self):
+    def test_the_staged_file_inherits_the_group_from_the_inbox(self):
+        """THE MECHANISM, observed rather than described.
+
+        The staging root is setgid (as the tmpfiles config makes it), so the
+        inbox inherits both the group and the bit, and the file created inside
+        inherits the group in turn. That chain is what hands the prediction set
+        to a different uid without `qfd` being in its group -- Linux allows
+        `chown(-1, gid)` only for a member -- and it is broken by any chmod of
+        the inbox, because a non-member's chmod silently strips setgid.
+        """
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        staged = self.stage(effective)
+        inbox = os.path.dirname(staged)
+        self.assertTrue(os.stat(inbox).st_mode & stat.S_ISGID,
+                        "the inbox lost its setgid bit, so the staged file's"
+                        " group came from the process rather than the directory")
+        self.assertEqual(os.stat(staged).st_gid,
+                         os.stat(self.eval_dir).st_gid)
+        self.assertTrue(os.stat(staged).st_mode & stat.S_IRGRP)
+
+    def test_a_staged_file_the_evaluator_could_not_read_is_refused(self):
+        """The check that makes the DAC chain above non-silent.
+
+        Simulated by leaving the group as it is and telling the runner the
+        evaluator is a different group -- which is what a staging root that is
+        not 2770, or an inbox somebody chmodded, produces. `os.chown` is patched
+        to succeed without changing anything, because that is what the real
+        failure looks like from here: every call returns 0 and the file is still
+        in the wrong group.
+        """
+        self.runner.qfeval_gid = os.stat(self.eval_dir).st_gid + 4242
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        with mock.patch("os.chown"):
+            with self.assertRaises(qfd.EvaluateStagingDenied) as caught:
+                self.stage(effective)
+        message = str(caught.exception)
+        self.assertIn("setgid", message)
+        self.assertIn("phase2c-setup.sh", message)
+        self.assertEqual(caught.exception.error_class, "eval_staging_denied")
+
+    def test_nothing_chmods_the_inbox(self):
+        # Structural, and narrow: the bit cannot be re-applied by a non-member,
+        # so the only way to keep it is not to touch the directory. A future
+        # tidy-up that adds `os.chmod(inbox, ...)` back would pass every other
+        # test on a host where the group happens to match.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            body = fh.read()
+        stage = body[body.index("def _stage_predictions"):]
+        stage = stage[:stage.index("\n    def ")]
+        chmods = re.findall(r"os\.chmod\(([a-z_]+)", stage)
+        self.assertNotIn("inbox", chmods, chmods)
+        self.assertIn("base", chmods)
+        self.assertIn("outbox", chmods)
+
+    def test_the_three_modes_are_what_each_directory_needs(self):
         """The defect this replaces, in one sentence: the staged file would have
         been in the wrong group.
 
         The first version chmodded the three directories to 0750/0750/0770 and
-        chowned their GROUP to qfeval, and then created `predictions.parquet`
-        inside the inbox. A file created in a directory takes that DIRECTORY's
-        group only if the setgid bit is set, and the chmod had just cleared it --
-        so the staged prediction set would have been `qfd:qfd` inside a directory
-        the evaluator could traverse, and the one file the whole staging path
-        exists to hand over is the one thing it could not read. `qfd` never
-        chowns the file itself, and every test here runs as one uid, so nothing
-        could see it.
+        chowned their GROUP to qfeval, then created `predictions.parquet` inside
+        the inbox -- and a file takes its parent's group only if the parent's
+        setgid bit is set, which the chmod had just cleared. The second version
+        asked for `2750` instead, which a non-member's chmod strips just the same.
 
-        The MODE is the checkable half of that on any host. The group half is
-        checked below with a gid this process does not hold.
+        So: the base is tightened against `other` (nothing is created in it after
+        that), the outbox is group-writable because the evaluator writes there,
+        and THE INBOX IS LEFT ALONE -- its inherited mode and its inherited
+        setgid bit are the handover.
         """
         probe = self.a_probe_run()
         hold, effective = self.an_evaluate(probe)
@@ -2104,11 +2164,14 @@ class TestTheEvaluateRelay(EvaluateCase):
         inbox = os.path.dirname(staged)
         base = os.path.dirname(inbox)
         outbox = os.path.join(base, "out")
-        self.assertEqual(stat.S_IMODE(os.stat(base).st_mode), 0o2750)
-        self.assertEqual(stat.S_IMODE(os.stat(inbox).st_mode), 0o2750)
-        self.assertEqual(stat.S_IMODE(os.stat(outbox).st_mode), 0o2770)
-        # And the file itself is group-readable, which is the other half of the
-        # handover: setgid puts it in the right group, 0640 lets that group read.
+        self.assertEqual(stat.S_IMODE(os.stat(base).st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE(os.stat(outbox).st_mode), 0o770)
+        inbox_mode = os.stat(inbox).st_mode
+        self.assertTrue(inbox_mode & stat.S_ISGID)
+        self.assertTrue(inbox_mode & stat.S_IRGRP)
+        self.assertTrue(inbox_mode & stat.S_IXGRP)
+        # And the file is group-readable, which is the other half: setgid puts it
+        # in the right group, 0640 lets that group read it.
         self.assertEqual(stat.S_IMODE(os.stat(staged).st_mode), 0o640)
 
     def test_a_group_that_is_already_right_needs_no_chown(self):

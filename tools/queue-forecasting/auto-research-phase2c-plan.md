@@ -813,6 +813,47 @@ This completes **2c-2**.
   does not, because a version writing only the spec pins would satisfy the other
   two.
 
+- **NC11's first live run (2026-08-29) produced two findings before it got past
+  clause (a).** `VOID NC11 (a) canary: the unmutated prediction set did not
+  produce a verdict: FAILED internal`, followed after the totals by `cp: cannot
+  stat '/tmp/tmp.XXXX/artifact.parquet'`.
+
+  The `cp` was mine and is fixed. **A RETURN trap set inside a shell function is
+  not scoped to that function**: it fires when the clause returns and AGAIN when
+  its caller returns. The cleanup was an inline command list ending in
+  `rm -rf "$scratch"`, so the second firing found the copies gone and reported a
+  restore that had in fact already happened as a failure -- of the code whose job
+  is to clean up after failures. Measured rather than reasoned about: a five-line
+  script reproduces both firings. It is now a self-disarming, idempotent
+  `nc11_restore`, with four harness clauses driving it twice (46 total,
+  red-green).
+
+  **And a real DAC defect it exposed on the way: `chmod` cannot preserve setgid
+  for a non-member, so the staging code was destroying the bit it depended on.**
+  Linux clears `S_ISGID` from any mode a process requests via `chmod` unless it
+  is in the file's group (`setattr_prepare` -> `in_group_or_capable`), and `qfd`
+  is deliberately not in `qfeval`. The first version of `_stage_predictions`
+  asked for `0750` on the inbox and lost the bit; the second asked for `2750` and
+  lost it just the same, for a reason nothing in the call shows. The inbox is now
+  left exactly as it was created -- it inherits both the group and the bit from
+  the `2770` staging root, and systemd's default umask gives it group r-x -- and
+  only the base and the outbox are chmodded, because nothing is created in either
+  afterwards.
+
+  Reasoning about DAC is what produced two wrong versions, so the mechanism is no
+  longer trusted to work: `_check_the_evaluator_can_read` stats the staged file
+  and refuses (`eval_staging_denied`, naming the staging root) if its group is not
+  the evaluator's or its group-read bit is clear. Four tests, including one that
+  sets the setgid bit on the test's own staging root so a single-uid test observes
+  the real inheritance chain, and one that patches `os.chown` to succeed without
+  changing anything -- which is what the failure looks like from inside qfd.
+
+  The `FAILED internal` itself is still unexplained: it is the generic
+  `except Exception: log.exception("%s: run failed", run_id)` handler, so the
+  traceback is in the journal, and the two spec-derived pins added earlier make
+  the bisect cheap -- `predictions_sha256` present means staging completed and the
+  fault is in the relay or the reply.
+
 - **NC11's subject discovery would have voided the group the moment the fixtures
   landed.** Clauses (a) and (b) need a prediction set that CAN be scored -- (a) is
   the canary and (b) compares a mutation against it -- and the discovery took "the
