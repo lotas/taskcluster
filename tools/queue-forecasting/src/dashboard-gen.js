@@ -13,7 +13,10 @@ const OUTPUT_DIR = process.env.DASHBOARD_OUTPUT_DIR || path.join(PROJECT_ROOT, '
 const MODELS_DIR = path.join(PROJECT_ROOT, 'trainer', 'data', 'models');
 const INTERVAL_MS = parseInt(process.env.DASHBOARD_INTERVAL_MS || '3600000', 10); // 1 hour
 const AGGREGATIONS_WINDOW_DAYS = parseInt(process.env.AGGREGATIONS_WINDOW_DAYS || '30', 10);
+const AGGREGATIONS_REFRESH_MS = parseInt(process.env.DASHBOARD_AGGREGATIONS_INTERVAL_MS || '21600000', 10); // 6 hours
 const DAILY_HEALTH_WINDOW_DAYS = parseInt(process.env.DAILY_HEALTH_WINDOW_DAYS || '60', 10);
+const AGGREGATIONS_CACHE_VERSION = 1;
+const AGGREGATIONS_CACHE_PATH = path.join(OUTPUT_DIR, 'aggregations-cache.json');
 
 // Per-query timing. Dashboard queries run sequentially so their repeated large
 // scans cannot compete for PostgreSQL work_mem/temp space. This also makes each
@@ -39,6 +42,39 @@ function formatInterval(ms) {
   return `${totalSeconds}s`;
 }
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
+
+function readAggregationsCache() {
+  if (!fs.existsSync(AGGREGATIONS_CACHE_PATH)) return null;
+
+  try {
+    const cache = JSON.parse(fs.readFileSync(AGGREGATIONS_CACHE_PATH, 'utf8'));
+    const generatedAtMs = Date.parse(cache.generatedAt);
+    if (cache.version !== AGGREGATIONS_CACHE_VERSION ||
+        cache.windowDays !== AGGREGATIONS_WINDOW_DAYS ||
+        !Number.isFinite(generatedAtMs) ||
+        !cache.data || typeof cache.data !== 'object') {
+      console.warn('[dashboard-gen] ignoring incompatible aggregations cache');
+      return null;
+    }
+    return { ...cache, generatedAtMs };
+  } catch (err) {
+    console.warn(`[dashboard-gen] ignoring unreadable aggregations cache: ${err.message}`);
+    return null;
+  }
+}
+
+function writeAggregationsCache(result) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  const tmpPath = `${AGGREGATIONS_CACHE_PATH}.${process.pid}.tmp`;
+  const cache = {
+    version: AGGREGATIONS_CACHE_VERSION,
+    windowDays: AGGREGATIONS_WINDOW_DAYS,
+    generatedAt: result.generatedAt,
+    data: result.data,
+  };
+  fs.writeFileSync(tmpPath, JSON.stringify(cache));
+  fs.renameSync(tmpPath, AGGREGATIONS_CACHE_PATH);
+}
 
 // ─── DB Queries ──────────────────────────────────────────────────────────────
 
@@ -85,7 +121,9 @@ async function queryFreshness(pool) {
       (SELECT max(pending_at)  FROM queue_forecast_task_runs) AS latest_pending,
       (SELECT max(started_at)  FROM queue_forecast_task_runs) AS latest_started,
       (SELECT max(resolved_at) FROM queue_forecast_task_runs) AS latest_resolved,
-      (SELECT max(enriched_at) FROM queue_forecast_tasks)     AS latest_enriched,
+      (SELECT enriched_at FROM queue_forecast_tasks
+        WHERE enriched_at IS NOT NULL
+        ORDER BY enriched_at DESC LIMIT 1)                    AS latest_enriched,
       (SELECT max(sampled_at)  FROM queue_forecast_worker_counts) AS latest_worker_sample,
       (SELECT max(computed_at) FROM queue_forecast_daily_health)  AS latest_daily_health;
   `);
@@ -604,6 +642,90 @@ async function queryTopMissesByName(pool, windowDays, side, limit = 25) {
     LIMIT $2;
   `, [windowDays, limit]);
   return rows;
+}
+
+async function queryAggregationsData(pool) {
+  const data = {};
+  data.aggOverall = await timed(
+    'queryAggregationsOverall', queryAggregationsOverall(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByDay = await timed(
+    'queryAggregationsByDay', queryAggregationsByDay(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByQueue = await timed(
+    'queryAggregationsByQueue', queryAggregationsByQueue(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByReason = await timed(
+    'queryAggregationsByReason', queryAggregationsByReason(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByScheduler = await timed(
+    'queryAggregationsByScheduler', queryAggregationsByScheduler(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByPriority = await timed(
+    'queryAggregationsByPriority', queryAggregationsByPriority(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByWaitBaselineLevel = await timed(
+    'queryAggregationsByWaitBaselineLevel',
+    queryAggregationsByWaitBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByWaitBaselineSample = await timed(
+    'queryAggregationsByWaitBaselineSampleSize',
+    queryAggregationsByWaitBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByRunBaselineLevel = await timed(
+    'queryAggregationsByRunBaselineLevel',
+    queryAggregationsByRunBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByRunBaselineSample = await timed(
+    'queryAggregationsByRunBaselineSampleSize',
+    queryAggregationsByRunBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByWaitBucket = await timed(
+    'queryAggregationsByWaitBucket', queryAggregationsByWaitBucket(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.aggByRunBucket = await timed(
+    'queryAggregationsByRunBucket', queryAggregationsByRunBucket(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.waitTailMissRate = await timed(
+    'queryWaitTailMissRate', queryWaitTailMissRate(pool, AGGREGATIONS_WINDOW_DAYS),
+  );
+  data.topWaitMisses = await timed(
+    'queryTopMissesByName(wait)', queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'wait'),
+  );
+  data.topRunMisses = await timed(
+    'queryTopMissesByName(run)', queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'run'),
+  );
+  return { generatedAt: new Date().toISOString(), data };
+}
+
+async function getAggregationsData(pool) {
+  const cached = readAggregationsCache();
+  const cacheAgeMs = cached ? Date.now() - cached.generatedAtMs : null;
+  if (cached && cacheAgeMs >= 0 && cacheAgeMs < AGGREGATIONS_REFRESH_MS) {
+    console.log(
+      `[dashboard-gen] using aggregations cache from ${cached.generatedAt} ` +
+      `(age ${formatInterval(cacheAgeMs)})`,
+    );
+    return cached;
+  }
+
+  console.log('[dashboard-gen] aggregations cache is missing or stale; refreshing');
+  try {
+    const refreshed = await queryAggregationsData(pool);
+    try {
+      writeAggregationsCache(refreshed);
+    } catch (err) {
+      console.warn(`[dashboard-gen] could not persist aggregations cache: ${err.message}`);
+    }
+    return refreshed;
+  } catch (err) {
+    if (!cached) throw err;
+    console.warn(
+      `[dashboard-gen] aggregations refresh failed; using stale cache from ` +
+      `${cached.generatedAt}: ${err.message}`,
+    );
+    return cached;
+  }
 }
 
 // ─── Manifest Loading ────────────────────────────────────────────────────────
@@ -1923,6 +2045,7 @@ ${data.unresolvedSample}
 
 function buildAggregationsPage(data) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const generatedAt = new Date(data.generatedAt).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const bodyHtml = `
 <div class="meta">Window: last ${AGGREGATIONS_WINDOW_DAYS} days · ${data.overallMeta}</div>
 <div class="meta">Bands: good (actual &le; p50) · warn (p50 &lt; actual &le; p90) · bad (actual &gt; p90). Each section shows two flavors: <b>all resolved</b> matches the existing aggregation page; <b>completed only</b> restricts to <code>reason_resolved = 'completed'</code>, matching the trainer's headline slice.</div>
@@ -2031,7 +2154,7 @@ ${data.topRunMisses}
   return renderPage({
     title: 'Aggregations — Queue Forecasting',
     h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Prediction Aggregations',
-    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a> · <a href="predictions.html">Predictions</a>`,
+    headerMetaHtml: `Aggregations computed ${generatedAt} · page rendered ${now} · refreshes every ${formatInterval(AGGREGATIONS_REFRESH_MS)} · <a href="/">Back to Dashboard</a> · <a href="predictions.html">Predictions</a>`,
     bodyHtml,
     extraStyle: tocStyle,
     extraScript: tocScript,
@@ -2055,21 +2178,6 @@ async function generate() {
     const predictorHealth = await timed('queryPredictorHealth', queryPredictorHealth(pool));
     const recentResolved = await timed('queryRecentResolved', queryRecentResolved(pool));
     const recentUnresolved = await timed('queryRecentUnresolved', queryRecentUnresolved(pool));
-    const aggOverall = await timed('queryAggregationsOverall', queryAggregationsOverall(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByDay = await timed('queryAggregationsByDay', queryAggregationsByDay(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByQueue = await timed('queryAggregationsByQueue', queryAggregationsByQueue(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByReason = await timed('queryAggregationsByReason', queryAggregationsByReason(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByScheduler = await timed('queryAggregationsByScheduler', queryAggregationsByScheduler(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByPriority = await timed('queryAggregationsByPriority', queryAggregationsByPriority(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByWaitBaselineLevel = await timed('queryAggregationsByWaitBaselineLevel', queryAggregationsByWaitBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByWaitBaselineSample = await timed('queryAggregationsByWaitBaselineSampleSize', queryAggregationsByWaitBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByRunBaselineLevel = await timed('queryAggregationsByRunBaselineLevel', queryAggregationsByRunBaselineLevel(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByRunBaselineSample = await timed('queryAggregationsByRunBaselineSampleSize', queryAggregationsByRunBaselineSampleSize(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByWaitBucket = await timed('queryAggregationsByWaitBucket', queryAggregationsByWaitBucket(pool, AGGREGATIONS_WINDOW_DAYS));
-    const aggByRunBucket = await timed('queryAggregationsByRunBucket', queryAggregationsByRunBucket(pool, AGGREGATIONS_WINDOW_DAYS));
-    const waitTailMissRate = await timed('queryWaitTailMissRate', queryWaitTailMissRate(pool, AGGREGATIONS_WINDOW_DAYS));
-    const topWaitMisses = await timed('queryTopMissesByName(wait)', queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'wait'));
-    const topRunMisses = await timed('queryTopMissesByName(run)', queryTopMissesByName(pool, AGGREGATIONS_WINDOW_DAYS, 'run'));
 
     const manifests = loadLatestManifests();
     const latestDir = manifests.length ? manifests[0]._date_dir : 'none';
@@ -2099,7 +2207,27 @@ async function generate() {
     });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'predictions.html'), predictionsHtml);
 
+    // Status page from markdown
+    const mdPath = path.join(PROJECT_ROOT, 'trainer-phase2-decision.md');
+    if (fs.existsSync(mdPath)) {
+      const md = fs.readFileSync(mdPath, 'utf8');
+      fs.writeFileSync(path.join(OUTPUT_DIR, 'status.html'), buildStatusPage(md));
+    }
+
+    // Publish the frequently-changing pages before a due aggregation refresh.
+    // A cold refresh can take around 30 minutes at production volume.
+    console.log(`[${new Date().toISOString()}] live dashboard written to ${OUTPUT_DIR}/`);
+
+    const aggregationResult = await getAggregationsData(pool);
+    const {
+      aggOverall, aggByDay, aggByQueue, aggByReason, aggByScheduler, aggByPriority,
+      aggByWaitBaselineLevel, aggByWaitBaselineSample,
+      aggByRunBaselineLevel, aggByRunBaselineSample,
+      aggByWaitBucket, aggByRunBucket, waitTailMissRate,
+      topWaitMisses, topRunMisses,
+    } = aggregationResult.data;
     const aggregationsHtml = buildAggregationsPage({
+      generatedAt: aggregationResult.generatedAt,
       overall:     renderAggregationsOverall(aggOverall),
       overallMeta: aggOverall && aggOverall.window_first_resolved
         ? `data range ${new Date(aggOverall.window_first_resolved).toISOString().slice(0, 10)} → ${new Date(aggOverall.window_last_resolved).toISOString().slice(0, 10)}`
@@ -2120,15 +2248,7 @@ async function generate() {
       topRunMisses:           renderTopMisses(topRunMisses, 'run'),
     });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'aggregations.html'), aggregationsHtml);
-
-    // Status page from markdown
-    const mdPath = path.join(PROJECT_ROOT, 'trainer-phase2-decision.md');
-    if (fs.existsSync(mdPath)) {
-      const md = fs.readFileSync(mdPath, 'utf8');
-      fs.writeFileSync(path.join(OUTPUT_DIR, 'status.html'), buildStatusPage(md));
-    }
-
-    console.log(`[${new Date().toISOString()}] dashboard written to ${OUTPUT_DIR}/`);
+    console.log(`[${new Date().toISOString()}] aggregations dashboard written to ${OUTPUT_DIR}/`);
   } finally {
     await pool.end();
   }

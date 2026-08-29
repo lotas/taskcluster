@@ -102,6 +102,11 @@ CREATE INDEX IF NOT EXISTS idx_qf_tasks_unenriched
     ON queue_forecast_tasks (task_id)
     WHERE metadata_name IS NULL;
 
+-- Dashboard freshness: newest successful enrichment without scanning all tasks.
+CREATE INDEX IF NOT EXISTS idx_qf_tasks_enriched_at
+    ON queue_forecast_tasks (enriched_at DESC)
+    WHERE enriched_at IS NOT NULL;
+
 -- Repo-family backfill: find tasks still needing derivation. Partial + task_id-ordered
 -- so selectTasksNeedingRepoFamily() is an O(remaining) index scan instead of a full
 -- nested-loop probe of every in-window task each batch.

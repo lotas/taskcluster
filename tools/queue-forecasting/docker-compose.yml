@@ -242,6 +242,9 @@ services:
       # Generation itself can take many minutes at production volume. The loop
       # waits for it to finish, then waits another hour before refreshing.
       DASHBOARD_INTERVAL_MS: "3600000"
+      # Historical aggregation queries account for most dashboard DB load.
+      # Persist their results in /dashboard and refresh them every six hours.
+      DASHBOARD_AGGREGATIONS_INTERVAL_MS: "${DASHBOARD_AGGREGATIONS_INTERVAL_MS:-21600000}"
     volumes:
       - ./src:/app/tools/queue-forecasting/src
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro

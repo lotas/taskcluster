@@ -123,6 +123,7 @@ docker compose up -d --build
 # 3. Apply additive schema migrations (idempotent — safe to re-run)
 docker compose exec -T postgres psql -U postgres -d forecasting < migrate.sql
 docker compose exec -T postgres psql -U postgres -d forecasting < migrate-retention.sql
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d forecasting < migrate-dashboard-perf.sql
 
 # 4. Re-run the anomaly detector to backfill any new flag columns
 #    (e.g. when worker-count flags were added)
