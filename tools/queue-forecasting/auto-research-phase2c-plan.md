@@ -694,6 +694,68 @@ This completes **2c-2**.
   `/var/lib/qf-eval/<run_id>/out/` is somebody's decision, and deleting evidence
   here to avoid asking for it would be the wrong answer to a full disk.
 
+- **NC11 clause (c) — the row-set fixtures. DONE 2026-08-29.**
+  `host/nc-fixtures-phase2c.sh` writes five experiment scripts into a
+  `qf-research` checkout, in the shape `nc-fixtures-phase2b.sh` established: it
+  writes files and prints the git commands, never committing and never pushing,
+  because the branch is the operator's to publish with the AGENT's credential.
+
+  Each violates exactly one part of the property and would pass the others:
+  `nc11_relabelled` (part 1, a row_id that disagrees with its own key),
+  `nc11_ghost_row` (part 2, a row the extract does not contain),
+  `nc11_cherry_picked` (part 3, complete days with the largest-`y_true` rows
+  dropped inside them), `nc11_easy_days` (the day block, an earlier block
+  complete within each day it claims) -- and `nc11_honest`, which must be
+  ACCEPTED and is the reason the other four prove anything. Four of them come
+  back as one class, `row_set_rejected`, which is all the job record carries; a
+  contract disagreement, a wrong holdout length or an empty slice would produce
+  the same class, so without an accepted honest set every refusal in the group
+  could be measuring the same unrelated mistake.
+
+  **THE FIXTURES ARE EXECUTED IN-REPO, and that is the part worth defending.**
+  `evaluator/tests/test_nc11_fixtures.py` (16 tests) runs each generated script
+  against the synthetic extract from `test_evaluate.py` and feeds its output to
+  the real `evaluate()`, asserting not just the class but the REASON -- that the
+  cherry-pick refusal says "omits" and not "not the candidate's to choose", that
+  the ghost row's refusal is absence and not mislabelling. It also compares the
+  fixtures' second implementation of `required_days` against the trusted one
+  (they cannot import it: agent-authored code inside a sandbox), and proves the
+  vacuity guards fire. Four claims red-green verified by breaking the fixtures:
+  a cherry-pick that drops a whole day, a missing vacuity guard, an
+  `easy_days` that claims every day, and an off-by-one in the derivation (which
+  fails 28 tests).
+
+  This cost three concessions in the fixtures -- `NC11_EXTRACT`, `NC11_OUT` and
+  `NC11_HOLDOUT_DAYS` env overrides, none of which the sandbox sets -- and they
+  are worth it: without them the refusal class each fixture produces would be a
+  guess, and a fixture whose violation is subtly wrong yields the right class for
+  the wrong reason, which reads as coverage and is not.
+
+  **Writing it found two defects, and the first is in code I wrote a day
+  earlier.** `qf list` takes `--state` and `--limit` and nothing else -- there is
+  no `--kind`. Both NC11 loops passed `--kind probe`, so every invocation exited
+  2 with "unrecognized arguments", read nothing, and voided with a message
+  blaming the absence of a probe or of a fixture. **A filter the client rejects
+  is not a filter, and the clause it disabled would have reported its subject
+  missing on a host where the subject was right there.** The kind is now taken
+  from the run id's own prefix, the experiment path is read from each probe's own
+  spec through `qf --json status` (the only place it exists -- a listing has no
+  path in it), and `test-nc-instrument.sh` now stubs `qf list` with argparse's
+  ACTUAL refusal, so reintroducing the flag fails off-host: 33 clauses, 3
+  red-green verified.
+
+  The second came only from executing a fixture: relabelling EVERY row_id
+  produces `evaluate_refused` -- "none of the predicted rows is in the frozen
+  extract" -- which is a different property, correctly checked earlier, and not
+  the row-set derivation at all. So the fixture now relabels one row in ten,
+  which is both the realistic candidate bug and the only version that reaches
+  the check it names. A fixture written from reasoning alone would have shipped
+  asserting a class it never produced.
+
+  **What is left is the operator's:** push the fixture branch, then one probe per
+  script against the same extract. Until then clause (c) voids, naming the
+  generator and the submit lines.
+
 **A ninth static-scan-matched-its-own-documentation instance produced a real
 fix.** `verdict.py`'s docstring says "nothing here writes to
 `trainer/data/models/`" -- which is exactly the string the test scanning for it

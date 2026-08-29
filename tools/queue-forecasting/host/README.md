@@ -710,6 +710,12 @@ evaluation fails on `mkdir` with EROFS, while `phase2c-setup.sh discover` report
 the directory as correct. It reports the *namespace* separately, measured with
 `nsenter` inside the running process, and says so when it could only infer.
 
+The NC fixtures are separate tooling and are never run by the setup steps:
+`nc-fixtures-phase2b.sh` and `nc-fixtures-phase2c.sh` write experiment scripts
+into a `qf-research` checkout and print the git commands. They never commit and
+never push — the branch is published with the AGENT's credential, and the
+dispatcher's token is read-only.
+
 `phase2c-setup.sh` does not create the contracts. `instantiate-contract.sh` pins
 a template to a promoted `baseline_hash`, which means `promote-baseline.sh` comes
 first — and until at least one contract resolves, NC9 and NC11 report `void`.

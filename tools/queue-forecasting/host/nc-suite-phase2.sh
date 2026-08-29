@@ -338,6 +338,31 @@ wait_state() {  # wait_state <run_id> <state> <timeout_s>
   return 1
 }
 
+spec_paths_of() {  # spec_paths_of <run_id> -> the probe's paths, space separated
+  # THE ONLY PLACE THE EXPERIMENT PATH LIVES that a client can read. `qf list`
+  # prints run_id, state, lane and submitted_at -- so "which probe ran which
+  # fixture" cannot be answered by grepping a listing, which is what NC11's first
+  # attempt did. `qf --json status` carries the submitted spec.
+  local out
+  if ! out="$(status_json "$1" 2>&1)"; then
+    note_blind "$out"; return 1
+  fi
+  printf '%s' "$out" | python3 -c "
+import json, sys
+spec = json.load(sys.stdin)['job'].get('spec') or {}
+print(' '.join((spec.get('args') or {}).get('paths') or []))
+" 2>/dev/null
+}
+
+succeeded_probes() {  # -> SUCCEEDED probe run ids
+  # The KIND comes from the run id's own prefix (`make_run_id`), because the
+  # client has no --kind flag: two clauses passed one, every invocation exited 2
+  # with "unrecognized arguments", and both voided with a message about their
+  # subject being absent. A filter the client rejects is not a filter.
+  as "$RESEARCH_USER" "qf list --state SUCCEEDED --limit 200" 2>/dev/null \
+    | awk '$1 ~ /^probe-/ {print $1}'
+}
+
 wait_terminal() {
   local rid="$1" limit="$2" waited=0 st
   while [ "$waited" -lt "$limit" ]; do
@@ -1046,8 +1071,12 @@ nc11() {
   # dispatcher, because the recorded artifact is the subject now -- a file in a
   # run directory with no row in `artifacts` is exactly what must not be judged.
   local probe="" rid
-  for rid in $(as "$RESEARCH_USER" "qf list --state SUCCEEDED --kind probe --limit 50" \
-                 2>/dev/null | sed -n 's/^ *\(probe-[0-9A-Za-z-]*\).*/\1/p'); do
+  # NO `--kind` FLAG EXISTS. `qf list` takes `--state` and `--limit` and nothing
+  # else, so the first version of this loop -- and of clause (c) -- passed
+  # `--kind probe`, exited 2 with "unrecognized arguments", read nothing, and
+  # voided with a message blaming the absence of a probe. A filter the client
+  # rejects is not a filter; the kind is the run id's own prefix.
+  for rid in $(succeeded_probes); do
     if [ -f "$RUNS_DIR/$rid/artifacts/predictions.parquet" ]; then
       probe="$rid"; break
     fi
@@ -1072,9 +1101,9 @@ nc11() {
         [ -f '$scratch/out.parquet' ] && cp -p '$scratch/out.parquet' '$out_copy';
         rm -rf '$scratch'" RETURN
 
-  _nc11_eval() {  # -> "<state> <error_class> <verdict>"
-    local r st
-    r="$(as "$RESEARCH_USER" "qf evaluate --run $probe --contract $ch" 2>&1 | tail -1)"
+  _nc11_eval_of() {  # _nc11_eval_of <probe> -> "<state> <error_class> <verdict>"
+    local subject="$1" r st
+    r="$(as "$RESEARCH_USER" "qf evaluate --run $subject --contract $ch" 2>&1 | tail -1)"
     if ! is_run_id "$r"; then
       printf 'NOTSUBMITTED %s -' "$(printf '%s' "$r" | tr -d ' ' | cut -c1-40)"
       return
@@ -1083,6 +1112,8 @@ nc11() {
     printf '%s %s %s' "$st" "$(field_of "$r" error_class)" \
       "$(pin_of "$r" verdict)"
   }
+
+  _nc11_eval() { _nc11_eval_of "$probe"; }
 
   # (a) THE CANARY. Every refusal below is measured against a working
   # evaluation; without it, an evaluator that refused everything would satisfy
@@ -1141,24 +1172,85 @@ pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
     ok "NC11 (b2) out/ has been pruned, so it cannot be the evaluator's input"
   fi
 
-  # (c) THE ROW-SET PROPERTY, from a candidate rather than from a mutation.
-  # Post-hoc mutation can no longer reach it: the digest binding refuses first,
-  # which is correct and means this clause needs a probe that legitimately emits
-  # an unscorable set. Those fixtures live on the qf-research fixture branch and
-  # are pushed by the operator, so this voids rather than passing quietly.
-  local fixture_probe="" script
-  for script in nc11_relabelled nc11_cherry_picked nc11_ghost_row; do
-    fixture_probe="$(as "$RESEARCH_USER" \
-      "qf list --state SUCCEEDED --kind probe --limit 50" 2>/dev/null \
-      | grep -c "$script" || true)"
-    if [ "${fixture_probe:-0}" = 0 ]; then
-      void "NC11 (c) no probe has run research/experiments/$script.py, so the
-  row-set property is not exercised on this host. nc-fixtures-phase2b.sh writes
-  the three scripts; the operator pushes the fixture branch. The property itself
-  is covered in-repo by evaluator/tests/test_evaluate.py."
-      break
-    fi
+  # (c) THE ROW-SET PROPERTY, FROM A CANDIDATE rather than from a mutation.
+  #
+  # Post-hoc mutation can no longer reach it, and that is the digest binding in
+  # (b) working: bytes that changed since the run are refused before the row set
+  # is ever read. So this clause needs a probe that LEGITIMATELY emits an
+  # unscorable prediction set. `nc-fixtures-phase2c.sh` writes five, the operator
+  # pushes them to the fixture branch, and one probe per script runs them.
+  #
+  # THE HONEST FIXTURE IS THE CANARY and it is not optional. Four of the five
+  # come back as `row_set_rejected`, which is also what a broken contract, a
+  # holdout length that disagrees with `holdout_days`, or a slice value that
+  # matches nothing would produce -- so without an accepted honest set, every
+  # refusal here could be measuring the same unrelated mistake. If the honest one
+  # is refused, the rest are VOIDED rather than counted.
+  #
+  # Each fixture's own outcome is proved in-repo, by running the generated script
+  # against a synthetic extract and feeding the result to the real evaluator
+  # (`evaluator/tests/test_nc11_fixtures.py`). This clause confirms it on the
+  # host, against real data, through the dispatcher.
+  local -a fixture_names=(nc11_honest nc11_relabelled nc11_ghost_row
+                          nc11_cherry_picked nc11_easy_days)
+  declare -A fixture_run=()
+  local paths name
+  for rid in $(succeeded_probes); do
+    paths="$(spec_paths_of "$rid")"
+    for name in "${fixture_names[@]}"; do
+      case "$paths" in
+        *"$name.py"*)
+          [ -n "${fixture_run[$name]:-}" ] || fixture_run[$name]="$rid" ;;
+      esac
+    done
   done
+
+  local canary_ok=0
+  if [ -z "${fixture_run[nc11_honest]:-}" ]; then
+    void "NC11 (c) no probe has run research/experiments/nc11_honest.py, so the
+  row-set property is not exercised on this host, and the fixtures that violate
+  it have nothing to be measured against:
+      ./nc-fixtures-phase2c.sh ~/qf-research     # writes the five scripts
+      # the operator pushes the fixture branch with the AGENT's credential, then
+      # one probe per script against the same extract
+  The property itself is covered in-repo by
+  evaluator/tests/test_nc11_fixtures.py, which runs each generated script and
+  feeds its output to the real evaluator."
+  else
+    result="$(_nc11_eval_of "${fixture_run[nc11_honest]}")"
+    case "$result" in
+      "SUCCEEDED  go"|"SUCCEEDED  no-go")
+        canary_ok=1
+        ok "NC11 (c) canary: the honest fixture's row set is scored ($result)" ;;
+      *)
+        void "NC11 (c) the HONEST fixture was REFUSED: $result. Every refusal
+  below would then be measuring that rather than the property it names. Most
+  likely the fixture and the contract disagree about the holdout: the scripts use
+  NC11_HOLDOUT_DAYS (default 5) and PRIMARY_SLICE ('completed'), and the contract
+  in the trusted checkout is authoritative for both. The evaluator's own message
+  says which:  journalctl -u qf-eval -n 40" ;;
+    esac
+  fi
+
+  if [ "$canary_ok" = 1 ]; then
+    for name in "${fixture_names[@]}"; do
+      [ "$name" = nc11_honest ] && continue
+      if [ -z "${fixture_run[$name]:-}" ]; then
+        void "NC11 (c) no probe has run research/experiments/$name.py"
+        continue
+      fi
+      result="$(_nc11_eval_of "${fixture_run[$name]}")"
+      case "$result" in
+        "FAILED row_set_rejected "*)
+          ok "NC11 (c) $name is refused as an unscorable row set" ;;
+        *)
+          bad "NC11 (c) $name was not refused as a row set: $result. The
+  fixture violates exactly one part of the property and is proved to do so in
+  evaluator/tests/test_nc11_fixtures.py, so a different outcome here is either
+  the host's contract or the evaluator." ;;
+      esac
+    done
+  fi
 
   # (d) THE STAGING ROOT IS THE HANDOVER, so its exact state is the clause.
   #

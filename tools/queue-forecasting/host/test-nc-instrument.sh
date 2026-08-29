@@ -36,7 +36,7 @@ awk '/^# A stand-in for the nightly:/{f=1} /^# NC8 -- the mutex/{f=0} f' \
   "$SUITE" >> "$BLOCK"
 for fn in state_of field_of submit_as wait_state wait_terminal \
           require_state_for never_concurrent terminal_state note_blind \
-          is_run_id \
+          is_run_id spec_paths_of succeeded_probes \
           standin_nightly standin_acquired wait_standin_acquired; do
   grep -q "^$fn()" "$BLOCK" || { echo "extraction missed $fn()" >&2; exit 2; }
 done
@@ -55,6 +55,7 @@ HBAD() { echo "FAIL  $1"; hfail=$((hfail+1)); }
 
 RESEARCH_USER=research
 declare -A STATES=()
+declare -A PATHS=()
 
 # STUB. $MODE selects which way `qf status` misbehaves.
 as() {
@@ -68,8 +69,31 @@ as() {
         nojob)   echo '{"ok": true, "stall": null}' ;;
         garbage) echo 'Traceback (most recent call last): boom' ;;
         good)    local rid="${cmd##qf --json status }"; rid="${rid%% *}"
-                 echo "{\"ok\": true, \"job\": {\"state\": \"${STATES[$rid]:-QUEUED}\"}}" ;;
+                 # The SPEC is part of the payload when a test says so: it is
+                 # where a probe's experiment path lives, and NC11 (c) reads it
+                 # to tell which fixture a probe ran.
+                 local spec="{}"
+                 if [ -n "${PATHS[$rid]:-}" ]; then
+                   spec="{\"args\": {\"paths\": [\"${PATHS[$rid]}\"]}}"
+                 elif [ "${SPEC_WITHOUT_ARGS:-0}" = 1 ]; then
+                   spec="{\"kind\": \"probe\"}"
+                 fi
+                 echo "{\"ok\": true, \"job\": {\"state\":" \
+                      "\"${STATES[$rid]:-QUEUED}\", \"spec\": $spec}}" ;;
       esac ;;
+    "qf list "*)
+      # argparse's ACTUAL behaviour reproduced, flag by flag. `list` takes
+      # --state and --limit and nothing else, and two NC11 clauses passed
+      # `--kind probe` -- so every invocation exited 2 and both clauses voided
+      # with a message about their subject being absent. If anything regresses to
+      # a flag the client does not have, it fails HERE.
+      case "$cmd" in
+        *--kind*|*--lane*)
+          echo "usage: qf [-h] [--json] {ping,submit,status,list,cancel} ..." >&2
+          echo "qf: error: unrecognized arguments: ${cmd#*--}" >&2
+          return 2 ;;
+      esac
+      printf '%s\n' "${LIST_OUTPUT:-}" ;;
     "qf submit "*)
       if [ "${SUBMIT_OK:-1}" = 1 ]; then echo "test-20260827T000000Z-abc-1"
       else echo "qf: submit refused: bad sha" >&2; return 2; fi ;;
@@ -253,6 +277,60 @@ if is_run_id "probe-20260829T123756Z-9d54e39271d7-4290"; then
 else
   HBAD "is_run_id consulted the filesystem"
 fi
+
+echo "== a probe listing is filtered by the run id, not by a flag qf lacks =="
+MODE=good; : > "$BLIND_FILE"
+LIST_OUTPUT="probe-20260829T000000Z-aaaaaaaaaaaa-1    SUCCEEDED        heavy  2026-08-29T00:00:00Z
+test-20260829T000100Z-aaaaaaaaaaaa-2     SUCCEEDED        light  2026-08-29T00:01:00Z
+evaluate-20260829T000200Z-aaaaaaaaaaaa-3 SUCCEEDED        light  2026-08-29T00:02:00Z
+probe-20260829T000300Z-bbbbbbbbbbbb-4    SUCCEEDED        heavy  2026-08-29T00:03:00Z"
+got="$(succeeded_probes | tr '\n' ' ')"
+case "$got" in
+  "probe-20260829T000000Z-aaaaaaaaaaaa-1 probe-20260829T000300Z-bbbbbbbbbbbb-4 ")
+    HOK "succeeded_probes returns the probes and only the probes" ;;
+  *) HBAD "succeeded_probes returned '$got'" ;;
+esac
+
+# THE REGRESSION GUARD. The stub refuses a flag the real client refuses, so a
+# clause that reintroduces `--kind` reads nothing here instead of on a host.
+if as research "qf list --state SUCCEEDED --kind probe --limit 200" >/dev/null 2>&1; then
+  HBAD "the stub accepted --kind, so this harness cannot catch that regression"
+else
+  HOK "a listing flag the client does not have fails loudly"
+fi
+if grep -q -- "qf list[^\"']*--kind" "$SUITE"; then
+  HBAD "the suite still passes --kind to qf list somewhere"
+else
+  HOK "no clause passes --kind to qf list"
+fi
+
+echo "== a probe's own spec is where its experiment path is read from =="
+PATHS[probe-x]="research/experiments/nc11_honest.py"
+STATES[probe-x]=SUCCEEDED
+got="$(spec_paths_of probe-x)"
+if [ "$got" = "research/experiments/nc11_honest.py" ]; then
+  HOK "spec_paths_of reads args.paths out of the status payload"
+else
+  HBAD "spec_paths_of returned '$got'"
+fi
+
+SPEC_WITHOUT_ARGS=1
+got="$(spec_paths_of probe-y)"
+if [ -z "$got" ]; then
+  HOK "a spec with no args yields no path rather than an error"
+else
+  HBAD "spec_paths_of invented a path: '$got'"
+fi
+SPEC_WITHOUT_ARGS=0
+
+MODE=die; : > "$BLIND_FILE"
+got="$(spec_paths_of probe-x)"; rc=$?
+if [ "$rc" -ne 0 ] && [ -n "$(cat "$BLIND_FILE")" ]; then
+  HOK "a failure to ASK for a spec is recorded as blindness, not an empty path"
+else
+  HBAD "spec_paths_of rc=$rc blind='$(cat "$BLIND_FILE")' -- the pass=49 defect"
+fi
+MODE=good
 
 echo
 echo "harness: pass=$hpass fail=$hfail"
