@@ -472,3 +472,56 @@ class TestTheShippedContractsTranscribeTheSpec(unittest.TestCase):
             with self.subTest(target=target):
                 self.assertTrue(os.path.isfile(os.path.join(
                     self.host, "contracts", f"{target}.v1.json.in")))
+
+
+class TestTheSourceScannerActuallyStrips(unittest.TestCase):
+    """`srcscan.code_only` exists because nine static scans in this programme
+    matched their own documentation. A scanner that quietly failed to strip would
+    make every `assertNotIn` built on it pass."""
+
+    def test_it_removes_a_docstring(self):
+        import srcscan
+        out = srcscan.code_only('"""writes to models/"""\nimport os\n')
+        self.assertNotIn("models/", out)
+        self.assertIn("import os", out)
+
+    def test_it_removes_a_string_literal(self):
+        import srcscan
+        out = srcscan.code_only('PATH = "models/x"\n')
+        self.assertNotIn("models/", out)
+        self.assertIn("PATH", out)
+
+    def test_it_removes_a_comment(self):
+        import srcscan
+        self.assertNotIn("subprocess",
+                         srcscan.code_only("x = 1  # subprocess\n"))
+
+    def test_it_keeps_the_line_count_and_offsets(self):
+        # Callers slice with `index()`, so removed tokens become spaces rather
+        # than disappearing.
+        import srcscan
+        src = 'a = 1\n"""doc\nspanning\nlines"""\nb = 2\n'
+        out = srcscan.code_only(src)
+        self.assertEqual(len(out.splitlines()), len(src.splitlines()))
+        self.assertEqual(out.splitlines()[4], "b = 2")
+
+    def test_a_file_that_does_not_tokenise_comes_back_unchanged(self):
+        # An empty result would make every assertion built on it pass.
+        import srcscan
+        broken = "def f(:\n  pass\n"
+        self.assertEqual(srcscan.code_only(broken), broken)
+
+    def test_the_shell_variant_says_it_is_line_based(self):
+        import srcscan
+        self.assertIn("line-based", srcscan.shell_code_only.__doc__)
+        self.assertEqual(srcscan.shell_code_only("a\n# b\nc"), "a\nc")
+
+    def test_it_is_stdlib_only(self):
+        import re as _re
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "srcscan.py")
+        with open(path) as fh:
+            source = fh.read()
+        for name in _re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)",
+                                source, _re.M):
+            self.assertIn(name.split(".")[0], {"io", "tokenize", "__future__"})

@@ -1578,6 +1578,14 @@ class TestNc16AssertsTheClassTheClassifierActuallyProduces(unittest.TestCase):
 
 
 def code_only(text, comment="#"):
+    # NINTH instance, and the shape changed: a `#`-line filter cannot see a
+    # DOCSTRING, so the evaluator's `verdict.py` matched its own prohibition
+    # ("nothing here writes to trainer/data/models/"). `shared/srcscan.py` now
+    # tokenises for Python source. This stays line-based because almost every
+    # caller here scans SHELL, which has no docstrings -- and delegating shell to
+    # a Python tokeniser would be worse than the bug.
+    #
+    # For PYTHON source, prefer `srcscan.code_only`.
     """`text` with comment lines removed.
 
     SIXTH time in this phase that a static scan matched its own documentation:

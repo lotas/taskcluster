@@ -407,6 +407,66 @@ Each ends where a control can fail closed, and none needs the next to be useful.
 
 This completes **2c-1**.
 
+## 4b. Tasks — 2c-2 (partial, 2026-08-29)
+
+- **Task 21 — `metrics.py` and `rows.py`. DONE**, 22 tests. The metric
+  definitions transcribed from `trainer/src/evaluate.py`, computed in ONE PASS,
+  with the per-day split derived from the same pass. Counts only: nothing
+  divides, so the ratio is computed once by the verdict from summed counts, which
+  is what lets a trusted process recompute every number from the parts.
+
+  **The parity test was RUN, not skipped.** It imports the trainer's own
+  `per_row_metrics` and compares on random data with NaNs and zeros. pandas is
+  outside the evaluator's closure by design, so the test skips there -- and a
+  skipped parity test is a canary that does not gate, so it was executed once
+  against a scratch venv with pandas and it passes. To re-run:
+  `uv venv /tmp/parity-venv && uv pip install --python /tmp/parity-venv/bin/python
+  pandas numpy`, then `PYTHONPATH=. /tmp/parity-venv/bin/python -m unittest
+  discover -s tests`. Three definition perturbations were verified to break it:
+  loosening `within_2x`'s zero exclusion, moving a bucket edge, and turning
+  coverage's `<=` into `<`.
+
+  **NC11's literal reading is wrong, and `rows.py` says why.** "The row_id
+  multiset matches the frozen extract" cannot mean equality: an extract covers
+  the training window as well as the holdout. The checkable property is
+  well-formed (row_id is derived, so it is checkable rather than declarable),
+  subset-without-duplicates, and -- the part that matters -- **complete within
+  each day it claims**. The first two leave a gaming vector wide open: a probe
+  could predict only the rows it does well on, inside days it chose, and score
+  beautifully on a subset of a subset. Holdout DAYS have to be derived from the
+  predictions (they live in the trainer's config, not the extract), but coverage
+  WITHIN a day is fully determined by the extract, so completeness is checkable
+  exactly where cherry-picking would happen.
+
+- **Task 22 — `verdict.py`. DONE**, 18 tests. Every ratio computed here, from
+  counts. A metric with no eligible rows is a REFUSAL, not a pass: "there were no
+  rows to check" is not evidence that a bar was met. A metric the contract names
+  and this cannot compute is refused BY NAME rather than skipped, because a
+  skipped metric makes a contract look stricter than the judgement it produced.
+  Consistency counts days where every per-day metric passes -- not one metric --
+  since "consistent across 3 of 5 days" is a statement about the result. Bucket
+  metrics are aggregate-only: a tail gate per day would fail on days with three
+  tail rows.
+
+- **Task 23 — the evaluator's `evaluate()`: read the parquet, join, write
+  `eval.parquet` and `verdict.json` atomically. NOT STARTED.**
+
+**A ninth static-scan-matched-its-own-documentation instance produced a real
+fix.** `verdict.py`'s docstring says "nothing here writes to
+`trainer/data/models/`" -- which is exactly the string the test scanning for it
+matched. `code_only()` (the sixth instance's fix) strips `#` lines and cannot see
+a docstring, because a docstring is an expression rather than a line prefix. So
+`host/shared/srcscan.py` now TOKENISES, stripping comments and string literals
+while preserving line offsets, and a file that fails to tokenise comes back
+unchanged rather than empty -- an empty result would make every assertion built on
+it pass.
+
+Two fixture bugs of the "more convenient than production" kind, both found by the
+tests failing: the synthetic result drew `lognormal(4, 1)` so the `30m+` bucket
+was EMPTY and every bucket metric refused for want of rows; and the
+inconsistent-day perturbation multiplied a `sum_abs_error` of 0.0 by 1000, which
+is 0.0, so the test passed while testing nothing.
+
 ## 5. Open questions for 2c-2 and 2c-3
 
 Deliberately not answered here -- 2c-1 will teach them, the way 2b-1 taught 2b-2:
@@ -419,8 +479,8 @@ Deliberately not answered here -- 2c-1 will teach them, the way 2b-1 taught 2b-2
    extract carries a settlement lag (D17) and the holdout window is inside it by
    construction, but "by construction" is exactly the kind of claim this project
    keeps measuring instead of asserting.
-3. **What tolerance is "agrees to tolerance"?** Counts must agree exactly.
-   `sum_abs_error` is a float sum over ~10^6 rows in a different order, so the
-   bound has to come from a measurement, not a guess -- the same way
-   `MAX_WINDOW_DAYS` came from 8 minutes over 36 days rather than from an
-   opinion.
+3. **What tolerance is "agrees to tolerance"?** SETTLED for the two-route
+   comparison: counts agree EXACTLY, and `sum_abs_error` to
+   `abs(value) * 1e-9 + 1e-9` -- a relative bound, because the two routes sum the
+   same floats in a different order and nothing else should differ. Still open
+   for the comparison against the RECORDED numbers, which needs real data.
