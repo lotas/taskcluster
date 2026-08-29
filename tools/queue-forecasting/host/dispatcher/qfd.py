@@ -2684,6 +2684,23 @@ class Runner:
         transitions to RUNNING before this is reached.
         """
         run_id = hold.run_id
+        # THE TWO PINS THAT NEED NOTHING RESOLVED, WRITTEN FIRST. Both come
+        # straight out of the submitted spec, and they are exactly what a FAILED
+        # evaluation has to say: which run it was going to judge, and by which
+        # rule. They used to be written with the other four, after the source
+        # resolved and the prediction set was staged -- so the earliest failure,
+        # `evaluate_input_missing`, recorded neither, and NC9 (d) found it on the
+        # host: `the contract is pinned regardless (want f740716d32b8..., got '')`.
+        #
+        # "Provenance that exists only on the happy path is provenance a reader
+        # cannot rely on" was already the rule here, in a comment, four lines
+        # below the code that broke it. The remaining pins genuinely require
+        # resolution: `request_hash`, `baseline_hash` and the staged digest are
+        # facts about the judged run, not about this request.
+        now = utcnow()
+        for key, value in (("judged_run", effective["args"]["run"]),
+                           ("contract_hash", effective["args"]["contract"])):
+            self.db.call("set_pin", run_id, key, str(value), now=now)
         try:
             _job, pins, source, recorded = self._evaluate_source(effective)
             staged, digest = self._stage_predictions(run_id, source, recorded)
@@ -2696,13 +2713,11 @@ class Runner:
                                "finished_at": utcnow()})
         try:
             now = utcnow()
-            # PINNED BEFORE THE RELAY, so a failed evaluation still says
-            # what it was judging and what it was judging by. Provenance that
-            # exists only on the happy path is provenance a reader cannot rely
-            # on -- the same rule as a probe's `baseline: none`.
+            # THE RESOLVED PROVENANCE, before the relay: what the judged run was
+            # made against, and the digest of the bytes the evaluator will read.
+            # Same rule as a probe's `baseline: none` -- a failed evaluation still
+            # says what it was judging by.
             for key, value in (
-                    ("judged_run", effective["args"]["run"]),
-                    ("contract_hash", effective["args"]["contract"]),
                     ("request_hash", pins.get("request_hash")),
                     ("baseline_hash", pins.get("baseline_hash")),
                     ("baseline", pins.get("baseline")),

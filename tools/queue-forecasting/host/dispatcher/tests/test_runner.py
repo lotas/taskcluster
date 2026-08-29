@@ -2205,6 +2205,59 @@ class TestTheEvaluateRelay(EvaluateCase):
         self.assertEqual(
             self.db.call("pins_for", hold.run_id).get("verdict"), "no-go")
 
+    def test_a_failed_resolution_still_records_what_it_would_have_judged(self):
+        """NC9 (d), found on the host: `the contract is pinned regardless (want
+        f740716d32b8..., got '')`.
+
+        `judged_run` and `contract_hash` come out of the submitted spec and need
+        nothing resolved, so they are written before anything can fail. They used
+        to go in with the four resolved pins, after the source was found and the
+        prediction set staged -- so the EARLIEST failure recorded neither, and the
+        job's row said it had failed without saying what it had been asked to do.
+        """
+        hold, effective = self.an_evaluate(
+            "probe-20260829T000000Z-000000000000-1")
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        self.assertEqual(fields["error_class"], "evaluate_input_missing")
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins.get("contract_hash"),
+                         effective["args"]["contract"])
+        self.assertEqual(pins.get("judged_run"), effective["args"]["run"])
+        # AND NOT THE RESOLVED ONES, which are facts about a run that was never
+        # found. A pin invented on a failure path is worse than a missing one.
+        for absent in ("request_hash", "predictions_sha256", "verdict"):
+            self.assertNotIn(absent, pins)
+
+    def test_the_same_holds_when_staging_is_what_fails(self):
+        # The other early exit: the artifact is there and its digest moved.
+        probe = self.a_probe_run(predictions=b"PAR1-original")
+        with open(os.path.join(self.runs, probe, "artifacts",
+                               "predictions.parquet"), "wb") as fh:
+            fh.write(b"PAR1-changed-underneath")
+        hold, effective = self.an_evaluate(probe)
+        state, _fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        pins = self.db.call("pins_for", hold.run_id)
+        self.assertEqual(pins.get("contract_hash"),
+                         effective["args"]["contract"])
+        self.assertEqual(pins.get("judged_run"), probe)
+
+    def test_a_successful_evaluation_pins_both_kinds(self):
+        # The canary: if the spec-derived pins were written and the resolved ones
+        # were not, every assertion above would still hold.
+        probe = self.a_probe_run()
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "go",
+                             "eval_hash": "e" * 64})
+        state, _fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "SUCCEEDED")
+        pins = self.db.call("pins_for", hold.run_id)
+        for key in ("judged_run", "contract_hash", "request_hash",
+                    "predictions_sha256", "verdict", "eval_hash"):
+            with self.subTest(pin=key):
+                self.assertTrue(pins.get(key), pins)
+
     def test_the_staged_copy_is_published_by_rename(self):
         # A partial file under the final name is one the evaluator could read
         # and digest-verify against a value taken from the whole.

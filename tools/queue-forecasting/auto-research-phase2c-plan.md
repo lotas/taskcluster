@@ -797,6 +797,22 @@ This completes **2c-2**.
   the contract, it reaches FAILED, and the contract is pinned regardless -- never
   ran, so NC9 is not yet a clean result.
 
+- **NC9 (d) then found a real defect on its last assertion:** `the contract is
+  pinned regardless (want f740716d32b8..., got '')`. `judged_run` and
+  `contract_hash` come straight out of the submitted spec and need nothing
+  resolved -- and they were being written with the four RESOLVED pins, after the
+  source was found and the prediction set staged. So the earliest failure,
+  `evaluate_input_missing`, recorded neither: the job's row said it had failed
+  without saying what it had been asked to do. **The rule was already written
+  four lines below the code that broke it** ("provenance that exists only on the
+  happy path is provenance a reader cannot rely on"), which is what a comment
+  standing in for a control looks like. The two spec-derived pins are now written
+  before anything can fail; the resolved ones stay where they were, because they
+  are facts about the judged run rather than about the request. Three tests, two
+  of which fail if the ordering is put back -- and the third is the canary that
+  does not, because a version writing only the spec pins would satisfy the other
+  two.
+
 - **The fixture probes must pin the promoted baseline**, and the generated
   instructions did not say so. None of the five scripts reads `/baseline`, but the
   evaluator refuses a judged run that recorded no `baseline_hash` (a bar stated
