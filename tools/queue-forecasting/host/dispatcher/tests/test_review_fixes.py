@@ -19,7 +19,15 @@ import threading
 import types
 import unittest
 
-import qfd
+# `host/shared` on the path: `qfd` imports `baseline` and `contract`, which live
+# there. Inline, for the reason `test_runner.py` records -- relying on another
+# test module's insert works under `discover` and fails when this file is run on
+# its own, which is the shape of bootstrap that hides until somebody bisects.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "shared"))
+
+import qfd                                                     # noqa: E402
 import sandbox
 import source
 import spec

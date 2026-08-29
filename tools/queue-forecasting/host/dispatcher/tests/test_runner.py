@@ -17,6 +17,7 @@ import types
 import unittest
 
 import os
+import re
 import sys
 
 # `host/shared` on the path: `spec.normalize` delegates the `extract` kind to
@@ -561,9 +562,6 @@ class TestRunDirLayout(RunnerCase):
         paths = self.runner.prepare_run_dir("r-twice")
         self.assertTrue(os.path.isdir(paths["logs"]))
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestWorktreesAreReclaimedHoweverAJobEnds(RunnerCase):
@@ -1859,8 +1857,22 @@ class EvaluateCase(RunnerCase):
         return digest
 
     def a_probe_run(self, *, state="SUCCEEDED", kind="probe", predictions=b"PAR1",
-                    pins=("request_hash", "extract_hash")):
-        """A finished probe in the job table, with a run directory."""
+                    pins=("request_hash", "extract_hash"),
+                    record_artifact=True, artifact_sha256=None):
+        """A finished probe in the job table, with a run directory.
+
+        THE ARTIFACT IS RECORDED, because that is what production does: the
+        handoff copies what the allowlist names into `artifacts/` and
+        `add_artifact` records its sha256 at the moment the run finishes. The
+        first version of this fixture wrote only `out/predictions.parquet` and
+        recorded nothing -- which is why the relay staged from `out/`, and why a
+        review found that bytes could change after a probe succeeded and still be
+        judged as that probe. A fixture that omits the digest is a fixture in
+        which the digest cannot matter.
+
+        `record_artifact` and `artifact_sha256` exist so the hostile cases -- no
+        artifact, and an artifact whose bytes no longer match -- can be built.
+        """
         effective = dict(spec.normalize(
             {"schema": 1, "kind": "probe", "source_sha": "b" * 40,
              "args": {"path": "research/experiments/c.py",
@@ -1877,10 +1889,22 @@ class EvaluateCase(RunnerCase):
                          ("c" * 64) if key == "request_hash" else ("d" * 64),
                          now=now)
         out = os.path.join(self.runs, run_id, "out")
+        artifacts = os.path.join(self.runs, run_id, "artifacts")
         os.makedirs(out, exist_ok=True)
+        os.makedirs(artifacts, exist_ok=True)
         if predictions is not None:
             with open(os.path.join(out, "predictions.parquet"), "wb") as fh:
                 fh.write(predictions)
+            path = os.path.join(artifacts, "predictions.parquet")
+            with open(path, "wb") as fh:
+                fh.write(predictions)
+            if record_artifact:
+                self.db.call(
+                    "add_artifact", run_id, name="predictions.parquet",
+                    path=path,
+                    sha256=(artifact_sha256 if artifact_sha256 is not None
+                            else qfd.file_digest(path)),
+                    bytes_=len(predictions), now=now)
         if state != "QUEUED":
             # `dequeue` leases the LANE HEAD, not a named run, so a leftover
             # QUEUED probe from an earlier subtest gets leased instead and the
@@ -1969,6 +1993,79 @@ class TestTheEvaluateRelay(EvaluateCase):
         _sock, payload, _t = self.asked[0]
         self.assertEqual(payload["predictions_sha256"],
                          qfd.file_digest(staged))
+
+    def test_the_recorded_artifact_is_what_gets_staged(self):
+        """NOT `out/`. The candidate's own output directory has no digest, is
+        pruned once the handoff has copied what the allowlist names (D9), and its
+        bytes can change after the run finishes -- so staging from it meant a
+        verdict could be attributed to a probe while judging bytes that probe
+        never produced."""
+        probe = self.a_probe_run(predictions=b"PAR1-recorded")
+        # The two copies diverge, which is exactly the situation the defect hid:
+        # `out/` is writable after the fact, the artifact is what was recorded.
+        with open(os.path.join(self.runs, probe, "out",
+                               "predictions.parquet"), "wb") as fh:
+            fh.write(b"PAR1-tampered-after-success")
+        hold, effective = self.an_evaluate(probe)
+        self.replies.append({"ok": True, "verdict": "go"})
+        state, _fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "SUCCEEDED")
+        staged = os.path.join(self.eval_dir, hold.run_id, "in",
+                              "predictions.parquet")
+        self.assertEqual(open(staged, "rb").read(), b"PAR1-recorded")
+        _sock, payload, _t = self.asked[0]
+        recorded = self.db.call("artifact", probe, "predictions.parquet")
+        self.assertEqual(payload["predictions_sha256"], recorded["sha256"])
+
+    def test_an_artifact_changed_since_the_run_is_refused(self):
+        probe = self.a_probe_run(predictions=b"PAR1-original")
+        with open(os.path.join(self.runs, probe, "artifacts",
+                               "predictions.parquet"), "wb") as fh:
+            fh.write(b"PAR1-changed-underneath")
+        hold, effective = self.an_evaluate(probe)
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        self.assertEqual(fields["error_class"], "evaluate_input_missing")
+        # And NOTHING was asked of the evaluator: a refusal that still relayed
+        # would have judged the changed bytes.
+        self.assertEqual(self.asked, [])
+
+    def test_a_run_that_recorded_no_artifact_is_refused(self):
+        probe = self.a_probe_run(record_artifact=False)
+        hold, effective = self.an_evaluate(probe)
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        self.assertEqual(fields["error_class"], "evaluate_input_missing")
+        self.assertEqual(self.asked, [])
+
+    def test_a_non_sha256_recorded_digest_is_refused(self):
+        # A digest column that could hold anything is not a binding.
+        probe = self.a_probe_run(artifact_sha256="not-a-digest")
+        hold, effective = self.an_evaluate(probe)
+        state, fields = self.runner._relay_evaluate(hold, effective)
+        self.assertEqual(state, "FAILED")
+        self.assertEqual(fields["error_class"], "evaluate_input_missing")
+        self.assertEqual(self.asked, [])
+
+    def test_the_relay_does_not_read_the_out_directory(self):
+        """Structural, and narrowly so.
+
+        A substring search for `"out"` is useless here -- it matches "without"
+        and "about" in the prose that explains why `out/` is wrong, which is
+        exactly what the first version of this test did. What is checkable is
+        the PATH COMPONENT: no `os.path.join` in this function may name `out`,
+        and the digest has to come from the store.
+        """
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "qfd.py")) as fh:
+            raw = fh.read()
+        source = raw[raw.index("    def _evaluate_source"):]
+        source = source[:source.index("\n    def _stage_predictions")]
+        joins = re.findall(r"os\.path\.join\((?:[^()]|\([^()]*\))*\)", source)
+        for call in joins:
+            self.assertNotIn('"out"', call, call)
+        self.assertIn('self.db.call("artifact"', source)
+        self.assertIn('"artifacts"', source)
 
     def test_the_staged_copy_is_published_by_rename(self):
         # A partial file under the final name is one the evaluator could read
@@ -2129,3 +2226,10 @@ class TestContractResolutionAtSubmit(EvaluateCase):
             1001)
         self.assertTrue(resp["ok"], resp)
         self.assertEqual(resp["state"], "QUEUED")
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

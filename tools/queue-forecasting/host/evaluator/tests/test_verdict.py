@@ -214,3 +214,9 @@ class TestItEmitsAVerdictNeverAnAction(unittest.TestCase):
         for key in ("value", "baseline", "measured", "bar", "direction",
                     "passed"):
             self.assertIn(key, entry)
+
+
+if __name__ == "__main__":
+    # Without this, `python tests/test_verdict.py` runs NOTHING and exits 0 --
+    # a file that reports success for having done no work.
+    unittest.main()

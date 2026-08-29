@@ -673,9 +673,6 @@ class TestTheRunIsLegibleInTheJournal(ExtractorCase):
         self.assertIn("reuse", "\n".join(captured.output).lower())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTheOutputAllowanceIsDerivedFromTheRequest(ExtractorCase):
     """A flat allowance cannot be right across the allowed range, because two
@@ -735,3 +732,10 @@ class TestTheOutputAllowanceIsDerivedFromTheRequest(ExtractorCase):
             {"train_start": "2026-07-31T00:00:00Z",
              "as_of_date": "2026-08-01T00:00:00Z", "lookback_days": 1})
         self.assertGreater(est, 0)
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

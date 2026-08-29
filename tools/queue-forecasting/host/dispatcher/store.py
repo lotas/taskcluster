@@ -1010,6 +1010,22 @@ class Store:
                               (run_id,)).fetchone()
         return None if row is None else dict(row)
 
+    def artifact(self, run_id, name):
+        """One recorded artifact, or `None`. `{path, sha256, bytes}`.
+
+        `get` returns the `jobs` row and nothing else, which is why this exists
+        as its own accessor rather than a key on it: the evaluate relay needs the
+        DIGEST recorded when the run finished, because that digest is the only
+        thing that ties a set of bytes to a run. Reading it off the projection
+        `status` builds would mean replaying the whole event log to answer one
+        question, and reaching into the table from the relay would put a second
+        SQL statement about artifacts outside this module.
+        """
+        row = self.db.execute(
+            "SELECT path, sha256, bytes FROM artifacts"
+            " WHERE run_id=? AND name=?", (run_id, name)).fetchone()
+        return None if row is None else dict(row)
+
     def list(self, *, state=None, lane=None, limit=100):
         sql = "SELECT * FROM jobs"
         where, params = [], []

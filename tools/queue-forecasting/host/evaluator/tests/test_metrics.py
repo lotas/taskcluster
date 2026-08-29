@@ -1,4 +1,5 @@
 """Phase 2c Task 21. The metric definitions, the two routes, and the row set."""
+import importlib.util
 import os
 import re
 import sys
@@ -81,7 +82,7 @@ class TestTheDefinitionsAreTheTrainers(unittest.TestCase):
             self.assertEqual("inf" in hi, myhi == float("inf"), name)
 
     @unittest.skipUnless(
-        __import__("importlib").util.find_spec("pandas"),
+        importlib.util.find_spec("pandas"),
         "pandas is outside the evaluator's closure by design (D26); this parity"
         " test runs where pandas exists and skips on the evaluator host")
     def test_it_agrees_with_the_trainers_own_functions(self):
@@ -193,6 +194,9 @@ class TestTheRowSet(unittest.TestCase):
         self.es = np.array([True, True, True, False, True])
 
     def check(self, task_id, run_id, row_id=None):
+        """Returns the extract POSITIONS, which is what `check` returns: the
+        caller reads days and y_true off one index, so there is no way to check
+        one alignment and score another."""
         task_id = np.asarray(task_id)
         run_id = np.asarray(run_id)
         if row_id is None:
@@ -202,14 +206,26 @@ class TestTheRowSet(unittest.TestCase):
                           extract_task_id=self.et, extract_run_id=self.er,
                           extract_days=self.ed, extract_in_slice=self.es)
 
+    def days_of(self, *args, **kwargs):
+        return self.ed[self.check(*args, **kwargs)]
+
     def test_a_complete_day_is_accepted_and_returns_its_days(self):
         # THE CANARY. Without it every refusal below could pass because the
         # check refuses everything.
-        days = self.check(["t1", "t2"], [0, 0])
-        self.assertEqual(days.tolist(), ["2026-08-01", "2026-08-01"])
+        index = self.check(["t1", "t2"], [0, 0])
+        self.assertEqual(index.tolist(), [0, 1])
+        self.assertEqual(self.days_of(["t1", "t2"], [0, 0]).tolist(),
+                         ["2026-08-01", "2026-08-01"])
+
+    def test_the_returned_index_aligns_the_predictions_to_the_extract(self):
+        # Predicted in the OPPOSITE order to the extract, so an index that
+        # merely happened to be a range would not survive.
+        index = self.check(["t2", "t1"], [0, 0])
+        self.assertEqual(index.tolist(), [1, 0])
+        self.assertEqual(self.et[index].tolist(), ["t2", "t1"])
 
     def test_two_complete_days_are_accepted(self):
-        days = self.check(["t1", "t2", "t3"], [0, 0, 0])
+        days = self.days_of(["t1", "t2", "t3"], [0, 0, 0])
         self.assertEqual(sorted(set(days.tolist())),
                          ["2026-08-01", "2026-08-02"])
 
@@ -259,3 +275,98 @@ class TestTheRowSet(unittest.TestCase):
     def test_the_derivation_is_the_2b2_contract(self):
         self.assertEqual(rows.row_ids(np.array(["abc"]), np.array([7]))[0],
                          "abc:7")
+
+
+class TestTheDayBlock(unittest.TestCase):
+    """The other half of the cherry-picking vector: choosing the DAYS.
+
+    The required set is DERIVED by the caller from the extract's `as_of_date` and
+    the contract's `holdout_days`, and anything else is refused. The first
+    version enforced only contiguity and merely RECORDED whether the block was
+    the most recent one -- hedging against a partial final day the trainer has no
+    mechanism to produce, while leaving a candidate free to hold out an easier
+    earlier block. A finding that does not gate is not a control.
+    """
+
+    AVAILABLE = ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04",
+                 "2026-08-05"]
+    REQUIRED = ["2026-08-03", "2026-08-04", "2026-08-05"]
+
+    def block(self, claimed, available=None, required=None):
+        return rows.check_day_block(
+            claimed,
+            self.AVAILABLE if available is None else available,
+            required=self.REQUIRED if required is None else required)
+
+    def test_the_required_set_is_accepted(self):
+        # THE CANARY. Without it every refusal below could hold because the
+        # check refuses everything.
+        out = self.block(list(self.REQUIRED))
+        self.assertEqual(out["claimed"], self.REQUIRED)
+        self.assertEqual(out["required"], self.REQUIRED)
+        self.assertEqual(out["available_days"], 5)
+
+    def test_an_earlier_contiguous_block_is_now_REFUSED(self):
+        # The finding this whole rewrite exists for. It used to be accepted with
+        # `is_tail: false` recorded and nothing gating on it.
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block(["2026-08-01", "2026-08-02", "2026-08-03"])
+        message = str(cm.exception)
+        self.assertIn("not the candidate's to choose", message)
+        self.assertIn("2026-08-01", message)
+
+    def test_a_gapped_block_is_refused(self):
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block(["2026-08-01", "2026-08-03", "2026-08-05"])
+        self.assertIn("holdout is", str(cm.exception))
+
+    def test_a_short_block_names_the_missing_days(self):
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block(["2026-08-04", "2026-08-05"])
+        self.assertIn("Missing: ['2026-08-03']", str(cm.exception))
+
+    def test_a_day_outside_the_holdout_is_named_as_such(self):
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block(self.REQUIRED + ["2026-08-02"])
+        self.assertIn("Not in the holdout: ['2026-08-02']", str(cm.exception))
+
+    def test_a_required_day_the_extract_cannot_supply_reads_differently(self):
+        """A gap in the EXTRACT is not the candidate's doing, and the two
+        refusals must not read alike -- one sends somebody to the prediction set
+        and the other to the collector."""
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block(["2026-08-04", "2026-08-05"],
+                       available=["2026-08-04", "2026-08-05"])
+        message = str(cm.exception)
+        self.assertIn("gap in the EXTRACT", message)
+        self.assertNotIn("not the candidate's to choose", message)
+
+    def test_an_empty_claim_is_refused(self):
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block([])
+        self.assertIn("no holdout day", str(cm.exception))
+
+    def test_an_empty_requirement_is_refused_not_treated_as_satisfied(self):
+        # `claimed == sorted([])` would be False for a non-empty claim, but an
+        # empty requirement means the derivation produced nothing, and accepting
+        # whatever was claimed is the failure mode this whole class is about.
+        with self.assertRaises(rows.RowSetError) as cm:
+            self.block(list(self.REQUIRED), required=[])
+        self.assertIn("no rule", str(cm.exception))
+
+    def test_duplicate_claims_collapse(self):
+        out = self.block(self.REQUIRED + [self.REQUIRED[-1]])
+        self.assertEqual(out["claimed"], self.REQUIRED)
+
+    def test_a_calendar_gap_in_the_required_set_is_honoured(self):
+        # The required set comes from the calendar, so if the extract genuinely
+        # has no in-slice rows on a required day that is the extract's gap --
+        # asserted above. What is checked here is that a required set spanning a
+        # month boundary is compared literally, not reshaped.
+        required = ["2026-07-31", "2026-08-01"]
+        out = self.block(required, available=required, required=required)
+        self.assertEqual(out["required"], required)
+
+
+if __name__ == "__main__":
+    unittest.main()

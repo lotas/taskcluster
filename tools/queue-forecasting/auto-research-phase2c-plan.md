@@ -448,8 +448,181 @@ This completes **2c-1**.
   metrics are aggregate-only: a tail gate per day would fail on days with three
   tail rows.
 
-- **Task 23 — the evaluator's `evaluate()`: read the parquet, join, write
-  `eval.parquet` and `verdict.json` atomically. NOT STARTED.**
+- **Task 23 — the evaluator's `evaluate()`. DONE (2026-08-29)**, 170 evaluator
+  tests. `evaluate.py` reads the staged prediction set and the frozen extract,
+  joins on the derived `row_id`, applies `rows`' NC11 property, computes
+  `metrics`' counts, decides with `verdict`, and publishes `eval.parquet` and
+  `verdict.json` atomically into `<eval_dir>/<run_id>/out/`. `main()` injects it;
+  the import lives inside `main` so `service.py` stays importable without the
+  closure, which is what lets the startup gate be tested here at all.
+
+  **`baseline.py` moved from `dispatcher/` to `shared/`.** Three things now read
+  it -- `promote-baseline.sh` from the deployment domain, `qfd` when it pins a
+  baseline to a probe, and the evaluator when it recomputes the hash before
+  judging. Its old home meant a root script in the deployment domain importing
+  from the dispatcher's tree, and the moment a second domain needed it that was
+  the mistake `shared/extract_spec.py` exists to avoid. The move exposed two
+  latent import-order bugs: `test_protocol.py` and `test_review_fixes.py` both
+  relied on `test_runner.py`'s `sys.path` insert, so they passed under
+  `discover` and failed run alone. Each now inserts its own.
+
+  **Memory is independent of the extract's window, by construction.**
+  `runs.parquet` covers months and the baseline NDJSON covers the same span; the
+  prediction set is one holdout. Both large inputs are STREAMED against the
+  small set of predicted keys — pass 1 finds the claimed days and the whole
+  window's in-slice days, pass 2 returns every row on the claimed days. Two
+  passes over a local file, deliberately, because the alternative is a
+  row-count-shaped memory profile in the component that must not fall over.
+
+  **The streaming reduction had quietly made the day-block check vacuous**, and
+  a test is what said so. `check_day_block` was being handed the REDUCED row set,
+  so it was asking whether the claimed days were a contiguous block of
+  themselves — always true, with `is_tail` always true too. `available_days` now
+  comes from pass 1, where it costs nothing. This is the same failure as the
+  static scan matching its own prose: a check whose input is derived from its own
+  subject.
+
+  **The day set is the other half of the cherry-picking vector**, and it is split
+  deliberately. `rows.check` closes "predict only the easy rows inside a day";
+  the days themselves come from the predictions, because the holdout dates live
+  in the trainer's config. Two properties are derivable from the extract:
+  *contiguity is ENFORCED* (a holdout is a block at one end of a window; five
+  days picked out of twenty is the same vector as picking rows inside a day), and
+  *recency is RECORDED, not enforced* — the trainer legitimately drops a partial
+  final day, and refusing that would fail valid runs for a reason unrelated to
+  the model. `is_tail` and `expected_tail` go into the verdict document; the
+  first live acceptance run decides whether it becomes a refusal.
+
+  **Both sides are scored over ONE population.** A relative bar compares two
+  ratios, and two ratios over different row sets are not comparable — so the
+  scored set is the rows in the primary slice where `y_true` and the baseline's
+  own p50 are both finite, and model and baseline are computed over exactly
+  that. `eligible_n` matches by construction, and `baseline_missing_n` and
+  `out_of_slice_n` record what was dropped **without overlapping**: the first
+  version subtracted one from the other, which double-counts the rows that are
+  hardest to reason about.
+
+  **The frozen prediction contract is now ENFORCED, not just declared.**
+  Design §4.6 froze the columns and types and `qfd` recorded them in a comment,
+  because `qfd` is stdlib-only and cannot read Parquet. Nulls, NaNs, infinities,
+  extra columns and missing columns are all refusals naming the field. The type
+  rule is deliberately NOT exact Arrow equality: §4.6 says `int32` and `double`,
+  and a candidate writing this file from pandas gets `int64` and `float64` by
+  default — so the family is fixed and the width is not, with the value checks
+  (non-null, finite, int32-representable) carrying what the widths were for.
+
+  **NC11 is in the suite**, voiding on three named preconditions. Its three
+  inline mutations — relabel a `row_id`, drop the widest-interval row from a day,
+  add a row the extract does not contain — are **extracted from the suite by a
+  unit test and run against the fixture**, so the suite's mutations and this
+  module's refusals are pinned together. Without that they drift the worst way:
+  a snippet that silently failed to mutate would leave the suite reporting a
+  refusal it caused itself.
+
+  Six controls red-green verified by reverting each: the contiguity check, the
+  `available_days` vacuity fix, the one-population scoring, the prediction
+  digest, the extract digest, and the idempotency identity.
+
+  Two housekeeping findings, both the "reports success for no work" shape:
+  `test_service.py` had `unittest.main()` two thirds of the way up with 160 lines
+  of test classes after it, so running it directly ran none of them; and
+  `test_metrics.py`'s parity skip used `__import__("importlib").util`, which
+  resolves only when another module has already imported the submodule — so
+  whether the parity test skipped or **errored at class-definition time**
+  depended on import order.
+
+  **The parity test was re-run against pandas**: 30 tests, no skips.
+
+### 2c-2 review round (2026-08-29): five findings, all upheld
+
+Reported against the Task 23 delivery above. Each was real; two of them
+invalidated claims that section makes, and those claims are corrected in place
+rather than left standing with a note.
+
+- **P1 — the candidate could select an easier historical holdout.** Upheld, and
+  my stated reasoning for recording rather than enforcing recency was **wrong on
+  the facts**. I hedged against the trainer legitimately dropping a partial final
+  day; `config.compute_windows` sets the holdout to
+  `[as_of_date - holdout_days, as_of_date)`, `holdout_day_starts` walks it one
+  calendar day at a time, and `load_config` REFUSES an `as_of_date` that is not
+  UTC midnight -- as does `extract_spec._parse_boundary`. No partial day can
+  arise. The hedge guarded a case that cannot happen and left the real vector
+  open. `check_day_block` now takes a `required` list DERIVED from the extract's
+  own `as_of_date` and the contract's `holdout_days`, and refuses anything else;
+  a required day the extract has no in-slice rows on gets a separately worded
+  refusal, because that is the extract's gap and not the candidate's doing.
+
+- **P1 — the evaluation was disconnected from the probe's recorded artifact.**
+  Upheld, and this is the worst of the five: `_evaluate_source` staged
+  `<run>/out/predictions.parquet`, the candidate's own output directory, which
+  has no recorded digest and is pruned after the handoff (D9). Bytes could change
+  after a probe succeeded and still be judged as that probe -- **and the NC11
+  clauses I had just written demonstrated exactly that, mutating `out/` after a
+  SUCCEEDED run and getting a refusal.** A negative control that passes because
+  of the defect it should find is worse than no control. The relay now reads
+  `artifacts/predictions.parquet` and requires the digest `add_artifact` recorded
+  when the run finished to equal both the current file and the staged copy, with
+  a new `Store.artifact` accessor (`get` returns the `jobs` row only). NC11 is
+  restructured: post-hoc mutation now tests THAT BINDING, a new clause asserts
+  that mutating `out/` changes nothing, and the row-set property moves to fixture
+  candidates -- which voids until the fixture branch carries them, since the
+  property can no longer be reached by editing a file behind a finished run.
+
+- **P1 — `extract_hash` was recorded without validation.** Upheld. It went into
+  every verdict unverified, and the test fixture computed it with
+  `json.dumps(..., sort_keys=True)` -- DEFAULT separators, so `", "` and `": "`,
+  so different bytes and a different hash from production. The fixture was wrong
+  and the suite was green, because the only code that could have noticed did not
+  look. New `shared/extract_manifest.py` owns the canonical form and the
+  verification; `extractor.py`'s inline `_canonical` + `sha256` is deleted in
+  favour of it (the extractor's 184 tests passing unchanged is what shows the
+  bytes are identical), the evaluator verifies before scoring, and the fixture
+  uses the shared implementation. A red-green pass caught that the FIRST test for
+  this exercised the wrong check -- editing `as_of_date` changes `request_hash`
+  too, so removing the new verification left the suite green. The test now edits
+  `settlement_lag_s`, which is deliberately outside `request_hash`.
+
+- **P2 — idempotent reuse trusted its own outputs.** Upheld. Reuse returns
+  somebody else's numbers as this run's answer, so it now recomputes the
+  document's `eval_hash` and verifies `eval.parquet` against the
+  `eval_sha256` the document pins. Deleting or editing the per-row file used to
+  return `reused: true` -- a verdict with no evidence behind it, reported as a
+  success.
+
+- **P2 — the prediction ceiling did not support the memory claim.** Upheld.
+  Measured at **536 MB per 1_000_000 rows** (`ru_maxrss` around a real
+  `read_predictions`), so the 20_000_000 ceiling was about 10.7 GB on a unit with
+  `MemoryMax=4G`, reached before validation finishes. Now 2_000_000 with the
+  arithmetic beside the constant and a test pinning it to a stated budget and to
+  the unit's own `MemoryMax`. A recorded 5-day holdout is ~162_000 eligible rows,
+  so this is ~12x the real cohort. The module docstring stated the streaming
+  property and read as though it covered the prediction set; it now says which
+  mechanism bounds what.
+
+**A systemic test-harness defect surfaced while fixing these.** Nine test files
+carried `if __name__ == "__main__": unittest.main()` mid-file with test classes
+below it, so running any of them directly executed only the classes above the
+guard and reported OK -- `test_protocol.py` ran 1166 of 3260 lines' worth.
+`discover` imports whole modules, so every suite was green and the gap was
+invisible. All nine fixed, and every test file now reports the same count run
+directly as under `discover`.
+
+Four of the five fixes were red-green verified by reverting them; the fifth
+(`extract_hash`) needed a new test first, as recorded above.
+
+This completes **2c-2**.
+
+- **Task 24 — the 2c install step. NOT STARTED, and NC11 says so.** The units
+  (`qf-eval.socket`, `qf-eval.service`), the closure (`evaluator/env/uv.lock`)
+  and the contracts directory exist in the checkout, and **nothing syncs them to
+  the host**: there is no `phase2c-setup.sh`. NC11 and NC9 (e)/(f) void until
+  there is. Named as its own task rather than folded into "deployment", because
+  an install step that does not exist is exactly the gap 2b-1's P1 came from --
+  a unit naming an interpreter no step creates.
+
+  Needs: the `qfeval` user and group, `/var/lib/qf-eval` with the mode `qfd`'s
+  staging expects, `uv sync --frozen` for the evaluator closure, the two units,
+  and `%%QFD_UID%%` substituted in `Environment=QFE_CLIENT_UID`.
 
 **A ninth static-scan-matched-its-own-documentation instance produced a real
 fix.** `verdict.py`'s docstring says "nothing here writes to

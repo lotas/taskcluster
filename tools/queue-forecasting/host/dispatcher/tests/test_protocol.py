@@ -11,14 +11,27 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from unittest import mock
 
-import qfd
-import spec
-import store
+# `host/shared` on the path. This file imports `baseline` and `contract`, both of
+# which live there -- and it used to get away with not saying so, because
+# `test_runner.py` inserts the same path and `unittest discover` imports every
+# test module into one process. That is an import-order dependency, not a
+# bootstrap: `test_protocol` sorts BEFORE `test_runner`, so running this file
+# alone failed while the suite passed. Inline rather than shared, for the reason
+# `test_runner.py` records: a bootstrap that works under one invocation only is
+# worse than two copies.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "shared"))
+
+import qfd                                                     # noqa: E402
+import spec                                                    # noqa: E402
+import store                                                   # noqa: E402
 
 SHA = "3f1c" + "0" * 36
 DEPLOY_UID = 4242
@@ -1149,9 +1162,6 @@ class TestRunId(unittest.TestCase):
         b = qfd.make_run_id("test", "a" * 40, 2, now=5)
         self.assertNotEqual(a, b)
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestCheckoutCommit(unittest.TestCase):
@@ -2420,7 +2430,7 @@ class TestTheBaselinePromoterIsWiredAndItsCheckIsReal(unittest.TestCase):
         # The promoter runs it with the SYSTEM python: no venv, no dependency on
         # the extractor's environment, so promotion works on a host where the
         # extractor was never installed.
-        with open(os.path.join(self.host, "dispatcher", "baseline.py")) as fh:
+        with open(os.path.join(self.host, "shared", "baseline.py")) as fh:
             source = fh.read()
         imports = re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)",
                              source, re.M)
@@ -3321,3 +3331,10 @@ class TestNc9IsWiredAndGated(unittest.TestCase):
         self.assertEqual(qfd.EvaluateInputMissing.error_class,
                          "evaluate_input_missing")
         self.assertIn("evaluate_input_missing", self.nc9)
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

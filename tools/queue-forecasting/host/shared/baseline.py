@@ -27,6 +27,16 @@ promotes, and the manifest records that it is declared. A manifest that presente
 a declared value as a derived one would be the strongest-looking claim in the
 record and the weakest fact in it.
 
+WHY THIS LIVES IN `shared/`. Three things read it and none may depend on either
+of the others: `promote-baseline.sh` publishes through it from the DEPLOYMENT
+domain, `qfd` recomputes a promoted set's hash when it pins one to a probe, and
+the EVALUATOR recomputes it again before judging anything against that set. It
+started out under `dispatcher/`, which meant a root script in the deployment
+domain importing from the dispatcher's tree -- and the moment a second domain
+needed it, that placement was the same mistake `shared/extract_spec.py` exists to
+avoid. A content key with two implementations is not a cross-check, it is a
+disagreement with no arbiter, so there is exactly one.
+
 Pure and stdlib-only: no filesystem writes, no clock. `describe` reads files and
 returns a manifest; publication is the shell script's job.
 """

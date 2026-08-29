@@ -81,7 +81,7 @@ fi
 # --- validate and identify, before anything is written ---------------------
 # `baseline.py` is stdlib-only, so the system python runs it: no venv, no
 # dependency on the extractor's environment.
-MANIFEST_JSON="$(PYTHONPATH="$HERE/dispatcher" python3 - "$SRC" "$EXCLUDE" <<'PY'
+MANIFEST_JSON="$(PYTHONPATH="$HERE/shared" python3 - "$SRC" "$EXCLUDE" <<'PY'
 import json, sys
 import baseline
 source, raw_exclude = sys.argv[1], sys.argv[2]

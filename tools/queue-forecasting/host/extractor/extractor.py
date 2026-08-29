@@ -41,6 +41,7 @@ import os
 import shutil
 import time
 
+import extract_manifest
 import extract_spec
 import inventory
 
@@ -136,10 +137,6 @@ def published_dir(root, request_hash):
     """
     path = os.path.join(root, request_hash)
     return path if os.path.isfile(os.path.join(path, MANIFEST)) else None
-
-
-def _canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
 def _stringify(value):
@@ -446,8 +443,14 @@ class Extractor:
             "watermark": watermark.as_manifest(),
             "files": files,
         }
-        manifest["extract_hash"] = hashlib.sha256(
-            _canonical(manifest)).hexdigest()
+        # THE ONE IMPLEMENTATION, in `shared/`. It used to be `_canonical` plus
+        # a `sha256` call right here -- which was fine while nothing checked it,
+        # and a review found what "nothing checked it" cost: the evaluator
+        # recorded the field into every verdict without recomputing it, and a
+        # test fixture computed it with default `json.dumps` separators and
+        # passed.
+        manifest[extract_manifest.HASH_FIELD] = \
+            extract_manifest.extract_hash(manifest)
         with open(os.path.join(staging, MANIFEST), "w") as fh:
             json.dump(manifest, fh, sort_keys=True, indent=2)
         return manifest

@@ -221,9 +221,6 @@ class TestTrailingNewlineIsNotAnAnchorHole(unittest.TestCase):
                 spec.normalize(payload)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTheExtractKind(unittest.TestCase):
     """Phase 2b-1 Task 5. An extraction is a job so that it gets the state
@@ -509,3 +506,10 @@ class TestTheProbeBaselineIsOptionalAndTyped(unittest.TestCase):
         # Two copies of "64 lowercase hex" are two things that can drift.
         self.assertTrue(spec._HASH64_RE.match("a" * 64))
         self.assertIsNone(spec._HASH64_RE.match("A" * 64))
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

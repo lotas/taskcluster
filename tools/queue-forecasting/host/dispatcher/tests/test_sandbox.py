@@ -298,9 +298,6 @@ class TestCreateThenStart(unittest.TestCase):
             sandbox.docker_start_argv(self.RUN, "shell")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTheExtractAndDataMounts(unittest.TestCase):
     """Phase 2b-2 Task 8. Two new mount destinations, and the direction each is
@@ -465,3 +462,10 @@ class TestTheDataMountLandsWhereTheTrainerActuallyWrites(unittest.TestCase):
              "args": {"path": "research/experiments/x.py", "extract": "a" * 64}})
         self.assertEqual(argv[1], sandbox.SRC_DEST + "/research/experiments/x.py")
         self.assertTrue(argv[1].startswith("/"))
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

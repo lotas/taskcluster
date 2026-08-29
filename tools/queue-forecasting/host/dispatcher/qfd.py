@@ -2485,19 +2485,58 @@ class Runner:
                 f"{run_id} records no request_hash, so there is no way to know"
                 f" which extract its predictions were made against. A verdict"
                 f" without that is not attributable to any data.")
-        path = os.path.join(self.run_dir(run_id), "out", self.PREDICTIONS_NAME)
+        # THE RECORDED ARTIFACT, NOT `out/`. The first version staged
+        # `<run>/out/predictions.parquet`, which is the candidate's own output
+        # directory: nothing has a digest for it, `out/` is pruned once the
+        # handoff has copied what the allowlist names (D9), and the bytes can
+        # change after the probe succeeds. So a verdict could be attributed to a
+        # probe while judging bytes that probe never produced -- and this
+        # project's own NC11 clauses demonstrated it, mutating `out/` after a
+        # SUCCEEDED run and getting a scored result. A negative control that
+        # works because of a defect is worse than no control.
+        #
+        # `artifacts/predictions.parquet` is the copy the handoff made, whose
+        # sha256 `add_artifact` recorded in the event store at the moment the run
+        # finished. That digest is the only thing that ties bytes to a run.
+        artifact = self.db.call("artifact", run_id, self.PREDICTIONS_NAME)
+        if not artifact:
+            raise EvaluateInputMissing(
+                f"{run_id} recorded no {self.PREDICTIONS_NAME} artifact: it"
+                f" succeeded without producing the prediction set the contract"
+                f" judges, or the handoff did not collect it")
+        recorded = artifact.get("sha256")
+        if not isinstance(recorded, str) or not HEX64_RE.match(recorded):
+            raise EvaluateInputMissing(
+                f"{run_id}'s {self.PREDICTIONS_NAME} artifact records"
+                f" {str(recorded)[:16]!r} as its digest, which is not a sha256."
+                f" Without one there is nothing tying these bytes to this run.")
+        path = artifact.get("path") or os.path.join(
+            self.run_dir(run_id), "artifacts", self.PREDICTIONS_NAME)
         if not os.path.isfile(path):
             raise EvaluateInputMissing(
-                f"{run_id} produced no {self.PREDICTIONS_NAME}: it succeeded"
-                f" without writing the prediction set the contract judges")
+                f"{run_id} records a {self.PREDICTIONS_NAME} artifact at {path},"
+                f" which is not there. The store has been pruned or the run"
+                f" directory was removed; an evaluation cannot be attributed to"
+                f" bytes nobody has.")
         if os.path.getsize(path) == 0:
             raise EvaluateInputMissing(
                 f"{run_id}'s {self.PREDICTIONS_NAME} is empty. An empty"
                 f" prediction set joins to nothing, which produces a verdict"
                 f" over zero rows rather than an error.")
-        return job, pins, path
+        # CHECKED NOW, BEFORE STAGING, so the failure names the artifact rather
+        # than the copy. `_stage_predictions` checks the staged bytes against the
+        # same recorded digest, which is what closes the window between the two.
+        current = file_digest(path)
+        if current != recorded:
+            raise EvaluateInputMissing(
+                f"{run_id}'s {self.PREDICTIONS_NAME} now digests to"
+                f" {current[:12]} but the run recorded {recorded[:12]} when it"
+                f" finished. The artifact has changed since the probe produced"
+                f" it, so judging it would attribute a verdict to a run that did"
+                f" not emit these bytes.")
+        return job, pins, path, recorded
 
-    def _stage_predictions(self, run_id, source):
+    def _stage_predictions(self, run_id, source, recorded_sha256):
         """Copy the untrusted prediction set where the evaluator can read it.
 
         WHY A COPY AT ALL (D28). The base run directory is `0750 qfd:qfclient`,
@@ -2537,7 +2576,19 @@ class Runner:
                 dst.write(chunk)
         os.chmod(tmp, 0o640)
         os.replace(tmp, target)
-        return target, file_digest(target)
+        digest = file_digest(target)
+        # THE STAGED BYTES MUST BE THE RECORDED BYTES. The digest is taken from
+        # the copy -- what the evaluator will read is what must be described, and
+        # a digest of the source would still verify if the copy were truncated --
+        # and it is then compared against what the RUN recorded, which is what
+        # makes the evaluator's input attributable to the probe rather than
+        # merely internally consistent.
+        if digest != recorded_sha256:
+            raise EvaluateInputMissing(
+                f"the staged copy of {run_id}'s {self.PREDICTIONS_NAME} digests"
+                f" to {digest[:12]}, not the {recorded_sha256[:12]} the run"
+                f" recorded. The artifact changed while it was being copied.")
+        return target, digest
 
     def _relay_evaluate(self, hold, effective):
         """Ask the evaluator, record the verdict. Returns an outcome tuple.
@@ -2548,13 +2599,15 @@ class Runner:
         """
         run_id = hold.run_id
         try:
-            _job, pins, source = self._evaluate_source(effective)
+            _job, pins, source, recorded = self._evaluate_source(effective)
+            staged, digest = self._stage_predictions(run_id, source, recorded)
         except EvaluateInputMissing as e:
+            # STAGING IS INSIDE THE SAME GUARD as resolution: its digest check is
+            # the second half of one property, and a mismatch there is the same
+            # kind of failure as a missing artifact, not an internal fault.
             log.error("%s: %s", run_id, e)
             return ("FAILED", {"error_class": e.error_class,
                                "finished_at": utcnow()})
-
-        staged, digest = self._stage_predictions(run_id, source)
         now = utcnow()
         # PINNED BEFORE THE RELAY, so a failed evaluation still says what it was
         # judging and what it was judging by. Provenance that exists only on the

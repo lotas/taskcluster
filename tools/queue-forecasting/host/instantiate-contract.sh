@@ -50,7 +50,7 @@ esac
 # like a mistake made here.
 [ -d "$STORE/$HASH" ] || die "no promoted baseline $HASH in $STORE.
   'qf baselines' lists what is promoted; promote-baseline.sh promotes one."
-PYTHONPATH="$HERE/dispatcher" python3 - "$STORE/$HASH/MANIFEST.json" "$HASH" <<'PY' \
+PYTHONPATH="$HERE/shared" python3 - "$STORE/$HASH/MANIFEST.json" "$HASH" <<'PY' \
   || die "the promoted baseline does not verify; refusing to pin a contract to it"
 import json, sys
 import baseline

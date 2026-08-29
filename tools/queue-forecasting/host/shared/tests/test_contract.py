@@ -334,9 +334,6 @@ class TestItStaysImportableByQfd(unittest.TestCase):
             self.assertNotEqual(base.__name__, "SpecError")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTheShippedContractsTranscribeTheSpec(unittest.TestCase):
     """Task 18. The bars are transcribed from `trainer-spec.md` and the tail gate
@@ -525,3 +522,10 @@ class TestTheSourceScannerActuallyStrips(unittest.TestCase):
         for name in _re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)",
                                 source, _re.M):
             self.assertIn(name.split(".")[0], {"io", "tokenize", "__future__"})
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

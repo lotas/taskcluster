@@ -3,27 +3,27 @@ contract resolution that NC9 rests on, and the units that grant its authority.""
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "shared"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))), "shared"))
+EVALUATOR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOST = os.path.dirname(EVALUATOR)
+sys.path.insert(0, EVALUATOR)
+sys.path.insert(0, os.path.join(HOST, "shared"))
 
 import contract as contract_mod
 import service
-
-
-def code_only(text, comment="#"):
-    """`text` with comment lines removed. The eighth instance this programme of
-    a static scan matching its own documentation; `test_protocol.py` has the
-    same helper for the same reason."""
-    return "\n".join(line for line in text.splitlines()
-                     if not line.lstrip().startswith(comment))
+# THE TOKENISING SCAN, not the line-based helper this file used to carry. That
+# helper strips `#` lines and structurally cannot see a docstring, which is how
+# a scan came to match its own prose for the ninth time in this programme.
+# `srcscan.code_only` blanks comments AND string literals, preserving line
+# offsets -- and returns a file that does not tokenise unchanged rather than
+# empty, because an empty result makes every assertion built on it pass.
+from srcscan import code_only
 
 
 class ServiceCase(unittest.TestCase):
@@ -211,7 +211,10 @@ class TestContractResolutionIsTheControlNc9Asserts(ServiceCase):
             "contract": digest, "request_hash": "e" * 64,
             "predictions_sha256": "d" * 64})
         self.assertFalse(reply["ok"])
-        # Refused for the RIGHT reason: 2c-1 has no implementation yet.
+        # Refused for the RIGHT reason: this `Handler` was built with no
+        # implementation injected. `main` injects `evaluate.evaluate`; a handler
+        # without one answers a refusal rather than a plausible empty verdict,
+        # which would be the worst possible stub.
         self.assertEqual(reply["error_class"], "not_implemented")
 
     def test_a_template_is_not_a_contract(self):
@@ -397,10 +400,6 @@ class TestTheUnitsGrantOnlyWhatTheCodeExpects(unittest.TestCase):
                 self.assertIn(f"Environment={knob}=", self.svc)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestTheUnitNamesAnInterpreterThatWillExist(unittest.TestCase):
     """2b-1's P1: the unit named `/usr/bin/python3`, which has neither pyarrow
     nor psycopg, and the tests hid it by putting the packages on `sys.path`. The
@@ -453,3 +452,116 @@ class TestTheUnitNamesAnInterpreterThatWillExist(unittest.TestCase):
             lock = fh.read()
         for package in ("pyarrow", "numpy"):
             self.assertIn(f'name = "{package}"', lock)
+
+
+class TestTheRefusalClassReachesTheDispatcher(ServiceCase):
+    """`qfd` records an `error_class`, and folding every cause into `refused`
+    makes a negative control's own signal invisible -- which is why
+    `contract_not_trusted` is carried through rather than flattened."""
+
+    class Refusal(ValueError):
+        def __init__(self, message, error_class):
+            super().__init__(message)
+            self.error_class = error_class
+
+    def _reply(self, raiser):
+        digest = self.write_contract()
+        handler = service.Handler(self.cfg, evaluate=raiser)
+        return handler.handle({
+            "op": "evaluate",
+            "run_id": "probe-20260829T123756Z-9d54e39271d7-1",
+            "contract": digest, "request_hash": "e" * 64,
+            "predictions_sha256": "d" * 64})
+
+    def test_a_named_class_is_carried_through(self):
+        def raiser(_cfg, _req, _name):
+            raise self.Refusal("the row set is not scorable", "row_set_rejected")
+        reply = self._reply(raiser)
+        self.assertEqual(reply["error_class"], "row_set_rejected")
+        self.assertIn("not scorable", reply["error"])
+
+    def test_a_refusal_with_no_class_still_gets_one(self):
+        def raiser(_cfg, _req, _name):
+            raise ValueError("something ordinary")
+        self.assertEqual(self._reply(raiser)["error_class"], "refused")
+
+    def test_a_non_string_class_does_not_reach_the_reply(self):
+        # A column consumers grep must not be able to hold an object.
+        def raiser(_cfg, _req, _name):
+            raise self.Refusal("x", {"not": "a token"})
+        self.assertEqual(self._reply(raiser)["error_class"], "refused")
+
+    def test_an_empty_class_does_not_reach_the_reply(self):
+        def raiser(_cfg, _req, _name):
+            raise self.Refusal("x", "")
+        self.assertEqual(self._reply(raiser)["error_class"], "refused")
+
+    def test_an_unexpected_failure_is_still_opaque(self):
+        # THE BOUNDARY THAT MUST NOT MOVE: a dependency's error prose is not a
+        # control, and this reply crosses a trust boundary in the direction
+        # that matters.
+        def raiser(_cfg, _req, _name):
+            raise RuntimeError("pyarrow internal detail with a path in it")
+        reply = self._reply(raiser)
+        self.assertEqual(reply["error_class"], "internal")
+        self.assertNotIn("pyarrow", reply["error"])
+        self.assertIn("journal reference", reply["error"])
+
+    def test_a_verdict_reaches_the_reply(self):
+        # THE CANARY: without it every clause above could hold because the
+        # handler refuses everything.
+        def works(_cfg, _req, _name):
+            return {"verdict": "go", "eval_hash": "a" * 64}
+        reply = self._reply(works)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["verdict"], "go")
+
+
+class TestMainInjectsTheImplementation(unittest.TestCase):
+    """2c-2 supplies `evaluate.evaluate`, and `main` is where it is wired."""
+
+    def setUp(self):
+        with open(os.path.join(EVALUATOR, "service.py")) as fh:
+            body = fh.read()
+        self.main = code_only(body[body.index("def main(argv=None):"):])
+
+    def test_it_injects_the_real_evaluate(self):
+        self.assertIn("import evaluate as evaluate_mod", self.main)
+        self.assertIn("evaluate_mod.evaluate", self.main)
+        self.assertIn("Handler(cfg, evaluate=evaluate", self.main)
+
+    def test_the_import_is_inside_main_not_at_module_scope(self):
+        # `service` must stay importable without pyarrow, which is what lets the
+        # startup gate -- the part that enforces this domain's privilege
+        # boundaries -- be tested in an environment without the closure.
+        with open(os.path.join(EVALUATOR, "service.py")) as fh:
+            module_scope = code_only(fh.read()).split("def main(")[0]
+        for name in ("pyarrow", "numpy", "import evaluate"):
+            self.assertNotIn(name, module_scope, name)
+
+    def test_an_import_failure_becomes_a_startup_problem(self):
+        # Not a crash: under socket activation, exiting is a hang plus a restart
+        # counter, which 2b-1 discovered at 15 restarts.
+        self.assertIn("problems.append", self.main)
+        self.assertIn("evaluator/env/.venv", self.main)
+
+    def test_service_imports_with_no_closure_installed(self):
+        # Executed rather than asserted about: the claim is that THIS
+        # interpreter, which has neither pyarrow nor numpy, can import it.
+        p = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); sys.path.insert(0, %r);"
+             " import service; print(service.FORBIDDEN_GROUPS)"
+             % (EVALUATOR, os.path.join(HOST, "shared"))],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("docker", p.stdout)
+
+
+
+if __name__ == "__main__":
+    # AT THE END, deliberately. It used to sit two thirds of the way up with 160
+    # lines of test classes after it, so `python tests/test_service.py` ran none
+    # of them and reported OK. `discover` imports the whole module, so the suite
+    # was green either way and the gap was invisible.
+    unittest.main()

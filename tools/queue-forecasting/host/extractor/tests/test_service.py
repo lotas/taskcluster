@@ -559,9 +559,6 @@ class TestTheUnitsAndTheCodeAgree(unittest.TestCase):
         self.assertRegex(self.sock_directives, r"SocketGroup=\S+")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTheDatabaseHalfOfTheGate(unittest.TestCase):
     """`Config.check_startup` cannot see the database, so a host with a perfect
@@ -804,3 +801,10 @@ class TestListingPublishedExtracts(ProtocolCase):
         blob = json.dumps(self.call({"op": "extracts"}))
         self.assertNotIn("postgresql://", blob)
         self.assertNotIn("forecast_experiment", blob)
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

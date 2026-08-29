@@ -1005,6 +1005,203 @@ sys.exit(0 if r.get('ok') else 1)\""
 # =========================================================================
 # NC10 -- trusted paths resolve only from the trusted checkout.
 # =========================================================================
+nc11() {
+  echo
+  echo "== NC11: a prediction set that is not a scorable row set is refused =="
+  #
+  # RESTRUCTURED AFTER A REVIEW, and the reason is worth stating because the
+  # first version LOOKED like a working control. It mutated
+  # `<run>/out/predictions.parquet` after a probe had succeeded and watched the
+  # evaluation refuse. That worked -- because the relay staged from `out/`, which
+  # has no recorded digest and is pruned after the handoff, so bytes could change
+  # after a run finished and still be judged as that run. The control passed
+  # BECAUSE OF the defect it should have found.
+  #
+  # Now the relay stages `artifacts/predictions.parquet` and requires its digest
+  # to equal the one `add_artifact` recorded when the run finished. So post-hoc
+  # mutation tests THAT BINDING, which is clause (b), and the row-set property
+  # needs a candidate that legitimately emits a bad row set -- clause (c), from a
+  # fixture experiment, voiding until the fixture branch carries one.
+
+  local py="$TRUSTED/tools/queue-forecasting/host/evaluator/env/.venv/bin/python"
+  if [ ! -x "$py" ]; then
+    void "NC11 the evaluator venv is not built at $py. There is no 2c install
+  step yet (Task 24): the units under host/evaluator/ and its uv.lock are in the
+  checkout, and nothing installs them. Until then this whole group is void."
+    return
+  fi
+  local ch listing
+  listing="$(as "$RESEARCH_USER" "qf contracts" 2>&1)"
+  ch="$(printf '%s' "$listing" | sed -n 's/^ *--contract \([0-9a-f]\{64\}\)$/\1/p' \
+    | head -1)"
+  if [ -z "$ch" ]; then
+    void "NC11 no contract resolves; run instantiate-contract.sh against a
+  promoted baseline (same precondition as NC9)"
+    return
+  fi
+
+  # A SUCCEEDED probe that RECORDED a predictions artifact. Asked of the
+  # dispatcher, because the recorded artifact is the subject now -- a file in a
+  # run directory with no row in `artifacts` is exactly what must not be judged.
+  local probe="" rid
+  for rid in $(as "$RESEARCH_USER" "qf list --state SUCCEEDED --kind probe --limit 50" \
+                 2>/dev/null | sed -n 's/^ *\(probe-[0-9A-Za-z-]*\).*/\1/p'); do
+    if [ -f "$RUNS_DIR/$rid/artifacts/predictions.parquet" ]; then
+      probe="$rid"; break
+    fi
+  done
+  if [ -z "$probe" ]; then
+    void "NC11 no SUCCEEDED probe recorded an artifacts/predictions.parquet, so
+  there is no prediction set to judge. Run one 2b-2 cohort first."
+    return
+  fi
+  ok "NC11 subject: $probe"
+
+  local art="$RUNS_DIR/$probe/artifacts/predictions.parquet"
+  local out_copy="$RUNS_DIR/$probe/out/predictions.parquet"
+  local scratch; scratch="$(mktemp -d)"
+  cp -p "$art" "$scratch/artifact.parquet"
+  [ -f "$out_copy" ] && cp -p "$out_copy" "$scratch/out.parquet"
+  # RESTORED ON EVERY PATH, including a `return` from a failed clause. A mutated
+  # artifact left behind would make every later evaluation of this probe fail for
+  # a reason the suite caused.
+  # shellcheck disable=SC2064
+  trap "cp -p '$scratch/artifact.parquet' '$art'; chown qfd '$art' 2>/dev/null || true;
+        [ -f '$scratch/out.parquet' ] && cp -p '$scratch/out.parquet' '$out_copy';
+        rm -rf '$scratch'" RETURN
+
+  _nc11_eval() {  # -> "<state> <error_class> <verdict>"
+    local r st
+    r="$(as "$RESEARCH_USER" "qf evaluate --run $probe --contract $ch" 2>&1 | tail -1)"
+    if ! is_run_id "$r"; then
+      printf 'NOTSUBMITTED %s -' "$(printf '%s' "$r" | tr -d ' ' | cut -c1-40)"
+      return
+    fi
+    st="$(wait_terminal "$r" 1200)"
+    printf '%s %s %s' "$st" "$(field_of "$r" error_class)" \
+      "$(pin_of "$r" verdict)"
+  }
+
+  # (a) THE CANARY. Every refusal below is measured against a working
+  # evaluation; without it, an evaluator that refused everything would satisfy
+  # the whole group.
+  local result verdict_seen
+  result="$(_nc11_eval)"
+  case "$result" in
+    "SUCCEEDED  go"|"SUCCEEDED  no-go")
+      verdict_seen="$(printf '%s' "$result" | awk '{print $3}')"
+      ok "NC11 (a) the real prediction set is scored (verdict $verdict_seen)" ;;
+    *)
+      void "NC11 (a) canary: the unmutated prediction set did not produce a
+  verdict: $result"
+      return ;;
+  esac
+
+  # (b) THE JUDGED BYTES ARE THE RECORDED BYTES. Two halves, and the second is
+  # the one that would have caught the original defect.
+  #
+  # (b1) Changing the RECORDED artifact is refused on the digest.
+  "$py" -c '
+import sys
+import pyarrow.parquet as pq
+t = pq.read_table(sys.argv[1])
+pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
+' "$art" || { bad "NC11 (b1) could not rewrite the artifact"; return; }
+  result="$(_nc11_eval)"
+  case "$result" in
+    "FAILED evaluate_input_missing "*)
+      ok "NC11 (b1) an artifact changed since the run is refused on its digest" ;;
+    *) bad "NC11 (b1) a changed artifact was not refused on its digest: $result" ;;
+  esac
+  cp -p "$scratch/artifact.parquet" "$art"; chown qfd "$art" 2>/dev/null || true
+
+  # (b2) Changing `out/` changes NOTHING, because `out/` is not the input. This
+  # is the direct control for the defect the first version of this group rested
+  # on: it used to make the evaluation refuse.
+  if [ -f "$out_copy" ]; then
+    "$py" -c '
+import sys
+import pyarrow.parquet as pq
+t = pq.read_table(sys.argv[1])
+pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
+' "$out_copy" || { bad "NC11 (b2) could not rewrite out/"; return; }
+    result="$(_nc11_eval)"
+    case "$result" in
+      "SUCCEEDED  $verdict_seen")
+        ok "NC11 (b2) mutating out/ does not change the verdict: it is not the input" ;;
+      *) bad "NC11 (b2) mutating out/ changed the outcome, so the relay is
+  reading the candidate's own output directory rather than the recorded
+  artifact: $result" ;;
+    esac
+    cp -p "$scratch/out.parquet" "$out_copy"
+  else
+    # Expected once D9 pruning has run -- and its absence is itself the point.
+    ok "NC11 (b2) out/ has been pruned, so it cannot be the evaluator's input"
+  fi
+
+  # (c) THE ROW-SET PROPERTY, from a candidate rather than from a mutation.
+  # Post-hoc mutation can no longer reach it: the digest binding refuses first,
+  # which is correct and means this clause needs a probe that legitimately emits
+  # an unscorable set. Those fixtures live on the qf-research fixture branch and
+  # are pushed by the operator, so this voids rather than passing quietly.
+  local fixture_probe="" script
+  for script in nc11_relabelled nc11_cherry_picked nc11_ghost_row; do
+    fixture_probe="$(as "$RESEARCH_USER" \
+      "qf list --state SUCCEEDED --kind probe --limit 50" 2>/dev/null \
+      | grep -c "$script" || true)"
+    if [ "${fixture_probe:-0}" = 0 ]; then
+      void "NC11 (c) no probe has run research/experiments/$script.py, so the
+  row-set property is not exercised on this host. nc-fixtures-phase2b.sh writes
+  the three scripts; the operator pushes the fixture branch. The property itself
+  is covered in-repo by evaluator/tests/test_evaluate.py."
+      break
+    fi
+  done
+
+  # (d) NOTHING THE CANDIDATE OWNS IS IN THE STAGING ROOT (D28).
+  local staged="${QFD_EVAL_DIR:-/var/lib/qf-eval}"
+  if [ -d "$staged" ]; then
+    local owner; owner="$(stat -c %U "$staged")"
+    case "$owner" in
+      "$RESEARCH_USER") bad "NC11 (d) the eval staging root is owned by $owner" ;;
+      *) ok "NC11 (d) the staging root is owned by $owner, not the candidate" ;;
+    esac
+    refuse_as "$RESEARCH_USER" "NC11 (d) research cannot read the staged input" \
+      "ls $staged"
+  else
+    void "NC11 (d) $staged does not exist, so nothing was ever staged"
+  fi
+
+  # (e) AND THE VERDICT IS RECOMPUTABLE. `eval.parquet` beside `verdict.json` is
+  # what makes the numbers checkable rather than believable.
+  local out_dir
+  out_dir="$(find "$staged" -mindepth 2 -maxdepth 2 -type d -name out 2>/dev/null \
+    | head -1)"
+  if [ -n "$out_dir" ] && [ -f "$out_dir/verdict.json" ]; then
+    [ -f "$out_dir/eval.parquet" ] \
+      && ok "NC11 (e) the verdict is published beside its per-row file" \
+      || bad "NC11 (e) $out_dir has a verdict.json and no eval.parquet"
+    "$py" -c '
+import hashlib, json, sys
+d = json.load(open(sys.argv[1]))
+body = {k: v for k, v in d.items() if k != "eval_hash"}
+canon = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+rows = d.get("inputs", {}).get("eval_sha256")
+h = hashlib.sha256()
+with open(sys.argv[2], "rb") as fh:
+    for chunk in iter(lambda: fh.read(1 << 20), b""):
+        h.update(chunk)
+ok = (hashlib.sha256(canon).hexdigest() == d.get("eval_hash")
+      and rows == h.hexdigest())
+sys.exit(0 if ok else 1)
+' "$out_dir/verdict.json" "$out_dir/eval.parquet" \
+      && ok "NC11 (e) the verdict hashes to its own eval_hash and pins its rows" \
+      || bad "NC11 (e) the verdict does not verify against its own body and rows"
+  else
+    void "NC11 (e) no verdict.json under $staged"
+  fi
+}
+
 nc10() {
   echo
   echo "== NC10: trusted paths resolve only from the trusted checkout =="
@@ -2149,6 +2346,7 @@ main() {
   nc8
   nc9
   nc10
+  nc11
   nc12
   nc13
   nc14

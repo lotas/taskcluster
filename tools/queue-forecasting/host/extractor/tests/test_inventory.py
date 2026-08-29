@@ -385,9 +385,6 @@ class TestTheWatermarkColumnsAreDeclared(unittest.TestCase):
                          {"pending_at", "resolved_at"})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTheInventoryAndTheValidatorCannotDrift(unittest.TestCase):
     """`inventory.py` declares which request fields each query binds;
@@ -589,3 +586,10 @@ class TestBoundValuesReachTheDriverAsDriverTypes(unittest.TestCase):
                     inventory.bindings(name, request))
                 for value in bound.values():
                     self.assertIsInstance(value, datetime.datetime)
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

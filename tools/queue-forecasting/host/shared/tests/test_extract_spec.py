@@ -388,9 +388,6 @@ class TestTheEffectiveRequestNamesEverythingThatRuns(unittest.TestCase):
                         self.assertNotIn(forbidden, value)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # The trainer's own prefixes, spelled out rather than imported, because these
 # are the numbers the extract must never be later than. From
@@ -611,3 +608,10 @@ class TestARelayCannotForwardWhatItValidated(unittest.TestCase):
         again = extract_spec.validate(extract_spec.to_raw(effective), now=NOW)
         self.assertEqual(extract_spec.request_hash(again),
                          extract_spec.request_hash(effective))
+
+if __name__ == "__main__":
+    # AT THE END. This guard had drifted into the middle of the file as classes
+    # were appended below it, so running the file directly executed only the
+    # classes above it and reported OK. `discover` imports the whole module, so
+    # the suite was green and the gap invisible.
+    unittest.main()

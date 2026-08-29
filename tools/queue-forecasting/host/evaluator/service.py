@@ -314,7 +314,13 @@ class Handler:
             return {"ok": True, **self._evaluate(self.cfg, req,
                                                  contracts[req["contract"]])}
         except SAFE_ERRORS as e:
-            return {"ok": False, "error": str(e), "error_class": "refused"}
+            # The CLASS the refusal named, when it named one. `qfd` constrains
+            # what it accepts here, so an unrecognised value degrades to its own
+            # default rather than becoming a column consumers cannot grep.
+            klass = getattr(e, "error_class", None)
+            return {"ok": False, "error": str(e),
+                    "error_class": klass if isinstance(klass, str) and klass
+                    else "refused"}
         except Exception:                                      # noqa: BLE001
             # An opaque reference, never the exception's own words: a
             # dependency's future error prose is not a control, and this reply
@@ -437,7 +443,21 @@ def main(argv=None):
                         format="%(levelname)s %(name)s: %(message)s")
     cfg = Config.from_env()
     problems = cfg.check_startup()
-    handler = Handler(cfg)
+    # IMPORTED HERE, NOT AT MODULE SCOPE. `evaluate` needs pyarrow and numpy;
+    # `service` needs neither, and keeping the import inside `main` is what lets
+    # the startup gate -- the part that enforces this domain's privilege
+    # boundaries -- be tested in an environment without the closure installed.
+    # An import failure is a startup problem like any other, so it is reported
+    # through the same path rather than crashing under socket activation.
+    evaluate = None
+    try:
+        import evaluate as evaluate_mod
+        evaluate = evaluate_mod.evaluate
+    except Exception as e:                                     # noqa: BLE001
+        problems.append(
+            f"cannot import the evaluation implementation ({e}): the venv at"
+            f" evaluator/env/.venv is what provides pyarrow and numpy")
+    handler = Handler(cfg, evaluate=evaluate)
     if problems:
         for problem in problems:
             log.error("startup: %s", problem)

@@ -25,7 +25,7 @@ with open(os.path.join(d, "baseline_predictions.ndjson"), "w") as fh:
 with open(os.path.join(d, "2026-08-01.json"), "w") as fh:
     json.dump({"day": "2026-08-01"}, fh)
 PY
-  PYTHONPATH="$HOST/dispatcher" python3 - "$src" "$QF_BASELINE_STORE" <<'PY'
+  PYTHONPATH="$HOST/shared" python3 - "$src" "$QF_BASELINE_STORE" <<'PY'
 import json, os, shutil, sys
 import baseline
 src, store = sys.argv[1], sys.argv[2]
