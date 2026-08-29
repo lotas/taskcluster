@@ -444,11 +444,21 @@ finds them by reading each SUCCEEDED probe's own spec, so the order does not
 matter, but they must all judge the same data to be comparable:
 
   sudo -H -u research qf extracts     # copy the `--extract <hash>` line it prints
+  sudo -H -u research qf baselines    # copy the `--baseline <hash>` line too
   for f in nc11_honest nc11_relabelled nc11_ghost_row nc11_cherry_picked \
            nc11_easy_days; do
     sudo -H -u research qf probe --sha <the qf-research sha> \
-      --path research/experiments/$f.py --extract <request_hash>
+      --path research/experiments/$f.py --extract <request_hash> \
+      --baseline <baseline_hash>
   done
+
+--baseline IS REQUIRED HERE even though none of these scripts reads /baseline.
+The evaluator refuses a run that recorded no baseline -- "the contract is stated
+against baseline X, and this request carries no baseline_hash" -- and refuses
+again if the pin does not EQUAL the contract's, because a relative bar measured
+against another baseline is not the bar that was agreed. Without it every one of
+the five comes back refused for that reason, including the honest canary, and the
+group is void.
 
 Each probe SUCCEEDS -- emitting an unscorable prediction set is not a failure,
 it is the fixture's job. A probe that FAILS means its own violation was vacuous

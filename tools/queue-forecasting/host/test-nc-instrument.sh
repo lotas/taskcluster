@@ -252,9 +252,21 @@ rm -f "$STANDIN_ACQUIRED" "$SLOCK"
 # healthy submit: NC19's canary voided on a working probe, and the
 # unpromoted-baseline clause printed `ok "never became a run"` for a job the
 # dispatcher had accepted and was about to start.
+# EVERY KIND, AND BOTH WAYS THE SHA CAN END. The three fixtures this list used to
+# hold all had a 12-hex prefix ending in a DIGIT -- `9d54e39271d7`,
+# `abcdef012345`, `000000000000` -- and `is_run_id`'s first clause was
+# `*[0-9]-[0-9]*`, which is satisfied by exactly that coincidence. Six commits in
+# sixteen end in a letter, and on one of them NC9 (d) reported "a trusted contract
+# was refused at submit" for a run id the dispatcher had just minted. The fixtures
+# below are the real one from that run plus one per kind, ending in a letter.
 for good in "probe-20260829T123756Z-9d54e39271d7-4290" \
             "extract-20260829T000000Z-abcdef012345-1" \
-            "test-20260829T235959Z-000000000000-999"; do
+            "test-20260829T235959Z-000000000000-999" \
+            "evaluate-20260829T192144Z-f58141c0d68e-4448" \
+            "probe-20260829T000000Z-aaaaaaaaaaaa-7" \
+            "extract-20260829T000000Z-0123456789ab-12" \
+            "test-20260829T000000Z-deadbeefcafe-1" \
+            "selftest-20260829T000000Z-fffffffffffe-30"; do
   if is_run_id "$good"; then
     HOK "is_run_id accepts $good"
   else

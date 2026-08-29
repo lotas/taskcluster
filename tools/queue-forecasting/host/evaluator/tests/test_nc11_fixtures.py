@@ -22,6 +22,7 @@ extract is three days, not five). The sandbox sets none of them.
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -306,6 +307,32 @@ class TestTheGeneratedScriptsAreWhatTheSandboxCanRun(Nc11FixtureCase):
             self.assertIn("does not look like qf-research",
                           done.stdout + done.stderr)
             self.assertFalse(os.path.exists(os.path.join(other, "research")))
+
+    def test_the_probe_lines_pin_a_baseline(self):
+        """None of these scripts reads /baseline, and the probes still need one.
+
+        The evaluator refuses a judged run that recorded no `baseline_hash` --
+        the contract states its bars against a specific baseline, and a relative
+        improvement measured against a different one is not the bar that was
+        agreed. So instructions that omitted `--baseline` would produce five
+        probes whose evaluations all fail for that reason, canary included, and
+        NC11 (c) would void with nothing to say about row sets.
+        """
+        with open(GENERATOR) as fh:
+            source = fh.read()
+        instructions = source[source.index("cat <<'NEXT'"):]
+        # THE COMMAND ITSELF, continuations joined. A first version of this test
+        # searched the whole instruction block, and `--baseline` also appears
+        # there in a `qf baselines` comment and in the paragraph explaining the
+        # requirement -- so deleting the flag from the probe line left it green.
+        joined = re.sub(r"\\\n\s*", " ", instructions)
+        probe = [line for line in joined.splitlines() if "qf probe" in line]
+        self.assertEqual(len(probe), 1, probe)
+        self.assertIn("--extract", probe[0])
+        self.assertIn("--baseline", probe[0])
+        # And it says WHY, because an unexplained flag is the first thing
+        # somebody drops when the command does not fit on a line.
+        self.assertIn("carries no baseline_hash", instructions)
 
     def test_it_never_commits_or_pushes(self):
         with open(GENERATOR) as fh:

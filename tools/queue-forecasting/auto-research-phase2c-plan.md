@@ -775,6 +775,40 @@ This completes **2c-2**.
   red-green verifications: reintroducing `--kind`, restoring the bad `submit`
   line, and inventing a subcommand each fail it.
 
+- **NC9 ran live for the first time (2026-08-29) and reported 15 pass, 1 fail --
+  and the failure was the INSTRUMENT.** `NC9 (d) a trusted contract was refused
+  at submit: evaluate-20260829T192144Z-f58141c0d68e-4448`. That string is a
+  perfectly good run id; the dispatcher HAD accepted the contract and minted it.
+  `is_run_id`'s first clause was `case "$1" in *[0-9]-[0-9]*)`, written to mean
+  "there is a numeric seq" and actually meaning "some digit is immediately
+  followed by a hyphen and another digit" -- which in a real id is satisfied only
+  when the `sha[:12]` segment before the seq HAPPENS TO END IN A DIGIT. Six
+  commits in sixteen end in a letter, and on those the helper rejects every id
+  the dispatcher mints. All three fixtures in the harness ended in a digit
+  (`9d54e39271d7`, `abcdef012345`, `000000000000`), so the check passed there for
+  the same reason it failed here.
+
+  Now the seq is tested as the seq -- the last hyphen-separated segment, all
+  digits -- and the harness carries the real failing id plus one per kind ending
+  in a letter (42 clauses, red-green verified: reverting the clause fails five).
+  The direction of the bug is worth recording: `is_run_id` gates POSITIVE claims,
+  so it produced false FAILURES rather than false passes, in seven clauses across
+  the suite. NC9 (d)'s three follow-on assertions -- the job fails on the RUN not
+  the contract, it reaches FAILED, and the contract is pinned regardless -- never
+  ran, so NC9 is not yet a clean result.
+
+- **The fixture probes must pin the promoted baseline**, and the generated
+  instructions did not say so. None of the five scripts reads `/baseline`, but the
+  evaluator refuses a judged run that recorded no `baseline_hash` (a bar stated
+  against one baseline and measured against another is not the bar that was
+  agreed) -- so five probes submitted without `--baseline` would ALL be refused
+  for that reason, canary included, and clause (c) would void with nothing to say
+  about row sets. The generator's probe line now carries it with the reason
+  attached, and a test asserts it on the joined command rather than on the
+  instruction block: the first version of that test searched the whole block,
+  where `--baseline` also appears in a `qf baselines` comment, so deleting the
+  flag from the probe line left it green.
+
 - **The pipeline's own baseline directory is not promotable, by design, and the
   refusal now says what to do.** `ensure_baseline_ndjson.sh` writes a coverage
   sidecar (`baseline_predictions.ndjson.meta.json`) beside the aggregate, and

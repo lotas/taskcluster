@@ -275,9 +275,20 @@ is_run_id() {  # is_run_id <candidate>
   # are the client's error messages -- "qf: error: unrecognized arguments",
   # "no dispatcher socket at ..." -- and a length floor accepts most of those
   # once `tail -1` has trimmed them to one line.
-  case "$1" in
-    *[0-9]-[0-9]*) ;;
-    *) return 1 ;;
+  #
+  # THE SEQ IS THE LAST HYPHEN-SEPARATED SEGMENT, and it is tested as such.
+  # This clause used to be `case "$1" in *[0-9]-[0-9]*)`, which was meant to say
+  # "there is a numeric seq" and actually said "some digit is immediately
+  # followed by a hyphen and another digit". In a real id the segment before the
+  # seq is `sha[:12]`, so the pattern held only when that 12-hex prefix happened
+  # to END IN A DIGIT -- about ten commits in sixteen. It failed NC9 (d) on
+  # `evaluate-20260829T192144Z-f58141c0d68e-4448`: a perfectly good run id, a
+  # trusted contract that HAD been accepted at submit, reported as
+  # "a trusted contract was refused at submit". Every fixture in the harness had
+  # a sha ending in a digit, so the check passed there.
+  local seq="${1##*-}"
+  case "$seq" in
+    ""|*[!0-9]*) return 1 ;;
   esac
   case "$1" in
     [a-z]*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*) ;;
