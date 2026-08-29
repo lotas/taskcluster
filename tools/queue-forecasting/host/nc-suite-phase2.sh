@@ -364,10 +364,28 @@ spec_paths_of() {  # spec_paths_of <run_id> -> the probe's paths, space separate
   if ! out="$(status_json "$1" 2>&1)"; then
     note_blind "$out"; return 1
   fi
+  # KEY-AGNOSTIC, and that is the fix rather than fussiness. The first version
+  # read `args.paths` -- which is what a `test` job carries. A PROBE carries
+  # `args.path`, a single string (`cmd_probe` in the client builds it), so this
+  # returned nothing for every probe on the host: NC11's subject discovery
+  # skipped nothing, took the newest probe, and handed clause (a)'s canary
+  # `nc11_easy_days` -- a prediction set that is refused BY DESIGN. The clause
+  # then voided the group with "the unmutated prediction set did not produce a
+  # verdict", which was true and about the wrong probe.
+  #
+  # So instead of naming a key, take every string under `args` that looks like a
+  # path. Hashes and run ids have no slash in them; `paths`, `path` and whatever
+  # a later kind calls it all come through.
   printf '%s' "$out" | python3 -c "
 import json, sys
-spec = json.load(sys.stdin)['job'].get('spec') or {}
-print(' '.join((spec.get('args') or {}).get('paths') or []))
+args = (json.load(sys.stdin)['job'].get('spec') or {}).get('args') or {}
+found = []
+for value in args.values():
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, list):
+        found.extend(v for v in value if isinstance(v, str))
+print(' '.join(v for v in found if '/' in v))
 " 2>/dev/null
 }
 
@@ -1139,7 +1157,7 @@ nc11() {
   by design.)"
     return
   fi
-  ok "NC11 subject: $probe"
+  ok "NC11 subject: $probe ($(spec_paths_of "$probe"))"
 
   local art="$RUNS_DIR/$probe/artifacts/predictions.parquet"
   local out_copy="$RUNS_DIR/$probe/out/predictions.parquet"
@@ -1187,7 +1205,11 @@ nc11() {
       ok "NC11 (a) the real prediction set is scored (verdict $verdict_seen)" ;;
     *)
       void "NC11 (a) canary: the unmutated prediction set did not produce a
-  verdict: $result"
+  verdict: $result
+  The subject was $probe ($(spec_paths_of "$probe")). If that is 2b-2's
+  extract_contract.py, its predictions.parquet is a 1000-row STUB with the right
+  columns and an arbitrary row set -- refused by design, and not a finding. Run
+  nc11_honest from nc-fixtures-phase2c.sh, which emits a scorable set."
       return ;;
   esac
 

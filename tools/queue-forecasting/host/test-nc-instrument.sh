@@ -56,6 +56,7 @@ HBAD() { echo "FAIL  $1"; hfail=$((hfail+1)); }
 RESEARCH_USER=research
 declare -A STATES=()
 declare -A PATHS=()
+declare -A PATHS_LIST=()
 
 # STUB. $MODE selects which way `qf status` misbehaves.
 as() {
@@ -74,7 +75,12 @@ as() {
                  # to tell which fixture a probe ran.
                  local spec="{}"
                  if [ -n "${PATHS[$rid]:-}" ]; then
-                   spec="{\"args\": {\"paths\": [\"${PATHS[$rid]}\"]}}"
+                   # A PROBE's shape: `args.path`, one string. `test` jobs use
+                   # `args.paths`, a list -- and reading only the list is what
+                   # made NC11 hand its canary a fixture that refuses by design.
+                   spec="{\"args\": {\"path\": \"${PATHS[$rid]}\", \"extract\": \"c179c7f5b961\"}}"
+                 elif [ -n "${PATHS_LIST[$rid]:-}" ]; then
+                   spec="{\"args\": {\"paths\": [\"${PATHS_LIST[$rid]}\"]}}"
                  elif [ "${SPEC_WITHOUT_ARGS:-0}" = 1 ]; then
                    spec="{\"kind\": \"probe\"}"
                  fi
@@ -317,13 +323,31 @@ else
 fi
 
 echo "== a probe's own spec is where its experiment path is read from =="
+# BOTH SHAPES. A probe's spec carries `args.path` (a string); a test job carries
+# `args.paths` (a list). The first version of this helper read only the list, so
+# it returned nothing for every probe -- and NC11's subject discovery, which uses
+# it to skip the fixtures that refuse by design, skipped nothing and voided the
+# group on the wrong probe.
 PATHS[probe-x]="research/experiments/nc11_honest.py"
 STATES[probe-x]=SUCCEEDED
 got="$(spec_paths_of probe-x)"
 if [ "$got" = "research/experiments/nc11_honest.py" ]; then
-  HOK "spec_paths_of reads args.paths out of the status payload"
+  HOK "spec_paths_of reads a PROBE's args.path (a string)"
 else
-  HBAD "spec_paths_of returned '$got'"
+  HBAD "spec_paths_of returned '$got' for a probe"
+fi
+# And the hash beside it is not mistaken for a path.
+case "$got" in
+  *c179c7f5b961*) HBAD "spec_paths_of returned args.extract as a path" ;;
+  *) HOK "a hash in args is not read as a path" ;;
+esac
+PATHS_LIST[test-x]="test/test_thing.py"
+STATES[test-x]=SUCCEEDED
+got="$(spec_paths_of test-x)"
+if [ "$got" = "test/test_thing.py" ]; then
+  HOK "and a TEST job's args.paths (a list)"
+else
+  HBAD "spec_paths_of returned '$got' for a test job"
 fi
 
 SPEC_WITHOUT_ARGS=1

@@ -866,6 +866,25 @@ This completes **2c-2**.
   is a routing decision, which this programme has written down twice before --
   once for `source_unavailable` and once for `contract_not_trusted`.
 
+- **The second NC11 attempt got past staging and voided on my helper reading the
+  wrong key.** No `PermissionError` this time: the evaluation reached the row-set
+  check, which is the staging fix working. But the canary's subject was
+  `probe-...-4484` -- `nc11_easy_days` -- and `row_set_rejected` is what that
+  fixture exists to produce. The skip list had not skipped anything, because
+  `spec_paths_of` read `args.paths`: that is a `test` job's shape. A PROBE carries
+  `args.path`, a single string (`cmd_probe` builds it), so the helper returned
+  nothing for every probe on the host and the discovery took the newest one.
+
+  Third instance this session of a helper reading a field that is not there, so
+  the fix is not another key name: it takes every string under `args` that
+  contains a slash, which covers `path`, `paths` and whatever a later kind calls
+  it, while hashes and run ids fall out by themselves. The harness stub now
+  carries BOTH shapes and asserts a hash beside the path is not mistaken for one
+  (48 clauses, red-green). The canary's void message also names the subject's
+  script now, and says that 2b-2's `extract_contract.py` emits a 1000-row STUB
+  that is refused by design -- because that is the probe the discovery falls
+  through to on a host where the fixtures are absent.
+
 - **NC11's subject discovery would have voided the group the moment the fixtures
   landed.** Clauses (a) and (b) need a prediction set that CAN be scored -- (a) is
   the canary and (b) compares a mutation against it -- and the discovery took "the
