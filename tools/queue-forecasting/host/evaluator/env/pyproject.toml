@@ -1,0 +1,34 @@
+# The evaluator's HOST environment. Task 19.
+#
+# THE CLOSURE IS ONE TASK AHEAD OF THE CODE, deliberately. `service.py` as it
+# stands is stdlib-only plus `shared/contract.py`, so `/usr/bin/python3` would
+# run it today -- and then 2c-2 would add `import pyarrow` and the unit would
+# fail at its first start with a ModuleNotFoundError. That is exactly what
+# happened in 2b-1: `ExecStart=/usr/bin/python3 service.py` shipped against a
+# host python with neither pyarrow nor psycopg, and the tests hid it by putting
+# the package on `sys.path`. Declaring the environment with the unit that names
+# it means there is one install step, not two, and no window in which the
+# service is installed and cannot start.
+#
+# NOT PANDAS, and that is a decision rather than an omission. The trainer's
+# evaluation path builds per-day DataFrames; the trusted evaluator computes the
+# same metrics per ROW in a single pass (D26), which is what makes the two an
+# independent cross-check rather than one implementation twice. numpy over a
+# pyarrow table does that, and leaving pandas out keeps this closure from being
+# coupled to a trainer dependency bump -- the same reasoning as the extractor's
+# manifest, which deliberately does not reuse the trainer's list either.
+[project]
+name = "qf-evaluator-env"
+version = "0"
+requires-python = ">=3.11"
+dependencies = [
+    # Ranges here, exact versions in uv.lock. A range in a manifest with no lock
+    # is a wish; the lock is what makes an install reproducible -- and 2b-1 made
+    # a missing lock a REFUSAL rather than a warning after the warning was
+    # ignored twice.
+    "pyarrow>=15.0.0",
+    "numpy>=1.26.0",
+]
+
+[tool.uv]
+package = false

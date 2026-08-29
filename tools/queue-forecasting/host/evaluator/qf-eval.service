@@ -1,0 +1,79 @@
+[Unit]
+Description=Queue-forecasting trusted evaluator
+Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/auto-research-phase2c-plan.md
+Requires=qf-eval.socket
+After=qf-eval.socket
+
+[Service]
+Type=simple
+User=qfeval
+Group=qfeval
+# NO SupplementaryGroups. Deliberately absent rather than empty: this domain
+# holds no privilege, and `check_startup` REFUSES on membership of docker,
+# qfheavy, qfclient, qfrun or qfextract. qfclient is in that list for a second
+# reason -- it is the group that would let this read run directories directly,
+# which is the access design D28 exists to avoid needing.
+
+# NO LoadCredential. The evaluator reads files and nothing else; `check_startup`
+# refuses if CREDENTIALS_DIRECTORY or a DSN variable is present, because either
+# means the unit grants more than this code was reviewed for.
+
+# The venv `env/uv.lock` builds, at the path phase2c-setup.sh syncs -- NOT
+# /usr/bin/python3, and not a path nothing creates. An earlier draft of this
+# line named /opt/qfevalenv/bin/python, which no install step produces: the
+# same shape as 2b-1's P1, where the unit named an interpreter without the
+# imports and the tests hid it with sys.path.
+ExecStart=/srv/queue-forecasting/tools/queue-forecasting/host/evaluator/env/.venv/bin/python /srv/queue-forecasting/tools/queue-forecasting/host/evaluator/service.py
+WorkingDirectory=/srv/queue-forecasting/tools/queue-forecasting/host/evaluator
+Environment=PYTHONPATH=/srv/queue-forecasting/tools/queue-forecasting/host/shared
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+Environment=QFE_SOCKET=/run/qf-eval/sock
+Environment=QFE_EVAL_DIR=/var/lib/qf-eval
+# READ-ONLY inputs. Both are outside ReadWritePaths below, so a write is not
+# merely unintended -- it is impossible, and `check_startup` refuses at boot if
+# either store turns out to be writable after all.
+Environment=QFE_EXTRACTS_DIR=/var/lib/qf-extracts
+Environment=QFE_BASELINES_DIR=/var/lib/qf-baselines
+# The contracts live in the trusted checkout, root-owned. That placement IS the
+# control NC9 asserts: a rule the candidate can edit is not a rule.
+Environment=QFE_CONTRACTS_DIR=/srv/queue-forecasting/tools/queue-forecasting/host/contracts
+# Substituted at install time by phase2c-setup.sh, like QFX_CLIENT_UID. A peer
+# check against the wrong uid is worse than none: it reads as though it names the
+# dispatcher.
+Environment=QFE_CLIENT_UID=%%QFD_UID%%
+
+StateDirectory=qf-eval
+StateDirectoryMode=0750
+
+# --- containment ---------------------------------------------------------
+# PrivateNetwork, which the EXTRACTOR cannot have -- it needs Postgres over TCP.
+# The evaluator reads files, so the strongest available network posture is also
+# the correct one, and an evaluator that could reach the network could publish a
+# verdict somewhere nobody agreed to.
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# THE ONLY WRITABLE PATH. Not the extracts store, not the baselines store, not
+# the contracts directory, not the run directories.
+ReadWritePaths=/var/lib/qf-eval
+UMask=0027
+
+# A judge must not compete with the nightly for memory. 4g because it holds one
+# prediction set and one extract column set in memory, not a training run.
+MemoryMax=4G
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

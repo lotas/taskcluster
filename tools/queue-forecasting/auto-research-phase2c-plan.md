@@ -1,6 +1,6 @@
 # Phase 2c — evaluation integrity
 
-Revision 1. Written after 2b-3's implementation, per the convention in
+Revision 2. Written after 2b-3's implementation, per the convention in
 `auto-research-phase2b-plan.md` §2: the details worth writing are the ones the
 previous group taught.
 
@@ -280,7 +280,15 @@ Each ends where a control can fail closed, and none needs the next to be useful.
   1. **The socket peer is `qfd` and nothing else.** `SO_PEERCRED`, compared
      against a uid resolved at start-up -- not group membership on the socket,
      which is how `research` came to be able to reach a channel in revision 8.
-     The socket is `0600 root:qfeval`, so there is no group to be added to.
+
+     *Revision 2 correction: an earlier draft of this line said the socket would
+     be `0600 root:qfeval`, "so there is no group to be added to". That is
+     wrong, and building to it would have produced a channel `qfd` could not
+     open: `0600` grants the group nothing, and `qfd` is not root. The socket is
+     `0660 root:qfd`, exactly as `qf-extract.socket` is -- the group is the
+     DISPATCHER's, whose only member is the dispatcher, and owning a socket is
+     not membership of a group. The DAC layer keeps `research` from reaching the
+     channel at all; `SO_PEERCRED` is the control on top of it.*
   2. **No Docker, no credential, no network, not `qfheavy`, not `qfclient`.**
      `Config.check_startup` refuses on membership, naming
      `SupplementaryGroups=`, the same shape as `qfextract`'s -- with `qfclient`
@@ -304,6 +312,45 @@ Each ends where a control can fail closed, and none needs the next to be useful.
      `/var/lib/qf-eval/<run_id>/out/`. `eval.parquet` and `verdict.json` are
      written to a temporary name and renamed -- the same single-act discipline as
      D20 and the baseline promoter, so a reader never sees a partial verdict.
+  **Delivered 2026-08-29**, 57 tests. `evaluator/service.py`,
+  `evaluator/request.py`, both units, and `env/` with a committed lock. All six
+  properties above are asserted, and four were red-green verified by reverting
+  them: narrowing `FORBIDDEN_GROUPS`, removing the writable-store refusal,
+  removing the peer check, and exiting instead of serving on a failed gate each
+  break tests.
+
+  Three things the writing changed:
+
+  - `FORBIDDEN_GROUPS` is `docker, qfheavy, qfclient, qfrun, qfextract` -- wider
+    than `qfextract`'s three. `qfclient` is refused with its reason attached
+    (it is the access D28 exists to avoid needing), because a refusal that does
+    not say so reads as boilerplate and gets relaxed by whoever next needs a
+    group.
+  - A **writable input store is a startup refusal**, not a warning, and `ping`
+    reports each store's state so a mode that changes under a running service is
+    visible. The gate has a canary test: a correct configuration must produce
+    ZERO problems, or every refusal above it could be passing because the gate
+    refuses everything.
+  - `ping` reports `can_evaluate: false` while 2c-1 has no implementation. A
+    stub that returned a plausible empty verdict would be the worst possible
+    placeholder, so the absence is answered rather than filled.
+
+  Two defects of mine, both the same shape as ones this programme has already
+  paid for. The socket was drafted `0600 root:qfeval` -- which grants the group
+  nothing, so `qfd` could not have opened the channel at all; it is `0660
+  root:qfd`, as `qf-extract.socket` is. And `ExecStart` named
+  `/opt/qfevalenv/bin/python`, a path no install step creates: 2b-1's P1 exactly,
+  where the unit named an interpreter lacking the imports and the tests hid it
+  with `sys.path`. Now three tests pin the interpreter, the directory the setup
+  script syncs, and the manifest that declares the closure to each other.
+
+  The closure is deliberately **one task ahead of the code**: `service.py` is
+  stdlib-only today, so `/usr/bin/python3` would run it and then fail the moment
+  2c-2 imports pyarrow. It declares pyarrow and numpy and **not pandas** -- the
+  trusted evaluator's per-row single pass is what makes it an independent route
+  rather than the trainer's path twice (D26), and leaving pandas out keeps this
+  environment off the trainer's dependency bump cycle.
+
 - **Task 20 — the `evaluate` kind, and NC9.** `args.contract` is a 64-hex hash
   resolved and verified against the trusted checkout; a job naming a contract
   that is not there, or whose body does not hash to its name, is refused before
