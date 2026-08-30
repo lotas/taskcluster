@@ -67,6 +67,93 @@ def _split_by_pending_at(df: pd.DataFrame, c: cfg.Config) -> tuple[pd.DataFrame,
     return train, val, hold
 
 
+# The frozen prediction contract, `host/evaluator/evaluate.py:98`. CLOSED-WORLD:
+# the evaluator refuses an extra column as loudly as a missing one, so this tuple
+# is the whole file and not a minimum.
+PREDICTION_COLUMNS = ("task_id", "run_id", "row_id", "p50", "p90_raw")
+
+
+def _write_predictions(path: Path, *, c: cfg.Config, builder: FeatureBuilder,
+                       models: dict, refresh_cache: bool,
+                       worker_pools: "pd.DataFrame | None") -> None:
+    """The holdout prediction set a `qf evaluate` run is scored from.
+
+    PREDICTED OVER THE UNFILTERED WINDOW, which is the whole reason this is not
+    three lines over the `hold` split already in hand. The evaluator requires
+    that "every primary-slice extract row on a claimed day must be predicted"
+    (`host/evaluator/rows.py:117`), and its primary slice is the contract's --
+    `reason_resolved = 'completed'`, with NONE of `c.filters` applied. The
+    trainer's holdout is filtered (`started_at IS NOT NULL`,
+    `queue_pending IS NOT NULL`, `wait >= 0`), so it is a strict SUBSET of that
+    slice and a dump of it is refused as "omits N primary-slice row(s)". That
+    rule is the anti-cherry-picking one: a candidate that could filter the
+    population would be scored on the rows it chose. Predicting a superset is
+    allowed and reported as `out_of_slice_n`, so this predicts everything in the
+    holdout window and lets the evaluator pick the slice.
+
+    The reload narrows `lookback_days`/`validation_days` to 1 because holdout
+    membership depends only on `as_of_date` and `holdout_days` -- the training
+    window is not needed here, and re-reading it would double a load that peaks
+    near this config's memory ceiling.
+    """
+    import dataclasses
+
+    c_pred = dataclasses.replace(c, filters=[], lookback_days=1,
+                                 validation_days=1)
+    df = data_loader.load(c_pred, refresh_cache=refresh_cache,
+                          worker_pools=worker_pools)
+    _, _, hold_all = _split_by_pending_at(df, c_pred)
+    del df
+    print(f"  predictions: {len(hold_all):,} unfiltered holdout rows"
+          f" (contract slice is a subset of these)")
+
+    missing_q = [q for q in (0.5, 0.9) if q not in models]
+    if missing_q:
+        raise SystemExit(
+            f"ERROR: --predictions-out needs quantiles 0.5 and 0.9; this config"
+            f" trained {sorted(models)} and is missing {missing_q}. The"
+            f" contract's columns are p50 and p90_raw.")
+
+    feats = builder.transform(hold_all)
+    p50 = np.asarray(models[0.5].predict(feats.X), dtype=float)
+    p90 = np.asarray(models[0.9].predict(feats.X), dtype=float)
+
+    # NON-FINITE IS FATAL HERE, not dropped. Every contract column is non-null
+    # on the evaluator's side, and a row dropped to satisfy that would recreate
+    # the subset the completeness rule exists to forbid. A residual config
+    # produces NaN wherever the baseline NDJSON has no row for a (task_id,
+    # run_id) -- so this count IS the answer to "does the baseline export cover
+    # the unfiltered slice", and it belongs in front of a human the first time.
+    bad = int((~np.isfinite(p50)).sum() + (~np.isfinite(p90)).sum())
+    if bad:
+        n50 = int((~np.isfinite(p50)).sum())
+        n90 = int((~np.isfinite(p90)).sum())
+        raise SystemExit(
+            f"ERROR: {n50:,} non-finite p50 and {n90:,} non-finite p90 over"
+            f" {len(hold_all):,} unfiltered holdout rows. The evaluator's"
+            f" contract is non-null on every column and dropping the rows would"
+            f" reproduce the subset its completeness rule forbids.\n"
+            f"For a residual config this is baseline coverage: the NDJSON in"
+            f" {_baseline_dir(c)} has no row for those (task_id, run_id)."
+            f" Widen the baseline export to the unfiltered window, or predict"
+            f" the contract slice with a non-residual config."
+        )
+
+    task_id = hold_all["task_id"].astype(str)
+    run_id = hold_all["run_id"].astype("int64")
+    out = pd.DataFrame({
+        "task_id": task_id,
+        "run_id":  run_id,
+        # `row_ids` in host/evaluator/rows.py:40 -- f"{task_id}:{run_id}".
+        "row_id":  task_id + ":" + run_id.astype(str),
+        "p50":     p50,
+        "p90_raw": p90,
+    })[list(PREDICTION_COLUMNS)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(path, index=False)
+    print(f"  predictions written: {path} ({len(out):,} rows)")
+
+
 def _require_baselines(holdout_day_keys: list[str], baseline_dir: Path) -> None:
     missing = [d for d in holdout_day_keys if not (baseline_dir / f"{d}.json").exists()]
     if missing:
@@ -218,6 +305,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--as-of-date", default=None,
                         help="Override as_of_date from config (UTC midnight of given day)")
+    parser.add_argument("--predictions-out", default=None, metavar="PATH",
+                        help="write the holdout prediction set for `qf evaluate` "
+                             "(frozen contract: task_id, run_id, row_id, p50, "
+                             "p90_raw) over the UNFILTERED holdout window")
     parser.add_argument("--from-extract", default=None, metavar="DIR",
                         help="Train from a frozen extract directory instead of "
                              "Postgres (default: $QF_EXTRACT_DIR if set). No "
@@ -389,6 +480,13 @@ def main(argv: list[str] | None = None) -> int:
     }
     feature_schema_path = run_dir / f"{run_stem}_feature_schema.json"
     feature_schema_path.write_text(json.dumps(feature_schema, indent=2, default=str))
+
+    if args.predictions_out:
+        _write_predictions(
+            Path(args.predictions_out), c=c, builder=builder, models=models,
+            refresh_cache=args.refresh_cache,
+            worker_pools=_worker_pools_snapshot,
+        )
 
     # artifact_hash: SHA256 over the four serving files concatenated in order.
     serving_files = [

@@ -210,3 +210,51 @@ def test_without_an_extract_the_db_path_is_taken(cohort):
     config_path, _extract, _root = cohort
     with pytest.raises(KeyError, match="DATABASE_URL"):
         train.main(["--config", str(config_path)])
+
+
+def test_predictions_out_covers_the_unfiltered_holdout(tmp_path, monkeypatch):
+    """The evaluator's completeness rule is about the CONTRACT's slice, not the
+    config's filtered population.
+
+    `host/evaluator/rows.py:117` refuses a set that omits a primary-slice row on
+    a claimed day, and its slice applies none of `c.filters`. So a holdout row
+    the config filtered out still has to be predicted -- here, rows with a null
+    `queue_pending`, which `r.queue_pending IS NOT NULL` drops from training.
+    """
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv(xs.ENV_DIR, raising=False)
+    xs._reset_for_tests()
+
+    rows = _synthetic_runs()
+    # One unfilterable row per holdout day: completed, but no queue_pending.
+    for day in (15, 16, 17, 18, 19):
+        rows.append(_run_row(day, 1, task=f"t-nofilter-{day}", wait=42.0,
+                             queue_pending=None))
+    extract = write_extract(tmp_path / "extract", runs_rows=rows)
+    _write_baselines(tmp_path / "data" / "baseline")
+    monkeypatch.setattr(train, "TRAINER_ROOT", tmp_path)
+    monkeypatch.setattr(train, "MODELS_DIR", tmp_path / "data" / "models")
+    config_path = tmp_path / "wait_time_smoke.yaml"
+    config_path.write_text(CONFIG)
+
+    out = tmp_path / "out" / "predictions.parquet"
+    assert train.main(["--config", str(config_path),
+                       "--from-extract", str(extract),
+                       "--predictions-out", str(out)]) == 0
+
+    preds = pd.read_parquet(out)
+    manifest = json.loads(
+        (tmp_path / "data" / "models" / "2026-04-20"
+         / "wait_time_smoke_manifest.json").read_text())
+
+    # Exactly the frozen contract, in order, closed-world.
+    assert list(preds.columns) == list(train.PREDICTION_COLUMNS)
+    # A strict superset of what the model was scored on: the five filtered-out
+    # rows are present.
+    assert len(preds) == manifest["windows"]["holdout"]["rows"] + 5
+    assert {f"t-nofilter-{d}" for d in (15, 16, 17, 18, 19)} <= set(preds["task_id"])
+    # Non-null everywhere, and row_id is `task_id:run_id`.
+    assert not preds.isna().any().any()
+    assert (preds["row_id"] == preds["task_id"] + ":"
+            + preds["run_id"].astype(str)).all()
+    assert (preds["p50"] > 0).all() and (preds["p90_raw"] > 0).all()
