@@ -44,39 +44,66 @@ done
 echo "  ok: --from-extract, --predictions-out, canonical sort all present"
 
 # --- 1. resolve the pinned inputs --------------------------------------------
+# Every lookup PRINTS THE LISTING when it misses. The first version said "run
+# `qf contracts`" instead, which cost a round trip to discover that the
+# contract's name is `wait_time_v1` and its file is `wait_time.v1.json`.
 say "resolve extract / baseline / contract"
-if [ -z "${EXTRACT:-}" ]; then
-  EXTRACT="$(qf extracts --json 2>/dev/null \
-    | python3 -c 'import json,sys
-rows=[r for r in (json.load(sys.stdin).get("extracts") or [])
-      if r.get("target")=="wait_time"]
-print(rows[-1]["request_hash"] if rows else "")')" || true
-  [ -n "$EXTRACT" ] || fail "no wait_time extract published; run qf extract first"
-fi
-if [ -z "${BASELINE:-}" ]; then
-  BASELINE="$(qf baselines --json 2>/dev/null \
-    | python3 -c 'import json,sys
-rows=json.load(sys.stdin).get("baselines") or []
-print(rows[-1]["baseline_hash"] if rows else "")')" || true
-  [ -n "$BASELINE" ] || fail "no promoted baseline; run host/promote-baseline.sh"
-fi
-# `--contract` takes a HEX PREFIX, not a name (`resolve_contract` ->
-# `_resolve_prefix`), so a friendly default has to be looked up. The listing
-# carries `file`, which is `<name>.json`.
+
+# `.` and `-` normalise to `_` so a contract NAME (`wait_time_v1`) matches its
+# FILE (`wait_time.v1.json`). Injected into the python below rather than
+# duplicated in each selector.
+NORM_PY='
+def norm(s):
+    s = (s or "")
+    if s.endswith(".json"):
+        s = s[: -len(".json")]
+    return s.replace(".", "_").replace("-", "_")
+'
+
+pick() {             # pick <op> <key> <python-expr over r, may use norm()>
+  local op="$1" key="$2" expr="$3" json out
+  json="$(qf "$op" --json 2>/dev/null)" || return 1
+  out="$(printf '%s' "$json" | OP="$op" KEY="$key" EXPR="$expr" python3 -c "
+import json, os, sys
+$NORM_PY
+op, key, expr = os.environ['OP'], os.environ['KEY'], os.environ['EXPR']
+rows = json.load(sys.stdin).get(op) or []
+hit = [r for r in rows if eval(expr, {'r': r, 'norm': norm})]
+if hit:
+    print(hit[-1][key])
+else:
+    print('', end='')
+    print(f'  nothing in {op} matched: {expr}', file=sys.stderr)
+    print(f'  {len(rows)} published:', file=sys.stderr)
+    for r in rows:
+        flat = '  '.join(f'{k}={v}' for k, v in sorted(r.items())
+                         if not isinstance(v, (dict, list)))
+        print('    ' + flat, file=sys.stderr)
+")" || return 1
+  printf '%s' "$out"
+}
+
+[ -n "${EXTRACT:-}" ] || EXTRACT="$(pick extracts request_hash \
+  "r.get('target') == 'wait_time'")"
+[ -n "$EXTRACT" ] || fail "no wait_time extract published (listing above)"
+
+[ -n "${BASELINE:-}" ] || BASELINE="$(pick baselines baseline_hash "True")"
+[ -n "$BASELINE" ] || fail "no promoted baseline (listing above);
+    see host/promote-baseline.sh"
+
+# A hex prefix passes through; anything else is a NAME, matched against the
+# contract file with `.` and `-` normalised to `_` so `wait_time_v1` finds
+# `wait_time.v1.json`.
 case "$CONTRACT" in
   *[!0-9a-f]*|"")
-    CONTRACT_NAME="$CONTRACT"
-    CONTRACT="$(qf contracts --json 2>/dev/null \
-      | CONTRACT_NAME="$CONTRACT_NAME" python3 -c 'import json,os,sys
-want = os.environ["CONTRACT_NAME"]
-rows = json.load(sys.stdin).get("contracts") or []
-hit = [r for r in rows if (r.get("file") or "").startswith(want)]
-print(hit[0]["contract_hash"] if hit else "")')" || true
-    [ -n "$CONTRACT" ] || fail "no contract matching '$CONTRACT_NAME'.
-    \`qf contracts\` lists what is published; a .json.in template is not a
-    contract (see instantiate-contract.sh)."
+    CONTRACT="$(pick contracts contract_hash \
+      "norm(r.get('file')) == '$CONTRACT' or norm(r.get('file')).startswith('$CONTRACT')")"
+    [ -n "$CONTRACT" ] || fail "no contract matched (listing above). A .json.in
+    template is not a contract -- it pins no baseline. See
+    host/instantiate-contract.sh"
     ;;
 esac
+
 echo "  extract=${EXTRACT:0:12}  baseline=${BASELINE:0:12}  contract=${CONTRACT:0:12}"
 
 # --- 2. the sync that was the actual bug -------------------------------------
