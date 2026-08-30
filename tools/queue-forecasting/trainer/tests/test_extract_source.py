@@ -57,11 +57,11 @@ _RUNS_SCHEMA = pyarrow.schema([
     ("tags", pyarrow.string()),
 ])
 
-# `task_created` is NOT in today's real extract -- adding it is the deferred
-# trusted change `ExtractSource.qctx_runs` names. The fixture carries it so the
-# working path is covered, and
-# `test_qctx_is_refused_when_the_extract_lacks_task_created` covers the shape
-# that exists now.
+# `task_created` is carried by `DATASETS["qctx_runs"]` since 2026-08-30, because
+# the tasks-side join floor cannot be re-applied without it.
+# `test_qctx_is_refused_when_the_extract_lacks_task_created` covers extracts
+# published before that -- the column list is not part of `request_hash`, so an
+# older artifact can still be handed back for a matching request.
 _QCTX_SCHEMA = pyarrow.schema([
     ("task_id", pyarrow.string()),
     ("run_id", pyarrow.int32()),
@@ -464,15 +464,20 @@ def test_qctx_keeps_open_runs_and_drops_exited_ones(extract):
     assert "q-a" not in ids      # started on day 4, before window_start
     assert "q-noqueue" not in ids  # task_queue_id IS NOT NULL in the SQL
     assert "q-oldtask" not in ids  # t.task_created >= ref_lower
+    # `task_created` is filtered on and then dropped: the DB path never selects
+    # it, and a column the feature code sees on one source only is a difference
+    # between sources that nothing would report.
+    assert "task_created" not in got.columns
 
 
 def test_qctx_is_refused_when_the_extract_lacks_task_created(tmp_path):
-    """The shape every extract has TODAY: no `task_created` column.
+    """The shape of any extract published before 2026-08-30.
 
-    Without it the tasks-side floor cannot be re-applied and the reference set
-    would be a superset of the SQL cohort's -- so the read is refused, not
-    approximated. Fixing it is a one-column change in trusted code plus a
-    `generation` bump; deferred until a qctx config is queued.
+    Without the column the tasks-side floor cannot be re-applied and the
+    reference set would be a superset of the SQL cohort's -- so the read is
+    refused, not approximated. `request_hash` does not cover the column list, so
+    an older artifact is still a D20 hit for a matching request and this is the
+    error that says so; the operator's fix is a bumped `generation`.
     """
     root = write_extract(tmp_path / "extract")
     manifest = json.loads((root / "MANIFEST.json").read_text())

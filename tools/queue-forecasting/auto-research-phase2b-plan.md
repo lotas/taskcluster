@@ -1630,7 +1630,7 @@ now mutually exclusive in `training_lineage`, with a `source` discriminator);
 and the discrete-hazard path returns before that block, so its manifest carried
 no extract identity at all.
 
-**One deferred trusted change, now fail-closed rather than silent.**
+**One deferred trusted change, DONE 2026-08-30 (see the closing note below).**
 `_QCTX_SQL` floors both sides of its join -- `r.pending_at >= ref_lower` AND
 `t.task_created >= ref_lower` -- and `qctx_runs.parquet` carries only the
 runs-side column, so the tasks-side floor cannot be reconstructed (the trainer's
@@ -1641,8 +1641,23 @@ queue-context count for the first rows of the window. `ExtractSource.qctx_runs`
 therefore REFUSES an extract without `task_created` instead of approximating.
 Fixing it is one column in `_QCTX_SQL` and `DATASETS["qctx_runs"]` here, plus a
 `generation` bump on the request -- `request_hash` does not cover the column
-list, so D20 reuse would otherwise hand back the old extract. Deferred until a
-queue-context config is queued; no promoted wait config needs it.
+list, so D20 reuse would otherwise hand back the old extract.
+
+That column landed on 2026-08-30, when the first experiment queued was
+`wait_time_residual_throughput_filtered_baseline_qctx.yaml`. Two details worth
+keeping: the extract's `ref_lower` is `train_start - 24h - lookback_days` and the
+trainer's is `train_start - 90m - lookback_days`, so the extract's floor is the
+earlier of the two and containment holds for any request whose `lookback_days` is
+at least the config's (14 today) -- the column exists to re-narrow, never to
+widen. And `qctx_runs()` DROPS it after filtering, because the SQL path never
+selected it: a column the feature code sees on one source only is a difference
+between sources that nothing downstream would report.
+
+The `generation` bump is not optional and not cosmetic. `request_hash` covers
+target, window, lookback and generation -- not the column list -- so a re-extract
+at generation 1 is a D20 cache hit that returns the OLD file, and
+`ExtractSource.qctx_runs` then raises the refusal again. That error is the
+symptom of a missing bump, not of a missing column.
 
 Still outstanding for a probe, all three in the research-side wrapper rather
 than here: `predictions.parquet` (`train.py` writes none), an explicit

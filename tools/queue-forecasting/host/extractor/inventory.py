@@ -189,6 +189,15 @@ WHERE r.resolved_at IS NOT NULL
 # queue-context features for the first rows of the window. Neither would have
 # failed anything: the extract would simply have been a subset, and the model
 # trained on it slightly different.
+#
+# `t.task_created` IS SELECTED, and it is the one column here that no feature
+# reads. The trainer's own `ref_lower` is `train_start - 90m - lookback_days`,
+# strictly later than the extract's, so the consumer has to re-apply BOTH floors
+# to reproduce the cohort -- and it can only re-apply a floor on a column it can
+# see. Without it `extract_source.qctx_runs` refuses the read rather than
+# returning a superset of the reference set (added 2026-08-30; an extract from
+# before then triggers that refusal, and `request_hash` does not cover the column
+# list, so re-extracting takes a bumped `generation`).
 _QCTX_SQL = """
 SELECT r.task_id,
        r.run_id,
@@ -197,7 +206,8 @@ SELECT r.task_id,
        r.resolved_at,
        r.priority_at_pending,
        t.task_queue_id,
-       t.repo_family
+       t.repo_family,
+       t.task_created
 FROM queue_forecast_task_runs r
 JOIN queue_forecast_tasks t ON r.task_id = t.task_id
 WHERE r.pending_at < %(as_of_date)s
@@ -302,13 +312,14 @@ DATASETS = {
         params=("as_of_date", "ref_lower", "window_lower"),
         columns=("task_id", "run_id", "pending_at", "started_at",
                  "resolved_at", "priority_at_pending", "task_queue_id",
-                 "repo_family"),
+                 "repo_family", "task_created"),
         watermark_columns=("pending_at", "resolved_at"),
         types={
             "task_id": "string", "run_id": "int32",
             "pending_at": "timestamp", "started_at": "timestamp",
             "resolved_at": "timestamp", "priority_at_pending": "string",
             "task_queue_id": "string", "repo_family": "string",
+            "task_created": "timestamp",
         },
     ),
     "daily_health": Dataset(

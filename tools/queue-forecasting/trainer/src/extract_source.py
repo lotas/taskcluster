@@ -503,17 +503,15 @@ class ExtractSource:
         the extract keeps MORE rows, so `<=` is the containment direction here
         too.
 
-        REFUSED WHEN THE EXTRACT LACKS `task_created`, which today it always
-        does. The SQL floors BOTH sides of its join -- `r.pending_at >=
-        ref_lower` AND `t.task_created >= ref_lower` -- and the extract carries
-        only the runs-side column. The trainer's `ref_lower` is derived from
-        `train_start - 90m` while the extract's hangs off the generic
-        `train_start - 24h` prefix, so the two floors are not the same instant
-        and the missing tasks-side one cannot be reconstructed from what is in
-        the file. The result would be a SUPERSET: reference runs whose task was
-        created before the floor, which the database cohort never saw,
-        contributing to every queue-context count for the first rows of the
-        window.
+        REFUSED WHEN THE EXTRACT LACKS `task_created`. The SQL floors BOTH sides
+        of its join -- `r.pending_at >= ref_lower` AND `t.task_created >=
+        ref_lower`. The trainer's `ref_lower` is derived from `train_start - 90m`
+        while the extract's hangs off the generic `train_start - 24h` prefix, so
+        the two floors are not the same instant and the tasks-side one has to be
+        re-applied here. Without the column it cannot be, and the result would be
+        a SUPERSET: reference runs whose task was created before the floor, which
+        the database cohort never saw, contributing to every queue-context count
+        for the first rows of the window.
 
         An earlier version of this method skipped the floor with a comment
         claiming re-applying it "would only ever drop rows this query kept".
@@ -521,12 +519,12 @@ class ExtractSource:
         query being mirrored, so keeping them is a different population, not a
         conservative one.
 
-        The fix is one column in trusted code (`task_created` in `_QCTX_SQL` and
-        `DATASETS["qctx_runs"]`, `host/extractor/inventory.py`) plus a
-        `generation` bump on the extract request, since `request_hash` does not
-        cover the column list and D20 would otherwise hand back the old extract.
-        Deferred until a queue-context config enters the experiment queue; until
-        then this raises rather than training on a population nobody chose.
+        `task_created` is carried by `DATASETS["qctx_runs"]` since 2026-08-30 and
+        is dropped from the returned frame, which the DB path never selects: the
+        column exists to be filtered on, not to reach the feature code. An
+        extract published before that date lacks it, and `request_hash` does not
+        cover the column list -- so re-extracting needs a BUMPED `generation` or
+        D20 hands back the old artifact and this raises again.
         """
         available = set(self._entry("qctx_runs").get("columns") or [])
         if "task_created" not in available:
@@ -551,7 +549,7 @@ class ExtractSource:
                 & (exit_at.isna() | (exit_at > window_start))
                 & (df["task_created"] >= ref_lower)
                 & df["task_queue_id"].notna()]
-        return df.reset_index(drop=True)
+        return df.drop(columns=["task_created"]).reset_index(drop=True)
 
     def anomalous_dates(self, flag_subset) -> set[datetime.date]:
         """`data_loader.load_anomalous_dates`.

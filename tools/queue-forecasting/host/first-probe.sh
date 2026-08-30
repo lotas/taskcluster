@@ -22,6 +22,8 @@
 #   EXTRACT       extract request_hash            (default: newest wait_time)
 #   BASELINE      promoted baseline_hash          (default: newest)
 #   CONTRACT      contract hash or name           (default wait_time_v1)
+#   COHORT_CONFIG trainer config the probe trains (default: whatever the
+#                 research copy of run_cohort.py already names)
 #   SKIP_SYNC=1   do not touch the research repo, probe the current HEAD
 #   NO_EVAL=1     stop after the probe
 set -uo pipefail
@@ -37,10 +39,42 @@ CONTRACT="${CONTRACT:-wait_time_v1}"
 # correct: a cohort trains, so it must serialise against the nightly.
 PROBE_MEM="${PROBE_MEM:-20g}"
 AS_RESEARCH=(sudo -H -u research)
+COHORT_CONFIG="${COHORT_CONFIG:-}"
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 qf()   { "${AS_RESEARCH[@]}" qf "$@"; }
+
+# WHICH CONFIG THE COHORT TRAINS, written into the research copy of
+# `run_cohort.py`. A probe gets no arguments and no injected environment, so the
+# config is a CONSTANT IN A FILE -- selecting one is necessarily a commit, and
+# the only question is whether the operator makes that edit by hand and then
+# describes it in EXPERIMENT_NOTE from memory.
+#
+# Only rewrites when COHORT_CONFIG is set: the default is to leave the research
+# copy alone, because that file is where an experiment lives.
+set_cohort_config() {
+  [ -n "$COHORT_CONFIG" ] || return 0
+  local target="$QF_RESEARCH/research/experiments/run_cohort.py"
+  [ -f "$target" ] || fail "no $target yet -- run bootstrap mode once first"
+  # Checked against the RESEARCH trainer, not the trusted one: that is the copy
+  # the probe opens, and a config present only here would fail inside the
+  # sandbox as a missing file, minutes after submission.
+  [ -f "$QF_RESEARCH/trainer/$COHORT_CONFIG" ] || fail \
+    "$QF_RESEARCH/trainer/$COHORT_CONFIG does not exist. The probe reads the
+    config from the RESEARCH copy of the trainer, so it has to be there:
+$(ls "$QF_RESEARCH/trainer/configs" 2>/dev/null | sed 's/^/      /')"
+  COHORT_CONFIG="$COHORT_CONFIG" python3 -c '
+import os, re, sys
+path, cfg = sys.argv[1], os.environ["COHORT_CONFIG"]
+src = open(path).read()
+out, n = re.subn(r"^CONFIG = \".*\"$", f"CONFIG = \"{cfg}\"", src, flags=re.M)
+if n != 1:
+    raise SystemExit(f"expected one CONFIG assignment in {path}, found {n}")
+open(path, "w").write(out)
+' "$target" || fail "could not set CONFIG in $target"
+  echo "  CONFIG = $COHORT_CONFIG"
+}
 
 # A run id is `<kind>-<UTC stamp>-<12 hex>-<pid>`; nothing else in the output
 # looks like that.
@@ -83,15 +117,29 @@ def norm(s):
     return s.replace(".", "_").replace("-", "_")
 '
 
-pick() {             # pick <op> <key> <python-expr over r, may use norm()>
-  local op="$1" key="$2" expr="$3" json out
+# `pick <op> <key> <filter-expr> [<newest-expr>]`.
+#
+# THE FOURTH ARGUMENT IS NOT A REFINEMENT. Both listings arrive in
+# `sorted(os.listdir())` order -- sorted by HASH -- so "the last row" is
+# effectively random, and it was only ever right because exactly one wait_time
+# extract existed. The moment a second one is published (which is what bumping
+# `generation` does) an unsorted `hit[-1]` becomes a coin flip between two
+# extracts that differ in their column list, and the wrong side of that flip
+# either refuses the read or trains a cohort nobody asked for. So a caller that
+# means "newest" says what newest MEANS in that listing.
+pick() {
+  local op="$1" key="$2" expr="$3" newest="${4:-}" json out
   json="$(qf "$op" --json 2>/dev/null)" || return 1
-  out="$(printf '%s' "$json" | OP="$op" KEY="$key" EXPR="$expr" python3 -c "
+  out="$(printf '%s' "$json" \
+    | OP="$op" KEY="$key" EXPR="$expr" NEWEST="$newest" python3 -c "
 import json, os, sys
 $NORM_PY
 op, key, expr = os.environ['OP'], os.environ['KEY'], os.environ['EXPR']
+newest = os.environ['NEWEST']
 rows = json.load(sys.stdin).get(op) or []
 hit = [r for r in rows if eval(expr, {'r': r, 'norm': norm})]
+if hit and newest:
+    hit.sort(key=lambda r: eval(newest, {'r': r}))
 if hit:
     print(hit[-1][key])
 else:
@@ -106,11 +154,18 @@ else:
   printf '%s' "$out"
 }
 
+# Newest = latest snapshot, then highest generation: a re-extract of the SAME
+# window (the `generation` bump) shares `as_of_date` with the one it replaces, so
+# `as_of_date` alone does not order them.
 [ -n "${EXTRACT:-}" ] || EXTRACT="$(pick extracts request_hash \
-  "r.get('target') == 'wait_time'")"
+  "r.get('target') == 'wait_time'" \
+  "(r.get('snapshot_start_ts') or '', r.get('generation') or 0)")"
 [ -n "$EXTRACT" ] || fail "no wait_time extract published (listing above)"
 
-[ -n "${BASELINE:-}" ] || BASELINE="$(pick baselines baseline_hash "True")"
+# `broken` baselines are excluded rather than merely deprioritised: a promoted
+# baseline that failed its own checks is not a fallback.
+[ -n "${BASELINE:-}" ] || BASELINE="$(pick baselines baseline_hash \
+  "not r.get('broken')" "r.get('promoted_at') or ''")"
 [ -n "$BASELINE" ] || fail "no promoted baseline (listing above);
     see host/promote-baseline.sh"
 
@@ -143,6 +198,7 @@ if [ "${EXPERIMENT:-0}" = "1" ]; then
   # So here nothing is copied: whatever is in the worktree is committed, pushed
   # and probed as-is.
   say "experiment: probing $QF_RESEARCH as it stands"
+  set_cohort_config
   if [ -n "$(git -C "$QF_RESEARCH" status --porcelain)" ]; then
     git -C "$QF_RESEARCH" status --short | sed 's/^/    /'
     git -C "$QF_RESEARCH" add -A
@@ -172,6 +228,7 @@ $(git -C "$QF_RESEARCH" status --short | sed 's/^/      /')"
     || fail "rsync of trainer/ failed"
   cp "$HERE/research-experiments/run_cohort.py" \
      "$QF_RESEARCH/research/experiments/run_cohort.py"
+  set_cohort_config   # after the cp, which would otherwise overwrite it
 
   if [ -n "$(git -C "$QF_RESEARCH" status --porcelain)" ]; then
     echo "  the sync changed:"

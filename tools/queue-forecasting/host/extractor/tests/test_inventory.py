@@ -43,7 +43,7 @@ EXPECTED = {
     },
     "qctx_runs": {
         "task_id", "run_id", "pending_at", "started_at", "resolved_at",
-        "priority_at_pending", "task_queue_id", "repo_family",
+        "priority_at_pending", "task_queue_id", "repo_family", "task_created",
     },
     "daily_health": {
         "sample_date", "is_anomalous",
