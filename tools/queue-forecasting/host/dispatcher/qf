@@ -416,7 +416,65 @@ def cmd_evaluate(args):
                         "request_hash", "baseline_hash", "predictions_sha256"):
                 if pins.get(key):
                     print(f"{key}: {pins[key]}", file=sys.stderr)
+            print_scoreboard(pins.get("scoreboard"))
             raise SystemExit(0 if job["state"] == "SUCCEEDED" else 1)
+
+
+def print_scoreboard(text):
+    """The metrics behind a verdict, one line each.
+
+    A word is not a result. `no-go` at 6.7% against a 15% bar and `no-go` at
+    14.9% against the same bar are the same word and different situations, and
+    the difference is the whole content of an experiment. `verdict.json` has
+    always held this, in the run's `out/` -- which the submitting identity
+    cannot read.
+
+    Unparseable is printed RAW rather than swallowed: the pin came from another
+    service, and a summary that quietly renders as nothing is worse than one
+    that renders badly.
+    """
+    if not text:
+        return
+    try:
+        board = json.loads(text)
+        metrics = board["metrics"]
+    except (ValueError, KeyError, TypeError):
+        print(f"scoreboard: {text}", file=sys.stderr)
+        return
+    print("scoreboard:", file=sys.stderr)
+    for name, spec in sorted(metrics.items()):
+        # `is True` / `is False`, never truthiness. `passed: "false"` and
+        # `passed: 1` are both truthy in python, so a bare `if spec["passed"]`
+        # printed PASS for a metric that had failed. `qfd` refuses a non-bool
+        # now, and this stays strict anyway: this renders pins that may have been
+        # written by an older build, and "??" is the honest answer to a field
+        # that does not say.
+        passed = spec.get("passed")
+        mark = "PASS" if passed is True else "FAIL" if passed is False else "??"
+        bits = [f"  {mark}  {name}"]
+        if spec.get("bucket"):
+            bits.append(f"[{spec['bucket']}]")
+        for field in ("measured", "value", "baseline"):
+            value = spec.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                bits.append(f"{field}={value:.4g}")
+        # `bar` is an OBJECT: `{kind, value}` for a threshold, `{kind, low,
+        # high}` for a band. Rendered as `bar=<kind>:<numbers>` so the rule and
+        # the number it compares against stay together -- `bar=0.15` alone does
+        # not say whether that is 15% better than baseline or an absolute 0.15.
+        bar = spec.get("bar")
+        if isinstance(bar, dict):
+            numbers = [f"{bar[k]:.4g}" for k in ("value", "low", "high")
+                       if isinstance(bar.get(k), (int, float))
+                       and not isinstance(bar.get(k), bool)]
+            label = bar.get("kind") or "bar"
+            bits.append(f"bar={label}"
+                        + (f":{'..'.join(numbers)}" if numbers else ""))
+        print(" ".join(bits), file=sys.stderr)
+    days = board.get("consistency") or {}
+    if days.get("days_required") is not None:
+        print(f"  days_passed={days.get('days_passed')}"
+              f"/{days.get('days_required')} required", file=sys.stderr)
 
 
 def cmd_status(args):

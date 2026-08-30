@@ -31,6 +31,7 @@ import grp
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -824,6 +825,150 @@ def _one_line(text, limit=300):
     treats each line as a record, so an untrimmed multi-line error is
     interleaved with everything else and reads as several unrelated events."""
     return " ".join((text or "").split())[:limit]
+
+
+# --- the evaluator's scoreboard -------------------------------------------
+# One metric name per contract metric; bounded because a pin is written from
+# another service's reply and "the contract has four metrics today" is not a
+# property of this code.
+_METRIC_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}\Z")
+_BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+.<>-]{0,31}\Z")
+SCOREBOARD_MAX_METRICS = 32
+SCOREBOARD_MAX_BYTES = 8 * 1024
+
+# WHAT EACH FIELD MAY BE, per field. One generic "numbers, strings and bools all
+# pass" policy was the first version of this, and it let `passed: "false"` and
+# `passed: 1` through -- both of which `qf` then rendered as PASS, so a scoreboard
+# that failed its bars printed as one that met them. A validator whose output can
+# invert the thing it describes is worse than no validator, because the pin reads
+# as checked.
+#
+# `passed` is the field that must be exactly `True` or `False`: it is the only one
+# a reader turns into a word.
+_SCOREBOARD_NUMERIC = ("value", "baseline", "measured")   # finite number or null
+_SCOREBOARD_REQUIRED = ("passed", "bar", "value", "measured")
+# `direction` is checked against the CONTRACT's vocabulary rather than "is a
+# string", because it is a contract field and `contract_mod` already owns what it
+# may say. `bucket` is free-form by comparison -- `metrics.WAIT_BUCKETS` owns that
+# vocabulary and lives in the evaluator, which this service deliberately does not
+# import -- so it gets a shape check instead.
+
+
+def _finite(value):
+    """A real number, or None if it is not one. `bool` is not a number here:
+    `isinstance(True, int)` is True in python, and `value: true` would otherwise
+    be recorded and printed as 1."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        # NaN and inf serialise to JSON that `json.loads` accepts and no other
+        # language does, so a reader outside python would see a parse error
+        # rather than a missing number.
+        return value
+    return None
+
+
+def _scoreboard_bar(bar):
+    """One contract bar, projected, or None if it is not a bar.
+
+    THE KIND DECIDES THE SHAPE, exactly as `contract.py` does when it validates
+    the same object: `band` carries `low` and `high`, every other kind carries
+    `value`. A bar with no `kind`, or with a `kind` this build does not know, or
+    carrying the fields of the other shape, is not a bar -- and a bar printed
+    without its kind is a number whose rule nobody can look up.
+    """
+    if not isinstance(bar, dict):
+        return None
+    if set(bar) - {"kind", "value", "low", "high"}:
+        return None
+    kind = bar.get("kind")
+    if kind not in contract_mod.BAR_KINDS:
+        return None
+    if kind == "band":
+        low, high = _finite(bar.get("low")), _finite(bar.get("high"))
+        if low is None or high is None or "value" in bar:
+            return None
+        return {"kind": kind, "low": low, "high": high}
+    value = _finite(bar.get("value"))
+    if value is None or "low" in bar or "high" in bar:
+        return None
+    return {"kind": kind, "value": value}
+
+
+def _scoreboard_pin(board):
+    """A compact JSON pin from the evaluator's scoreboard, or None if it is not
+    the shape this records.
+
+    PROJECTED, NOT PASSED THROUGH. The evaluator is trusted, but a pin is a
+    string this service stores under a name that other things read, and
+    forwarding an arbitrary nested object from a reply is how a field nobody
+    chose ends up in a record everybody cites. So: known field names, per-field
+    types, bounded count, bounded length. Anything else and the caller keeps the
+    verdict and loses the numbers, which is the correct direction to fail.
+
+    Unknown METRIC-level fields are dropped rather than refused, because the
+    evaluator may grow one and an older dispatcher should still record the rest.
+    Unknown fields INSIDE a bar are refused, because a bar is a closed grammar
+    that `contract_mod` owns.
+    """
+    if not isinstance(board, dict):
+        return None
+    metrics = board.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return None
+    if len(metrics) > SCOREBOARD_MAX_METRICS:
+        return None
+    out = {}
+    for name, spec in metrics.items():
+        if not isinstance(name, str) or not _METRIC_NAME_RE.match(name):
+            return None
+        if not isinstance(spec, dict):
+            return None
+        if any(field not in spec for field in _SCOREBOARD_REQUIRED):
+            return None
+        if not isinstance(spec["passed"], bool):
+            return None
+        bar = _scoreboard_bar(spec["bar"])
+        if bar is None:
+            return None
+        kept = {"passed": spec["passed"], "bar": bar}
+        for field in _SCOREBOARD_NUMERIC:
+            if field not in spec:
+                continue
+            if spec[field] is None:
+                kept[field] = None
+                continue
+            number = _finite(spec[field])
+            if number is None:
+                return None
+            kept[field] = number
+        direction = spec.get("direction")
+        if direction is not None:
+            if direction not in contract_mod.DIRECTIONS:
+                return None
+            kept["direction"] = direction
+        bucket = spec.get("bucket")
+        if bucket is not None:
+            if not isinstance(bucket, str) or not _BUCKET_RE.match(bucket):
+                return None
+            kept["bucket"] = bucket
+        out[name] = kept
+
+    consistency = board.get("consistency")
+    payload = {"metrics": out}
+    if isinstance(consistency, dict):
+        days = {}
+        for field in ("days_required", "days_passed"):
+            value = consistency.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                days[field] = value
+        if days:
+            payload["consistency"] = days
+
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return None if len(text.encode()) > SCOREBOARD_MAX_BYTES else text
 
 
 # --- docker ---------------------------------------------------------------
@@ -2843,6 +2988,25 @@ class Runner:
             if isinstance(reply.get("eval_hash"), str):
                 self.db.call("set_pin", run_id, "eval_hash",
                              reply["eval_hash"], now=now)
+            # THE NUMBERS, not just the word. `verdict.json` lives in the run's
+            # `out/` (qfrun 2770), which the submitting identity cannot read, so
+            # before this a client saw `no-go` and nothing else -- and 6.7%
+            # against a 15% bar and 14.9% against a 15% bar are the same word.
+            #
+            # A MALFORMED SCOREBOARD DOES NOT FAIL THE RUN. The verdict is the
+            # contract-bearing fact and it has already been validated; the
+            # scoreboard is a readout. So this logs and records nothing rather
+            # than turning a completed evaluation into a failure over its
+            # summary -- and the pin's absence beside a present verdict is what
+            # says so.
+            board = _scoreboard_pin(reply.get("scoreboard"))
+            if board is None:
+                if reply.get("scoreboard") is not None:
+                    log.error("%s: the evaluator's scoreboard is not a shape"
+                              " this can record; verdict kept, numbers"
+                              " dropped", run_id)
+            else:
+                self.db.call("set_pin", run_id, "scoreboard", board, now=now)
             log.info("%s: verdict %s", run_id, verdict)
             return ("SUCCEEDED", {"exit_code": 0, "finished_at": utcnow()})
         finally:

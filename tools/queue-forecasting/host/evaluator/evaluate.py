@@ -706,6 +706,31 @@ def _identity(document):
     return {k: document["inputs"].get(k) for k in IDENTITY_INPUTS}
 
 
+def _scoreboard(document):
+    """The numbers behind a verdict, small enough to travel in the reply.
+
+    WHY THIS CROSSES THE SOCKET AT ALL. `verdict.json` already holds everything
+    here and more, and it is written into the run's `out/`, which is qfrun 2770
+    -- so the identity that submits experiments cannot read it. What that
+    identity could see was one word, `go` or `no-go`, and a research loop cannot
+    choose its next hypothesis from a word: 6.7% against a 15% bar and 14.9%
+    against a 15% bar are the same verdict and completely different situations.
+
+    Deliberately NOT the whole document: no per-day block, no per-bucket table,
+    no row counts. Those belong in the file, and a reply that grew with the
+    holdout would eventually be a reply nobody bounded.
+    """
+    consistency = document.get("consistency") or {}
+    # `.get` throughout: this also runs over a verdict document READ BACK FROM
+    # DISK, and a KeyError on the reuse path would turn a valid cached verdict
+    # into an opaque internal error. A missing field yields a thinner
+    # scoreboard, which is visibly thin.
+    return {"metrics": document.get("metrics") or {},
+            "consistency": {
+                "days_required": consistency.get("days_required"),
+                "days_passed": consistency.get("days_passed")}}
+
+
 def _existing_verdict(out_dir, document):
     """A previous verdict for this run, if it judged the SAME inputs.
 
@@ -904,6 +929,7 @@ def evaluate(cfg, req, contract_name):
     if previous is not None:
         return {"verdict": previous["verdict"],
                 "eval_hash": previous.get("eval_hash"),
+                "scoreboard": _scoreboard(previous),
                 "reused": True}
 
     table = _eval_table(scored, contract)
@@ -919,4 +945,5 @@ def evaluate(cfg, req, contract_name):
                                    indent=2).encode())
     return {"verdict": document["verdict"], "eval_hash": document["eval_hash"],
             "scored_n": document["rows"]["scored_n"],
+            "scoreboard": _scoreboard(document),
             "days": day_block["claimed"], "reused": False}

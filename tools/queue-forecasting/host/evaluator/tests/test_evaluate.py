@@ -1152,7 +1152,16 @@ class TestTheNcSuiteAgreesWithThisModule(EvaluateCase):
         self.assertIsNotNone(pattern)
         # The tokens NC11 asserts on, taken from the clause bodies rather than
         # listed here, so adding a clause with a typo is caught.
+        #
+        # TWO SHAPES, because the clause bodies have had two. NC11 used to
+        # compare against the literal `"FAILED <class> -"`; the suite then moved
+        # that comparison into `nc11_refused_as "$result" <class>`, and this
+        # extraction went to zero -- which is exactly what the assertion below
+        # exists to catch, and did. Both are matched now so that reverting either
+        # way does not silently empty the check again.
         matched = set(re.findall(r'"FAILED ([a-z][a-z0-9_]+) ', nc11))
+        matched |= set(re.findall(
+            r'nc11_refused_as\s+"\$\w+"\s+([a-z][a-z0-9_]+)', nc11))
         self.assertTrue(matched, "NC11 matches on no error class at all")
         for klass in sorted(matched):
             with self.subTest(error_class=klass):

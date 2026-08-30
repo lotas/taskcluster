@@ -228,6 +228,11 @@ $(git -C "$QF_RESEARCH" status --short | sed 's/^/      /')"
     || fail "rsync of trainer/ failed"
   cp "$HERE/research-experiments/run_cohort.py" \
      "$QF_RESEARCH/research/experiments/run_cohort.py"
+  # AT THE ROOT, not beside the script: this is the file an agent reads on its
+  # own, and one two directories down is one nothing reads. Operator-owned like
+  # `run_cohort.py`, and overwritten for the same reason -- the loop's rules are
+  # not a thing the agent running inside it gets to edit.
+  cp "$HERE/research-experiments/AGENTS.md" "$QF_RESEARCH/AGENTS.md"
   set_cohort_config   # after the cp, which would otherwise overwrite it
 
   if [ -n "$(git -C "$QF_RESEARCH" status --porcelain)" ]; then
