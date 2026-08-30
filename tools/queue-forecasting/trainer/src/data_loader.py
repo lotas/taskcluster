@@ -632,6 +632,39 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
     # before this downcast existed, without needing a cache-format bump.
     df = _downcast_categorical_columns(df)
 
+    # CANONICAL ROW ORDER. Not cosmetic, and not for the extract path's benefit.
+    #
+    # `_build_query` has no ORDER BY, so Postgres returns rows in whatever order
+    # the plan produces -- which for a parallel sequential scan is not stable
+    # across runs of the SAME query. And row order changes the MODEL: LightGBM
+    # samples up to `bin_construct_sample_cnt` (default 200k) rows BY INDEX to
+    # compute bin boundaries, so a different order gives different bin edges,
+    # different splits, and different predictions on identical data.
+    #
+    # MEASURED, 2026-08-30. The same cohort trained from Postgres and from a
+    # frozen extract, with row sets proven identical (4,735,428 common rows,
+    # every `y` equal) and nothing but order differing: aggregate MAE 211.34 vs
+    # 218.82, and 30m+ MAE 3860.7 vs 4121.4 -- a 6.8% swing in the tail bucket
+    # this whole program is trying to improve. Two runs from the same extract
+    # were bit-identical, so the training itself is deterministic; the order was
+    # the only variable.
+    #
+    # So this is what makes a walk-forward number mean something: without it,
+    # two runs of one config on one cohort can disagree by more than the effect
+    # a research experiment is trying to detect.
+    #
+    # PLACED HERE, before the baseline join and every feature add, because this
+    # is where the frame is narrowest -- `sort_values` copies, and the peak RSS
+    # for this config is already 17.4GB against a 22g cap.
+    #
+    # `kind="stable"` and a total key: (pending_at, task_id, run_id) is unique
+    # per row, so the result does not depend on the incoming order at all. A
+    # sort on `pending_at` alone would leave ties ordered by whatever arrived.
+    t0 = time.monotonic()
+    df = df.sort_values(["pending_at", "task_id", "run_id"], kind="stable") \
+           .reset_index(drop=True)
+    _log_step("canonical sort", t0)
+
     baseline_file = resolve_baseline_file(c)
     if baseline_file:
         t0 = time.monotonic()

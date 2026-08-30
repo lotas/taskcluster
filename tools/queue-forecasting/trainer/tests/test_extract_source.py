@@ -640,3 +640,40 @@ def test_needed_source_columns_matches_the_sql_select():
     sql = dl._build_query(c)
     for col in needed:
         assert f".{col}" in sql
+
+
+def test_load_is_row_order_canonical_whatever_the_source_order(tmp_path):
+    """Order is not incidental: LightGBM samples rows BY INDEX to build bin
+    boundaries, so the same rows in a different order train a different model.
+
+    `_build_query` has no ORDER BY, so the database side has no order to
+    promise -- which is why the sort lives in `load()`, applied to both sources,
+    rather than in the extract adapter.
+    """
+    rows = [
+        _run_row(9, 5, task="t-late", wait=90.0),
+        _run_row(5, 1, task="t-early", wait=30.0),
+        _run_row(6, 2, task="t-mid", wait=300.0),
+    ]
+    xs.configure(write_extract(tmp_path / "a", runs_rows=rows))
+    first = dl.load(_cfg())
+    xs._reset_for_tests()
+    xs.configure(write_extract(tmp_path / "b", runs_rows=list(reversed(rows))))
+    second = dl.load(_cfg())
+
+    assert list(first["task_id"]) == ["t-early", "t-mid", "t-late"]
+    assert list(first["task_id"]) == list(second["task_id"])
+    assert first["pending_at"].is_monotonic_increasing
+
+
+def test_canonical_sort_breaks_ties_on_a_total_key(tmp_path):
+    """Same `pending_at` on every row: without task_id/run_id in the key the
+    result would keep whatever order arrived."""
+    rows = [
+        _run_row(5, 1, task="t-c", wait=30.0),
+        _run_row(5, 1, task="t-a", wait=40.0),
+        _run_row(5, 1, task="t-b", wait=50.0),
+    ]
+    xs.configure(write_extract(tmp_path / "extract", runs_rows=rows))
+    got = dl.load(_cfg())
+    assert list(got["task_id"]) == ["t-a", "t-b", "t-c"]
