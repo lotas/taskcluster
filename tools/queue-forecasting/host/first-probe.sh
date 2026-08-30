@@ -8,7 +8,13 @@
 # read a two-line verdict, guess, repeat. Every step below exists because it was
 # a step somebody did by hand.
 #
-#   ./host/first-probe.sh
+#   ./host/first-probe.sh                  bootstrap: trusted trainer -> research
+#   EXPERIMENT=1 ./host/first-probe.sh     experiment: probe the agent's edits
+#
+# The two modes differ in ONE way that matters: bootstrap OVERWRITES
+# `qf-research/trainer/` from the trusted checkout, and experiment mode does not
+# touch it. Running bootstrap on a worktree that holds an experiment would
+# discard the experiment.
 #
 # Environment (all optional except the first, which is only optional if
 # ~/dev/qf-research is where the worktree is):
@@ -38,9 +44,12 @@ qf()   { "${AS_RESEARCH[@]}" qf "$@"; }
 
 # A run id is `<kind>-<UTC stamp>-<12 hex>-<pid>`; nothing else in the output
 # looks like that.
+# `run_id_of <kind> <text>`. The KIND matters: an evaluation's output also
+# carries `judged_run: probe-...`, and matching any kind returned the probe's id
+# as the evaluation's.
 run_id_of() {
-  printf '%s\n' "$1" \
-    | grep -oE '(probe|evaluate|extract|test)-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9]+' \
+  printf '%s\n' "$2" \
+    | grep -oE "$1-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9]+" \
     | head -1
 }
 
@@ -124,10 +133,28 @@ echo "  extract=${EXTRACT:0:12}  baseline=${BASELINE:0:12}  contract=${CONTRACT:
 # A probe runs the QF-RESEARCH copy of the trainer. A `--from-extract` that
 # exists only in the trusted checkout makes argparse exit 2 inside the sandbox,
 # which surfaces as `error_class=nonzero_exit` and looks like a crash.
-if [ "${SKIP_SYNC:-0}" != "1" ]; then
-  say "sync trainer + experiment into $QF_RESEARCH"
-  [ -d "$QF_RESEARCH/.git" ] || fail "$QF_RESEARCH is not a git worktree
+[ -d "$QF_RESEARCH/.git" ] || fail "$QF_RESEARCH is not a git worktree
     (set QF_RESEARCH=<path>)"
+
+if [ "${EXPERIMENT:-0}" = "1" ]; then
+  # EXPERIMENT MODE. The default mode rsyncs the trusted trainer OVER
+  # `qf-research/trainer/`, which is right for bootstrapping and destructive for
+  # an experiment -- it is exactly the agent's edits that are the experiment.
+  # So here nothing is copied: whatever is in the worktree is committed, pushed
+  # and probed as-is.
+  say "experiment: probing $QF_RESEARCH as it stands"
+  if [ -n "$(git -C "$QF_RESEARCH" status --porcelain)" ]; then
+    git -C "$QF_RESEARCH" status --short | sed 's/^/    /'
+    git -C "$QF_RESEARCH" add -A
+    git -C "$QF_RESEARCH" -c core.hooksPath=/dev/null \
+        commit -q -m "${EXPERIMENT_NOTE:-experiment}" || fail "commit failed"
+    echo "  committed"
+  else
+    echo "  worktree clean; probing HEAD"
+  fi
+  git -C "$QF_RESEARCH" push -q || fail "push failed"
+elif [ "${SKIP_SYNC:-0}" != "1" ]; then
+  say "sync trainer + experiment into $QF_RESEARCH"
   [ -z "$(git -C "$QF_RESEARCH" status --porcelain)" ] || fail \
     "$QF_RESEARCH has uncommitted changes. That is somebody's work in progress
     -- possibly the research agent's -- and this script is about to write over
@@ -175,7 +202,7 @@ echo "$PROBE_OUT"
 # NOT `head -1`. `qf` prints the run id on stdout and the state on stderr, and
 # merging the two reorders them (stderr is unbuffered) -- the first version took
 # "FAILED exit_code=137" as the run id and then reported "no stderr log" for it.
-RUN_ID="$(run_id_of "$PROBE_OUT")"
+RUN_ID="$(run_id_of probe "$PROBE_OUT")"
 
 if [ "$PROBE_RC" -ne 0 ]; then
   # THE LOGS, UNPROMPTED. The two-line verdict never says why, and fetching them
@@ -196,7 +223,7 @@ say "evaluate"
 EVAL_OUT="$(qf evaluate --run "$RUN_ID" --contract "$CONTRACT" --wait 2>&1)"
 EVAL_RC=$?
 echo "$EVAL_OUT"
-EVAL_ID="$(run_id_of "$EVAL_OUT")"
+EVAL_ID="$(run_id_of evaluate "$EVAL_OUT")"
 
 if [ "$EVAL_RC" -ne 0 ]; then
   say "evaluate stderr (tail 80) -- $EVAL_ID"
