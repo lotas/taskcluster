@@ -35,3 +35,86 @@ pass=110 fail=2
 failed: NC18 (slow) generation 2 did not publish a separate artifact
 failed: VOID:NC19 canary: the no-baseline probe produced no run id: probe-20260829T123756Z-9d54e39271d7-4290
 
+=== 2026-08-29T19:21:44Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 7911032f2eefd60387a7f90dd5aa1012d85e9aae
+PARTIAL RUN: only nc9 ran. The counts below cover those
+  groups and nothing else.
+pass=15 fail=1
+failed: NC9 (d) a trusted contract was refused at submit: evaluate-20260829T192144Z-f58141c0d68e-4448
+
+=== 2026-08-29T19:33:45Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 3d1696b2695c813817f55bfa4d03690444c27776
+PARTIAL RUN: only nc9 ran. The counts below cover those
+  groups and nothing else.
+pass=18 fail=1
+failed: NC9 (d) the contract is pinned regardless  (want 'f740716d32b8ddef20bd2e42ede873fd0b59486f752c8d077293ebc440997173', got '')
+
+=== 2026-08-29T19:41:00Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 897f8f1017cd2d676ca9b146ddee7fbe5988d190
+PARTIAL RUN: only nc9 ran. The counts below cover those
+  groups and nothing else.
+pass=19 fail=0
+
+=== 2026-08-29T19:57:56Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: d0755176e37b57ff0473c9eb72482b60104405fb
+PARTIAL RUN: only nc11 ran. The counts below cover those
+  groups and nothing else.
+pass=1 fail=1
+failed: VOID:NC11 (a) canary: the unmutated prediction set did not produce a
+  verdict: FAILED internal 
+
+=== 2026-08-29T20:00:24Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: d0755176e37b57ff0473c9eb72482b60104405fb
+PARTIAL RUN: only nc11 ran. The counts below cover those
+  groups and nothing else.
+pass=1 fail=1
+failed: VOID:NC11 (a) canary: the unmutated prediction set did not produce a
+  verdict: FAILED internal 
+
+=== 2026-08-29T20:22:54Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: cbdd509f2478aa59951ed760786b918fcb217dd0
+PARTIAL RUN: only nc11 ran. The counts below cover those
+  groups and nothing else.
+pass=1 fail=1
+failed: VOID:NC11 (a) canary: the unmutated prediction set did not produce a
+  verdict: FAILED row_set_rejected 
+
+=== 2026-08-29T20:26:02Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: cbdd509f2478aa59951ed760786b918fcb217dd0
+PARTIAL RUN: only nc11 ran. The counts below cover those
+  groups and nothing else.
+pass=1 fail=1
+failed: VOID:NC11 (a) canary: the unmutated prediction set did not produce a
+  verdict: FAILED row_set_rejected 
+
+=== 2026-08-29T20:34:30Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 419596c90fe37c0f256f91c3f5de0f31793648ac
+PARTIAL RUN: only nc11 ran. The counts below cover those
+  groups and nothing else.
+pass=1 fail=1
+failed: VOID:NC11 (a) canary: the unmutated prediction set did not produce a
+  verdict: SUCCEEDED None no-go
+  The subject was probe-20260829T195509Z-f75ded03a386-4480 (research/experiments/nc11_honest.py). If that is 2b-2's
+  extract_contract.py, its predictions.parquet is a 1000-row STUB with the right
+  columns and an arbitrary row set -- refused by design, and not a finding. Run
+  nc11_honest from nc-fixtures-phase2c.sh, which emits a scorable set.
+
+=== 2026-08-29T21:06:57Z nc-suite-phase2.sh ===
+host=queue-forecasting trusted=/srv/queue-forecasting
+dispatcher commit: commit: 230b77ebde1ec91c4c3ff80cd0f665027a73eca8
+pass=138 fail=3
+failed: VOID:NC11 (e) no verdict.json under /var/lib/qf-eval
+failed: NC16 the probe reads a nonexistent container as positively absent  (want 'False', got 'unknown')
+failed: VOID:NC19 canary: the probe printed no BASELINE-CONTRACT summary (state
+  FAILED). If research/experiments/baseline_contract.py is not on the fixture
+  branch, re-run host/nc-fixtures-phase2b.sh, push it, and update
+  /home/ykurmyza/dev/taskcluster/tools/queue-forecasting/host/nc12-sha.txt.
+
