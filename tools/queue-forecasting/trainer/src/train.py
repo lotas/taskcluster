@@ -481,13 +481,6 @@ def main(argv: list[str] | None = None) -> int:
     feature_schema_path = run_dir / f"{run_stem}_feature_schema.json"
     feature_schema_path.write_text(json.dumps(feature_schema, indent=2, default=str))
 
-    if args.predictions_out:
-        _write_predictions(
-            Path(args.predictions_out), c=c, builder=builder, models=models,
-            refresh_cache=args.refresh_cache,
-            worker_pools=_worker_pools_snapshot,
-        )
-
     # artifact_hash: SHA256 over the four serving files concatenated in order.
     serving_files = [
         run_dir / f"{run_stem}_p50.onnx",
@@ -752,6 +745,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{name:<7} {n:>10,} {_fmt_mae(lgb_b):>12} {_fmt_mae(base_b):>12} {_fmt_w2x(lgb_b):>14} {_fmt_w2x(base_b):>15}")
 
     print(f"\nModels + manifest in {run_dir}")
+
+    # LAST, and after the splits are freed. This reloads the holdout window
+    # unfiltered, so running it while `train`/`val`/`hold` are still live put a
+    # second copy of a window alongside the peak -- which is how the first probe
+    # died (exit 137 at the `probe` kind's 8g cap). Everything above has already
+    # read `train.stats` / `hold.stats` into the manifest.
+    if args.predictions_out:
+        del train, val, hold
+        _write_predictions(
+            Path(args.predictions_out), c=c, builder=builder, models=models,
+            refresh_cache=args.refresh_cache,
+            worker_pools=_worker_pools_snapshot,
+        )
+        print(f"  peak RSS after predictions: {_peak_rss_mb():,.0f} MB")
+
     return 0
 
 

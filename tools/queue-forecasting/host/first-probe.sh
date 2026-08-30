@@ -24,11 +24,25 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRUSTED="$(cd "$HERE/.." && pwd)"          # tools/queue-forecasting
 QF_RESEARCH="${QF_RESEARCH:-$HOME/dev/qf-research}"
 CONTRACT="${CONTRACT:-wait_time_v1}"
+# The `probe` kind DEFAULTS to 8g (spec.py KINDS) and this config measured a
+# 17.4GB peak on the extract path -- the first probe was SIGKILLed (exit 137)
+# with no log, because a container the kernel kills writes nothing on the way
+# out. 20g stays under MEM_CEILING_MB (22g) and derives the heavy lane, which is
+# correct: a cohort trains, so it must serialise against the nightly.
+PROBE_MEM="${PROBE_MEM:-20g}"
 AS_RESEARCH=(sudo -H -u research)
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 qf()   { "${AS_RESEARCH[@]}" qf "$@"; }
+
+# A run id is `<kind>-<UTC stamp>-<12 hex>-<pid>`; nothing else in the output
+# looks like that.
+run_id_of() {
+  printf '%s\n' "$1" \
+    | grep -oE '(probe|evaluate|extract|test)-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9]+' \
+    | head -1
+}
 
 # --- 0. the trusted copy is the one the sync propagates, so check it first ----
 say "preflight: trusted checkout"
@@ -154,10 +168,14 @@ echo "  sha=$SHA"
 say "probe"
 PROBE_OUT="$(qf probe --sha "$SHA" \
   --path research/experiments/run_cohort.py \
-  --extract "$EXTRACT" --baseline "$BASELINE" --wait 2>&1)"
+  --extract "$EXTRACT" --baseline "$BASELINE" \
+  --mem "$PROBE_MEM" --wait 2>&1)"
 PROBE_RC=$?
 echo "$PROBE_OUT"
-RUN_ID="$(printf '%s\n' "$PROBE_OUT" | head -1)"
+# NOT `head -1`. `qf` prints the run id on stdout and the state on stderr, and
+# merging the two reorders them (stderr is unbuffered) -- the first version took
+# "FAILED exit_code=137" as the run id and then reported "no stderr log" for it.
+RUN_ID="$(run_id_of "$PROBE_OUT")"
 
 if [ "$PROBE_RC" -ne 0 ]; then
   # THE LOGS, UNPROMPTED. The two-line verdict never says why, and fetching them
@@ -178,7 +196,7 @@ say "evaluate"
 EVAL_OUT="$(qf evaluate --run "$RUN_ID" --contract "$CONTRACT" --wait 2>&1)"
 EVAL_RC=$?
 echo "$EVAL_OUT"
-EVAL_ID="$(printf '%s\n' "$EVAL_OUT" | head -1)"
+EVAL_ID="$(run_id_of "$EVAL_OUT")"
 
 if [ "$EVAL_RC" -ne 0 ]; then
   say "evaluate stderr (tail 80) -- $EVAL_ID"
