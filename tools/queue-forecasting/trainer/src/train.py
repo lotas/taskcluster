@@ -13,6 +13,7 @@ import pandas as pd
 
 from src import config as cfg
 from src import data_loader
+from src import extract_source
 from src import hazard_labels
 from src.features import FeatureBuilder, Split
 from src.hazard_model import DiscreteHazardModel
@@ -196,6 +197,17 @@ def _run_discrete_hazard_training(
             },
         },
     }
+    # This path returns before `main`'s common lineage block, so it has to name
+    # its own data. Read from module state rather than threaded through: the
+    # source is process-wide by construction (`extract_source.active()`), and a
+    # parameter that could disagree with what the loaders actually used would be
+    # a second answer to the same question.
+    _extract = extract_source.active()
+    if _extract is not None:
+        manifest["training_lineage"] = {
+            "source": "extract",
+            "extract": _extract.lineage(),
+        }
     (run_dir / f"{run_stem}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
     return manifest
 
@@ -206,7 +218,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--as-of-date", default=None,
                         help="Override as_of_date from config (UTC midnight of given day)")
+    parser.add_argument("--from-extract", default=None, metavar="DIR",
+                        help="Train from a frozen extract directory instead of "
+                             "Postgres (default: $QF_EXTRACT_DIR if set). No "
+                             "DATABASE_URL is read on this path.")
     args = parser.parse_args(argv)
+
+    if args.from_extract:
+        extract_source.configure(args.from_extract)
+    _extract = extract_source.active()
+    if _extract is not None:
+        print(f"Source: frozen extract {_extract.root} "
+              f"(extract_hash={str(_extract.extract_hash)[:12]})")
 
     c = cfg.load_config(args.config, as_of_date_override=args.as_of_date)
     w = cfg.compute_windows(c)
@@ -382,11 +405,28 @@ def main(argv: list[str] | None = None) -> int:
     artifact_hash = h.hexdigest()[:16]
 
     # training_lineage: content hashes of every input that produced this model.
-    main_cache = data_loader.cache_path(c)
-    training_lineage: dict = {
-        "training_cache_file":            main_cache.name,
-        "training_cache_content_sha256":  data_loader.file_sha256(main_cache) if main_cache.exists() else None,
-    }
+    #
+    # THE TWO SOURCES ARE MUTUALLY EXCLUSIVE HERE, and that is not tidiness. A
+    # cache filename encodes the config and the window but not the source, so on
+    # any host that has ever trained from Postgres the extract run's cache paths
+    # EXIST -- holding data it did not read. Hashing them because they are on
+    # disk would put a digest in the manifest that names a file that contributed
+    # nothing, which is worse than no digest: it is provenance that reads as
+    # confirmed and is wrong.
+    if _extract is not None:
+        training_lineage: dict = {
+            "source":                        "extract",
+            "training_cache_file":           None,
+            "training_cache_content_sha256": None,
+            "extract":                       _extract.lineage(),
+        }
+    else:
+        main_cache = data_loader.cache_path(c)
+        training_lineage = {
+            "source":                        "database",
+            "training_cache_file":           main_cache.name,
+            "training_cache_content_sha256":  data_loader.file_sha256(main_cache) if main_cache.exists() else None,
+        }
     if c.anomaly_filter and c.anomaly_filter.get("enabled"):
         mode = c.anomaly_filter.get("mode", "training")
         if mode in ("training", "both"):
@@ -411,13 +451,21 @@ def main(argv: list[str] | None = None) -> int:
         training_lineage["anomaly_filter_basis"] = None
 
     engineered: dict = {}
-    throughput_path = data_loader.throughput_cache_path(c)
+    # Same exclusion as above, for the same reason: every entry below is a digest
+    # of a `data/cache` file or of a DB snapshot, and on the extract path the
+    # reference data came from `throughput_runs.parquet` / `worker_counts.parquet`
+    # / `worker_pools.parquet` -- already digested, per file, under
+    # `training_lineage["extract"]["files"]`.
+    if _extract is not None:
+        throughput_path = wc_path = None
+    else:
+        throughput_path = data_loader.throughput_cache_path(c)
+        wc_path = data_loader.worker_counts_cache_path(c)
     if throughput_path is not None:
         engineered["throughput_runs"] = {
             "file":           throughput_path.name,
             "content_sha256": data_loader.file_sha256(throughput_path) if throughput_path.exists() else None,
         }
-    wc_path = data_loader.worker_counts_cache_path(c)
     if wc_path is not None:
         engineered["worker_counts"] = {
             "file":           wc_path.name,

@@ -155,3 +155,47 @@ def test_object_dtype_input_with_unmatched_rows_yields_float64_nan():
     assert np.isclose(out["utilization_now"].iloc[1], 5 / 14)
     assert out["provision_lag_now"].iloc[1] == 2.0
     assert np.isclose(out["tasks_per_worker"].iloc[1], 50 / 14)
+
+
+def test_categorical_join_key_merges_against_string_reference_tables():
+    """`data_loader` hands this function a main frame whose `task_queue_id` is
+    `category` and reference tables whose key is `str`.
+
+    Under pandas 3 both `read_parquet` and a psycopg fetch produce `str` dtype,
+    and `merge`/`merge_asof` refuse mismatched key dtypes outright -- so
+    without alignment the first velocity-config cohort dies in the merge with
+    `MergeError: incompatible merge keys`. The main frame's key stays
+    categorical: widening it back to strings is the memory cost the downcast
+    exists to avoid.
+    """
+    df = pd.DataFrame({
+        "task_id": ["a", "b"],
+        "run_id": [0, 0],
+        "pending_at": pd.to_datetime(
+            ["2026-04-10T12:00:00Z", "2026-04-10T12:00:00Z"]),
+        "task_queue_id": pd.Series(["q/one", "q/two"], dtype="str")
+        .astype("category"),
+        "queue_pending": [10, 20],
+    })
+    worker_counts = pd.DataFrame({
+        "task_queue_id": pd.Series(["q/one", "q/two"], dtype="str"),
+        "sampled_at": pd.to_datetime(
+            ["2026-04-10T11:59:00Z", "2026-04-10T11:59:00Z"]),
+        "running_workers": [4, 8],
+        "claimed_tasks": [2, 4],
+        "existing_capacity": [5, 9],
+    })
+    worker_pools = pd.DataFrame({
+        "task_queue_id": pd.Series(["q/one", "q/two"], dtype="str"),
+        "pool_kind": ["worker-pool", "worker-pool"],
+        "provider_type": ["fxci-level1-gcp", "azure2"],
+    })
+
+    out = add_velocity_features(df, worker_counts, worker_pools,
+                                tolerance_minutes=10,
+                                trailing_windows_minutes=(60,))
+
+    assert list(out["running_workers_now"]) == [4.0, 8.0]
+    assert list(out["provider_type"]) == ["fxci-level1-gcp", "azure2"]
+    # The main frame's key was not widened.
+    assert isinstance(out["task_queue_id"].dtype, pd.CategoricalDtype)

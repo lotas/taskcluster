@@ -19,6 +19,31 @@ import numpy as np
 import pandas as pd
 
 
+def _align_join_key(reference: pd.DataFrame, main: pd.DataFrame,
+                    key: str = "task_queue_id") -> pd.DataFrame:
+    """Cast a reference table's join key to the main frame's dtype.
+
+    `data_loader._downcast_categorical_columns` makes the main frame's
+    `task_queue_id` a `category` -- deliberately, it was the dominant fixable
+    memory cost -- while the reference tables keep whatever their source
+    produced. Under pandas 3 that is `str` dtype from both `read_parquet` and a
+    psycopg fetch, and `merge`/`merge_asof` REFUSE mismatched key dtypes:
+
+        MergeError: incompatible merge keys [0] CategoricalDtype(..) and
+        StringDtype(..), must be the same type
+
+    The SMALL side is cast, never the large one: widening the main frame's key
+    back to strings would undo the downcast for every row in the training
+    window. A queue absent from the main frame's categories becomes NaN and so
+    matches nothing, which is what a join miss already did.
+    """
+    if key not in reference.columns or key not in main.columns:
+        return reference
+    if reference[key].dtype == main[key].dtype:
+        return reference
+    return reference.assign(**{key: reference[key].astype(main[key].dtype)})
+
+
 def add_velocity_features(
     df: pd.DataFrame,
     worker_counts: pd.DataFrame,
@@ -33,6 +58,7 @@ def add_velocity_features(
 
     # --- Point-in-time features via merge_asof per queue ---
     df_sorted = df.sort_values("pending_at").reset_index()
+    worker_counts = _align_join_key(worker_counts, df)
     wc_sorted = (
         worker_counts.sort_values("sampled_at")
         if not worker_counts.empty
@@ -97,6 +123,7 @@ def add_velocity_features(
 
     # --- Pool dimension join ---
     if worker_pools is not None and not worker_pools.empty:
+        worker_pools = _align_join_key(worker_pools, df)
         df = df.merge(
             worker_pools[["task_queue_id", "pool_kind", "provider_type"]],
             on="task_queue_id",

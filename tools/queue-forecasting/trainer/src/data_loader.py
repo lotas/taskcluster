@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 import psycopg
 
+from src import extract_source
 from src.config import Config, compute_windows
 
 
@@ -196,6 +197,45 @@ BASE_META_COLUMNS = [
 ]
 
 
+# The loader pulls everything the feature builder or evaluator might
+# need; builder decides which columns become features. Table-qualified for the
+# SQL path; `_needed_source_columns` returns the bare names, which is what the
+# extract path projects with (the extract is already joined).
+CANDIDATE_SOURCE_COLUMNS = {
+    "task_queue_id":       "t.task_queue_id",
+    "scheduler_id":        "t.scheduler_id",
+    "metadata_name":       "t.metadata_name",
+    "normalized_name":     "t.normalized_name",
+    "max_run_time_s":      "t.max_run_time_s",
+    "priority_at_pending": "r.priority_at_pending",
+    "queue_pending":       "r.queue_pending",
+    "repo_family":         "t.repo_family",
+    "tags":                "t.tags",
+}
+
+
+def _needed_source_columns(c: Config) -> set[str]:
+    """The optional source columns this config's SELECT needs, bare names.
+
+    Shared by both sources so the two cannot drift: a column the SQL path
+    selected and the extract path did not would be a feature silently absent
+    from one of them, and LightGBM does not object to a column that never
+    arrives -- it just fits a different model.
+    """
+    needed: set[str] = set()
+    for feat in c.categorical_features + c.numeric_features:
+        if feat.startswith("tags."):
+            needed.add("tags")
+        elif feat in CANDIDATE_SOURCE_COLUMNS:
+            needed.add(feat)
+    # Derived sources
+    derived_sources = {v.get("source") for v in c.derived_features.values() if isinstance(v, dict)}
+    for src in derived_sources:
+        if src in CANDIDATE_SOURCE_COLUMNS:
+            needed.add(src)
+    return needed
+
+
 def _build_query(c: Config) -> str:
     # Always select meta columns + target. Append any feature-derived
     # source columns the builder will need (tags is JSONB — one column,
@@ -208,33 +248,8 @@ def _build_query(c: Config) -> str:
         "r.reason_resolved",
         f"r.{c.target_column} AS y",
     }
-    # The loader pulls everything the feature builder or evaluator might
-    # need; builder decides which columns become features.
-    candidate_cols = {
-        "task_queue_id":       "t.task_queue_id",
-        "scheduler_id":        "t.scheduler_id",
-        "metadata_name":       "t.metadata_name",
-        "normalized_name":     "t.normalized_name",
-        "max_run_time_s":      "t.max_run_time_s",
-        "priority_at_pending": "r.priority_at_pending",
-        "queue_pending":       "r.queue_pending",
-        "repo_family":         "t.repo_family",
-        "tags":                "t.tags",
-    }
-    needed: set[str] = set()
-    for feat in c.categorical_features + c.numeric_features:
-        if feat.startswith("tags."):
-            needed.add("tags")
-        elif feat in candidate_cols:
-            needed.add(feat)
-    # Derived sources
-    derived_sources = {v.get("source") for v in c.derived_features.values() if isinstance(v, dict)}
-    for src in derived_sources:
-        if src in candidate_cols:
-            needed.add(src)
-
-    for col in needed:
-        source_cols.add(candidate_cols[col])
+    for col in _needed_source_columns(c):
+        source_cols.add(CANDIDATE_SOURCE_COLUMNS[col])
 
     select_sql = ",\n       ".join(sorted(source_cols))
     where = ["r.pending_at >= %(train_start)s", "r.pending_at < %(as_of_date)s", *c.filters]
@@ -293,6 +308,10 @@ def load_worker_counts(
     to_str = fetch_to.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
     cache_file = CACHE_DIR / f"worker_counts_{from_str}_{to_str}.parquet"
 
+    src = extract_source.active()
+    if src is not None:
+        return src.worker_counts(fetch_from, fetch_to)
+
     if cache_file.exists() and not refresh_cache:
         return pd.read_parquet(cache_file)
 
@@ -325,6 +344,10 @@ def load_worker_pools() -> pd.DataFrame:
 
     Small table (~650 rows), no caching needed.
     """
+    src = extract_source.active()
+    if src is not None:
+        return src.worker_pools()
+
     dsn = os.environ["DATABASE_URL"]
     query = """
 SELECT task_queue_id, pool_kind, provider_type
@@ -367,6 +390,10 @@ def load_task_runs_for_throughput(
     from_str = window_start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
     to_str   = window_end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
     cache_file = CACHE_DIR / f"throughput_runs_{from_str}_{to_str}.parquet"
+
+    src = extract_source.active()
+    if src is not None:
+        return src.throughput_runs(window_start, window_end)
 
     if cache_file.exists() and not refresh_cache:
         return pd.read_parquet(cache_file)
@@ -449,6 +476,13 @@ def load_task_runs_for_queue_context(
     # cleared after a backfill, otherwise Tier D trains on stale/NULL repo_family.
     cache_file = CACHE_DIR / f"queue_context_runs_{from_str}_{to_str}_rfv{REPO_FAMILY_DERIVATION_VERSION}.parquet"
 
+    src = extract_source.active()
+    if src is not None:
+        return src.qctx_runs(
+            window_start, as_of_date,
+            window_start - timedelta(days=c.lookback_days),
+        )
+
     if cache_file.exists() and not refresh_cache:
         return pd.read_parquet(cache_file)
 
@@ -512,7 +546,6 @@ def load_anomalous_dates(c: Config) -> set[datetime.date]:
     """
     if c.anomaly_filter is None or not c.anomaly_filter.get("enabled"):
         return set()
-    dsn = os.environ["DATABASE_URL"]
     flag_subset = c.anomaly_filter.get("flag_subset")  # list[str] | None
     if flag_subset:
         invalid = [f for f in flag_subset if f not in _ALLOWED_FLAGS]
@@ -521,6 +554,15 @@ def load_anomalous_dates(c: Config) -> set[datetime.date]:
                 f"Unknown flag(s) in anomaly_filter.flag_subset: {invalid}. "
                 f"Allowed: {sorted(_ALLOWED_FLAGS)}"
             )
+    # The allowlist check runs on BOTH paths, before either source is touched:
+    # it is the config validation that catches a typo'd flag name, and only
+    # incidentally the thing that keeps the SQL below non-injectable.
+    src = extract_source.active()
+    if src is not None:
+        return src.anomalous_dates(flag_subset)
+
+    dsn = os.environ["DATABASE_URL"]
+    if flag_subset:
         condition = " OR ".join(f"{f} = TRUE" for f in flag_subset)
     else:
         condition = "is_anomalous = TRUE"
@@ -540,9 +582,24 @@ def _log_step(label: str, t0: float) -> None:
 
 
 def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame | None = None) -> pd.DataFrame:
+    src = extract_source.active()
     path = cache_path(c)
     t0 = time.monotonic()
-    if path.exists() and not refresh_cache:
+    if src is not None:
+        # The extract path neither reads nor writes `data/cache`: the extract is
+        # already an immutable, content-hashed cache, and a cache filename that
+        # cannot say which source produced it would let the two mix. See the
+        # module docstring in `extract_source.py`.
+        w = compute_windows(c)
+        df = src.runs(
+            train_start=w.train_start,
+            as_of_date=w.as_of_date,
+            target_column=c.target_column,
+            keep_columns=BASE_META_COLUMNS + sorted(_needed_source_columns(c)),
+            filters=c.filters,
+        )
+        _log_step(f"main dataset (extract, {len(df)} rows)", t0)
+    elif path.exists() and not refresh_cache:
         df = pd.read_parquet(path)
         _log_step("main dataset (cache hit)", t0)
     else:

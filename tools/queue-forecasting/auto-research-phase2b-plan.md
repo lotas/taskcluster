@@ -1594,6 +1594,64 @@ Written here as a generator script (the `nc-fixtures-phase2.sh` pattern) and
 pushed by the operator with the AGENT's credential: the dispatcher's token is
 read-only by design and this session cannot push to `qf-research`.
 
+**SUPERSEDED 2026-08-30: `--from-extract` was built instead, and the fixture was
+not.** The estimate above was wrong in the direction that mattered. The extract's
+six datasets were derived FROM the trainer's six queries, so they map 1:1 onto
+them, and every one of those loaders already had the shape
+`if <cache>.parquet exists: read_parquet else: SQL`. Adding a third source to
+that branch is smaller than a fixture that rebuilds features -- and it is the
+only version that answers the question the first cohort exists to answer: a
+fixture trains a model no recorded walk-forward number can be compared against,
+so it proves the plumbing and nothing about the science.
+
+What the loader path has to do that the SQL did not, all four of which are
+silent if skipped: narrow the window, apply `c.filters` (parsed, closed grammar,
+fail-closed -- they are raw SQL fragments), project the columns that SELECT
+listed, and parse `tags` back from `json_text` to a dict, because
+`FeatureBuilder._extract_tags` returns `None` for a non-dict and would leave
+nine tag features null with no error. Containment is checked against each file's
+recorded `window`: a subset extract does not fail, it trains a slightly
+different model.
+
+See `trainer/src/extract_source.py`, `trainer/README.md`, and
+`trainer/tests/test_extract_source.py` + `test_train_from_extract.py` (a whole
+cohort trained from a synthetic extract with `DATABASE_URL` unset). Two things
+found on the way: the pandas-3 `MergeError` between the main frame's
+categorical `task_queue_id` and a reference table's `str` (fixed in
+`velocity_features._align_join_key`; it broke the DB path too, on any
+velocity config), and that `add_queue_context_features` needs
+`priority_at_pending`/`repo_family` declared as features to be selected at all.
+
+A review pass on 2026-08-30 then found two more, both fixed: the manifest hashed
+whatever `data/cache` files happened to be on disk, so an extract run on a host
+that had ever trained from Postgres would have cited a cache that contributed
+nothing (provenance that reads as confirmed and is wrong -- the two sources are
+now mutually exclusive in `training_lineage`, with a `source` discriminator);
+and the discrete-hazard path returns before that block, so its manifest carried
+no extract identity at all.
+
+**One deferred trusted change, now fail-closed rather than silent.**
+`_QCTX_SQL` floors both sides of its join -- `r.pending_at >= ref_lower` AND
+`t.task_created >= ref_lower` -- and `qctx_runs.parquet` carries only the
+runs-side column, so the tasks-side floor cannot be reconstructed (the trainer's
+`ref_lower` hangs off `train_start - 90m`, the extract's off the generic
+`train_start - 24h`). The result would be a SUPERSET of the SQL cohort's
+reference set: runs whose task predates the floor, contributing to every
+queue-context count for the first rows of the window. `ExtractSource.qctx_runs`
+therefore REFUSES an extract without `task_created` instead of approximating.
+Fixing it is one column in `_QCTX_SQL` and `DATASETS["qctx_runs"]` here, plus a
+`generation` bump on the request -- `request_hash` does not cover the column
+list, so D20 reuse would otherwise hand back the old extract. Deferred until a
+queue-context config is queued; no promoted wait config needs it.
+
+Still outstanding for a probe, all three in the research-side wrapper rather
+than here: `predictions.parquet` (`train.py` writes none), an explicit
+`--from-extract /extract` (a probe entrypoint takes no arguments and gets no
+injected environment), and a baseline path bridge (`/baseline` is where the
+sandbox mounts the promoted baseline; a promoted config resolves
+`trainer/data/baseline_filtered`, which is inside the writable data mount, so a
+symlink there is enough and no trainer refactor is needed).
+
 **(ii) The dispatcher cannot validate `predictions.parquet`.** D6 keeps `qfd`
 stdlib-only, and reading Parquet needs `pyarrow`. So 2b-2 widens the artifact
 allowlist to carry the file and **defers validation to 2c's evaluator**, which has
