@@ -258,3 +258,81 @@ def test_predictions_out_covers_the_unfiltered_holdout(tmp_path, monkeypatch):
     assert (preds["row_id"] == preds["task_id"] + ":"
             + preds["run_id"].astype(str)).all()
     assert (preds["p50"] > 0).all() and (preds["p90_raw"] > 0).all()
+
+
+# A hazard cohort, end to end. `model_type: discrete_hazard` takes a different
+# branch of `main()` -- one that used to `return 0` before the predictions block,
+# so the run SUCCEEDED and wrote no `predictions.parquet`, and the probe failed
+# minutes later at the handoff with `handoff_missing_artifact`.
+#
+# The unit tests around `_run_discrete_hazard_training` and `_HazardQuantile`
+# cannot see that: the defect was the CALL, not either piece. Deleting the
+# `_write_predictions` call in the hazard branch has to fail something, and this
+# is the something.
+HAZARD_CONFIG = CONFIG.replace(
+    "model_type: lightgbm", "model_type: discrete_hazard"
+).replace(
+    "quantiles: [0.5, 0.9]",
+    # The terminal edge is `.inf` because `hazard_labels.bin_edges_seconds`
+    # refuses anything else. The last FINITE edge is 2 minutes, chosen so the
+    # synthetic waits (10s..290s) STRADDLE it: `DiscreteHazardModel.fit` raises
+    # on a bin with an empty training risk set, so a grid whose top edge sits
+    # past every wait cannot be fitted at all -- and rows that survive past it
+    # give the tail rate observed starts to fit, which is what makes a tail
+    # quantile finite. This grid therefore exercises the tail branch of
+    # `predict_quantile` rather than avoiding it.
+    "quantiles: [0.5, 0.9]\nhazard_bins_minutes: [0, 1, 2, .inf]"
+)
+
+
+def test_a_hazard_cohort_writes_the_same_prediction_contract(tmp_path,
+                                                             monkeypatch):
+    """One prediction contract, both model types.
+
+    A hazard model trains one booster per wait bin and answers a quantile off
+    the survival curve, which is a completely different object from a pair of
+    quantile regressors -- and the evaluator must not be able to tell. Same five
+    columns, same completeness over the unfiltered holdout, same non-null rule.
+    """
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv(xs.ENV_DIR, raising=False)
+    xs._reset_for_tests()
+
+    rows = _synthetic_runs()
+    # The same unfilterable rows as the quantile test: completed, no
+    # `queue_pending`, so training drops them and the contract still wants them.
+    for day in (15, 16, 17, 18, 19):
+        rows.append(_run_row(day, 1, task=f"t-nofilter-{day}", wait=42.0,
+                             queue_pending=None))
+    extract = write_extract(tmp_path / "extract", runs_rows=rows)
+    _write_baselines(tmp_path / "data" / "baseline")
+    monkeypatch.setattr(train, "TRAINER_ROOT", tmp_path)
+    monkeypatch.setattr(train, "MODELS_DIR", tmp_path / "data" / "models")
+    config_path = tmp_path / "wait_hazard_smoke.yaml"
+    config_path.write_text(HAZARD_CONFIG)
+
+    out = tmp_path / "out" / "predictions.parquet"
+    assert train.main(["--config", str(config_path),
+                       "--from-extract", str(extract),
+                       "--predictions-out", str(out)]) == 0
+
+    assert out.exists(), ("the hazard branch returned 0 and wrote no prediction"
+                          " set -- which is exactly how it failed in a probe")
+    preds = pd.read_parquet(out)
+    manifest = json.loads(
+        (tmp_path / "data" / "models" / "2026-04-20"
+         / "wait_hazard_smoke_manifest.json").read_text())
+    assert manifest["model_type"] == "discrete_hazard"
+
+    assert list(preds.columns) == list(train.PREDICTION_COLUMNS)
+    assert len(preds) == manifest["windows"]["holdout"]["rows"] + 5
+    assert {f"t-nofilter-{d}" for d in (15, 16, 17, 18, 19)} <= set(preds["task_id"])
+    assert not preds.isna().any().any()
+    assert (preds["row_id"] == preds["task_id"] + ":"
+            + preds["run_id"].astype(str)).all()
+    # FINITE and positive, which is the hazard path's own failure mode: an
+    # unplaceable quantile comes back as `inf`, and `inf` is not null.
+    import numpy as np
+    assert np.isfinite(preds["p50"]).all() and np.isfinite(preds["p90_raw"]).all()
+    assert (preds["p50"] > 0).all() and (preds["p90_raw"] > 0).all()
+    assert (preds["p90_raw"] >= preds["p50"]).all()

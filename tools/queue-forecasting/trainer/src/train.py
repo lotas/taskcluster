@@ -73,6 +73,24 @@ def _split_by_pending_at(df: pd.DataFrame, c: cfg.Config) -> tuple[pd.DataFrame,
 PREDICTION_COLUMNS = ("task_id", "run_id", "row_id", "p50", "p90_raw")
 
 
+class _HazardQuantile:
+    """One quantile of a `DiscreteHazardModel`, shaped like the quantile models.
+
+    `_write_predictions` wants `models[0.5].predict(X)` and `models[0.9]`, because
+    the quantile path trains one model per quantile. The hazard path trains ONE
+    model answered at a quantile, so this closes over the q rather than the two
+    paths growing separate prediction writers -- the prediction CONTRACT is the
+    same for both, and it is the contract the evaluator reads.
+    """
+
+    def __init__(self, model: DiscreteHazardModel, q: float):
+        self._model = model
+        self._q = q
+
+    def predict(self, X):
+        return self._model.predict_quantile(X, self._q)
+
+
 def _write_predictions(path: Path, *, c: cfg.Config, builder: FeatureBuilder,
                        models: dict, refresh_cache: bool,
                        worker_pools: "pd.DataFrame | None") -> None:
@@ -136,7 +154,13 @@ def _write_predictions(path: Path, *, c: cfg.Config, builder: FeatureBuilder,
             f"For a residual config this is baseline coverage: the NDJSON in"
             f" {_baseline_dir(c)} has no row for those (task_id, run_id)."
             f" Widen the baseline export to the unfiltered window, or predict"
-            f" the contract slice with a non-residual config."
+            f" the contract slice with a non-residual config.\n"
+            f"For a discrete_hazard config it is the terminal bin instead: a"
+            f" survival curve that has not reached the quantile by the last"
+            f" finite edge is placed by the exponential tail, and a degenerate"
+            f" `tail_rate_` (no observed starts in the terminal risk set) leaves"
+            f" it undefined. The terminal edge must stay `.inf`; move the last"
+            f" FINITE boundary earlier so that risk set has events."
         )
 
     task_id = hold_all["task_id"].astype(str)
@@ -180,7 +204,8 @@ def _run_discrete_hazard_training(
     n_train_rows: int,
     n_val_rows: int,
     n_hold_rows: int,
-) -> dict:
+    predictions_requested: bool = False,
+) -> "tuple[dict, DiscreteHazardModel]":
     """Train + evaluate a DiscreteHazardModel (Bet 2's discrete-time hazard
     model for wait_time) and write its manifest + model artifacts.
 
@@ -194,6 +219,13 @@ def _run_discrete_hazard_training(
     path below this function -- the hazard model has its own save format
     (one booster per bin, not a single quantile head) and doesn't support
     live serving yet (see bet2-hazard-survival-design.md's serving scope).
+
+    RETURNS THE MODEL as well as the manifest, so `--predictions-out` can score
+    this path through the same contract as the quantile path. Without it a
+    hazard config trained for twenty minutes, returned 0, wrote no
+    `predictions.parquet`, and the probe failed at the handoff with
+    `handoff_missing_artifact` -- an error about a missing file, for a cause that
+    was a model type.
     """
     edges_minutes = c.hazard_bins_minutes or hazard_labels.DEFAULT_BIN_EDGES_MINUTES
     model = DiscreteHazardModel(edges_minutes=edges_minutes, params=c.model_params)
@@ -209,6 +241,29 @@ def _run_discrete_hazard_training(
     if n_bad:
         print(f"  WARNING: {n_bad:,}/{len(preds_p90):,} holdout p90s non-finite "
               f"(tail_rate_={model.tail_rate_!r}); these rows are excluded from all metrics")
+    if n_bad and predictions_requested:
+        # REFUSED HERE, not after another full-window load. The contract's
+        # columns are non-null, so a prediction set carrying these rows is
+        # rejected whole -- and this holdout is the FILTERED one, a subset of the
+        # window the prediction set covers, so the count can only grow. Failing
+        # now costs the operator seconds; failing in `_write_predictions` costs
+        # another load of a window that peaks near the memory ceiling.
+        raise SystemExit(
+            f"ERROR: {n_bad:,}/{len(preds_p90):,} holdout p90s are non-finite,"
+            f" and --predictions-out cannot emit them: every contract column is"
+            f" non-null, and dropping the rows would reproduce the subset the"
+            f" evaluator's completeness rule forbids.\n"
+            f"A non-finite p90 means the survival curve had not fallen to 0.1"
+            f" by the last FINITE bin edge, and the exponential tail could not"
+            f" place it: tail_rate_={model.tail_rate_!r}, which is degenerate --"
+            f" no observed `started` events in the terminal bin's risk set, so"
+            f" the MLE has no rate to fit.\n"
+            f"THE TERMINAL EDGE MUST STAY `.inf` (`hazard_labels.bin_edges_"
+            f"seconds` refuses anything else). What to change is the LAST FINITE"
+            f" boundary -- move it EARLIER so the terminal risk set contains"
+            f" observed starts and the rate comes out positive -- or fix the tail"
+            f" estimator. Or train without --predictions-out: the manifest's own"
+            f" numbers exclude these rows and are still worth having.")
 
     # Hardcoded because discrete_hazard is wait-only; config.load_config
     # rejects any other target up front, but re-check here so a hand-built
@@ -296,7 +351,7 @@ def _run_discrete_hazard_training(
             "extract": _extract.lineage(),
         }
     (run_dir / f"{run_stem}_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
-    return manifest
+    return manifest, model
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -410,9 +465,10 @@ def main(argv: list[str] | None = None) -> int:
     del train_df, val_df, hold_df
 
     if c.model_type == "discrete_hazard":
-        manifest = _run_discrete_hazard_training(
+        manifest, hazard_model = _run_discrete_hazard_training(
             c, w, holdout_day_keys, baseline_dir,
             train, val, hold, n_train_rows, n_val_rows, n_hold_rows,
+            predictions_requested=bool(args.predictions_out),
         )
         run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
         buckets30 = manifest["evaluation"]["primary"]["buckets_aggregate"].get("30m+", {})
@@ -422,6 +478,18 @@ def main(argv: list[str] | None = None) -> int:
         raw = buckets30.get("p90_miss_rate")
         print(f"\n=== Discrete hazard model — 30m+ wait p90 miss: {_pct(guarded)} guarded (gate bar: 34.49%) / {_pct(raw)} raw ===")
         print(f"Models + manifest in {run_dir}")
+        if args.predictions_out:
+            # Same ordering as the quantile path, for the same reason: the
+            # prediction pass re-loads the holdout window, and holding the three
+            # training splits across it stacks two copies of the heaviest frame.
+            del train, val, hold
+            _write_predictions(
+                Path(args.predictions_out), c=c, builder=builder,
+                models={q: _HazardQuantile(hazard_model, q) for q in (0.5, 0.9)},
+                refresh_cache=args.refresh_cache,
+                worker_pools=_worker_pools_snapshot,
+            )
+            print(f"  peak RSS after predictions: {_peak_rss_mb():,.0f} MB")
         return 0
 
     # Train one model per quantile.

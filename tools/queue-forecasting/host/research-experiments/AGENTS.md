@@ -123,6 +123,9 @@ days is a change that has found a day, not a signal.
 - **No database.** A probe has no `DATABASE_URL` and no network. Training reads
   the frozen extract at `/extract`. If you find yourself wanting a query, the
   column you want has to be added to the extract by a human first.
+- **A config the extract cannot serve is refused in the first second**, not
+  twenty minutes in: a target mismatch, and a config enabling
+  `queue_context_features` against an extract with no `task_created`.
 - **The extract is immutable.** You cannot widen its window or add a column. A
   column that is not in it has to be added by a human, to trusted code, and
   re-extracted -- which produces a new hash and therefore a new series.
@@ -134,6 +137,26 @@ days is a change that has found a day, not a signal.
   your change.
 - **Every prediction row is scored.** You cannot drop the rows you do badly on;
   a prediction set that does not cover the holdout slice is rejected whole.
+
+## The discrete-hazard configs
+
+`model_type: discrete_hazard` (Bet 2) trains one booster per wait bin instead of
+one model per quantile, and it is scored through the same contract: p50 and p90
+come out of the survival curve. It is a TAIL specialist -- it roughly halves the
+30m+ p90 miss and gives up overall within-2x -- so read those two metrics
+together rather than the verdict alone.
+
+Its one operational difference: a p90 the survival curve has not reached by the
+last FINITE bin edge is placed by an exponential tail, and if that tail's rate is
+degenerate -- no observed starts in the terminal bin's risk set, so the MLE has
+no rate -- the p90 is undefined. The contract's columns are non-null, so the run
+refuses right after training rather than after the prediction pass.
+
+**The terminal edge must stay `.inf`.** `hazard_labels.bin_edges_seconds` refuses
+a finite one: the terminal bin is open by construction and the model gives it a
+finite SHAPE through the tail rate, not a finite edge. What to change is the last
+finite boundary -- move it earlier (480 -> 240, say) so the terminal risk set
+contains observed starts.
 
 ## What a good experiment looks like
 

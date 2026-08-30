@@ -43,6 +43,8 @@ EXTRACT = pathlib.Path("/extract")
 BASELINE = pathlib.Path("/baseline")
 OUT = pathlib.Path("/out/predictions.parquet")
 
+_MANIFEST: "dict | None" = None
+
 
 def bridge_baseline() -> None:
     """Point the config's `baseline_dir` at the mount the sandbox provides.
@@ -72,6 +74,21 @@ def bridge_baseline() -> None:
     print(f"[run_cohort] {link} -> {BASELINE}", flush=True)
 
 
+def manifest() -> dict:
+    """The extract's manifest, read once.
+
+    Three callers below ask it three different questions, and an extract that
+    changed between two of them would be an extract that changed under a running
+    probe -- which cannot happen (a published extract is immutable), so the only
+    thing three reads buy is three chances to write the path wrong.
+    """
+    global _MANIFEST
+    if _MANIFEST is None:
+        with (EXTRACT / "MANIFEST.json").open() as fh:
+            _MANIFEST = json.load(fh)
+    return _MANIFEST
+
+
 def cohort_as_of() -> str:
     """The extract's own `as_of_date`, not the config's.
 
@@ -82,9 +99,7 @@ def cohort_as_of() -> str:
     waited for it). Reading the boundary off the manifest means the cohort
     cannot drift from the data it was handed.
     """
-    with (EXTRACT / "MANIFEST.json").open() as fh:
-        request = json.load(fh).get("request") or {}
-    as_of = request.get("as_of_date")
+    as_of = (manifest().get("request") or {}).get("as_of_date")
     if not as_of:
         raise SystemExit("[run_cohort] the extract manifest names no as_of_date")
     return as_of
@@ -97,12 +112,42 @@ def check_target(config_target: str) -> None:
     trained -- and a wait config scored against a run_duration extract is twenty
     minutes nobody gets back.
     """
-    with (EXTRACT / "MANIFEST.json").open() as fh:
-        request = json.load(fh).get("request") or {}
+    request = manifest().get("request") or {}
     if request.get("target") != config_target:
         raise SystemExit(
             f"[run_cohort] the extract's target is {request.get('target')!r}"
             f" and the config's is {config_target!r}")
+
+
+def check_qctx(raw: dict) -> None:
+    """Refuse a queue-context config against an extract that cannot serve it.
+
+    `extract_source.qctx_runs` already refuses this, correctly and fail-closed --
+    but it refuses when the reference set is LOADED, which is minutes into a run
+    that the operator is no longer watching. The information is in the manifest
+    at second zero: `task_created` is the column the tasks-side join floor is
+    re-applied on, and without it the reference set would be a superset of the
+    cohort the SQL path saw.
+
+    Checked from the MANIFEST's column list rather than by opening the parquet:
+    the manifest is the extract's description of itself, and it is what
+    `ExtractSource` consults for the same decision.
+    """
+    if not (raw.get("queue_context_features") or {}).get("enabled"):
+        return
+    columns = ((manifest().get("files") or {}).get("qctx_runs") or {}).get(
+        "columns") or []
+    if "task_created" not in columns:
+        raise SystemExit(
+            "[run_cohort] this config enables queue_context_features and the"
+            " extract's qctx_runs carries no `task_created`, so the tasks-side"
+            " join floor cannot be re-applied and the reference set would be a"
+            " SUPERSET of what the database cohort saw.\n"
+            "  The column landed in host/extractor/inventory.py on 2026-08-30."
+            " `request_hash` does not cover the column list, so an extract"
+            " requested before then is still a cache hit for the same window --"
+            " re-extract with a BUMPED `generation`.\n"
+            f"  qctx_runs columns in this extract: {', '.join(columns) or 'none'}")
 
 
 def main() -> int:
@@ -125,7 +170,9 @@ def main() -> int:
 
     import yaml
     with (TRAINER / CONFIG).open() as fh:
-        check_target(yaml.safe_load(fh)["target"])
+        raw = yaml.safe_load(fh)
+    check_target(raw["target"])
+    check_qctx(raw)
 
     as_of = cohort_as_of()
     print(f"[run_cohort] {CONFIG} as_of={as_of} extract={EXTRACT}", flush=True)

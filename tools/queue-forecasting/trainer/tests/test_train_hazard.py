@@ -62,7 +62,7 @@ def test_run_discrete_hazard_training_end_to_end(tmp_path, monkeypatch):
     holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
     baseline_dir = tmp_path / "nonexistent_baseline_dir"
 
-    manifest = _run_discrete_hazard_training(
+    manifest, _model = _run_discrete_hazard_training(
         c, w, holdout_day_keys, baseline_dir,
         train, val, hold, len(train_df), len(val_df), len(hold_df),
     )
@@ -106,7 +106,7 @@ def test_run_discrete_hazard_training_uses_default_bins_when_unset(tmp_path, mon
     hold  = builder.transform(hold_df)
 
     holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
-    manifest = _run_discrete_hazard_training(
+    manifest, _model = _run_discrete_hazard_training(
         c, w, holdout_day_keys, tmp_path / "nonexistent_baseline_dir",
         train, val, hold, len(train_df), len(val_df), len(hold_df),
     )
@@ -186,7 +186,7 @@ def test_run_discrete_hazard_training_handles_censored_holdout_rows(tmp_path, mo
     hold  = builder.transform(hold_df)
 
     holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
-    manifest = _run_discrete_hazard_training(
+    manifest, _model = _run_discrete_hazard_training(
         c, w, holdout_day_keys, tmp_path / "nonexistent_baseline_dir",
         train, val, hold, len(train_df), len(val_df), len(hold_df),
     )
@@ -196,3 +196,101 @@ def test_run_discrete_hazard_training_handles_censored_holdout_rows(tmp_path, mo
     assert agg["mae_s"] == agg["mae_s"]  # not NaN
     buckets = manifest["evaluation"]["primary"]["buckets_aggregate"]
     assert buckets["30m+"]["p90_miss_rate"] == buckets["30m+"]["p90_miss_rate"]  # not NaN
+
+
+def test_predictions_requested_refuses_non_finite_p90_before_reloading(
+        tmp_path, monkeypatch):
+    """The fast failure, at the point where the evidence exists.
+
+    A non-finite p90 cannot go into a prediction set: every contract column is
+    non-null, and dropping the rows reproduces the subset the evaluator's
+    completeness rule forbids. `_write_predictions` would catch it -- AFTER
+    re-loading a window that peaks near the memory ceiling. This holdout is the
+    filtered one, a subset of what the prediction set covers, so a non-finite
+    count here can only grow: refusing now is sound, not merely cheaper.
+    """
+    import pytest
+    import src.train as train_module
+    from src.hazard_model import DiscreteHazardModel
+    monkeypatch.setattr(train_module, "MODELS_DIR", tmp_path / "models")
+
+    c = _hazard_config(tmp_path)
+    w = cfg.compute_windows(c)
+    rng = np.random.default_rng(11)
+    train_df = _synthetic_rows(rng, w.train_start, w.train_end, 800)
+    val_df   = _synthetic_rows(rng, w.val_start,   w.val_end,   800)
+    hold_df  = _synthetic_rows(rng, w.hold_start,  w.hold_end,  800)
+
+    builder = FeatureBuilder(c)
+    train = builder.fit_transform(train_df)
+    val   = builder.transform(val_df)
+    hold  = builder.transform(hold_df)
+    holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
+
+    # Forced rather than provoked: whether a real fit leaves a p90 unplaced
+    # depends on the tail rate it happens to estimate, and a test that waits for
+    # that is a test that passes for the wrong reason most of the time.
+    real = DiscreteHazardModel.predict_quantile
+    def infinite_p90(self, X, q):
+        out = real(self, X, q)
+        if q == 0.9:
+            out = np.asarray(out, dtype=float).copy()
+            out[0] = np.inf
+        return out
+    monkeypatch.setattr(DiscreteHazardModel, "predict_quantile", infinite_p90)
+
+    args = dict(predictions_requested=True)
+    with pytest.raises(SystemExit) as excinfo:
+        _run_discrete_hazard_training(
+            c, w, holdout_day_keys, tmp_path / "nonexistent_baseline_dir",
+            train, val, hold, len(train_df), len(val_df), len(hold_df), **args)
+    message = str(excinfo.value)
+    assert "non-finite" in message
+    assert "--predictions-out" in message
+
+    # WITHOUT the flag it is a warning, not a refusal: the manifest's own
+    # numbers exclude those rows and are still worth having.
+    manifest, model = _run_discrete_hazard_training(
+        c, w, holdout_day_keys, tmp_path / "nonexistent_baseline_dir",
+        train, val, hold, len(train_df), len(val_df), len(hold_df))
+    assert manifest["model_type"] == "discrete_hazard"
+    assert model is not None
+
+
+def test_the_hazard_quantile_adapter_answers_like_a_quantile_model(tmp_path,
+                                                                   monkeypatch):
+    """`_write_predictions` asks `models[0.5].predict(X)`, because the quantile
+    path trains one model per quantile. The hazard path trains one model answered
+    AT a quantile, and the two must not grow separate prediction writers -- the
+    prediction contract is what the evaluator reads, and it is one contract."""
+    import src.train as train_module
+    monkeypatch.setattr(train_module, "MODELS_DIR", tmp_path / "models")
+
+    c = _hazard_config(tmp_path)
+    w = cfg.compute_windows(c)
+    rng = np.random.default_rng(5)
+    train_df = _synthetic_rows(rng, w.train_start, w.train_end, 800)
+    val_df   = _synthetic_rows(rng, w.val_start,   w.val_end,   800)
+    hold_df  = _synthetic_rows(rng, w.hold_start,  w.hold_end,  800)
+
+    builder = FeatureBuilder(c)
+    train = builder.fit_transform(train_df)
+    val   = builder.transform(val_df)
+    hold  = builder.transform(hold_df)
+    holdout_day_keys = [d.strftime("%Y-%m-%d") for d in cfg.holdout_day_starts(c)]
+
+    _manifest, model = _run_discrete_hazard_training(
+        c, w, holdout_day_keys, tmp_path / "nonexistent_baseline_dir",
+        train, val, hold, len(train_df), len(val_df), len(hold_df))
+
+    p50 = train_module._HazardQuantile(model, 0.5)
+    p90 = train_module._HazardQuantile(model, 0.9)
+    got50 = np.asarray(p50.predict(hold.X), dtype=float)
+    got90 = np.asarray(p90.predict(hold.X), dtype=float)
+
+    assert got50.shape == (len(hold.X),)
+    assert np.array_equal(got50, model.predict_quantile(hold.X, 0.5))
+    assert np.array_equal(got90, model.predict_quantile(hold.X, 0.9))
+    # A p90 below its p50 would be a crossed pair, which the evaluator counts.
+    finite = np.isfinite(got50) & np.isfinite(got90)
+    assert (got90[finite] >= got50[finite]).all()
