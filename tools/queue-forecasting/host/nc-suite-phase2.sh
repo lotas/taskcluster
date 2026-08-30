@@ -361,6 +361,23 @@ wait_state() {  # wait_state <run_id> <state> <timeout_s>
   return 1
 }
 
+qfd_pythonpath() {  # qfd_pythonpath [unit path] -- what `import qfd` needs
+  # READ FROM THE UNIT, not written here. `qfd.py` imports `baseline` and
+  # `contract` at module scope and both live in `host/shared/`, which the service
+  # gets from `Environment=PYTHONPATH=` -- so a probe that sets only the
+  # dispatcher directory cannot import the module it is probing. That is exactly
+  # what happened to NC16: `baseline.py` moved from `dispatcher/` to `shared/` in
+  # 2c-2, the clause's `PYTHONPATH="$DISPATCHER"` stopped being sufficient, the
+  # `2>/dev/null` swallowed the ModuleNotFoundError, and an empty answer read as
+  # "unknown" -- reported as Docker failing to confirm an absence, which is a
+  # frightening thing to read and was not true.
+  local unit="${1:-/etc/systemd/system/qf-dispatch.service}" from_unit=""
+  [ -f "$unit" ] && from_unit="$(sed -n 's/^Environment=PYTHONPATH=\(.*\)$/\1/p' \
+    "$unit" | head -1)"
+  [ -n "$from_unit" ] || from_unit="$TRUSTED/tools/queue-forecasting/host/shared"
+  printf '%s:%s' "$DISPATCHER" "$from_unit"
+}
+
 spec_paths_of() {  # spec_paths_of <run_id> -> the probe's paths, space separated
   # THE ONLY PLACE THE EXPERIMENT PATH LIVES that a client can read. `qf list`
   # prints run_id, state, lane and submitted_at -- so "which probe ran which
@@ -1433,10 +1450,16 @@ pq.write_table(t.slice(0, max(1, t.num_rows - 1)), sys.argv[1])
 
   # (e) AND THE VERDICT IS RECOMPUTABLE. `eval.parquet` beside `verdict.json` is
   # what makes the numbers checkable rather than believable.
-  local out_dir
-  out_dir="$(find "$staged" -mindepth 2 -maxdepth 2 -type d -name out 2>/dev/null \
-    | head -1)"
-  if [ -n "$out_dir" ] && [ -f "$out_dir/verdict.json" ]; then
+  # THE FIRST DIRECTORY WITH A VERDICT IN IT, not the first `out/`. Most
+  # evaluations in this group FAIL by design -- four fixtures plus the mutated
+  # artifact -- and each still gets an empty `out/`, so taking `head -1` of the
+  # directories found whichever the walk reached first and then reported "no
+  # verdict.json under /var/lib/qf-eval" with three verdicts sitting beside it.
+  local verdict_file out_dir=""
+  verdict_file="$(find "$staged" -mindepth 3 -maxdepth 3 -type f \
+    -name verdict.json 2>/dev/null | head -1)"
+  [ -n "$verdict_file" ] && out_dir="$(dirname "$verdict_file")"
+  if [ -n "$out_dir" ]; then
     [ -f "$out_dir/eval.parquet" ] \
       && ok "NC11 (e) the verdict is published beside its per-row file" \
       || bad "NC11 (e) $out_dir has a verdict.json and no eval.parquet"
@@ -1893,11 +1916,21 @@ nc16() {
   # run that could no longer complete, so the suite would have reported a
   # confusing downstream failure instead of the one-line cause. Asking the
   # primitive directly costs nothing and names the real thing.
-  absent="$(PYTHONPATH="$DISPATCHER" python3 -c \
+  local probe_err; probe_err="$(mktemp)"
+  absent="$(PYTHONPATH="$(qfd_pythonpath)" python3 -c \
     'import qfd; print(qfd.Docker().is_running("qf-nc16-certainly-absent"))' \
-    2>/dev/null)"
-  assert_eq "NC16 the probe reads a nonexistent container as positively absent" \
-    "False" "${absent:-unknown}"
+    2>"$probe_err")"
+  if [ -z "$absent" ]; then
+    # THE REASON, NOT `unknown`. Discarding this probe's stderr turned a
+    # ModuleNotFoundError into "Docker cannot confirm an absence" -- a different
+    # and much more alarming claim than the truth.
+    bad "NC16 the absence probe did not answer at all, so it says nothing about
+  Docker: $(tr '\n' ' ' < "$probe_err" | tail -c 300)"
+  else
+    assert_eq "NC16 the probe reads a nonexistent container as positively absent" \
+      "False" "$absent"
+  fi
+  rm -f "$probe_err"
   sha="$(head_sha)"
   if [ -z "$sha" ]; then void "NC16 canary: no mirror HEAD"; return; fi
   rid="$(submit_as "$RESEARCH_USER" --kind test --sha "$sha" \

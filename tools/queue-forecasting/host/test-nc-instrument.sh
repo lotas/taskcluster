@@ -393,11 +393,50 @@ MODE=good
 # said the function existed while its body was garbage. The tests below then
 # failed on the code under test for a defect in how they had loaded it.
 for _fn in nc11_restore nc11_outcome_line nc11_scored nc11_refused_as \
-           nc11_verdict_of; do
+           nc11_verdict_of qfd_pythonpath; do
   # shellcheck disable=SC1090
   source <(sed -n "/^$_fn()/,/^}/p" "$SUITE")
   declare -F "$_fn" >/dev/null || HBAD "extraction missed $_fn()"
 done
+
+echo "== a probe of the daemon imports what the daemon imports =="
+# WHY: `qfd.py` imports `baseline` and `contract` at module scope, and both live
+# in `host/shared/`, which the SERVICE gets from `Environment=PYTHONPATH=`. NC16
+# probed `qfd.Docker().is_running` with only the dispatcher directory on the
+# path, so after `baseline.py` moved to `shared/` in 2c-2 the import failed, the
+# clause's `2>/dev/null` ate the ModuleNotFoundError, and an empty answer was
+# reported as "Docker cannot confirm an absence" -- a far more alarming claim
+# than the truth. So the path comes from the unit, and this checks that it does.
+UTMP="$(mktemp -d)"
+TRUSTED="$UTMP/trusted"; DISPATCHER="$UTMP/trusted/tools/queue-forecasting/host/dispatcher"
+cat > "$UTMP/unit" <<'UNIT'
+[Service]
+Environment=PYTHONPATH=/srv/queue-forecasting/tools/queue-forecasting/host/shared
+UNIT
+got="$(qfd_pythonpath "$UTMP/unit")"
+case "$got" in
+  "$DISPATCHER:/srv/queue-forecasting/tools/queue-forecasting/host/shared")
+    HOK "the probe's path is the unit's PYTHONPATH plus the dispatcher directory" ;;
+  *) HBAD "qfd_pythonpath returned '$got'" ;;
+esac
+# NO UNIT INSTALLED: fall back to the checkout, rather than to a path that
+# imports nothing.
+got="$(qfd_pythonpath "$UTMP/absent-unit")"
+case "$got" in
+  *"/host/shared") HOK "with no unit it falls back to the checkout's shared/" ;;
+  *) HBAD "qfd_pythonpath returned '$got' with no unit" ;;
+esac
+# A UNIT WITH NO PYTHONPATH -- the 2b-1 state -- must not yield a trailing colon,
+# which python reads as the current directory.
+printf '[Service]\nUser=qfd\n' > "$UTMP/bare"
+got="$(qfd_pythonpath "$UTMP/bare")"
+case "$got" in
+  *:) HBAD "qfd_pythonpath ended in a colon, so '.' is on the path" ;;
+  *"/host/shared") HOK "a unit with no PYTHONPATH falls back the same way" ;;
+  *) HBAD "qfd_pythonpath returned '$got'" ;;
+esac
+rm -rf "$UTMP"
+unset TRUSTED DISPATCHER
 
 echo "== NC11 reads an outcome the way the dispatcher writes one =="
 # THE STRINGS ARE THE ONES THE HOST PRODUCED, verbatim. Two live rounds were

@@ -3355,6 +3355,78 @@ class TestNc9IsWiredAndGated(unittest.TestCase):
                          "evaluate_input_missing")
         self.assertIn("evaluate_input_missing", self.nc9)
 
+class TestTheDaemonImportsWithOnlyWhatItsUnitProvides(unittest.TestCase):
+    """`import qfd` must resolve from the unit's own PYTHONPATH, and nothing else.
+
+    THE FAILURE THIS EXISTS FOR. `qfd.py` imports `baseline` and `contract` at
+    module scope; both live in `host/shared/`, which the SERVICE gets from
+    `Environment=PYTHONPATH=`. When `baseline.py` moved from `dispatcher/` to
+    `shared/` in 2c-2, everything that ran qfd through systemd kept working and
+    everything that imported it with only the dispatcher directory stopped --
+    including NC16's absence probe, which then reported that Docker could not
+    confirm a container was gone. A frightening claim, and not true.
+
+    Executed rather than read: the imports resolve or they do not.
+    """
+
+    HOST = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    def unit_pythonpath(self):
+        """The unit's PYTHONPATH, mapped onto this checkout.
+
+        The unit names `/srv/queue-forecasting/...`, which is the deployed path;
+        every entry is under `host/`, so the tail after `/host/` locates it here.
+        """
+        with open(os.path.join(self.HOST, "dispatcher",
+                               "qf-dispatch.service")) as fh:
+            unit = fh.read()
+        values = [l.split("=", 2)[2] for l in unit.splitlines()
+                  if l.startswith("Environment=PYTHONPATH=")]
+        self.assertEqual(len(values), 1, values)
+        return [os.path.join(self.HOST, entry.split("/host/", 1)[-1])
+                for entry in values[0].split(":") if entry]
+
+    def run_import(self, path_entries):
+        env = dict(os.environ, PYTHONPATH=":".join(path_entries),
+                   PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run([sys.executable, "-c", "import qfd"],
+                              capture_output=True, text=True, timeout=120,
+                              env=env)
+
+    def test_it_imports_with_the_unit_path_plus_its_own_directory(self):
+        dispatcher = os.path.join(self.HOST, "dispatcher")
+        done = self.run_import([dispatcher] + self.unit_pythonpath())
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_it_does_not_import_with_the_dispatcher_directory_alone(self):
+        # THE CANARY, and it is the shape of the real failure: without this the
+        # test above would pass on any host where `shared/` happened to be
+        # importable for another reason, and prove nothing about the unit.
+        done = self.run_import([os.path.join(self.HOST, "dispatcher")])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("No module named", done.stderr)
+
+    def test_every_module_level_import_lives_where_the_path_points(self):
+        # The same property statically, so the message names the module and the
+        # directory rather than a traceback.
+        with open(os.path.join(self.HOST, "dispatcher", "qfd.py")) as fh:
+            source = fh.read()
+        body = source[:source.index("\nlog = ")] if "\nlog = " in source \
+            else source
+        local = re.findall(r"^import (\w+) as \w+_mod$", body, re.M)
+        self.assertTrue(local, "no aliased local imports found to check")
+        directories = [os.path.join(self.HOST, "dispatcher")] \
+            + self.unit_pythonpath()
+        for module in local:
+            with self.subTest(module=module):
+                found = [d for d in directories
+                         if os.path.isfile(os.path.join(d, f"{module}.py"))]
+                self.assertTrue(found,
+                                f"qfd.py imports {module}, which is in none of"
+                                f" {directories} -- the service would not start")
+
+
 class TestNc11PicksASubjectItCanCanaryWith(unittest.TestCase):
     """Clause (a) is the canary for the whole NC11 group, so the prediction set
     it scores must be one that CAN be scored.

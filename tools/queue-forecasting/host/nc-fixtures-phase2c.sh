@@ -37,6 +37,29 @@ fi
 EXP="$REPO/research/experiments"
 mkdir -p "$EXP"
 
+# THE FIXTURE BRANCH MUST CARRY EVERY FIXTURE, because the suite resolves them
+# all from ONE sha (`nc12-sha.txt`). This refuses rather than writing into a
+# checkout that has only half of them: NC19's first live run voided with
+# `can't open file '/app/trainer/research/experiments/baseline_contract.py'`
+# because the 2c fixtures had been committed to a fresh branch off main, which
+# does not carry 2b's. A generator that lets that happen is a generator that
+# produces a branch the suite cannot use.
+missing=""
+for needed in extract_contract.py baseline_contract.py; do
+  [ -f "$EXP/$needed" ] || missing="$missing $needed"
+done
+if [ -n "$missing" ]; then
+  echo "$REPO/research/experiments is missing:$missing" >&2
+  echo >&2
+  echo "The NC suite resolves EVERY fixture from one commit -- the sha in" >&2
+  echo "host/nc12-sha.txt -- so a branch with only these five scripts makes" >&2
+  echo "NC13 and NC19 void. Write 2b's first, then re-run this:" >&2
+  echo "    ./nc-fixtures-phase2b.sh $REPO" >&2
+  echo "    ./nc-fixtures-phase2c.sh $REPO" >&2
+  echo "and commit all seven files in one commit." >&2
+  exit 2
+fi
+
 # The shared core, written once here and into each file: the fixtures are
 # standalone because a probe names ONE path and a sibling import inside the
 # sandbox is a second thing to be wrong. The duplication lives in this generator,
@@ -430,7 +453,11 @@ cat <<'NEXT'
 
 Next, in the qf-research checkout, with the AGENT's credential:
 
-  git checkout -b probe-nc11-rowset      # or commit to the fixture branch
+  # ON THE EXISTING FIXTURE BRANCH, or a new branch made FROM it -- never a
+  # fresh branch off main. Every fixture the suite runs comes from the single sha
+  # in host/nc12-sha.txt, so a branch carrying only these five makes NC13 and
+  # NC19 void on a working host.
+  git checkout <the fixture branch>       # the one nc12-sha.txt points at
   git add research/experiments/nc11_honest.py \
           research/experiments/nc11_relabelled.py \
           research/experiments/nc11_ghost_row.py \
@@ -438,6 +465,8 @@ Next, in the qf-research checkout, with the AGENT's credential:
           research/experiments/nc11_easy_days.py
   git commit -m "NC11 row-set fixtures"
   git push -u origin HEAD
+  git rev-parse HEAD > <checkout>/tools/queue-forecasting/host/nc12-sha.txt
+  # ^ and COMMIT that too: it is what the suite submits every fixture probe with.
 
 Then, on the host, ONE PROBE PER SCRIPT against the same extract -- the suite
 finds them by reading each SUCCEEDED probe's own spec, so the order does not

@@ -58,11 +58,23 @@ EXPECTED = {
 }
 
 
-def generate(into):
-    """Run the real generator against a directory shaped like qf-research."""
+def generate(into, *, with_2b_fixtures=True):
+    """Run the real generator against a directory shaped like qf-research.
+
+    `with_2b_fixtures` because the generator REFUSES a checkout that does not
+    already carry 2b's two fixtures: the suite resolves every fixture from one
+    sha, so a branch with only these five makes NC13 and NC19 void -- which is
+    what happened on the host when they were committed to a fresh branch off
+    main.
+    """
     os.makedirs(os.path.join(into, "trainer"), exist_ok=True)
     os.makedirs(os.path.join(into, ".git"), exist_ok=True)
     open(os.path.join(into, "trainer", "pyproject.toml"), "w").close()
+    if with_2b_fixtures:
+        experiments = os.path.join(into, "research", "experiments")
+        os.makedirs(experiments, exist_ok=True)
+        for name in ("extract_contract.py", "baseline_contract.py"):
+            open(os.path.join(experiments, name), "w").close()
     done = subprocess.run(["bash", GENERATOR, into],
                           capture_output=True, text=True, timeout=120)
     if done.returncode != 0:
@@ -333,6 +345,34 @@ class TestTheGeneratedScriptsAreWhatTheSandboxCanRun(Nc11FixtureCase):
         # And it says WHY, because an unexplained flag is the first thing
         # somebody drops when the command does not fit on a line.
         self.assertIn("carries no baseline_hash", instructions)
+
+    def test_it_refuses_a_checkout_without_the_2b_fixtures(self):
+        # The suite submits every fixture probe with ONE sha, so a branch that
+        # carries only these five scripts makes NC13 and NC19 void on a working
+        # host -- and it did: `can't open file
+        # '/app/trainer/research/experiments/baseline_contract.py'`.
+        with tempfile.TemporaryDirectory() as half:
+            os.makedirs(os.path.join(half, "trainer"))
+            os.makedirs(os.path.join(half, ".git"))
+            open(os.path.join(half, "trainer", "pyproject.toml"), "w").close()
+            done = subprocess.run(["bash", GENERATOR, half],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(done.returncode, 0)
+            output = done.stdout + done.stderr
+            self.assertIn("baseline_contract.py", output)
+            self.assertIn("nc-fixtures-phase2b.sh", output)
+            # AND IT WROTE NOTHING: a half-written fixture set on a branch that
+            # cannot be used is worse than a refusal.
+            self.assertFalse(os.path.exists(
+                os.path.join(half, "research", "experiments",
+                             "nc11_honest.py")))
+
+    def test_the_instructions_point_at_the_existing_fixture_branch(self):
+        with open(GENERATOR) as fh:
+            instructions = fh.read()
+        instructions = instructions[instructions.index("cat <<'NEXT'"):]
+        self.assertIn("nc12-sha.txt", instructions)
+        self.assertNotIn("checkout -b probe-nc11-rowset", instructions)
 
     def test_it_never_commits_or_pushes(self):
         with open(GENERATOR) as fh:
