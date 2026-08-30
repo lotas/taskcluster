@@ -720,6 +720,27 @@ dispatcher's token is read-only.
 a template to a promoted `baseline_hash`, which means `promote-baseline.sh` comes
 first — and until at least one contract resolves, NC9 and NC11 report `void`.
 
+## Reading experiments back
+
+`results.sh` (with `results.py`) joins `qf list --json` and `qf status --json`
+into one row per SCORED run: when, verdict, each metric's `measured` value with a
+`!` where it missed its bar, the config, and the note. Oldest first, so it reads
+as a history.
+
+Deliberately not a `qf` subcommand: the data is already reachable by a client, so
+the missing piece was the join, and a join is not a new privilege — an op in
+`qfd` would mean a service restart to read numbers nobody's permissions blocked.
+
+The column to look at first is `extract`. Rows against different extracts are not
+better and worse results, they are results from different series, and two of them
+in one table is how a regime change gets read as a model improvement. The script
+prints the prefix on every row and warns when more than one input set is in view.
+
+The config name comes from the run's `note`, which `first-probe.sh` writes as
+`cfg=<config> | <EXPERIMENT_NOTE>`. Nothing else in a run record says which config
+trained — it is a constant inside the commit — so without the note, telling two
+experiments apart means `git show` per row.
+
 ## Two instruments that do NOT detect a leaked file handle
 
 Both were tried here and both reported success over a live leak:
@@ -752,6 +773,16 @@ PYTHONPATH=. python3 -m unittest discover -s tests
 `PYTHONPATH=.` is required: the tests import `spec`, `store` and friends as
 top-level modules, and `unittest discover` only puts the *start* directory on
 `sys.path`.
+
+The evaluator's suite needs `numpy` and `pyarrow`, so it runs under its own
+interpreter rather than the system one:
+
+```sh
+cd tools/queue-forecasting/host/evaluator
+PYTHONPATH=. env/.venv/bin/python -m unittest discover -s tests
+```
+
+`tests/test_results.sh` covers `results.py` and needs neither.
 
 **Two things the unit suite cannot answer**, because they are properties of the
 Docker CLI rather than of this code, so `nc-suite-phase2.sh` NC16 asks a real

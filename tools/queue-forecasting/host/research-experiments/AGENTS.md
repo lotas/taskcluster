@@ -94,11 +94,20 @@ the verdict word on its own tells you nothing about how close you came.
 ## Reading a result
 
 ```sh
-qf status <evaluate run id> --json     # pins.scoreboard, as JSON
+# EVERY experiment so far, one row each, oldest first. Read this before
+# proposing the next change: a hypothesis somebody already tested is not one.
+/srv/queue-forecasting/tools/queue-forecasting/host/results.sh
+/srv/queue-forecasting/tools/queue-forecasting/host/results.sh --json
+
+qf status <evaluate run id> --json     # one result: pins.scoreboard
 qf logs <probe run id>                 # the trainer's own output
-qf logs <probe run id> --stream stderr
-qf list --limit 50 --json              # every run; pair with `qf status` for history
+qf logs <probe run id> --stream stderr # why it failed, when it failed
 ```
+
+`results.sh` prints an `extract` column and warns when the table holds rows from
+more than one input set. Rows from different extracts are not comparable to each
+other -- if your row's extract prefix differs from the reference row's, you have
+measured something else.
 
 Each metric in the scoreboard carries `value` (what the model scored),
 `baseline` (what the percentile model scored), `measured` (the quantity actually
@@ -132,3 +141,8 @@ State the hypothesis before you run it, in the commit message: what you changed,
 what you expect to move, and roughly how much. Then one variable, so the number
 attributes to something. A run that changes three things and improves is a run
 that has to be repeated three more times before anyone knows why.
+
+The config name is recorded on every run, so `results.sh` can tell your rows
+apart. If you add a config, give it a name whose ENDING says what is different --
+the table elides long names from the left, and two configs that differ only in a
+prefix print as the same experiment.

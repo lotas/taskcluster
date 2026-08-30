@@ -253,12 +253,31 @@ fi
 SHA="$(git -C "$QF_RESEARCH" rev-parse HEAD)" || fail "cannot read HEAD"
 echo "  sha=$SHA"
 
+# WHAT THIS RUN IS, recorded ON the run. A run record carries the commit and the
+# pinned inputs, and neither says which config trained -- that is a constant
+# inside the commit, so telling two experiments apart in a listing meant
+# `git show` per run. The note is stored in `jobs.spec_json`, which `qf list
+# --json` returns, so putting the config in it is what makes a results table
+# possible at all.
+#
+# READ BACK from the research copy rather than taken from $COHORT_CONFIG: that
+# variable is empty on a run that did not change the config, and "unknown" is
+# exactly the wrong thing to record about the majority of runs.
+CONFIG_IN_USE="$(sed -n 's/^CONFIG = "\(.*\)"$/\1/p' \
+  "$QF_RESEARCH/research/experiments/run_cohort.py" | head -1)"
+[ -n "$CONFIG_IN_USE" ] || fail "no CONFIG constant in
+    $QF_RESEARCH/research/experiments/run_cohort.py -- a run whose config cannot
+    be named is a result nobody can attribute"
+NOTE="cfg=$CONFIG_IN_USE"
+[ -z "${EXPERIMENT_NOTE:-}" ] || NOTE="$NOTE | $EXPERIMENT_NOTE"
+echo "  note=$NOTE"
+
 # --- 3. probe -----------------------------------------------------------------
 say "probe"
 PROBE_OUT="$(qf probe --sha "$SHA" \
   --path research/experiments/run_cohort.py \
   --extract "$EXTRACT" --baseline "$BASELINE" \
-  --mem "$PROBE_MEM" --wait 2>&1)"
+  --mem "$PROBE_MEM" --note "$NOTE" --wait 2>&1)"
 PROBE_RC=$?
 echo "$PROBE_OUT"
 # NOT `head -1`. `qf` prints the run id on stdout and the state on stderr, and
@@ -282,7 +301,11 @@ fi
 
 # --- 4. evaluate --------------------------------------------------------------
 say "evaluate"
-EVAL_OUT="$(qf evaluate --run "$RUN_ID" --contract "$CONTRACT" --wait 2>&1)"
+# The SAME note on the evaluation. It could be joined through the `judged_run`
+# pin instead, but a row that has to be joined to say what it is is a row people
+# read wrong.
+EVAL_OUT="$(qf evaluate --run "$RUN_ID" --contract "$CONTRACT" \
+  --note "$NOTE" --wait 2>&1)"
 EVAL_RC=$?
 echo "$EVAL_OUT"
 EVAL_ID="$(run_id_of evaluate "$EVAL_OUT")"
