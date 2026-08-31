@@ -32,6 +32,7 @@ feature code under `trainer/src/`. That is the whole research loop.
 from __future__ import annotations
 
 import json
+import datetime
 import os
 import pathlib
 import sys
@@ -150,6 +151,79 @@ def check_qctx(raw: dict) -> None:
             f"  qctx_runs columns in this extract: {', '.join(columns) or 'none'}")
 
 
+def check_window(raw: dict) -> None:
+    """Refuse a config whose train window reaches earlier than the extract's.
+
+    `extract_source._covers` already refuses this, correctly -- but it refuses
+    when the `runs` table is loaded, which is a container start and a data load
+    into a run nobody is watching. The arithmetic is available at second zero,
+    because a cohort's train_start is a pure function of the config's window
+    keys and the extract's own `as_of_date`:
+
+        train_start = as_of - holdout_days - validation_days - lookback_days
+
+    THIS IS THE CHECK THAT UNBLOCKS AN AGENT rather than just failing it faster.
+    A frozen extract's window is a function of the config family it was
+    requested for, so a config with a wider window than that family's is not a
+    broken config -- `wait_hazard_qctx_d_priority_flow` needs
+    `validation_days: 7` for a measured reason, and no amount of editing it to
+    fit is a legitimate fix. The remedy is a different extract, which is an
+    operator decision, so this says so instead of leaving a traceback to
+    interpret.
+    """
+    request = manifest().get("request") or {}
+    have = request.get("train_start")
+    as_of = request.get("as_of_date")
+    if not (have and as_of):
+        return                      # cohort_as_of() already refuses a missing as_of
+
+    days = 0
+    for key in ("holdout_days", "validation_days", "lookback_days"):
+        value = raw.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            # Not this check's business to validate the config -- the trainer
+            # owns that, and guessing a default here would produce a train_start
+            # the trainer never computes.
+            return
+        days += value
+
+    as_of_dt, have_dt = _parse_day(as_of), _parse_day(have)
+    if as_of_dt is None or have_dt is None:
+        return                      # an unparseable manifest is not this check's call
+    need = as_of_dt - datetime.timedelta(days=days)
+    if need >= have_dt:
+        return
+
+    raise SystemExit(
+        f"[run_cohort] this config's cohort needs train_start <="
+        f" {need.date()}, and the extract's window starts"
+        f" {have_dt.date()}.\n"
+        f"  as_of {as_of_dt.date()} minus holdout"
+        f" {raw['holdout_days']} + validation {raw['validation_days']} +"
+        f" lookback {raw['lookback_days']} = {days} days.\n"
+        "  Training on it would silently train on a subset, so this refuses"
+        " here rather than after the data load.\n"
+        "  DO NOT shrink the config's window to fit. A window key is part of"
+        " the experiment (this config's validation_days: 7 is measured), and"
+        " editing it to make a run start is changing what is being tested.\n"
+        "  The remedy is an extract whose window covers this cohort. Choosing"
+        " one is an OPERATOR decision -- it starts a new series, and results"
+        " across series are not comparable. Report this and stop:"
+        " `qf extracts` prints every published window.")
+
+
+def _parse_day(value: str):
+    """A manifest day boundary as an aware datetime, or None."""
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z",
+                                                                   "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
 def main() -> int:
     for path, what in ((EXTRACT, "extract"), (BASELINE, "baseline"),
                        (OUT.parent, "output")):
@@ -173,6 +247,7 @@ def main() -> int:
         raw = yaml.safe_load(fh)
     check_target(raw["target"])
     check_qctx(raw)
+    check_window(raw)
 
     as_of = cohort_as_of()
     print(f"[run_cohort] {CONFIG} as_of={as_of} extract={EXTRACT}", flush=True)

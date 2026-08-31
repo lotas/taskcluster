@@ -8,10 +8,16 @@ that the next bootstrap overwrites.
 
 ## What you are doing
 
-Predicting how long a Taskcluster task will wait before it starts. There is a
-production candidate already, and it is not good enough: it improves mean
-absolute error by ~7% over the percentile baseline where the bar is 15%. Your job
-is to find the change that closes that gap, one variable at a time.
+Predicting how long a Taskcluster task will wait before it starts. A percentile
+baseline is what you are beating, and a contract of four bars is what decides it.
+
+**As of 2026-08-31 the situation is not "close the gap" any more.** Queue-context
+features cleared the MAE bar by 11.9pp and the within-2x bar by 3.7pp on the
+first try. **One bar is still failing, by 0.42pp**: the 30m+ p90 miss, at 0.3042
+against a 0.30 ceiling. So the job is narrower and harder than a general search
+for improvement -- it is a tail-coverage problem with three bars already banked,
+and a change that trades any of them away for tail coverage has to trade at a
+rate the contract survives.
 
 **The ranked list of what to run and why is at**
 
@@ -28,18 +34,39 @@ Read it before proposing anything: it records which ideas were already tried and
 therefore still open. Three of its six entries are one-variable versions of
 experiments that were run, dismissed, and cannot actually be attributed.
 
-The two places the current model is weakest, from fourteen walk-forward cohorts:
+### Where the error actually is
 
-- **5-30 minute waits.** Short waits are easy (the queue is empty) and long ones
-  are structural (the pool is saturated). The middle is where the information is
-  missing, and it is the bucket that has resisted every feature so far.
-- **The 30m+ tail.** Guarded p90 misses ~25% of the time against a 30% bar, so
-  it passes -- but a group ETA is a max over tasks, and a max is all tail.
+Measured on one cohort of 1.13M holdout rows, and it contradicts what this file
+used to say:
+
+| bucket | rows | share of rows | share of model error |
+|---|---|---|---|
+| <1m | 562,562 | 49.8% | 3.5% |
+| 1-5m | 365,583 | 32.3% | 8.0% |
+| 5-30m | 161,823 | 14.3% | 20.5% |
+| **30m+** | **40,359** | **3.6%** | **68.0%** |
+
+**68% of the error is in 3.6% of the rows.** `<1m` and `1-5m` cannot reach the
+MAE bar even at zero error -- their whole contribution is smaller than the bar.
+So MAE is a tail bar whatever it is called, and this file's old claim that
+"5-30m is the bucket where the information is missing" came from the model's
+relative edge over baseline being thinnest there, not from leverage.
+
+The mirror image: **within-2x leverage is in `<1m`**, which holds half the rows
+and has the worst within-2x of any bucket (49.5%). Nothing in the queue targets
+it, because nobody has a hypothesis for it -- sub-minute waits are probably
+scheduler and claim latency rather than queueing, and no feature in any config
+describes that. If you have one, that is a real contribution.
 
 ## The canonical inputs
 
-Three hashes. **Copy them verbatim into every probe and every evaluation. Do not
-substitute your own, and do not take "the newest" from a listing.**
+**Two published series, and which one you use is decided by arithmetic, not by
+preference.** A frozen extract's window is a function of the config family it was
+requested for, so a config with a wider train window than that family's cannot
+run on it at all.
+
+**Series A -- the default.** For configs with `validation_days: 1`, which is
+every quantile config. All the scored results below are on this series.
 
 ```
 EXTRACT   bd29b39ab6254a3cf5de6a7413c1476a6caa178a0685f88aaa7d489c9a2db91f
@@ -47,32 +74,65 @@ BASELINE  e51a321057ca884977edc357c3c2c254dcefb01ed700f9009f5d92b412ec9a27
 CONTRACT  f740716d32b8ddef20bd2e42ede873fd0b59486f752c8d077293ebc440997173
 ```
 
-A hash makes ONE run reproducible. Only the same three hashes across runs make
-two results comparable -- and comparing results is the entire job, so a run
-against a different extract is not a better experiment, it is a number that
-belongs to no series. If a listing shows something newer, that is not permission:
-changing the trio is an operator decision that starts a new series, and the old
-numbers do not carry across it.
-
-**The reference point below is NOT yet in this series, and that matters.** It was
-produced on the gen-1 extract of the same window (`cd467b4bd869...`), which is a
-different snapshot of the same days and therefore a different hash. Treat it as
-the magnitude to expect, not as the number to beat, until the promoted config has
-been re-run against the canonical extract above -- that run is the in-series
-reference, and it is the operator's to make.
-
-From the promoted config `wait_time_residual_throughput_filtered_baseline.yaml`:
+**Series B -- wider window, for configs Series A cannot hold.** Its window starts
+2026-07-21 and its `as_of` is 2026-08-26, one day earlier than Series A, so its
+holdout is a DIFFERENT population.
 
 ```
-FAIL  mae            measured=0.067  bar=relative_improvement:0.15
-FAIL  within_2x      measured=0.044  bar=absolute_improvement:0.05
-PASS  p90_coverage   measured=0.887  bar=band:0.85..0.95
-PASS  p90_miss_tail  measured=0.247  bar=absolute:0.3       [30m+]
-verdict: no-go
+EXTRACT   c179c7f5b961edc30fac1a494be4867f50129c2639a99b7015e77f9be6c47a12
+BASELINE  e51a321057ca884977edc357c3c2c254dcefb01ed700f9009f5d92b412ec9a27
+CONTRACT  f740716d32b8ddef20bd2e42ede873fd0b59486f752c8d077293ebc440997173
 ```
 
-Beat the in-series reference, with the same three hashes, and the improvement is
-real. Beat only the number above and you may have beaten a snapshot.
+**Series B has no scored rows yet.** So a result there is comparable to nothing
+until you also run the config you are comparing against on the same extract. Two
+runs, not one. If you are not willing to spend the second run, you do not have an
+experiment.
+
+### Choosing between them
+
+`run_cohort.py` computes your cohort's train_start in the first second and
+refuses if the extract cannot cover it:
+
+```
+train_start = as_of - holdout_days - validation_days - lookback_days
+```
+
+Use Series A. If that check refuses, use Series B and run the comparison config
+there too. If Series B also refuses, **stop and report it** -- do not go looking
+through `qf extracts` for something that fits, and above all do not shrink the
+config's window keys to make the run start. A window key is part of what is being
+tested (`wait_hazard_qctx_d_priority_flow` carries `validation_days: 7` for a
+measured reason: it lifted validation AUC on the far bins from 0.711/0.574 to
+0.915/0.909), and editing it to fit an extract changes the experiment into a
+different one that happens to be runnable.
+
+Copy the hashes verbatim. `qf extracts`, `qf baselines` and `qf contracts` are
+for CONFIRMING they exist and reading their windows. They are not a menu, and
+"something newer exists" is not permission -- a run against an extract nobody
+else used is a number that belongs to no series.
+
+### The scored results so far
+
+Series A, all on the contract's unfiltered `completed` slice. Read the queue for
+what each one means; these are here so you know what you are beating.
+
+| config | mae | within_2x | p90 cov | 30m+ miss | days |
+|---|---|---|---|---|---|
+| bar | −0.15 | +0.05 | 0.85–0.95 | <0.30 | 3 |
+| `..._filtered_baseline` (reference) | 0.0404 ✗ | 0.0442 ✗ | 0.8901 | 0.2946 ✓ | 0/3 |
+| `..._filtered_baseline_qctx` | **0.2686** ✓ | **0.0951** ✓ | 0.8821 | 0.3108 ✗ | 4/3 |
+| `wait_qctx_d_priority_flow` | 0.2585 ✓ | 0.0868 ✓ | 0.8870 | **0.3042** ✗ | — |
+
+All three are no-go. The last two fail on the tail alone.
+
+**Read the third row before proposing a feature.** qctx_d is qctx minus the 8
+capacity numerics and 4 other columns, and it moved the tail 0.66pp closer while
+costing 1.0pp of MAE and 0.8pp of within-2x. Two lessons in one row: the tail and
+the central metrics trade against each other here, and a pre-freeze ablation
+finding that capacity "actively dilutes the model" did NOT reproduce in-series.
+Off-series findings are hypotheses, including the ones written in config
+comments.
 
 ## The loop
 
@@ -85,7 +145,7 @@ One experiment is one commit.
 # 2. commit and push -- a probe runs a COMMIT, never a working tree
 git add -A && git commit -m "what changed and why you expect it to help" && git push
 
-# 3. the canonical trio, verbatim from the block above -- not from a listing
+# 3. the series from "The canonical inputs" -- Series A unless it refuses you
 EXTRACT=bd29b39ab6254a3cf5de6a7413c1476a6caa178a0685f88aaa7d489c9a2db91f
 BASELINE=e51a321057ca884977edc357c3c2c254dcefb01ed700f9009f5d92b412ec9a27
 CONTRACT=f740716d32b8ddef20bd2e42ede873fd0b59486f752c8d077293ebc440997173
@@ -126,8 +186,9 @@ measured something else.
 
 Each metric in the scoreboard carries `value` (what the model scored),
 `baseline` (what the percentile model scored), `measured` (the quantity actually
-compared against the bar) and `bar` (the rule). `measured=0.067
-bar=relative_improvement:0.15` means you got 6.7% where 15% was needed.
+compared against the bar) and `bar` (the rule). The live example is
+`measured=0.3042 bar=absolute:0.3` -- 0.3042 where 0.30 or lower was needed, so
+the whole verdict turns on 0.42pp of one metric.
 
 `days_passed=N/M` is the consistency rule: a result has to hold on M of the
 holdout days, not just in aggregate. A change that wins overall and loses on two
@@ -139,17 +200,24 @@ days is a change that has found a day, not a signal.
   the frozen extract at `/extract`. If you find yourself wanting a query, the
   column you want has to be added to the extract by a human first.
 - **A config the extract cannot serve is refused in the first second**, not
-  twenty minutes in: a target mismatch, and a config enabling
-  `queue_context_features` against an extract with no `task_created`.
+  twenty minutes in. Three checks, all from the manifest: a target mismatch, a
+  config enabling `queue_context_features` against an extract with no
+  `task_created`, and a config whose train window reaches earlier than the
+  extract's. The third one names the remedy, because the remedy is not yours to
+  apply -- see "Choosing between them".
 - **The extract is immutable.** You cannot widen its window or add a column. A
   column that is not in it has to be added by a human, to trusted code, and
   re-extracted -- which produces a new hash and therefore a new series.
 - **You cannot change the contract or the baseline.** Both are named by hash from
   the trusted checkout. A bar you could move is not a bar.
 - **A probe runs a pushed commit.** Uncommitted work is invisible to it.
-- **~22g of memory, one training job at a time.** An exit code of 137 with an
-  empty log is the kernel killing the container: that is memory, not a bug in
-  your change.
+- **~22g of memory, one training job at a time.** The host ceiling is 22528m and
+  `qf probe` refuses a larger `--mem` outright, before starting anything. An exit
+  code of 137 with an empty log is the kernel killing the container: that is
+  memory, not a bug in your change. Series B is ~71% more rows than Series A
+  (8.6M vs 5.0M), so a config that fits in Series A may not fit in Series B --
+  and 20g is already close. For a hazard config the lever is the last FINITE bin
+  edge; for a quantile config there is no lever, so report it.
 - **Every prediction row is scored.** You cannot drop the rows you do badly on;
   a prediction set that does not cover the holdout slice is rejected whole.
 
@@ -157,7 +225,8 @@ days is a change that has found a day, not a signal.
 
 `model_type: discrete_hazard` (Bet 2) trains one booster per wait bin instead of
 one model per quantile, and it is scored through the same contract: p50 and p90
-come out of the survival curve. It is a TAIL specialist -- it roughly halves the
+come out of the survival curve. **It needs Series B**: `validation_days: 7` puts
+its train_start 6 days earlier than Series A's window reaches. It is a TAIL specialist -- it roughly halves the
 30m+ p90 miss and gives up overall within-2x -- so read those two metrics
 together rather than the verdict alone.
 
