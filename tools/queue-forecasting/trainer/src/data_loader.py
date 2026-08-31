@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -581,7 +582,78 @@ def _log_step(label: str, t0: float) -> None:
     print(f"[data_loader] {label}: {time.monotonic() - t0:.1f}s", flush=True)
 
 
-def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame | None = None) -> pd.DataFrame:
+def _fetch_main_dataset_from_db(c: Config) -> pd.DataFrame:
+    """Fetch and compact the main training frame, without post-load features.
+
+    Kept separate from ``load`` so cron can materialize the Parquet cache in a
+    short-lived process. psycopg/pandas can retain a large allocator arena after
+    fetching millions of rows; exiting that process before sorting, loading the
+    baseline NDJSON, and merging prevents those otherwise-disjoint peaks from
+    accumulating inside the trainer's cgroup.
+    """
+    dsn = os.environ["DATABASE_URL"]
+    w = compute_windows(c)
+    query = _build_query(c)
+    params = {
+        "train_start": w.train_start,
+        "as_of_date": w.as_of_date,
+    }
+    with _connect(dsn) as conn:
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        except Exception:
+            # pandas may not support psycopg3 connections directly;
+            # fall back to manual cursor fetch.
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                columns = [d.name for d in cur.description]
+                df = pd.DataFrame(rows, columns=columns)
+    return _downcast_categorical_columns(df)
+
+
+def _write_main_cache(df: pd.DataFrame, path: Path) -> None:
+    """Publish a Parquet cache atomically in the destination directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def ensure_main_cache(c: Config, *, refresh_cache: bool = False) -> Path | None:
+    """Materialize the DB-backed main-frame cache without reading it back.
+
+    The caller is expected to exit after a cold-cache fill. The subsequent
+    trainer process then starts with a clean heap and takes the cache-hit path.
+    Frozen extracts are already immutable caches, so there is nothing to do for
+    that source.
+    """
+    if extract_source.active() is not None:
+        print("[data_loader] frozen extract is already a materialized cache", flush=True)
+        return None
+
+    path = cache_path(c)
+    if path.exists() and not refresh_cache:
+        print(f"[data_loader] main dataset cache ready: {path}", flush=True)
+        return path
+
+    t0 = time.monotonic()
+    df = _fetch_main_dataset_from_db(c)
+    _write_main_cache(df, path)
+    _log_step(f"main dataset cache materialized ({len(df)} rows)", t0)
+    return path
+
+
+def load(
+    c: Config,
+    *,
+    refresh_cache: bool = False,
+    worker_pools: pd.DataFrame | None = None,
+    require_main_cache: bool = False,
+) -> pd.DataFrame:
     src = extract_source.active()
     path = cache_path(c)
     t0 = time.monotonic()
@@ -603,28 +675,14 @@ def load(c: Config, *, refresh_cache: bool = False, worker_pools: pd.DataFrame |
         df = pd.read_parquet(path)
         _log_step("main dataset (cache hit)", t0)
     else:
-        dsn = os.environ["DATABASE_URL"]
-        w = compute_windows(c)
-        query = _build_query(c)
-        params = {
-            "train_start": w.train_start,
-            "as_of_date":  w.as_of_date,
-        }
-        with _connect(dsn) as conn:
-            try:
-                df = pd.read_sql_query(query, conn, params=params)
-            except Exception:
-                # pandas may not support psycopg3 connections directly;
-                # fall back to manual cursor fetch.
-                with conn.cursor() as cur:
-                    cur.execute(query, params)
-                    rows = cur.fetchall()
-                    columns = [d.name for d in cur.description]
-                    df = pd.DataFrame(rows, columns=columns)
-
-        df = _downcast_categorical_columns(df)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(path, index=False)
+        if require_main_cache:
+            raise RuntimeError(
+                f"Required main dataset cache is missing: {path}. "
+                "Run scripts.prepare_training_cache for this exact config/as-of "
+                "before starting the memory-isolated training process."
+            )
+        df = _fetch_main_dataset_from_db(c)
+        _write_main_cache(df, path)
         _log_step(f"main dataset (SQL fetch, {len(df)} rows)", t0)
 
     # Idempotent (astype("category") on an already-categorical column is a

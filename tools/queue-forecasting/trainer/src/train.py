@@ -358,6 +358,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--require-main-cache", action="store_true",
+                        help="fail instead of fetching the main SQL dataset when "
+                             "its Parquet cache is absent")
     parser.add_argument("--as-of-date", default=None,
                         help="Override as_of_date from config (UTC midnight of given day)")
     parser.add_argument("--predictions-out", default=None, metavar="PATH",
@@ -397,7 +400,12 @@ def main(argv: list[str] | None = None) -> int:
     if c.velocity_features and c.velocity_features.get("enabled"):
         _worker_pools_snapshot = data_loader.load_worker_pools()
 
-    df = data_loader.load(c, refresh_cache=args.refresh_cache, worker_pools=_worker_pools_snapshot)
+    df = data_loader.load(
+        c,
+        refresh_cache=args.refresh_cache,
+        worker_pools=_worker_pools_snapshot,
+        require_main_cache=args.require_main_cache,
+    )
     print(f"  rows loaded: {len(df):,}")
 
     train_df, val_df, hold_df = _split_by_pending_at(df, c)

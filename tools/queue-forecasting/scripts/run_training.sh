@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Two-step training orchestration:
+# Memory-isolated training orchestration:
 #   1. Generate per-holdout-day baseline JSONs via the Node predictor.
-#   2. Train + evaluate via the Python trainer.
+#   2. Materialize the main SQL cache in a short-lived Python process.
+#   3. Train + evaluate from that cache in a fresh Python process.
 #
 # Usage (all three work):
 #   ./scripts/run_training.sh configs/wait_time.yaml
@@ -53,11 +54,22 @@ if [[ ! -f "trainer/$CONFIG" ]]; then
   exit 1
 fi
 
-# Build --as-of-date flag fragments for passing through to sub-commands.
-AS_OF_FLAG=()
-if [[ -n "$AS_OF_DATE" ]]; then
-  AS_OF_FLAG=(--as-of-date "$AS_OF_DATE")
+# Resolve the effective date ONCE. Configs normally leave as_of_date null, and
+# independently resolving that default in each container lets a run crossing
+# UTC midnight generate baselines/cache for one cohort and train another.
+if [[ -z "$AS_OF_DATE" ]]; then
+  AS_OF_DATE=$(docker compose run --rm \
+    --entrypoint uv \
+    trainer \
+    run python -m src.resolve_as_of_date --config "$CONFIG" \
+    | { grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || true; } | tail -n 1)
 fi
+if [[ -z "$AS_OF_DATE" ]]; then
+  echo "ERROR: could not resolve effective as_of_date for $CONFIG" >&2
+  exit 1
+fi
+AS_OF_FLAG=(--as-of-date "$AS_OF_DATE")
+echo "Effective as-of date: $AS_OF_DATE"
 
 # Step 1: resolve holdout days from config (no DB access, pure config math).
 # --entrypoint takes a single executable; the rest of the command becomes argv.
@@ -116,7 +128,7 @@ mkdir -p "trainer/${BASELINE_REL}"
 # Window: [as_of - lookback_days - validation_days - holdout_days, as_of)
 # matches the trainer's compute_windows() math; +2 days padding for safety.
 if grep -qE '^(residual|baseline_features):' "trainer/${CONFIG}"; then
-  AS_OF_FOR_NDJSON="${AS_OF_DATE:-$(date -u +%F)}"
+  AS_OF_FOR_NDJSON="$AS_OF_DATE"
   NDJSON_FROM=$(python3 -c "
 import sys, yaml
 from datetime import datetime, timedelta
@@ -143,5 +155,24 @@ for d in $HOLDOUT_DAYS; do
       "${EXCLUDE_FLAG[@]}"
 done
 
-# Step 3: train + evaluate.
-docker compose run --rm trainer --config "$CONFIG" "${AS_OF_FLAG[@]}"
+# Step 2.5: materialize the main SQL cache in its own short-lived process.
+#
+# This process boundary is load-bearing for the large run-duration cohort. A
+# cold psycopg/pandas fetch can leave several GB of allocator arenas resident
+# after the Parquet write. If that same process continues into the canonical
+# sort and baseline merge, those otherwise-disjoint peaks stack up and hit the
+# trainer's cgroup limit. The next container starts with a clean heap and reads
+# the compact Parquet cache -- the same path that made an immediate retry after
+# the 2026-08-31 OOM succeed.
+echo "Preparing main training-data cache"
+docker compose run --rm \
+  --entrypoint uv \
+  trainer \
+  run python -m scripts.prepare_training_cache \
+    --config "$CONFIG" "${AS_OF_FLAG[@]}"
+
+# Step 3: train + evaluate from the materialized cache. Requiring the cache is
+# the fail-closed half of the split: a key mismatch or missing file must not
+# silently fall back to the high-memory cold-fetch path in this process.
+docker compose run --rm trainer \
+  --config "$CONFIG" "${AS_OF_FLAG[@]}" --require-main-cache

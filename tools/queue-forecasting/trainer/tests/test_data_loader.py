@@ -205,6 +205,94 @@ def test_downcast_categorical_columns_skips_absent_columns():
     assert list(out.columns) == ["queue_pending"]
 
 
+def test_ensure_main_cache_reuses_existing_without_reading_or_fetching(monkeypatch, tmp_path):
+    import pandas as pd
+
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(dl.extract_source, "active", lambda: None)
+    c = _cfg()
+    path = dl.cache_path(c)
+    pd.DataFrame({"task_id": ["cached"]}).to_parquet(path, index=False)
+
+    def unexpected_fetch(_config):
+        raise AssertionError("existing cache should not be fetched or read")
+
+    monkeypatch.setattr(dl, "_fetch_main_dataset_from_db", unexpected_fetch)
+    assert dl.ensure_main_cache(c) == path
+
+
+def test_ensure_main_cache_materializes_a_cold_cache(monkeypatch, tmp_path):
+    import pandas as pd
+
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(dl.extract_source, "active", lambda: None)
+    c = _cfg()
+    expected = pd.DataFrame({"task_id": ["task-1"], "run_id": [0]})
+    monkeypatch.setattr(dl, "_fetch_main_dataset_from_db", lambda _config: expected)
+
+    path = dl.ensure_main_cache(c)
+
+    assert path == dl.cache_path(c)
+    assert path.exists()
+    pd.testing.assert_frame_equal(pd.read_parquet(path), expected)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_ensure_main_cache_refreshes_an_existing_cache(monkeypatch, tmp_path):
+    import pandas as pd
+
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(dl.extract_source, "active", lambda: None)
+    c = _cfg()
+    path = dl.cache_path(c)
+    pd.DataFrame({"task_id": ["old"]}).to_parquet(path, index=False)
+    fresh = pd.DataFrame({"task_id": ["new"]})
+    monkeypatch.setattr(dl, "_fetch_main_dataset_from_db", lambda _config: fresh)
+
+    assert dl.ensure_main_cache(c, refresh_cache=True) == path
+    pd.testing.assert_frame_equal(pd.read_parquet(path), fresh)
+
+
+def test_ensure_main_cache_skips_frozen_extract(monkeypatch, tmp_path):
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(dl.extract_source, "active", lambda: object())
+    c = _cfg()
+
+    assert dl.ensure_main_cache(c) is None
+    assert not dl.cache_path(c).exists()
+
+
+def test_load_can_require_the_materialized_main_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(dl.extract_source, "active", lambda: None)
+    c = _cfg()
+
+    with pytest.raises(RuntimeError, match="Required main dataset cache is missing"):
+        dl.load(c, require_main_cache=True)
+
+
+def test_materialized_cache_is_consumed_without_a_second_db_fetch(monkeypatch, tmp_path):
+    import pandas as pd
+
+    monkeypatch.setattr(dl, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(dl.extract_source, "active", lambda: None)
+    c = _cfg()
+    fetched = pd.DataFrame({
+        "task_id": ["b", "a"],
+        "run_id": [0, 0],
+        "pending_at": pd.to_datetime(["2026-04-01T01:00:00Z", "2026-04-01T00:00:00Z"]),
+    })
+    monkeypatch.setattr(dl, "_fetch_main_dataset_from_db", lambda _config: fetched)
+    dl.ensure_main_cache(c)
+
+    def unexpected_fetch(_config):
+        raise AssertionError("training process must consume the warm cache")
+
+    monkeypatch.setattr(dl, "_fetch_main_dataset_from_db", unexpected_fetch)
+    out = dl.load(c, require_main_cache=True)
+    assert list(out["task_id"]) == ["a", "b"]
+
+
 def test_queue_context_query_bounds_pending_at_and_task_created(monkeypatch, tmp_path):
     """load_task_runs_for_queue_context must floor pending_at/task_created at
     (window_start - lookback_days). Without this the reference-run query scans
