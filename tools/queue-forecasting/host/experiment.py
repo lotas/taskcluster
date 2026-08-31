@@ -507,6 +507,30 @@ PORTED = (("run_cohort.py", "research/experiments/run_cohort.py"),
 
 SKIP_DIRS = ("__pycache__", ".venv", "data", "env", ".git")
 
+# PASSED PER COMMIT, not read from the environment. The research account has no
+# git identity and no GECOS name, so git derives `research@<hostname>` with an
+# empty name and refuses: "fatal: empty ident name ... not allowed". Configuring
+# it on the host would work, but then the identity of every agent commit depends
+# on host state nobody can see from the history -- and on a machine whose
+# hostname is an image-builder artifact. These are machine commits and they say
+# so. Override with QF_GIT_NAME / QF_GIT_EMAIL to attribute them elsewhere.
+GIT_NAME = os.environ.get("QF_GIT_NAME", "qf-research agent")
+GIT_EMAIL = os.environ.get("QF_GIT_EMAIL", "research@queue-forecasting.invalid")
+GIT_IDENT = ("-c", f"user.name={GIT_NAME}", "-c", f"user.email={GIT_EMAIL}")
+
+
+def same_bytes(left, right):
+    """Whether two files have identical contents; False if either cannot be read.
+
+    A named helper because the inline version leaked a file handle per
+    comparison, and this runs once per trainer file on every sync.
+    """
+    try:
+        with open(left, "rb") as a, open(right, "rb") as b:
+            return a.read() == b.read()
+    except OSError:
+        return False
+
 
 def sync_trainer(workspace, trusted_trainer, trusted_research, apply=True):
     """Port the trusted trainer and the loop's own files into the workspace.
@@ -529,13 +553,7 @@ def sync_trainer(workspace, trusted_trainer, trusted_research, apply=True):
             relative = os.path.join("trainer",
                                     os.path.relpath(source, trusted_trainer))
             target = os.path.join(workspace, relative)
-            try:
-                same = (os.path.exists(target)
-                        and open(source, "rb").read()
-                        == open(target, "rb").read())
-            except OSError:
-                same = False
-            if same:
+            if same_bytes(source, target):
                 continue
             written.append(relative)
             if apply:
@@ -549,12 +567,7 @@ def sync_trainer(workspace, trusted_trainer, trusted_research, apply=True):
                           " mirror-refresh has not run, or the mirror is"
                           " incomplete.")
         target = os.path.join(workspace, relative)
-        try:
-            same = (os.path.exists(target) and open(source, "rb").read()
-                    == open(target, "rb").read())
-        except OSError:
-            same = False
-        if same:
+        if same_bytes(source, target):
             continue
         written.append(relative)
         if apply:
@@ -574,8 +587,8 @@ def commit_and_push(workspace, message):
         raise Refused(f"cannot read the workspace state: {dirty}")
     if dirty.strip():
         for command in (("add", "-A"),
-                        ("-c", "core.hooksPath=/dev/null", "commit", "-q",
-                         "-m", message)):
+                        (*GIT_IDENT, "-c", "core.hooksPath=/dev/null",
+                         "commit", "-q", "-m", message)):
             ok, out = git(workspace, *command)
             if not ok:
                 raise Refused(f"git {command[0]} failed: {out}")
@@ -595,17 +608,24 @@ def cmd_sync(args):
     workspace = workspace_path(args.workspace)
     written = sync_trainer(workspace, args.trusted_trainer,
                            args.trusted_research, apply=not args.dry_run)
-    if not written:
-        print("already in sync with the mirror")
-        return 0
-    print(f"{len(written)} file(s) {'would be' if args.dry_run else ''} ported"
-          " from the mirror:")
-    for relative in written[:40]:
-        print(f"  {relative}")
-    if len(written) > 40:
-        print(f"  ... and {len(written) - 40} more")
+    if written:
+        print(f"{len(written)} file(s)"
+              f"{' would be' if args.dry_run else ''} ported from the mirror:")
+        for relative in written[:40]:
+            print(f"  {relative}")
+        if len(written) > 40:
+            print(f"  ... and {len(written) - 40} more")
+    else:
+        print("every file already matches the mirror")
     if args.dry_run:
         return 0
+    # COMMITTED EVEN WHEN NOTHING WAS PORTED, because "nothing to port" and
+    # "nothing to commit" are different states and the first does not imply the
+    # second. A sync that copied files and then failed to commit them leaves a
+    # workspace where the files match the mirror and the COMMIT does not -- and
+    # returning early there would report success while a probe still trains the
+    # old tree. Reached for real: the first sync copied 17 files and died on a
+    # missing git identity.
     print(f"sha       {commit_and_push(workspace, args.note or 'sync trainer and run_cohort from the trusted mirror')}")
     return 0
 
@@ -725,6 +745,8 @@ def cmd_doctor(args):
         ok, out = git(workspace, "push", "--dry-run", "--porcelain", timeout=120)
         check("push works without a prompt", ok,
               out.splitlines()[-1][:160] if out else "", push_fix(out))
+        note("committer identity", True, f"{GIT_NAME} <{GIT_EMAIL}>",
+             "")
         drift = trainer_drift(workspace, args.trusted_trainer)
         if drift is None:
             note("trainer comparable to the deployed one", False,

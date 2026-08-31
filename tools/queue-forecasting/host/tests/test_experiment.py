@@ -14,6 +14,36 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import experiment as X                                          # noqa: E402
 
+
+def can_commit():
+    """Whether `git commit` works here at all.
+
+    Some sandboxes refuse commits outright ("Commits are disabled in
+    devtainer"). Skipped rather than deleted: these assertions are about git's
+    behaviour with an UNCONFIGURED identity, which is exactly what broke on the
+    host, so they have to keep running wherever they can run.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    root = tempfile.mkdtemp()
+    try:
+        subprocess.run(["git", "init", "-q", "-b", "main", root],
+                       capture_output=True)
+        with open(os.path.join(root, "f"), "w") as fh:
+            fh.write("x")
+        subprocess.run(["git", "-C", root, "add", "-A"], capture_output=True)
+        done = subprocess.run(["git", "-C", root, *X.GIT_IDENT, "commit",
+                               "-m", "probe"], capture_output=True, text=True)
+        return done.returncode == 0
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+CAN_COMMIT = can_commit()
+
 QCTX = ["task_id", "run_id", "pending_at", "started_at", "resolved_at",
         "priority_at_pending", "task_queue_id", "repo_family", "task_created"]
 GEN1 = QCTX[:-1]                        # before `task_created` landed
@@ -506,6 +536,98 @@ class SyncTrainer(unittest.TestCase):
         with self.assertRaises(X.Refused) as caught:
             X.sync_trainer(workspace, trainer, empty)
         self.assertIn("mirror-refresh", str(caught.exception))
+
+
+@unittest.skipUnless(CAN_COMMIT, "this environment refuses `git commit`")
+class CommitAndPush(unittest.TestCase):
+    """Committing into a checkout whose account has no git identity.
+
+    Against a REAL local repository with a real remote, because both bugs here
+    were git's behaviour rather than this code's logic: an account with no
+    GECOS name makes git refuse with "empty ident name", and a sync that
+    reported success without committing left the files matching the mirror
+    while the commit did not.
+    """
+
+    def repo(self):
+        import shutil, subprocess, tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        remote, work = os.path.join(root, "remote.git"), os.path.join(root, "w")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", remote],
+                       check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", work], check=True)
+        # No user.name/user.email set ANYWHERE in this repo: that is the state
+        # the research account is actually in.
+        subprocess.run(["git", "-C", work, "remote", "add", "origin", remote],
+                       check=True)
+        with open(os.path.join(work, "seed"), "w") as fh:
+            fh.write("x\n")
+        subprocess.run(["git", "-C", work, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", work, *X.GIT_IDENT, "commit", "-q",
+                        "-m", "seed"], check=True)
+        subprocess.run(["git", "-C", work, "push", "-q", "-u", "origin",
+                        "main"], check=True)
+        return work
+
+    def test_it_commits_without_any_configured_identity(self):
+        work = self.repo()
+        with open(os.path.join(work, "new"), "w") as fh:
+            fh.write("y\n")
+        sha = X.commit_and_push(work, "an experiment")
+        self.assertRegex(sha, r"^[0-9a-f]{40}$")
+
+    def test_the_commit_carries_the_machine_identity(self):
+        """Attributable, and not a person: these are machine commits, and the
+        default must not silently borrow the operator's name."""
+        import subprocess
+        work = self.repo()
+        with open(os.path.join(work, "new"), "w") as fh:
+            fh.write("y\n")
+        X.commit_and_push(work, "an experiment")
+        author = subprocess.run(["git", "-C", work, "log", "-1",
+                                 "--format=%an <%ae>"], capture_output=True,
+                                text=True).stdout.strip()
+        self.assertEqual(author, f"{X.GIT_NAME} <{X.GIT_EMAIL}>")
+
+    def test_a_clean_tree_still_returns_head(self):
+        """`sync` calls this even when it ported nothing, so a clean tree is a
+        normal state and not an error."""
+        work = self.repo()
+        self.assertRegex(X.commit_and_push(work, "nothing"), r"^[0-9a-f]{40}$")
+
+    def test_files_copied_before_a_failed_commit_are_still_committed(self):
+        """The retry path. The first sync copied 17 files and died on the
+        identity; `sync_trainer` then reports nothing to port, so if `cmd_sync`
+        returned early the files would never reach a commit and a probe would
+        train the old tree while everything reported success."""
+        work = self.repo()
+        trainer = self.build_tree({"src/train.py": "new\n"})
+        research = self.build_tree({"run_cohort.py": "CONFIG = \"a\"\n",
+                                    "AGENTS.md": "# rules\n"})
+        first = X.sync_trainer(work, trainer, research)
+        self.assertTrue(first)                       # copied
+        second = X.sync_trainer(work, trainer, research)
+        self.assertEqual(second, [])                 # nothing left to port
+        import subprocess
+        dirty = subprocess.run(["git", "-C", work, "status", "--porcelain"],
+                               capture_output=True, text=True).stdout
+        self.assertTrue(dirty.strip())                # but uncommitted
+        X.commit_and_push(work, "sync")
+        dirty = subprocess.run(["git", "-C", work, "status", "--porcelain"],
+                               capture_output=True, text=True).stdout
+        self.assertFalse(dirty.strip())
+
+    def build_tree(self, files):
+        import shutil, tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        for relative, body in files.items():
+            path = os.path.join(root, relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(body)
+        return root
 
 
 class PushDiagnosis(unittest.TestCase):
