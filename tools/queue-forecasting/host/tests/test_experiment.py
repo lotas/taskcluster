@@ -161,9 +161,19 @@ class TheRefusal(unittest.TestCase):
     def test_it_prints_a_command_with_no_placeholders(self):
         text = self.message()
         self.assertIn("qf extract --target wait_time", text)
-        self.assertIn("--train-start 2026-08-01", text)
-        self.assertIn("--as-of 2026-08-27", text)
         self.assertIn("--lookback-days 30", text)
+
+    def test_the_dates_are_in_the_form_qf_accepts(self):
+        """`qf` refuses a bare date: "train_start must look like
+        2026-08-01T00:00:00Z". A generated command that needs editing is a
+        placeholder with extra steps -- this shipped once and cost two
+        attempts."""
+        text = self.message()
+        self.assertIn("--train-start 2026-08-01T00:00:00Z", text)
+        self.assertIn("--as-of 2026-08-27T00:00:00Z", text)
+        for flag in ("--train-start", "--as-of"):
+            value = text.split(flag, 1)[1].split()[0]
+            self.assertRegex(value, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         for placeholder in ("<", ">", "..."):
             self.assertNotIn(placeholder, text.split("qf extract")[1],
                              placeholder)

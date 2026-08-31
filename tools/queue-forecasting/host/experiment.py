@@ -243,6 +243,17 @@ def _newest_first(extract):
     return -parsed.timestamp() if parsed else float("inf")
 
 
+def as_instant(when):
+    """A day boundary in the form `qf extract` accepts, not a bare date.
+
+    `qf` requires the full instant and refuses `2026-08-01` with
+    "train_start must look like 2026-08-01T00:00:00Z". A generated command
+    exists to be pasted, so emitting a date here made the one output whose
+    entire purpose is to be correct the one thing that needed editing.
+    """
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def no_extract_message(config, rejected):
     """The refusal that used to be a placeholder in a chat message.
 
@@ -277,8 +288,8 @@ def no_extract_message(config, rejected):
         " comparable to that series:",
         "",
         f"    qf extract --target {config['target']} \\",
-        f"        --train-start {need.date()} \\",
-        f"        --as-of {as_of.date()} \\",
+        f"        --train-start {as_instant(need)} \\",
+        f"        --as-of {as_instant(as_of)} \\",
         f"        --lookback-days {lookback if lookback is not None else 30} \\",
         f"        --note '{os.path.basename(config['path'])}:"
         f" {config['cohort_span_days']}d cohort' --wait",
