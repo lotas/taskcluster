@@ -497,6 +497,119 @@ def trainer_drift(workspace, trusted=TRUSTED_TRAINER):
     return differing
 
 
+TRUSTED_RESEARCH = "/srv/queue-forecasting/tools/queue-forecasting/host/research-experiments"
+
+# What the trusted mirror owns inside the agent's repo. Operator-owned files in
+# an agent-owned checkout: the loop's rules are not something the agent running
+# inside it gets to edit, so these are overwritten on every sync.
+PORTED = (("run_cohort.py", "research/experiments/run_cohort.py"),
+          ("AGENTS.md", "AGENTS.md"))
+
+SKIP_DIRS = ("__pycache__", ".venv", "data", "env", ".git")
+
+
+def sync_trainer(workspace, trusted_trainer, trusted_research, apply=True):
+    """Port the trusted trainer and the loop's own files into the workspace.
+
+    WHY THIS IS NOT rsync --delete. A file under `trainer/` that exists in the
+    workspace and not in the mirror may be the agent's work in progress, and
+    nothing here can tell that from a leftover. Overwriting what the trusted
+    copy NAMES is a curated port; removing what it does not name is not.
+    `first-probe.sh` records the same rule for the operator's worktree -- this
+    is the same port for the research user's, which nothing had ever done.
+
+    Returns the relative paths written.
+    """
+    import shutil
+    written = []
+    for root, subdirs, names in os.walk(trusted_trainer):
+        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+        for name in names:
+            source = os.path.join(root, name)
+            relative = os.path.join("trainer",
+                                    os.path.relpath(source, trusted_trainer))
+            target = os.path.join(workspace, relative)
+            try:
+                same = (os.path.exists(target)
+                        and open(source, "rb").read()
+                        == open(target, "rb").read())
+            except OSError:
+                same = False
+            if same:
+                continue
+            written.append(relative)
+            if apply:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(source, target)
+
+    for name, relative in PORTED:
+        source = os.path.join(trusted_research, name)
+        if not os.path.isfile(source):
+            raise Refused(f"the trusted copy of {name} is missing at {source}."
+                          " mirror-refresh has not run, or the mirror is"
+                          " incomplete.")
+        target = os.path.join(workspace, relative)
+        try:
+            same = (os.path.exists(target) and open(source, "rb").read()
+                    == open(target, "rb").read())
+        except OSError:
+            same = False
+        if same:
+            continue
+        written.append(relative)
+        if apply:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(source, target)
+    return written
+
+
+def commit_and_push(workspace, message):
+    """Commit whatever is uncommitted, then push. Returns the HEAD sha.
+
+    A probe runs a COMMIT, so anything not pushed is invisible to it -- which
+    is why this is one function and not two decisions.
+    """
+    ok, dirty = git(workspace, "status", "--porcelain")
+    if not ok:
+        raise Refused(f"cannot read the workspace state: {dirty}")
+    if dirty.strip():
+        for command in (("add", "-A"),
+                        ("-c", "core.hooksPath=/dev/null", "commit", "-q",
+                         "-m", message)):
+            ok, out = git(workspace, *command)
+            if not ok:
+                raise Refused(f"git {command[0]} failed: {out}")
+        print(f"committed: {message}")
+    ok, out = git(workspace, "push", "-q", timeout=300)
+    if not ok:
+        raise Refused(f"push failed, and an agent cannot answer a prompt:\n"
+                      f"  {out}\n{push_fix(out)}")
+    ok, sha = git(workspace, "rev-parse", "HEAD")
+    if not ok:
+        raise Refused(f"cannot read HEAD: {sha}")
+    return sha
+
+
+def cmd_sync(args):
+    """Provision the workspace from the trusted mirror."""
+    workspace = workspace_path(args.workspace)
+    written = sync_trainer(workspace, args.trusted_trainer,
+                           args.trusted_research, apply=not args.dry_run)
+    if not written:
+        print("already in sync with the mirror")
+        return 0
+    print(f"{len(written)} file(s) {'would be' if args.dry_run else ''} ported"
+          " from the mirror:")
+    for relative in written[:40]:
+        print(f"  {relative}")
+    if len(written) > 40:
+        print(f"  ... and {len(written) - 40} more")
+    if args.dry_run:
+        return 0
+    print(f"sha       {commit_and_push(workspace, args.note or 'sync trainer and run_cohort from the trusted mirror')}")
+    return 0
+
+
 def push_fix(output):
     """The remedy for a failed push, chosen by WHICH failure it was.
 
@@ -703,6 +816,17 @@ def point_run_cohort_at(workspace, config):
     try:
         with open(path) as fh:
             text = fh.read()
+    except FileNotFoundError:
+        # THE WORKSPACE HAS NEVER BEEN PROVISIONED, which is a different fault
+        # from a corrupted one and has a one-command fix. Nothing syncs the
+        # research user's checkout -- `first-probe.sh` syncs the operator's --
+        # so a freshly cloned workspace reaches exactly here.
+        raise Refused(
+            f"{path} does not exist, so this workspace has never been"
+            " provisioned from the mirror. Nothing syncs it automatically:\n"
+            "    experiment.py sync\n"
+            "  ports the trusted trainer, run_cohort.py and AGENTS.md into it,"
+            " then commits and pushes.")
     except OSError as e:
         raise Refused(f"cannot read {path}: {e}")
     patched, count = re.subn(r'^CONFIG = ".*"$', f'CONFIG = "{config}"', text,
@@ -740,26 +864,7 @@ def cmd_run(args):
         return 0
 
     point_run_cohort_at(workspace, args.config)
-    ok, dirty = git(workspace, "status", "--porcelain")
-    if not ok:
-        raise Refused(f"cannot read the workspace state: {dirty}")
-    if dirty.strip():
-        note = args.note or f"experiment: {args.config}"
-        for command in (("add", "-A"),
-                        ("-c", "core.hooksPath=/dev/null", "commit", "-q",
-                         "-m", note)):
-            ok, out = git(workspace, *command)
-            if not ok:
-                raise Refused(f"git {command[0]} failed: {out}")
-        print(f"committed: {note}")
-    ok, out = git(workspace, "push", "-q", timeout=300)
-    if not ok:
-        raise Refused("push failed, and an agent cannot answer a prompt:\n"
-                      f"  {out}\nRun `experiment.py doctor` -- this is the"
-                      " autonomy blocker it checks for.")
-    ok, sha = git(workspace, "rev-parse", "HEAD")
-    if not ok:
-        raise Refused(f"cannot read HEAD: {sha}")
+    sha = commit_and_push(workspace, args.note or f"experiment: {args.config}")
     print(f"sha       {sha}")
 
     note = f"cfg={args.config}" + (f" | {args.note}" if args.note else "")
@@ -808,9 +913,16 @@ def main(argv=None):
     parser.add_argument("--trusted-trainer", default=TRUSTED_TRAINER,
                         help="the deployed trainer to compare the workspace"
                              " against")
+    parser.add_argument("--trusted-research", default=TRUSTED_RESEARCH,
+                        help="the deployed run_cohort.py and AGENTS.md")
     parser.add_argument("--timeout", type=int, default=5400)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="can this host run an experiment unattended?")
+    one = sub.add_parser("sync", help="port the trusted trainer into the"
+                                      " workspace, then commit and push")
+    one.add_argument("--note", help="the commit message")
+    one.add_argument("--dry-run", action="store_true",
+                     help="list what would be ported")
     for name, help_text in (("plan", "resolve and explain, spending nothing"),
                             ("run", "plan, push, probe, evaluate, score")):
         one = sub.add_parser(name, help=help_text)
@@ -822,7 +934,7 @@ def main(argv=None):
                              help="stop after planning")
     args = parser.parse_args(argv)
     try:
-        return {"doctor": cmd_doctor, "plan": cmd_plan,
+        return {"doctor": cmd_doctor, "sync": cmd_sync, "plan": cmd_plan,
                 "run": cmd_run}[args.command](args)
     except Refused as e:
         print(f"\nrefused: {e}", file=sys.stderr)

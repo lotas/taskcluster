@@ -417,6 +417,97 @@ class TrainerDrift(unittest.TestCase):
         self.assertIsNone(X.trainer_drift(self.build({}), "/nonexistent"))
 
 
+class SyncTrainer(unittest.TestCase):
+    """Provisioning the agent's checkout from the mirror.
+
+    Nothing did this: `first-probe.sh` syncs the OPERATOR's worktree, so
+    `/home/research/qf-research` sat with no `run_cohort.py` at all and `run`
+    failed on an errno two minutes into a session.
+    """
+
+    def build(self, files):
+        import shutil, tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        for relative, body in files.items():
+            path = os.path.join(root, relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(body)
+        return root
+
+    def trees(self, workspace_files=None):
+        trainer = self.build({"src/train.py": "print(1)\n",
+                              "configs/a.yaml": "target: wait_time\n",
+                              "scripts/prep.py": "pass\n",
+                              "__pycache__/x.pyc": "junk",
+                              "data/big.parquet": "junk"})
+        research = self.build({"run_cohort.py": 'CONFIG = "configs/a.yaml"\n',
+                               "AGENTS.md": "# rules\n"})
+        return self.build(workspace_files or {}), trainer, research
+
+    def test_an_empty_workspace_gets_everything(self):
+        workspace, trainer, research = self.trees()
+        written = X.sync_trainer(workspace, trainer, research)
+        self.assertIn("trainer/src/train.py", written)
+        self.assertIn("trainer/configs/a.yaml", written)
+        self.assertIn("research/experiments/run_cohort.py", written)
+        self.assertIn("AGENTS.md", written)
+        for relative in written:
+            self.assertTrue(os.path.isfile(os.path.join(workspace, relative)),
+                            relative)
+
+    def test_caches_and_data_are_not_ported(self):
+        """Copying `data/` would move gigabytes of parquet into the agent's git
+        repo, and `__pycache__` would be committed."""
+        workspace, trainer, research = self.trees()
+        written = X.sync_trainer(workspace, trainer, research)
+        self.assertFalse([w for w in written
+                          if "__pycache__" in w or "/data/" in w])
+
+    def test_a_second_sync_writes_nothing(self):
+        """Idempotent, and it has to REPORT nothing rather than rewrite
+        identical bytes: `run` commits whatever changed, so a sync that always
+        touches files would put an empty experiment in the history."""
+        workspace, trainer, research = self.trees()
+        X.sync_trainer(workspace, trainer, research)
+        self.assertEqual(X.sync_trainer(workspace, trainer, research), [])
+
+    def test_it_does_not_delete_what_the_mirror_does_not_name(self):
+        """A file under trainer/ that exists only in the workspace may be the
+        agent's work in progress, and nothing here can tell that from a
+        leftover. Same rule `first-probe.sh` states for the operator's tree."""
+        workspace, trainer, research = self.trees(
+            {"trainer/src/my_experiment.py": "# the agent's work\n"})
+        X.sync_trainer(workspace, trainer, research)
+        survivor = os.path.join(workspace, "trainer", "src", "my_experiment.py")
+        self.assertTrue(os.path.isfile(survivor))
+
+    def test_it_overwrites_an_agent_edit_to_an_operator_owned_file(self):
+        """`run_cohort.py` and `AGENTS.md` are the loop's rules, not the
+        agent's to change -- so these are ported over, unlike trainer files."""
+        workspace, trainer, research = self.trees(
+            {"AGENTS.md": "# I rewrote the rules\n"})
+        X.sync_trainer(workspace, trainer, research)
+        with open(os.path.join(workspace, "AGENTS.md")) as fh:
+            self.assertEqual(fh.read(), "# rules\n")
+
+    def test_dry_run_writes_nothing_but_reports_everything(self):
+        workspace, trainer, research = self.trees()
+        written = X.sync_trainer(workspace, trainer, research, apply=False)
+        self.assertTrue(written)
+        self.assertFalse(os.path.exists(os.path.join(workspace, "AGENTS.md")))
+
+    def test_an_incomplete_mirror_refuses(self):
+        """Silently skipping a missing `run_cohort.py` would produce a
+        workspace that looks synced and cannot run."""
+        workspace, trainer, _ = self.trees()
+        empty = self.build({})
+        with self.assertRaises(X.Refused) as caught:
+            X.sync_trainer(workspace, trainer, empty)
+        self.assertIn("mirror-refresh", str(caught.exception))
+
+
 class PushDiagnosis(unittest.TestCase):
     """Connectivity and credentials fail similarly and have opposite fixes.
 
