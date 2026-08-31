@@ -218,29 +218,51 @@ Each entry is one variable. Run against the canonical trio in `AGENTS.md`.
 `probe-20260830T193901Z-22bcaf4f474a-5344` (−26.9%, no-go on the tail alone).
 Everything below is judged against both rows.
 
-**2. `wait_qctx_d_priority_flow` — drop capacity. Cheapest path to a full go.**
-A **strict feature subset** of the qctx config just scored: identical in every
-non-feature key (same residual/`log_ratio`, same Policy B `mode: baseline`, same
-`baseline_dir`, same throughput windows, same model params, same
-lookback/holdout/validation), dropping 12 features — the 8 capacity-touching
-numerics plus `repo_family`, `capacity_null_reason`, and the 3 per-repo pending
-counts. One hypothesis, already supported off-series: capacity dilutes. If it
-transfers, a 1.08pp tail gap closes and the contract passes **with a plain
-quantile model and no hazard work at all**. Cheaper than entry 3 in every sense:
-fewer features, same model class, and it also drops the `worker_counts` load, so
-peak RSS should fall rather than rise.
+**2. DONE — `wait_qctx_d_priority_flow`: capacity is a two-sided wash, not dilution.**
+`probe-20260831T130111Z-51b862ebf4de-5568`. Dropping the 12 capacity/repo
+features moved the tail the predicted direction and cost central accuracy:
 
-**3. `wait_hazard_qctx_d_priority_flow` — the tail specialist, same feature set.**
-Bet 2 roughly halves the 30m+ p90 miss (18.2% guarded in its first real run,
-18.97% vs 34.59% across 20 walk-forward cohorts) at a cost of 12.6pp of overall
-within-2x. That trade was unattractive when nothing cleared the MAE bar. It is
-attractive now: qctx has a 11.9pp MAE cushion and +4.5pp of within-2x slack to
-absorb the cost, and the tail is the only failing metric. Because it shares
-entry 2's feature set exactly, entry 3 minus entry 2 is close to a clean
-model-class delta — **but not exactly**: it also runs `validation_days: 7`
-against entry 2's `1`, for the documented weekend-composition reason. Its last
-finite bin edge is 480 minutes, so watch for the terminal-risk-set refusal in
-`AGENTS.md`.
+| metric | reference | qctx (all) | qctx_d (no capacity) | bar |
+|---|---|---|---|---|
+| MAE | −4.04% | −26.86% | −25.85% | −15% |
+| within_2x | +4.42pp | +9.51pp | +8.68pp | +5pp |
+| p90 coverage | 0.8901 | 0.8821 | 0.8870 | 0.85–0.95 |
+| 30m+ p90 miss | 0.2946 | 0.3108 | **0.3042 FAIL** | <0.30 |
+
+**The pre-freeze ablation finding does not transfer.** Capacity is not diluting
+the model; it trades ~1.0pp of MAE and ~0.8pp of within_2x for ~0.7pp of tail
+coverage. Both effects are real and both are small — which is itself the useful
+result: the qctx win is carried by the priority/flow features, and capacity is
+close to a wash. The comment at `wait_hazard_qctx_d_priority_flow.yaml:60`
+("capacity appears to actively dilute the model") should be read as pre-freeze
+and superseded.
+
+**The gap is now 0.42pp on one metric.** That is inside the range where entry 4
+stops being academic.
+
+**3. `wait_hazard_qctx_d_priority_flow` — BLOCKED on the trio, unblocked by a
+different one.** First attempt refused:
+`probe-20260831T135844Z-18c7eb6ed0db-5632`,
+`ExtractError: the extract's train_start is 2026-08-07, but this cohort needs
+train_start <= 2026-08-01`. The config's documented `validation_days: 7` (vs 1
+everywhere else) pushes train_start back exactly 6 days:
+`as_of − holdout(5) − validation(7) − lookback(14)`. **The canonical trio was
+frozen against a config family with `validation_days: 1` and cannot hold this
+cohort.** The guard is right — it refused rather than quietly training on 8 days
+less data.
+
+Do NOT fix this by cutting `validation_days` to 1. That number is measured (val
+AUC on bins 3-4 went 0.711/0.574 → 0.915/0.909), and shrinking it to fit an
+extract sabotages the experiment to make it runnable.
+
+The fix needs no new extract: **`c179c7f5b961` is already published, gen=2 (so it
+has `task_created`), and spans 2026-07-21..2026-08-26** — wide enough for every
+config including hazard. `run_cohort.py:92` reads `as_of` off the extract
+manifest, so pointing at it shifts the cohort to as_of=2026-08-26 with no code
+change. Its holdout is one day earlier than the current series, so **re-run
+qctx_d on it too** and compare the pair within that trio rather than across.
+Watch memory: 8.6M runs vs 5.0M (+71%), and Bet 2's hazard peaked at 99.9% of
+`mem_limit` on the smaller data. Raise `PROBE_MEM`.
 
 **4. The guardrail-width diagnostic (see above).** Not a promotion candidate.
 Bounds how much of the 1.08pp is information versus inflation, which tells us
