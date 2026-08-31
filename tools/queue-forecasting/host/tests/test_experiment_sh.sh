@@ -88,6 +88,34 @@ out="$(QF_TRUSTED_HOST="$WORK/srv/host" "$WORK/srv/host/experiment.sh" doctor 2>
 check "runs in place" "TRUSTED doctor" "$out"
 refute "no drift note against itself" "differs from" "$out"
 
+echo "== it elevates through a LOGIN shell"
+# The bug this pins: `sudo -u research python3 ...` is a non-login shell, so
+# ~/.profile is never read, so the tinyproxy variables are unset, so git
+# bypasses the proxy and nftables refuses it -- reported by git as a connection
+# failure. The stub records argv so the invocation itself is asserted.
+cat > "$WORK/bin/sudo" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$WORK_ARGV"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -H) shift ;;
+    -u) shift 2 ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+STUB
+chmod +x "$WORK/bin/sudo"
+export WORK_ARGV="$WORK/argv.txt"
+: > "$WORK_ARGV"
+out="$(QF_TRUSTED_HOST="$WORK/srv/host" "$WORK/checkout/experiment.sh" \
+        run configs/a.yaml --note "two words" 2>&1)"
+argv="$(cat "$WORK_ARGV")"
+check "elevates via bash -lc" "bash -lc" "$argv"
+refute "does not exec python3 directly under sudo" "research python3" "$argv"
+check "still preserves argv through the login shell" \
+  "TRUSTED run configs/a.yaml --note two words" "$out"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

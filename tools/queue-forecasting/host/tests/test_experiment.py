@@ -345,5 +345,49 @@ class Plan(unittest.TestCase):
             self.assertIn(full, text)
 
 
+class PushDiagnosis(unittest.TestCase):
+    """Connectivity and credentials fail similarly and have opposite fixes.
+
+    The real 2026-08-31 output is the first case: it was reported as a
+    credential problem and it was egress.
+    """
+
+    def test_the_real_egress_failure_is_named_as_egress(self):
+        real = ("fatal: unable to access"
+                " 'https://github.com/lotas/qf-research/': Failed to connect"
+                " to github.com port 443 after 5 ms: Could not connect to"
+                " server")
+        fix = X.push_fix(real)
+        self.assertIn("EGRESS", fix)
+        self.assertIn("~/.profile", fix)
+        self.assertNotIn("credential store", fix)
+
+    def test_a_missing_credential_is_named_as_one(self):
+        for output in ("fatal: Authentication failed for 'https://...'",
+                       "fatal: could not read Username for"
+                       " 'https://github.com': terminal prompts disabled",
+                       "remote: Permission to lotas/qf-research.git denied"):
+            with self.subTest(output[:40]):
+                fix = X.push_fix(output)
+                self.assertIn("CREDENTIAL", fix)
+                self.assertNotIn("EGRESS", fix)
+
+    def test_dns_failure_is_egress_too(self):
+        self.assertIn("EGRESS", X.push_fix("fatal: Could not resolve host:"
+                                           " github.com"))
+
+    def test_an_unrecognised_failure_does_not_guess(self):
+        """Naming the wrong cause is worse than naming none: it sends somebody
+        to rotate a credential that was fine."""
+        fix = X.push_fix("fatal: something nobody has seen before")
+        self.assertNotIn("EGRESS", fix)
+        self.assertNotIn("CREDENTIAL", fix)
+        self.assertIn("opposite fixes", fix)
+
+    def test_empty_output_does_not_crash(self):
+        for empty in (None, "", "   "):
+            self.assertTrue(X.push_fix(empty))
+
+
 if __name__ == "__main__":
     unittest.main()

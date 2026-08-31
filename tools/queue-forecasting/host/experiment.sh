@@ -64,4 +64,19 @@ if [ "$HERE" != "$TRUSTED_HOST" ] && [ -r "$HERE/experiment.py" ] \
   echo "      Your edits are not in this run until mirror-refresh." >&2
 fi
 
-exec "${AS[@]}" python3 "$SCRIPT" "$@"
+# A LOGIN SHELL, and this is not a style choice. The research user's egress is
+# nftables uid-scoped and only permitted through tinyproxy, and the proxy
+# variables live in `~/.profile` -- which `bash -c` does NOT read and
+# `sudo -u research <cmd>` does not either. Without them git bypasses the proxy,
+# nftables refuses the connection, and the failure reads as a credential
+# problem: "Failed to connect to github.com port 443 after 5 ms". README's
+# "Proxy environment lives in ~/.profile" records the same trap for cron.
+#
+# `bash -lc '...' name args...` and NOT `sudo -i <cmd>`: with `-i` sudo joins
+# argv into one string for the login shell to re-parse, which destroys quoting
+# (a `--note "two words"` would arrive as two arguments). Here $0 is a label and
+# "$@" is the untouched argv.
+if [ ${#AS[@]} -eq 0 ]; then
+  exec python3 "$SCRIPT" "$@"
+fi
+exec "${AS[@]}" bash -lc 'exec python3 "$@"' qf-experiment "$SCRIPT" "$@"

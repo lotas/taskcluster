@@ -441,6 +441,44 @@ def workspace_path(given):
         or os.path.expanduser("~/qf-research"))
 
 
+def push_fix(output):
+    """The remedy for a failed push, chosen by WHICH failure it was.
+
+    These have opposite fixes and similar-looking output, and conflating them
+    sends an operator to rotate a credential that was fine. Observed on
+    2026-08-31: a push failed with "Failed to connect to github.com port 443
+    after 5 ms" and was reported as a credential problem. It was egress -- the
+    research user reaches the network only through tinyproxy, the proxy
+    variables live in `~/.profile`, and a non-login shell reads neither that nor
+    `.bashrc`, so git bypassed the proxy and nftables refused it. Five
+    milliseconds to "fail to connect" is a local refusal, not a network.
+    """
+    text = (output or "").lower()
+    if ("could not connect" in text or "failed to connect" in text
+            or "could not resolve host" in text or "connection refused" in text):
+        return ("EGRESS, not a credential. This user reaches the network only"
+                " through tinyproxy, and the proxy variables live in"
+                " ~/.profile -- which a non-login shell does not read. Run"
+                " through `bash -lc` (experiment.sh does), or source"
+                " ~/.profile.d-proxy. If the proxy IS set, the host may not be"
+                " on the allowlist: /etc/tinyproxy/allowlist.txt.")
+    # `denied` on its own, and checked AFTER connectivity so a refused
+    # connection never lands here. Git says "Permission to <repo> denied" and
+    # "Permission denied (publickey)" -- matching the joined phrase misses the
+    # first, which is the one a token with the wrong scope produces.
+    if ("authentication failed" in text or "terminal prompts disabled" in text
+            or "could not read username" in text or "denied" in text
+            or "403" in text or "401" in text):
+        return ("A CREDENTIAL this user does not have. With"
+                " GIT_TERMINAL_PROMPT=0 a credential that needs typing fails"
+                " instead of hanging. Give this user one it owns -- a token in"
+                " its own git credential store, or a passphrase-less key"
+                " scoped to qf-research.")
+    return ("Unattended runs need a push that completes with no input. Read"
+            " the git output above: connectivity and credentials fail"
+            " differently and have opposite fixes.")
+
+
 def cmd_doctor(args):
     """Every precondition for an unattended run, and the fix for each.
 
@@ -501,12 +539,8 @@ def cmd_doctor(args):
               f"uid={os.getuid()}",
               "an agent cannot commit into a checkout it does not own")
         ok, out = git(workspace, "push", "--dry-run", "--porcelain", timeout=120)
-        check("push works without a prompt", ok, out.splitlines()[-1][:160]
-              if out else "",
-              "THE AUTONOMY BLOCKER. With GIT_TERMINAL_PROMPT=0 a credential"
-              " that needs typing fails instead of hanging. Give this user a"
-              " credential it owns -- a token in its own git credential"
-              " store, or a passphrase-less key scoped to qf-research.")
+        check("push works without a prompt", ok,
+              out.splitlines()[-1][:160] if out else "", push_fix(out))
         ok, out = git(workspace, "status", "--porcelain")
         check("clean tree", ok and not out.strip(),
               f"{len(out.splitlines())} changed" if out.strip() else "",
