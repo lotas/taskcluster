@@ -768,6 +768,8 @@ assert_units_current() {
       "extractor/qf-extract.socket:phase2b-setup.sh install" \
       "evaluator/qf-eval.service:phase2c-setup.sh install" \
       "evaluator/qf-eval.socket:phase2c-setup.sh install" \
+      "research-loop/qf-tick.service:research-loop/install.sh on" \
+      "research-loop/qf-tick.timer:research-loop/install.sh on" \
   ; do
     src="$here/${spec%%:*}"
     unit="$(basename "$src")"

@@ -1,0 +1,54 @@
+[Unit]
+Description=One turn of the queue-forecasting research loop
+Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/auto-research-loop-design.md
+# The tick submits jobs over the client socket, so a tick that starts before the
+# dispatcher is up would fail on its first `results.sh`.
+After=qf-dispatch.service
+Wants=qf-dispatch.service
+
+[Service]
+Type=oneshot
+User=research
+Group=research
+# The identity that owns the experiments. `SupplementaryGroups` is not set here:
+# the tick needs `qfclient` for the client socket, which `research`'s own group
+# membership already provides (phase0-setup.sh, "Identity: one user, three
+# groups"). Restating it here would be a second place to keep in step.
+
+# A LOGIN SHELL, and this is load-bearing, not style. The research user's egress
+# is nftables uid-scoped through tinyproxy and the proxy variables live in
+# `~/.profile`, which a bare ExecStart does not read. Without them git and both
+# agent CLIs bypass the proxy, nftables refuses, and the failure reads as a
+# credential problem: "Failed to connect to github.com port 443 after 5 ms".
+# README's "Proxy environment lives in ~/.profile, not ~/.bashrc" records the
+# same trap for cron.
+ExecStart=/bin/bash -lc '/srv/queue-forecasting/tools/queue-forecasting/host/research-loop/tick.sh'
+
+# THE TICK BLOCKS ON A TRAINING RUN, by design: one action per tick, and
+# `experiment.py run` waits for the probe and then the evaluation. Its own
+# default timeout is 5400s per job, so a generous ceiling here plus a kill that
+# is not instant. A tighter TimeoutStartSec would kill the loop mid-experiment
+# and leave the training mutex held until the dispatcher's lease expired.
+TimeoutStartSec=4h
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+Environment=QF_REQUIRE_PREREG=1
+Environment=QF_TICK_MAX_RUNS=4
+Environment=QF_TICK_MAX_TICKS=12
+Environment=QF_TICK_MAX_DISAGREE=3
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateDevices=yes
+# `ProtectHome` MUST NOT be set: the workspace, the journal, the agent CLIs'
+# credentials and `~/.profile` all live in the research user's home, and this
+# unit is the one thing that legitimately reads all four.
+ReadWritePaths=/home/research
+# PrivateTmp=no, deliberately. The dispatcher's lock lives at
+# /var/lib/qf-locks and the README's "The lock, and PrivateTmp=no" records why a
+# private namespace here breaks coordination between units.
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target

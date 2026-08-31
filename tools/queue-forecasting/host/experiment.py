@@ -36,6 +36,14 @@ import sys
 
 WINDOW_KEYS = ("holdout_days", "validation_days", "lookback_days")
 
+# The pre-registration format, imported rather than rebuilt here. `frontier.py`
+# reads the same module to decode what this writes, and a note whose writer and
+# reader were written twice is `spec.py:213`'s "two validators that agree by
+# having been written twice do not agree for long".
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "research-loop"))
+import prereg                                                   # noqa: E402
+
 
 class Refused(Exception):
     """A refusal whose text is meant to be read and acted on.
@@ -582,11 +590,25 @@ def commit_and_push(workspace, message):
     A probe runs a COMMIT, so anything not pushed is invisible to it -- which
     is why this is one function and not two decisions.
     """
-    ok, dirty = git(workspace, "status", "--porcelain")
+    # The dirty check EXCLUDES `journal/` for the same reason the add does: a
+    # tick whose only workspace change is the pending journal entry has nothing
+    # to commit here, and `git commit` on an empty staged tree fails.
+    ok, dirty = git(workspace, "status", "--porcelain", "--",
+                    ".", ":(exclude)journal", ":(exclude)journal/**")
     if not ok:
         raise Refused(f"cannot read the workspace state: {dirty}")
     if dirty.strip():
-        for command in (("add", "-A"),
+        # `journal/` IS EXCLUDED, and this is a trust boundary rather than
+        # tidiness. `tick.sh` writes `journal/PENDING.md` into this same
+        # workspace BEFORE invoking the leader, and the leader's action may be
+        # `experiment.py run` -- so a blanket `git add -A` committed and PUSHED
+        # the unverified entry (and any leftover journal file) before the
+        # copilot had seen it, which defeats the whole verification step.
+        #
+        # The journal has exactly one legitimate writer: the publish stage of
+        # `tick.sh`, after a verdict.
+        for command in (("add", "-A", "--",
+                         ".", ":(exclude)journal", ":(exclude)journal/**"),
                         (*GIT_IDENT, "-c", "core.hooksPath=/dev/null",
                          "commit", "-q", "-m", message)):
             ok, out = git(workspace, *command)
@@ -870,16 +892,109 @@ def config_path(workspace, given):
     file to compute the window, and it is not running in the container where
     `trainer/` is the working directory.
     """
-    if os.path.isabs(given) or os.path.exists(given):
+    # RESOLVED STRICTLY UNDER `workspace/trainer`, because that is the file the
+    # probe will train on. `or os.path.exists(given)` used to let a cwd-relative
+    # match win: run from a directory that happens to hold `configs/a.yaml` and
+    # the plan, the window and the CONTENT DIGEST all described that file while
+    # `run_cohort.py` trained the workspace copy. Two different files under one
+    # digest is a false identity, which is the one thing the digest exists to
+    # prevent.
+    #
+    # An ABSOLUTE path is still honoured: `plan` is legitimately used to inspect
+    # a config outside a workspace, and it is unambiguous about which file it
+    # means.
+    if os.path.isabs(given):
         return given
-    return os.path.join(workspace, "trainer", given)
+    resolved = os.path.join(workspace, "trainer", given)
+    # `..` would escape the trainer directory and reintroduce the ambiguity by
+    # another route.
+    root = os.path.realpath(os.path.join(workspace, "trainer"))
+    if not os.path.realpath(resolved).startswith(root + os.sep):
+        raise Refused(
+            f"the config path {given!r} resolves outside {root}. A config the"
+            " probe cannot see is a config this cannot digest.")
+    return resolved
+
+
+def experiment_note(args):
+    """The probe's note: a pre-registration when one was given, else the old
+    free-text shape.
+
+    WHY THE OLD SHAPE SURVIVES. An operator debugging a mount or re-running a
+    known config is not making a claim, and forcing one would produce a
+    pre-registration written to satisfy a flag -- which is worse than none,
+    because the frontier would count it. So the discipline is enforced where the
+    volume is, by `QF_REQUIRE_PREREG=1` in the tick's unit, and not here.
+    """
+    require = os.environ.get("QF_REQUIRE_PREREG") == "1"
+    bar = getattr(args, "bar", None)
+    if not bar:
+        if require:
+            raise Refused(
+                "QF_REQUIRE_PREREG=1 and this run carries no pre-registration."
+                " Add --bar <"
+                + "|".join(prereg.BARS) + ">, --dir <"
+                + "|".join(prereg.DIRECTIONS) + ">, --vs <run-id of the row"
+                " being beaten> and --note <the hypothesis>.")
+        return f"cfg={args.config}" + (f" | {args.note}" if args.note else "")
+
+    # CHECKED HERE TOO, not left to `prereg.encode`. A missing `--vs` produced a
+    # note that submitted happily, trained for an hour and scored a number that
+    # `frontier.py` could only mark `unjudgeable` -- the full cost of an
+    # experiment for a claim nobody can check. `--reference-run` is the declared
+    # exception for the first run of a new series.
+    if require:
+        missing = [flag for flag, value in (("--note", args.note),) if not value]
+        if not (args.vs or getattr(args, "reference_run", False)):
+            missing.append("--vs (or --reference-run for a new series)")
+        if missing:
+            raise Refused(
+                "QF_REQUIRE_PREREG=1 and this pre-registration is incomplete;"
+                f" missing {', '.join(missing)}. A claim without a reference and"
+                " a hypothesis costs a full training cycle and cannot come out"
+                " false.")
+
+    # THE CONTENT DIGEST, computed from the file that is about to be committed.
+    # Without it a confirmation identifies a config by PATH, and the agent owns
+    # the checkout that path points into -- so `configs/x.yaml` can be a
+    # different model on the second cohort than it was on the first, which is
+    # the one thing a second cohort exists to rule out.
+    try:
+        cfgh = prereg.config_digest(config_path(args.workspace_resolved,
+                                                args.config))
+    except OSError as e:
+        raise Refused(f"cannot digest the config: {e}")
+    try:
+        note = prereg.encode(args.config, bar, args.dir, args.note or "",
+                             vs=args.vs or "", cfgh=cfgh,
+                             tol=getattr(args, "tol", 0.0) or 0.0,
+                             reference=bool(getattr(args, "reference_run",
+                                                    False)))
+    except prereg.PreregError as e:
+        raise Refused(str(e))
+    # Checked HERE and not left to the dispatcher: a note `spec.py` rejects
+    # fails the submit AFTER the commit and push have already happened, so the
+    # workspace is left carrying a commit for an experiment that never ran.
+    if not prereg.is_valid_note(note):
+        raise Refused(f"the pre-registration is not a submittable note: {note!r}")
+    return note
 
 
 def cmd_run(args):
     workspace = workspace_path(args.workspace)
+    # Stashed on `args` so `experiment_note` can digest the SAME file this run
+    # resolves and commits, rather than re-deriving the workspace and risking a
+    # different one.
+    args.workspace_resolved = workspace
     config = read_config(config_path(workspace, args.config))
     resolved = plan(config, **inventory(limit=args.limit))
     print(render_plan(resolved))
+    # BUILT BEFORE THE PUSH, and that ordering is the point. A note the
+    # dispatcher rejects fails the SUBMIT, which happens after the commit and
+    # push -- leaving the workspace carrying a commit for an experiment that
+    # never ran. Refusing here costs nothing and leaves nothing behind.
+    note = experiment_note(args)
+    print(f"prereg    {note}")
     print()
     if args.dry_run:
         print("--dry-run: stopping before the push")
@@ -889,7 +1004,6 @@ def cmd_run(args):
     sha = commit_and_push(workspace, args.note or f"experiment: {args.config}")
     print(f"sha       {sha}")
 
-    note = f"cfg={args.config}" + (f" | {args.note}" if args.note else "")
     probe = ["probe", "--sha", sha,
              "--path", "research/experiments/run_cohort.py",
              "--extract", resolved["extract"]["request_hash"],
@@ -950,10 +1064,34 @@ def main(argv=None):
         one = sub.add_parser(name, help=help_text)
         one.add_argument("config", help="path under trainer/, e.g."
                          " configs/wait_qctx_d_priority_flow.yaml")
-        one.add_argument("--note", help="what this experiment tests")
+        one.add_argument("--note", help="what this experiment tests"
+                         " (with --bar, this is the pre-registered hypothesis)")
         if name == "run":
             one.add_argument("--dry-run", action="store_true",
                              help="stop after planning")
+            # THE PRE-REGISTRATION. Optional here and mandatory in the tick
+            # (`QF_REQUIRE_PREREG=1`): see `experiment_note`.
+            one.add_argument("--bar", choices=prereg.BARS,
+                             help="the contract metric this run claims to move")
+            one.add_argument("--dir", choices=prereg.DIRECTIONS,
+                             default="improve",
+                             help="`improve` beats --vs on that bar; `hold`"
+                                  " does not get WORSE than --vs on it"
+                                  " (numerically, within --tol)")
+            one.add_argument("--vs", help="the run id this claim is judged"
+                             " against, in the SAME series; without it the"
+                             " claim is unjudgeable")
+            one.add_argument("--reference-run", action="store_true",
+                             help="this is the first run of a new series, so"
+                                  " there is nothing to judge it against."
+                                  " Mutually exclusive with --vs; recorded in"
+                                  " the note so it is declared rather than"
+                                  " inferred from a missing --vs.")
+            one.add_argument("--tol", type=float, default=0.0,
+                             help="with --dir hold, how much WORSE the bar may"
+                                  " get and still count as held (default 0:"
+                                  " strictly not worse). Pre-registered, so the"
+                                  " slack is claimed before the result exists.")
     args = parser.parse_args(argv)
     try:
         return {"doctor": cmd_doctor, "sync": cmd_sync, "plan": cmd_plan,

@@ -1,0 +1,22 @@
+[Unit]
+Description=Run a research-loop tick periodically
+
+[Timer]
+# HOURLY, not more often, and the reason is the run budget rather than politeness:
+# a tick that finds work blocks for up to 90 minutes on a training run, and one
+# that finds none costs a single agent turn. Four scored runs a day
+# (QF_TICK_MAX_RUNS) is the real cap; this interval only decides how quickly the
+# loop notices a finished run.
+OnCalendar=hourly
+RandomizedDelaySec=10m
+# NOT Persistent=true. A missed tick is not work owed -- catching up after a
+# reboot would fire a tick against a frontier that has not changed, spend an
+# agent turn, and write a NOOP. The loop is idempotent, not scheduled.
+Persistent=false
+# The tick takes its own flock and exits quietly when one is live, so an overrun
+# cannot stack. This is belt-and-braces for the case where the lock file's
+# directory is missing.
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target
