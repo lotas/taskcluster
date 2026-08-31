@@ -274,11 +274,33 @@ echo "  note=$NOTE"
 
 # --- 3. probe -----------------------------------------------------------------
 say "probe"
-PROBE_OUT="$(qf probe --sha "$SHA" \
-  --path research/experiments/run_cohort.py \
-  --extract "$EXTRACT" --baseline "$BASELINE" \
-  --mem "$PROBE_MEM" --note "$NOTE" --wait 2>&1)"
+probe_once() {
+  qf probe --sha "$SHA" \
+    --path research/experiments/run_cohort.py \
+    --extract "$EXTRACT" --baseline "$BASELINE" \
+    --mem "$1" --note "$NOTE" --wait 2>&1
+}
+PROBE_OUT="$(probe_once "$PROBE_MEM")"
 PROBE_RC=$?
+
+# THE CEILING IS ONLY KNOWABLE BY BEING REFUSED BY IT, so being refused once is
+# not a reason to end the run. `qf` refuses before starting anything and names
+# the limit, so this retries exactly once at the value it named, and says so.
+#
+# This exists because the refusal cost two runs for a reason that had nothing to
+# do with either experiment: `PROBE_MEM` is read from the environment, and an
+# `export PROBE_MEM=28g` typed once outlives every later invocation of this
+# script. An env var that carries a decision between runs is a decision nobody
+# remembers making.
+CEILING="$(printf '%s' "$PROBE_OUT" \
+  | sed -n 's/.*exceeds the host ceiling of \([0-9]\+m\).*/\1/p' | head -1)"
+if [ "$PROBE_RC" -ne 0 ] && [ -n "$CEILING" ]; then
+  echo "  $PROBE_OUT"
+  say "probe refused --mem $PROBE_MEM; retrying at the host ceiling $CEILING"
+  PROBE_MEM="$CEILING"
+  PROBE_OUT="$(probe_once "$PROBE_MEM")"
+  PROBE_RC=$?
+fi
 echo "$PROBE_OUT"
 # NOT `head -1`. `qf` prints the run id on stdout and the state on stderr, and
 # merging the two reorders them (stderr is unbuffered) -- the first version took
