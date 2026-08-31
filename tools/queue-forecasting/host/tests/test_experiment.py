@@ -345,6 +345,68 @@ class Plan(unittest.TestCase):
             self.assertIn(full, text)
 
 
+class TrainerDrift(unittest.TestCase):
+    """Whether the agent's checkout trains the code that is deployed.
+
+    Nothing syncs the trusted trainer into the research user's workspace --
+    `first-probe.sh` syncs the OPERATOR's -- so a workspace can sit behind
+    deployed code indefinitely, and every result it produces gets attributed to
+    the wrong thing. Reported rather than refused: under this loop an edit to
+    `trainer/` IS the experiment.
+    """
+
+    def build(self, files):
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, root)
+        for relative, body in files.items():
+            path = os.path.join(root, relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(body)
+        return root
+
+    TRUSTED = {"src/train.py": "print(1)\n",
+               "configs/a.yaml": "target: wait_time\n",
+               "src/__pycache__/train.cpython.pyc": "junk",
+               "data/big.parquet": "junk"}
+
+    def test_identical_trees_have_no_drift(self):
+        trusted = self.build(self.TRUSTED)
+        workspace = self.build({f"trainer/{k}": v
+                                for k, v in self.TRUSTED.items()})
+        self.assertEqual(X.trainer_drift(workspace, trusted), [])
+
+    def test_an_edited_file_is_named(self):
+        trusted = self.build(self.TRUSTED)
+        changed = dict(self.TRUSTED, **{"configs/a.yaml": "target: other\n"})
+        workspace = self.build({f"trainer/{k}": v for k, v in changed.items()})
+        self.assertEqual(X.trainer_drift(workspace, trusted),
+                         ["configs/a.yaml"])
+
+    def test_a_missing_file_says_missing(self):
+        """Different from an edit: a file the workspace never got is a stale
+        checkout, and an edit is somebody's experiment."""
+        trusted = self.build(self.TRUSTED)
+        workspace = self.build({"trainer/src/train.py": "print(1)\n"})
+        self.assertIn("configs/a.yaml (MISSING)",
+                      X.trainer_drift(workspace, trusted))
+
+    def test_caches_and_data_are_not_compared(self):
+        """`__pycache__` and `data/` differ constantly and mean nothing, so
+        including them would make the check always fire and get ignored."""
+        trusted = self.build(self.TRUSTED)
+        workspace = self.build({"trainer/src/train.py": "print(1)\n",
+                                "trainer/configs/a.yaml": "target: wait_time\n",
+                                "trainer/data/big.parquet": "COMPLETELY OTHER"})
+        self.assertEqual(X.trainer_drift(workspace, trusted), [])
+
+    def test_no_trusted_tree_is_none_not_empty(self):
+        """`[]` means "verified identical" and `None` means "could not check".
+        Collapsing them would report an unreadable mirror as agreement."""
+        self.assertIsNone(X.trainer_drift(self.build({}), "/nonexistent"))
+
+
 class PushDiagnosis(unittest.TestCase):
     """Connectivity and credentials fail similarly and have opposite fixes.
 

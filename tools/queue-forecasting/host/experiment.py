@@ -441,6 +441,51 @@ def workspace_path(given):
         or os.path.expanduser("~/qf-research"))
 
 
+TRUSTED_TRAINER = "/srv/queue-forecasting/tools/queue-forecasting/trainer"
+
+
+def trainer_drift(workspace, trusted=TRUSTED_TRAINER):
+    """Which trainer files in the workspace differ from the deployed ones.
+
+    REPORTED, NOT REFUSED, and the distinction is the whole point. In this loop
+    an edit under `trainer/` IS the experiment -- refusing on difference would
+    refuse every real run. What is dangerous is difference the agent did not
+    make: nothing syncs the trusted trainer into the research user's checkout
+    (`first-probe.sh` syncs the OPERATOR's), so a workspace can sit behind
+    deployed code indefinitely and every result it produces is attributed to
+    the wrong thing.
+
+    So this names the files and lets a reader decide, which is the only
+    honest option without a way to tell an intended edit from a stale one.
+    """
+    import hashlib
+    interesting = []
+    for root, subdirs, names in os.walk(os.path.join(trusted)):
+        subdirs[:] = [d for d in subdirs
+                      if d not in ("__pycache__", ".venv", "data", "env")]
+        for name in names:
+            if name.endswith((".py", ".yaml", ".yml")):
+                full = os.path.join(root, name)
+                interesting.append(os.path.relpath(full, trusted))
+    if not interesting:
+        return None                 # nothing to compare against; say so upstream
+
+    def digest(path):
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            return None
+
+    differing = []
+    for relative in sorted(interesting):
+        here = digest(os.path.join(workspace, "trainer", relative))
+        there = digest(os.path.join(trusted, relative))
+        if here != there:
+            differing.append(relative if here else f"{relative} (MISSING)")
+    return differing
+
+
 def push_fix(output):
     """The remedy for a failed push, chosen by WHICH failure it was.
 
@@ -491,12 +536,27 @@ def cmd_doctor(args):
     failures = []
 
     def check(label, ok, detail="", fix=""):
+        """A BLOCKER when false: unattended runs are impossible until it holds."""
         print(f"  {'ok  ' if ok else 'FAIL'} {label}"
               + (f"  {detail}" if detail else ""))
         if not ok:
             failures.append((label, fix))
             if fix:
                 print(f"       -> {fix}")
+
+    def note(label, ok, detail="", guidance=""):
+        """Worth knowing, never a blocker.
+
+        Kept separate from `check` because conflating them makes the summary
+        lie in the direction that matters: a dirty workspace and an edited
+        trainer are what an experiment LOOKS like, and reporting either as
+        "unattended runs are not possible" would train a reader to ignore the
+        line that actually stops them.
+        """
+        print(f"  {'ok  ' if ok else 'note'} {label}"
+              + (f"  {detail}" if detail else ""))
+        if not ok and guidance:
+            print(f"       -- {guidance}")
 
     print("== qf")
     ok, body = qf("ping", timeout=30)
@@ -518,9 +578,9 @@ def cmd_doctor(args):
     check("contracts", bool(inv["contracts"]),
           f"{len(inv['contracts'])} published",
           "instantiate-contract.sh (operator)")
-    check("scored history", bool(inv["history"]),
-          f"{len(inv['history'])} scored evaluations",
-          "not fatal: with no history every input ranks by window, not by use")
+    note("scored history", bool(inv["history"]),
+         f"{len(inv['history'])} scored evaluations",
+         "with no history every input ranks by window, not by use")
 
     print("== the agent's workspace")
     workspace = workspace_path(args.workspace)
@@ -541,10 +601,24 @@ def cmd_doctor(args):
         ok, out = git(workspace, "push", "--dry-run", "--porcelain", timeout=120)
         check("push works without a prompt", ok,
               out.splitlines()[-1][:160] if out else "", push_fix(out))
+        drift = trainer_drift(workspace, args.trusted_trainer)
+        if drift is None:
+            note("trainer comparable to the deployed one", False,
+                 f"nothing readable at {args.trusted_trainer}",
+                 "nothing can tell whether this workspace trains current"
+                 " code; point --trusted-trainer at a readable copy")
+        else:
+            note("trainer matches the deployed one", not drift,
+                  f"{len(drift)} file(s) differ" if drift else "",
+                  ("expected when the agent's own edit IS the experiment;"
+                   " stale otherwise. differing: "
+                   + ", ".join(drift[:6])
+                   + (" ..." if len(drift) > 6 else "")) if drift else "")
+
         ok, out = git(workspace, "status", "--porcelain")
-        check("clean tree", ok and not out.strip(),
-              f"{len(out.splitlines())} changed" if out.strip() else "",
-              "not fatal: `run` commits what it finds, which is the point")
+        note("clean tree", ok and not out.strip(),
+             f"{len(out.splitlines())} changed" if out.strip() else "",
+             "`run` commits what it finds, which is the point")
 
     print("== memory")
     print(f"  probe default {args.mem}; a refusal names the host ceiling and"
@@ -720,6 +794,9 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=200,
                         help="how much history to read for usage counts")
     parser.add_argument("--mem", default="20g")
+    parser.add_argument("--trusted-trainer", default=TRUSTED_TRAINER,
+                        help="the deployed trainer to compare the workspace"
+                             " against")
     parser.add_argument("--timeout", type=int, default=5400)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="can this host run an experiment unattended?")
