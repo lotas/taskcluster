@@ -152,74 +152,146 @@ bucket" came from the model's relative edge over baseline being thinnest there
 among the short buckets — true, and it holds only 20.5% of the error. The two
 bars are closed in two different places: MAE in the tail, within-2x in `<1m`.
 
+## RESOLVED 2026-08-31: qctx clears three of four bars, and the tail is the only blocker
+
+Two corrections to the sections above, from the first two in-series scoreboards.
+
+**Finding 2's 3.6x disagreement was my own cross-series comparison.** The
+in-series reference scores **−4.038% MAE on the contract's unfiltered slice**
+against **−4.1% on the trainer's filtered slice** — 0.06pp apart, not 2.6pp and
+not 3.6x. The −6.7% quoted above came from a gen-1 run on extract `cd467b4b`.
+Population mismatch is not a small effect, it is a non-effect. The walk-forward
+gap is drift, and drift alone.
+
+**The evaluator is deterministic too.** The same probe re-evaluated at 10:34 and
+10:35 returned bit-identical metrics, as the trainer already had via
+`predictions_sha256`.
+
+### The two scored rows
+
+| metric | baseline | reference | `..._baseline_qctx` | bar |
+|---|---|---|---|---|
+| MAE | 234.6s | 225.1s (−4.04%) | **171.6s (−26.9%)** | −15% |
+| within_2x | 0.5933 | 0.6375 (+4.4pp) | **0.6884 (+9.5pp)** | +5pp |
+| p90 coverage | 0.8915 | 0.8901 | 0.8821 | 0.85–0.95 |
+| 30m+ p90 miss | 0.3989 | **0.2946 PASS** | **0.3108 FAIL** | < 0.30 |
+| days passed | — | 0/3 | **4/3** | 3 |
+
+qctx is **one metric from a full go, missing by 1.08pp**. Nothing before it
+cleared the MAE bar at all; it clears by 11.9pp with consistency to spare.
+
+**No leakage.** Checked before believing it. Every qctx window is
+backward-closed: backlog is `pending_at <= T AND exit > T`, arrivals and starts
+are `(T-w, T]`, and capacity is "the latest sample with `sampled_at <= T`"
+(`queue_context.py:919`). Nothing in the feature set reads past T.
+
+### Why the tail metric got worse while everything else got better
+
+qctx made the model **sharper**, and sharpness costs tail coverage: p90 coverage
+fell 0.8901 → 0.8821 and the 30m+ miss rose 0.2946 → 0.3108 while MAE fell 24%.
+The reference passes that bar largely by **over-inflating its p90**; qctx stopped
+needing to. So the tail miss is not qctx predicting the tail worse — it is qctx
+no longer being rescued by a wide guardrail.
+
+That is worth stating plainly because it defines what a legitimate fix is. The
+1.08pp gap is almost certainly closable by widening the p90 guardrail in the
+tail — coverage has room from 0.8821 to 0.95, and within_2x has +4.5pp of slack
+above its bar to spend. But that means re-inflating exactly what qctx fixed, and
+the program's goal (group ETA for `mach try`) needs sharp tails, not wide ones.
+**Run it as a diagnostic to bound the gap; do not promote on it.**
+
+### The run above tested features a prior ablation had already rejected
+
+`wait_hazard_qctx_d_priority_flow.yaml:60` records a Bet 1 finding that was never
+in `walk_forward_summary.csv`: qctx_b beat qctx_a, qctx_c was statistically
+indistinguishable from qctx_b, and **capacity "appears to actively dilute the
+model, not just sit inert."** The config scored above carries every feature that
+ablation rejected. That finding is pre-freeze and therefore not in-series, which
+is what entry 2 is for.
+
 ## The queue
 
 Each entry is one variable. Run against the canonical trio in `AGENTS.md`.
 
-**1. DONE — the promoted config is the in-series reference.**
-`probe-20260830T202842Z-4a2ae967d664-5418`, −4.1% filtered / −6.7% contract,
-verdict no-go. Everything below is judged against this row.
+**1. DONE — the reference and the first qctx result.** Reference
+`probe-20260830T202842Z-4a2ae967d664-5418` (−4.04% contract, no-go); qctx
+`probe-20260830T193901Z-22bcaf4f474a-5344` (−26.9%, no-go on the tail alone).
+Everything below is judged against both rows.
 
-**2. The hazard config — the only entry with the leverage to move the MAE bar.**
-`wait_hazard_qctx_d_priority_flow`, promoted from entry 5 by the decomposition
-above. Memory of Bet 2's walk-forward: it roughly HALVES the 30m+ p90 miss
-(18.97% vs 34.59%) while costing 12.6pp of overall within-2x. Read against the
-table above, that trade is no longer obviously bad: the tail is 68% of the error,
-a 16.7% tail cut clears the MAE bar on its own, and within-2x needs only +0.6pp
-which `<1m` can supply separately. Its last finite bin edge is 480 minutes, so
-watch for the terminal-risk-set refusal described in `AGENTS.md`.
+**2. `wait_qctx_d_priority_flow` — drop capacity. Cheapest path to a full go.**
+A **strict feature subset** of the qctx config just scored: identical in every
+non-feature key (same residual/`log_ratio`, same Policy B `mode: baseline`, same
+`baseline_dir`, same throughput windows, same model params, same
+lookback/holdout/validation), dropping 12 features — the 8 capacity-touching
+numerics plus `repo_family`, `capacity_null_reason`, and the 3 per-repo pending
+counts. One hypothesis, already supported off-series: capacity dilutes. If it
+transfers, a 1.08pp tail gap closes and the contract passes **with a plain
+quantile model and no hazard work at all**. Cheaper than entry 3 in every sense:
+fewer features, same model class, and it also drops the `worker_counts` load, so
+peak RSS should fall rather than rise.
 
-**3. `..._baseline_qctx` — queue-context features (Bet 1's first measurement).**
-`walk_forward_summary.csv` has **zero** rows for any qctx config: they were built
-and never measured across cohorts. Adds ~30 numerics describing the queue a task
-lands in (pending counts by priority, arrivals, per-capacity ratios). Aimed at
-the 5-30m bucket, which is where the candidate's error concentrates and where
-every previous feature has failed. Needs the gen-2 extract for `task_created`.
+**3. `wait_hazard_qctx_d_priority_flow` — the tail specialist, same feature set.**
+Bet 2 roughly halves the 30m+ p90 miss (18.2% guarded in its first real run,
+18.97% vs 34.59% across 20 walk-forward cohorts) at a cost of 12.6pp of overall
+within-2x. That trade was unattractive when nothing cleared the MAE bar. It is
+attractive now: qctx has a 11.9pp MAE cushion and +4.5pp of within-2x slack to
+absorb the cost, and the tail is the only failing metric. Because it shares
+entry 2's feature set exactly, entry 3 minus entry 2 is close to a clean
+model-class delta — **but not exactly**: it also runs `validation_days: 7`
+against entry 2's `1`, for the documented weekend-composition reason. Its last
+finite bin edge is 480 minutes, so watch for the terminal-risk-set refusal in
+`AGENTS.md`.
 
-**4. `..._baseline_pool` — the pool class alone (NEW, config written).**
-`pool_kind` and `provider_type` on top of the candidate, nothing removed. Per
-Finding 1, these two columns have never been tested on their own. The hypothesis
-is specific: Azure/Windows queues wait very differently from GCP ones, and today
-the model can only learn that through `task_queue_id`, whose cardinality prevents
-it from generalising from a busy Azure queue to a quiet one. A pool class is the
-same fact at a usable cardinality. `test_ablation_configs.py` asserts the delta is
-exactly two categoricals plus the join that supplies them. Costs a
-`worker_counts` load the candidate does not do, so expect a peak above 17.4GB.
+**4. The guardrail-width diagnostic (see above).** Not a promotion candidate.
+Bounds how much of the 1.08pp is information versus inflation, which tells us
+whether entries 2 and 3 are solving a real problem or a calibration one.
 
-**5. `bl_wait_p90` — is it earning its place?**
-Every config that dropped it (`wait_time`, velocity, `filtered_both`) also
-changed other things, so its contribution is unmeasured. Removing it from the
-candidate is a one-line delta, and if it contributes nothing then the residual
-model is simpler by a feature. A negative result here is worth having.
+**5. `..._baseline_pool` — the pool class alone (config written).**
+`pool_kind` and `provider_type` on top of the promoted config, nothing removed.
+Per Finding 1 these two columns have never been tested on their own. The
+hypothesis is specific: Azure/Windows queues wait very differently from GCP ones,
+and today the model can only learn that through `task_queue_id`, whose cardinality
+prevents generalising from a busy Azure queue to a quiet one. **Demoted by the
+qctx result**: it is a variant of the promoted config, which is now 23pp of MAE
+behind qctx, so a win here is a win on a superseded base. Rebase it on entry 2's
+winner before running it.
 
-**6. `normalized_name` — task identity, never used by a WAIT config.**
+**6. `bl_wait_p90` — is it earning its place?**
+Every config that dropped it (`wait_time`, velocity, `filtered_both`) also changed
+other things, so its contribution is unmeasured. A one-line delta, and if it
+contributes nothing the residual model is simpler by a feature. Same rebase note
+as entry 5.
+
+**7. `normalized_name` — task identity, never used by a WAIT config.**
 Both `run_duration.yaml` and `run_duration_residual.yaml` carry it as a
 categorical; no wait config does. That precedent is the useful part: the
-cardinality is evidently trainable in this codebase at the shared
-`min_data_in_leaf: 100`, so the wait version is a one-line addition with a known
-starting point rather than a tuning exercise. A specific test suite's queueing
-behaviour is plausibly the strongest per-task signal available, and no wait
-experiment has looked.
+cardinality is evidently trainable here at the shared `min_data_in_leaf: 100`, so
+the wait version is a one-line addition with a known starting point rather than a
+tuning exercise. Same rebase note.
+
+**8. Re-run qctx_a / _b / _c in-series.** Only if entry 2 disagrees with the
+pre-freeze ablation. Three probes to re-derive a finding we already have on
+paper; worth it only if the paper turns out to be wrong.
 
 ## What would change this ordering
 
-Entry 1 is done and it already reordered the queue once. What would move things
-again:
-
-- **A tail result that does not transfer.** The 68%-of-error figure is from one
-  cohort. If entry 2's tail gain evaporates on a second cohort, the leverage
-  argument is about this week's data rather than about the problem, and 5-30m
-  work goes back to the top.
-- **A `<1m` within-2x idea.** Nothing in the queue targets the bucket that holds
-  half the rows and has the worst within-2x (49.5%). Sub-minute waits are
-  probably dominated by scheduler and claim latency rather than by queueing, and
-  no feature in any config describes that. This is a gap in the queue, not an
-  entry in it — it needs a hypothesis first.
+- **Entry 2 clearing all four bars.** Then the question stops being "what
+  feature" and becomes promotion: a walk-forward sweep across cohorts to check
+  the result is not one week of data, then serving. The tail-modelling program
+  (Bet 2) becomes optional rather than load-bearing.
+- **A tail result that does not transfer.** The 68%-of-error decomposition is
+  from one cohort. If entry 3's tail gain evaporates on a second, the leverage
+  argument is about this week rather than about the problem.
+- **A `<1m` within-2x idea.** Nothing in the queue targets the bucket holding
+  half the rows with the worst within-2x (49.5%). Sub-minute waits are probably
+  dominated by scheduler and claim latency rather than queueing, and no feature
+  in any config describes that. A gap, not an entry — it needs a hypothesis
+  first. Note qctx already bought +9.5pp of within_2x, so some of this may
+  already be paid.
 - **Evidence about the bar itself.** Population is ruled out; drift is not
   quantified. Re-running one April cohort through the current pipeline would say
-  whether −24.3% was the model or the month. That is the honest way to decide
-  whether 15% is still the right number, and it is not something a verdict can
-  tell us.
+  whether −24.3% was the model or the month. Less urgent now that a config
+  clears 15% in-series by 11.9pp.
 
 Every entry is judged against entry 1 rather than against the bar, so a config
 that beats the reference is an improvement whether or not the reference passes.
