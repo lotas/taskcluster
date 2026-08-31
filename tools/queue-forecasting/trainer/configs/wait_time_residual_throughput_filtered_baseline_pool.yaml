@@ -1,0 +1,110 @@
+# The promoted candidate plus the POOL CLASS, and nothing else.
+#
+# WHY THIS EXISTS. `wait_time_residual_velocity` already carried `pool_kind` and
+# `provider_type`, scored worse, and was dropped -- but it differed from the
+# candidate in SIX keys and about nineteen features at once: it also lost Policy B
+# (`anomaly_filter` + the filtered baseline history), lost `bl_wait_p90`, lost
+# every throughput feature, and gained eight capacity numerics. Policy B is the
+# change that fixed the regime fragility in the first place, so attributing that
+# config's regression to the pool columns is not something its numbers support.
+#
+# So the pool class has never actually been tested. Two categoricals, on top of
+# the candidate, nothing removed:
+#
+#   pool_kind      the pool's class
+#   provider_type  azure2 / azure_trusted / fxci-levelN-gcp
+#
+# The hypothesis is specific: Windows-on-Azure queues wait very differently from
+# GCP ones, and today the model can only learn that through `task_queue_id`,
+# which is high-cardinality -- so it cannot generalise from a busy Azure queue to
+# a quiet one. A pool class is the same fact at a cardinality the model can use.
+#
+# `velocity_features` is enabled ONLY because that is what joins the pool
+# dimension onto the frame (`velocity_features.py`'s "Pool dimension join").
+# `trailing_windows_minutes: []` keeps its trailing-average columns from being
+# computed, and none of its capacity numerics are listed as features -- this is
+# the pool columns alone, not velocity.
+#
+# COSTS A `worker_counts` LOAD the candidate does not do, so expect a higher
+# peak than 17.4GB. Run it with the memory cap at the ceiling.
+
+target: wait_time
+target_column: wait_duration_s
+
+lookback_days: 14
+holdout_days: 5
+validation_days: 1
+as_of_date: null
+
+filters:
+  - "r.started_at IS NOT NULL"
+  - "r.queue_pending IS NOT NULL"
+  - "r.wait_duration_s IS NOT NULL"
+  - "r.wait_duration_s >= 0"
+
+categorical_features:
+  - task_queue_id
+  - scheduler_id
+  - priority_at_pending
+  - tags.kind
+  - tags.os
+  - tags.project
+  - tags.worker-implementation
+  - pool_kind
+  - provider_type
+
+# New numeric features — LightGBM will ignore any that are all-NaN,
+# so safe to list all windows even if some are sparse.
+numeric_features:
+  - queue_pending
+  - max_run_time_s
+  - hour_sin
+  - hour_cos
+  - day_sin
+  - day_cos
+  - bl_wait_p50
+  - bl_wait_p90
+  - queue_tasks_started_15m
+  - queue_tasks_completed_15m
+  - queue_avg_wait_15m
+  - queue_avg_run_time_15m
+  - queue_tasks_started_60m
+  - queue_tasks_completed_60m
+  - queue_avg_wait_60m
+  - queue_avg_run_time_60m
+
+derived_features:
+  cyclical_time:
+    source: pending_at
+
+model_type: lightgbm
+quantiles: [0.5, 0.9]
+model_params:
+  num_leaves: 63
+  learning_rate: 0.05
+  n_estimators: 500
+  early_stopping_rounds: 20
+  min_data_in_leaf: 100
+
+residual:
+  baseline_file: baseline_predictions.ndjson
+  baseline_feature: bl_wait_p50
+  transform: log_ratio
+
+throughput_features:
+  enabled: true
+  windows_minutes: [15, 60]
+
+# Enabled for the pool dimension join only; no trailing windows, and none of the
+# capacity numerics are features. See the header.
+velocity_features:
+  enabled: true
+  trailing_windows_minutes: []
+  tolerance_minutes: 10
+
+baseline_dir: data/baseline_filtered
+
+anomaly_filter:
+  enabled: true
+  mode: baseline            # Policy B: exclude anomalous days from baseline percentile history
+  # flag_subset: omitted    # use any of the flags

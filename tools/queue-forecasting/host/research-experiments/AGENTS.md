@@ -13,6 +13,21 @@ production candidate already, and it is not good enough: it improves mean
 absolute error by ~7% over the percentile baseline where the bar is 15%. Your job
 is to find the change that closes that gap, one variable at a time.
 
+**The ranked list of what to run and why is at**
+
+```
+/srv/queue-forecasting/tools/queue-forecasting/experiment-queue.md
+```
+
+**by absolute path**, because it is not copied into this repo -- bootstrap brings
+only this file and `research/experiments/run_cohort.py`, and a bare filename
+would send you looking in a checkout that does not have it.
+
+Read it before proposing anything: it records which ideas were already tried and
+-- more importantly -- which of those were tried in a CONFOUNDED form and are
+therefore still open. Three of its six entries are one-variable versions of
+experiments that were run, dismissed, and cannot actually be attributed.
+
 The two places the current model is weakest, from fourteen walk-forward cohorts:
 
 - **5-30 minute waits.** Short waits are easy (the queue is empty) and long ones
@@ -164,6 +179,14 @@ State the hypothesis before you run it, in the commit message: what you changed,
 what you expect to move, and roughly how much. Then one variable, so the number
 attributes to something. A run that changes three things and improves is a run
 that has to be repeated three more times before anyone knows why.
+
+THIS IS NOT A STYLE PREFERENCE. `wait_time_residual_velocity` was run over
+fifteen cohorts, scored worse, and was dropped -- and it differed from the
+candidate in six keys and about nineteen features at once, including the one
+change (Policy B) that had fixed the model's regime fragility. Fifteen cohorts of
+compute produced a number nobody can attribute to anything. Diff your config
+against the one you are comparing to, and if the diff is more than one idea,
+split it.
 
 The config name is recorded on every run, so `results.sh` can tell your rows
 apart. If you add a config, give it a name whose ENDING says what is different --

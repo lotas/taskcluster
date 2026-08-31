@@ -733,6 +733,22 @@ cmd_mirror_refresh() {
       systemctl try-restart qf-extract.service
     fi
   fi
+
+  # AND THE EVALUATOR, which this step used to leave behind -- the same defect as
+  # the extractor above, found the same way. 2c's evaluator gained a metrics
+  # block in its reply; a refresh moved the dispatcher and the checkout, the
+  # evaluator kept serving the old process, and every verdict came back with the
+  # word and none of the numbers. Nothing failed: the dispatcher records the
+  # scoreboard when the reply carries one, and an old reply simply does not.
+  #
+  # `try-restart` for the same reason as the extractor: socket-activated, and
+  # starting one eagerly would provision a staging root nobody asked for.
+  if systemctl list-unit-files qf-eval.service >/dev/null 2>&1 \
+     && [ -f /etc/systemd/system/qf-eval.service ]; then
+    if would "try-restart qf-eval (socket-activated, but long-lived)"; then
+      systemctl try-restart qf-eval.service
+    fi
+  fi
 }
 
 # --------------------------------------------------------------------------
