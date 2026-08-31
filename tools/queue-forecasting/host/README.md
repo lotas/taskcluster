@@ -782,7 +782,12 @@ cd tools/queue-forecasting/host/evaluator
 PYTHONPATH=. env/.venv/bin/python -m unittest discover -s tests
 ```
 
-`tests/test_results.sh` covers `results.py` and needs neither.
+`tests/test_results.sh` covers `results.py` and needs neither. Nor does
+`tests/test_experiment_sh.sh`, which stubs `sudo` to assert that
+`experiment.sh` executes the DEPLOYED `/srv` copy rather than the one beside
+it -- the research user cannot traverse an operator's home, so a file whose own
+mode is 0755 is still unreadable to it, and `[ -r ]` evaluated as the caller
+reports that as fine.
 
 **Two things the unit suite cannot answer**, because they are properties of the
 Docker CLI rather than of this code, so `nc-suite-phase2.sh` NC16 asks a real
