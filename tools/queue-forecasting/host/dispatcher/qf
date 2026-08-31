@@ -289,11 +289,19 @@ def cmd_extracts(args):
         return
     for row in rows:
         watermark = row.get("watermark") or {}
+        # `lookback` and `qctx` are here because both decide whether an
+        # extract can serve a config, and both used to be invisible: lookback
+        # is part of `request_hash` (so reproducing a window needs it) and
+        # `task_created` is what a queue-context config requires.
+        qctx = "task_created" in ((row.get("columns") or {}).get("qctx_runs")
+                                  or ())
         print(f"{(row.get('request_hash') or '?')[:12]}"
               f"  extract={(row.get('extract_hash') or '?')[:12]}"
               f"  {row.get('target')}"
               f"  {row.get('train_start')}..{row.get('as_of_date')}"
-              f"  gen={row.get('generation')}")
+              f"  lookback={row.get('lookback_days')}"
+              f"  gen={row.get('generation')}"
+              f"  qctx={'yes' if qctx else 'NO'}")
         # THE FULL HASH, on its own line and labelled with the flag it goes to.
         # The short form above is for reading; this is for copying. Printing only
         # the truncated one -- with the full value buried inside `dir=` -- made the

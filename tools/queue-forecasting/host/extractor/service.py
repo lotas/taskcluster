@@ -425,10 +425,25 @@ class Handler:
                 "train_start": (manifest.get("request") or {}).get(
                     "train_start"),
                 "as_of_date": (manifest.get("request") or {}).get("as_of_date"),
+                # PUBLISHED because a caller cannot otherwise reproduce this
+                # request. `lookback_days` is part of `request_hash`, so an
+                # operator asked to "extract the same window with a wider train
+                # start" had no way to read the value they had to match, and a
+                # guess produces a different hash rather than an error.
+                "lookback_days": (manifest.get("request") or {}).get(
+                    "lookback_days"),
                 "generation": (manifest.get("request") or {}).get("generation"),
                 "watermark": manifest.get("watermark"),
                 "rows": {n: e.get("rows")
                          for n, e in (manifest.get("files") or {}).items()},
+                # A PARALLEL dict rather than a richer `rows`, which `qf` prints
+                # positionally. Published so a caller can tell whether an
+                # extract can serve a config BEFORE spending a probe on it --
+                # `run_cohort.check_qctx` makes exactly this decision from the
+                # manifest, and until now it was the only thing that could see
+                # the column list.
+                "columns": {n: list(e.get("columns") or ())
+                            for n, e in (manifest.get("files") or {}).items()},
                 "snapshot_start_ts": manifest.get("snapshot_start_ts"),
             })
         return {"ok": True, "extracts": out}
