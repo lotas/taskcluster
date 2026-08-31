@@ -115,8 +115,8 @@ async function main() {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
 
-  const modelDir = findLatestModelDir(MODELS_ROOT);
-  if (!modelDir) throw new Error(`No model directories under ${MODELS_ROOT}`);
+  const modelDir = findLatestModelDir(MODELS_ROOT, [WAIT_STEM, DURATION_STEM]);
+  if (!modelDir) throw new Error(`No complete model directories under ${MODELS_ROOT}`);
   log('loading bundles from', modelDir);
 
   const [waitBundle, durationBundle] = await Promise.all([

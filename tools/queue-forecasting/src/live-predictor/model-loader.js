@@ -26,6 +26,16 @@ function computeArtifactHash(files) {
   return h.digest('hex').slice(0, 16);
 }
 
+function bundleFiles(dir, stem) {
+  return {
+    p50File: path.join(dir, `${stem}_p50.onnx`),
+    p90File: path.join(dir, `${stem}_p90.onnx`),
+    catFile: path.join(dir, `${stem}_category_mappings.json`),
+    schemaFile: path.join(dir, `${stem}_feature_schema.json`),
+    manifestFile: path.join(dir, `${stem}_manifest.json`),
+  };
+}
+
 /**
  * @param {string} dir   Directory containing the bundle files (a per-day model dir).
  * @param {string} stem  Filename stem (config name without _manifest.json).
@@ -34,11 +44,7 @@ function computeArtifactHash(files) {
  * @returns {Promise<{stem, schema, categories, manifest, artifact_hash, sessionP50, sessionP90}>}
  */
 export async function loadBundle(dir, stem, opts = {}) {
-  const p50File = path.join(dir, `${stem}_p50.onnx`);
-  const p90File = path.join(dir, `${stem}_p90.onnx`);
-  const catFile = path.join(dir, `${stem}_category_mappings.json`);
-  const schemaFile = path.join(dir, `${stem}_feature_schema.json`);
-  const manifestFile = path.join(dir, `${stem}_manifest.json`);
+  const { p50File, p90File, catFile, schemaFile, manifestFile } = bundleFiles(dir, stem);
 
   for (const f of [p50File, p90File, catFile, schemaFile, manifestFile]) {
     if (!fs.existsSync(f)) {
@@ -77,15 +83,32 @@ export async function loadBundle(dir, stem, opts = {}) {
 }
 
 /**
- * Find the latest models directory under trainer/data/models/.
+ * Find the latest complete models directory under trainer/data/models/.
+ *
+ * Training writes each config's bundle directly into the date directory. A
+ * later config can fail after an earlier one succeeds, leaving the newest date
+ * valid as walk-forward resume state but incomplete for live serving. Skip
+ * those partial dates rather than making a live-predictor restart fail.
+ *
  * @param {string} modelsRoot  Absolute path to trainer/data/models.
- * @returns {string|null}  Absolute path to the latest day dir, or null.
+ * @param {string[]} requiredStems  Every bundle the caller needs to serve.
+ * @returns {string|null}  Absolute path to the latest complete day dir, or null.
  */
-export function findLatestModelDir(modelsRoot) {
+export function findLatestModelDir(modelsRoot, requiredStems) {
+  if (!Array.isArray(requiredStems) || requiredStems.length === 0) {
+    throw new TypeError('requiredStems must contain at least one model stem');
+  }
   if (!fs.existsSync(modelsRoot)) return null;
   const dates = fs.readdirSync(modelsRoot)
     .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
     .sort()
     .reverse();
-  return dates[0] ? path.join(modelsRoot, dates[0]) : null;
+  for (const date of dates) {
+    const dir = path.join(modelsRoot, date);
+    const complete = requiredStems.every((stem) =>
+      Object.values(bundleFiles(dir, stem)).every((file) => fs.existsSync(file))
+    );
+    if (complete) return dir;
+  }
+  return null;
 }

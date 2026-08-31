@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import { loadBundle } from '../../src/live-predictor/model-loader.js';
+import { findLatestModelDir, loadBundle } from '../../src/live-predictor/model-loader.js';
 
 function writeJson(p, obj) { fs.writeFileSync(p, JSON.stringify(obj)); }
 
@@ -66,5 +66,56 @@ test('loadBundle throws when artifact_hash mismatches', async () => {
   await assert.rejects(
     () => loadBundle(dir, stem, { skipOnnxLoad: true }),
     /artifact_hash mismatch/,
+  );
+});
+
+function writeBundleFiles(dir, stem) {
+  fs.mkdirSync(dir, { recursive: true });
+  for (const suffix of [
+    'p50.onnx',
+    'p90.onnx',
+    'category_mappings.json',
+    'feature_schema.json',
+    'manifest.json',
+  ]) {
+    fs.writeFileSync(path.join(dir, `${stem}_${suffix}`), 'fixture');
+  }
+}
+
+test('findLatestModelDir falls back when the newest date is incomplete', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'model-dates-'));
+  const waitStem = 'wait_time_demo';
+  const durationStem = 'run_duration_demo';
+  const previous = path.join(root, '2026-08-29');
+  const latest = path.join(root, '2026-08-30');
+
+  writeBundleFiles(previous, waitStem);
+  writeBundleFiles(previous, durationStem);
+  writeBundleFiles(latest, waitStem);
+
+  assert.equal(findLatestModelDir(root, [waitStem, durationStem]), previous);
+});
+
+test('findLatestModelDir selects the newest date when every bundle is complete', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'model-dates-'));
+  const stems = ['wait_time_demo', 'run_duration_demo'];
+  const previous = path.join(root, '2026-08-29');
+  const latest = path.join(root, '2026-08-30');
+
+  for (const stem of stems) {
+    writeBundleFiles(previous, stem);
+    writeBundleFiles(latest, stem);
+  }
+
+  assert.equal(findLatestModelDir(root, stems), latest);
+});
+
+test('findLatestModelDir returns null when no date has every required bundle', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'model-dates-'));
+  writeBundleFiles(path.join(root, '2026-08-30'), 'wait_time_demo');
+
+  assert.equal(
+    findLatestModelDir(root, ['wait_time_demo', 'run_duration_demo']),
+    null,
   );
 });
