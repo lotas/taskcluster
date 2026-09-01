@@ -34,6 +34,7 @@ TRUSTED="${QF_TRUSTED_HOST:-/srv/queue-forecasting/tools/queue-forecasting/host}
 QUEUE="${QF_QUEUE_FILE:-$(dirname "$TRUSTED")/experiment-queue.md}"
 STATE="${QF_TICK_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/qf-tick}"
 JOURNAL="$QF_RESEARCH/journal"
+USAGE_LOG="${QF_TICK_USAGE_LOG:-$STATE/usage.log}"
 
 # Budgets. Both are per calendar day, UTC, and both are PRE-gates: a tick that
 # would exceed one does not start, rather than being stopped partway.
@@ -52,10 +53,9 @@ MAX_QUEUE_BYTES="${QF_TICK_MAX_QUEUE_BYTES:-24576}"
 # reasoning has drifted, and it must not keep pushing.
 MAX_DISAGREE="${QF_TICK_MAX_DISAGREE:-3}"
 
-# The CLI flags live here, in ONE place, because the exact spelling varies by
-# CLI version and a wrong flag should be a one-line fix rather than a hunt
-# through a 200-line script at 3am.
-LEADER_FLAGS=(${QF_LEADER_FLAGS:---output-format text --permission-mode bypassPermissions})
+# Configurable behaviour flags live here. The structured-output flags remain at
+# the two call sites because usage logging requires them and is not optional.
+LEADER_FLAGS=(${QF_LEADER_FLAGS:---permission-mode bypassPermissions})
 COPILOT_FLAGS=(${QF_COPILOT_FLAGS:---skip-git-repo-check})
 
 # ENFORCED HERE, not only in the unit. `install.sh once` and a hand-run tick
@@ -383,8 +383,18 @@ say "leader input: $LEADER_BYTES bytes"
 # shim ahead of the real `qf` for the leader and everything it spawns, including
 # `experiment.py`, whose own `qf` calls (probe, evaluate, extracts, contracts)
 # pass through untouched.
-if ! PATH="$LEADER_PATH" claude -p "${LEADER_FLAGS[@]}" \
-      <"$CTX/leader-input.md" >"$LEADER_LOG" 2>&1; then
+LEADER_RAW="$CTX/leader.json"
+LEADER_ERR="$CTX/leader.err"
+LEADER_RC=0
+PATH="$LEADER_PATH" claude -p "${LEADER_FLAGS[@]}" --output-format json \
+  <"$CTX/leader-input.md" >"$LEADER_RAW" 2>"$LEADER_ERR" || LEADER_RC=$?
+python3 "$HERE/usage.py" claude "$LEADER_RAW" "$USAGE_LOG" \
+  "$LEADER_RC" >"$LEADER_LOG" \
+  || say "WARNING: could not append Claude usage to $USAGE_LOG"
+if [ -s "$LEADER_ERR" ]; then
+  cat "$LEADER_ERR" >>"$LEADER_LOG"
+fi
+if [ "$LEADER_RC" -ne 0 ]; then
   say "leader exited non-zero; its output:"
   tail -c 2000 "$LEADER_LOG"
   # Not an escalation: a crashed leader made no claim, so there is nothing to
@@ -458,15 +468,24 @@ else
     echo '```'
   } >"$CTX/verify-input.md"
   say "copilot input: $(wc -c <"$CTX/verify-input.md") bytes"
-  CODEX_OK=1
+  CODEX_RC=0
   # `-` IS EXPLICIT: `codex exec` reads stdin when the prompt is `-` or absent,
   # but "if stdin is piped AND a prompt is also provided, stdin is appended as a
   # <stdin> block" -- so passing both would silently reshape the prompt.
-  CHECK="$(codex exec "${COPILOT_FLAGS[@]}" - <"$CTX/verify-input.md" 2>&1)" \
-    || CODEX_OK=0
-  printf '%s\n' "$CHECK" >"$CTX/verify.log"
+  CODEX_RAW="$CTX/codex.jsonl"
+  CODEX_ERR="$CTX/codex.err"
+  codex exec "${COPILOT_FLAGS[@]}" --json - <"$CTX/verify-input.md" \
+    >"$CODEX_RAW" 2>"$CODEX_ERR" || CODEX_RC=$?
+  python3 "$HERE/usage.py" codex "$CODEX_RAW" "$USAGE_LOG" \
+    "$CODEX_RC" >"$CTX/verify.log" \
+    || say "WARNING: could not append Codex usage to $USAGE_LOG"
+  CHECK="$(cat "$CTX/verify.log")"
+  if [ "$CODEX_RC" -ne 0 ] && [ -s "$CODEX_ERR" ]; then
+    CHECK="$CHECK
+$(cat "$CODEX_ERR")"
+  fi
   REASON="$(printf '%s' "$CHECK" | tail -c 1200)"
-  if [ "$CODEX_OK" = 0 ]; then
+  if [ "$CODEX_RC" -ne 0 ]; then
     # A FAILED COMMAND'S OUTPUT IS NOT PARSED AT ALL. Prepending a DISAGREE line
     # to it and re-parsing was wrong twice over: the tail-wins rule then picked a
     # trailing `VERDICT: AGREE` out of the partial output, so a copilot that

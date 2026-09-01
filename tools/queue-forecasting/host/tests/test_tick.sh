@@ -112,7 +112,14 @@ cat > "$W/leader_prompt"
 if [ -f "$W/leader_entry" ]; then
   cat "$W/leader_entry" > "$W/research/journal/PENDING.md"
 fi
-echo "leader done"
+python3 - <<'PYAGENT'
+import json
+print(json.dumps({
+    "type": "result", "result": "leader done", "total_cost_usd": 0.0123,
+    "usage": {"input_tokens": 1000, "cache_creation_input_tokens": 200,
+              "cache_read_input_tokens": 3000, "output_tokens": 50},
+}))
+PYAGENT
 EOF
   # `codex`: replies with whatever $W/codex_reply holds.
   cat >"$W/bin/codex" <<EOF
@@ -120,7 +127,18 @@ EOF
 printf '%s\n' "\$@" > "$W/codex_argv"
 cat > "$W/codex_prompt"
 [ ! -f "$W/codex_fails" ] || { echo "boom"; exit 4; }
-cat "$W/codex_reply" 2>/dev/null || echo "VERDICT: AGREE"
+[ ! -f "$W/codex_noise" ] || echo "npm notice: cosmetic stdout noise"
+python3 - "$W/codex_reply" <<'PYAGENT'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+reply = path.read_text() if path.exists() else "VERDICT: AGREE\n"
+print(json.dumps({"type": "thread.started", "thread_id": "test-thread"}))
+print(json.dumps({"type": "item.completed", "item": {
+    "id": "item-1", "type": "agent_message", "text": reply}}))
+print(json.dumps({"type": "turn.completed", "usage": {
+    "input_tokens": 2000, "cached_input_tokens": 1500,
+    "output_tokens": 100, "reasoning_output_tokens": 25}}))
+PYAGENT
 EOF
   # `qf list --json`: the budget's only source. Driven by $W/probes_today and
   # $W/extracts_today, and able to FAIL so the fail-closed path is testable.
@@ -244,12 +262,20 @@ printf '%s' "$out" | grep -q "NOOP" \
 # --------------------------------------------------------------------------
 setup agree
 echo "VERDICT: AGREE" >"$W/codex_reply"
-out="$(run_tick)"
+out="$(run_tick QF_CODEX_INPUT_USD_PER_MTOK=2 \
+                 QF_CODEX_CACHED_INPUT_USD_PER_MTOK=0.2 \
+                 QF_CODEX_OUTPUT_USD_PER_MTOK=10)"
 n="$(find "$W/research/journal" -maxdepth 1 -name '2*.md' | wc -l | tr -d ' ')"
 [ "$n" = 1 ] && ok "an agreed claim is recorded in the journal" \
              || bad "an agreed claim is recorded in the journal (found $n) -- $out"
 [ ! -e "$W/research/journal/PENDING.md" ] \
   && ok "PENDING.md is consumed" || bad "PENDING.md is consumed"
+present_in "$W/state/usage.log" "claude.*4.2K tokens.*est ~\\\$0.0123" \
+  "Claude usage is appended to the central log"
+present_in "$W/state/usage.log" "codex.*2.1K tokens.*input=2000 cached=1500 output=100" \
+  "Codex usage is appended with recalculable token categories"
+present_in "$W/state/usage.log" "codex.*est ~\\\$0.0023" \
+  "configured Codex rates produce an API-equivalent estimate"
 if [ "$CAN_COMMIT" = 0 ]; then
   skip "the journal is pushed" "this sandbox refuses git commit"
 elif git -C "$W/research" log --oneline origin/main 2>/dev/null | grep -q journal; then
@@ -257,6 +283,24 @@ elif git -C "$W/research" log --oneline origin/main 2>/dev/null | grep -q journa
 else
   bad "the journal is pushed -- $out"
 fi
+
+# --------------------------------------------------------------------------
+setup codexnoise
+: >"$W/codex_noise"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "stdout noise does not hide a valid Codex verdict" \
+  || bad "stdout noise hid a valid Codex verdict -- $out"
+present_in "$W/state/usage.log" "codex.*2.1K tokens.*skipped_lines=1" \
+  "ignored Codex stdout noise is visible in the usage log"
+
+# --------------------------------------------------------------------------
+setup partialrates
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick QF_CODEX_INPUT_USD_PER_MTOK=2)"
+present_in "$W/state/usage.log" "codex.*est n/a.*rates=partial" \
+  "a partial Codex rate configuration explains the missing estimate"
 
 # --------------------------------------------------------------------------
 setup disagree
@@ -310,6 +354,8 @@ out="$(run_tick)"
 [ -n "$(find "$W/research/journal/escalations" -name '2*.md')" ] \
   && ok "a crashed copilot means nothing is recorded" \
   || bad "a crashed copilot means nothing is recorded -- $out"
+present_in "$W/state/usage.log" "codex.*unknown tokens.*exit=4" \
+  "a crashed copilot logs its real exit code"
 
 # --------------------------------------------------------------------------
 setup leadercrash
@@ -320,6 +366,8 @@ out="$(run_tick)"
 [ ! -e "$W/research/journal/PENDING.md" ] \
   && ok "a crashed leader leaves no half-written entry" \
   || bad "a crashed leader leaves no half-written entry"
+present_in "$W/state/usage.log" "claude.*unknown tokens.*exit=3" \
+  "a crashed leader logs its real exit code"
 
 # --------------------------------------------------------------------------
 setup autopause
@@ -779,9 +827,18 @@ grep -q "research leader" "$W/leader_prompt" 2>/dev/null \
   || bad "the leader receives the prompt on stdin -- $out"
 absent_from "$W/leader_argv" "research leader" \
   "the prompt is not in argv (not visible in ps, no 128KiB cap)"
+if grep -qx -- "--output-format" "$W/leader_argv" 2>/dev/null \
+   && grep -qx -- "json" "$W/leader_argv" 2>/dev/null; then
+  ok "Claude is asked for structured usage output"
+else
+  bad "Claude is not asked for structured usage output -- $out"
+fi
 grep -q "Reject the entry" "$W/codex_prompt" 2>/dev/null \
   && ok "the copilot receives its prompt on stdin" \
   || bad "the copilot receives its prompt on stdin"
+grep -qx -- "--json" "$W/codex_argv" 2>/dev/null \
+  && ok "Codex is asked for structured usage output" \
+  || bad "Codex is not asked for structured usage output -- $out"
 grep -qx -- "-" "$W/codex_argv" 2>/dev/null \
   && ok "codex is invoked with an explicit \`-\` for stdin" \
   || bad "codex should get an explicit \`-\` (else a piped prompt is wrapped)"

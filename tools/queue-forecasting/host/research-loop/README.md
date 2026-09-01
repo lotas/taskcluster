@@ -23,8 +23,36 @@ nowhere.
 | `prereg.py` | the pre-registration format, written by `experiment.py`, read by `frontier.py` |
 | `frontier.py` | the progress artifact: per-series frontier, claims, confirm gate |
 | `agent-env.sh` | puts the nvm-installed CLIs and the proxy on PATH for a non-interactive shell |
+| `usage.py` | extracts structured CLI usage and appends the central log |
 | `install.sh` | turns the loop on and off |
 | `qf-tick.{service,timer}` | hourly, as `research` |
+
+## Token and cost log
+
+Every leader and copilot invocation appends one UTC line to
+`~research/.local/state/qf-tick/usage.log` (override with
+`QF_TICK_USAGE_LOG`). For example:
+
+```text
+2026-09-01 14:20  claude   3.5M tokens  est ~$7.0123 [total=3500000 input=1200 cache_write=3000 cache_read=3490000 output=5800] [exit=0]
+2026-09-01 14:22  codex    24.9K tokens  est n/a [total=24885 input=24763 cached=24448 output=122 reasoning=0] [rates=unset] [exit=0]
+```
+
+Claude's CLI supplies its own cost estimate. Codex supplies token counts; set
+all three API-equivalent rates to add a Codex estimate:
+
+```bash
+QF_CODEX_INPUT_USD_PER_MTOK=...
+QF_CODEX_CACHED_INPUT_USD_PER_MTOK=...
+QF_CODEX_OUTPUT_USD_PER_MTOK=...
+```
+
+The detailed counts remain in the line so old entries can be recalculated after
+a price or model change. This is accounting only: a missing or malformed usage
+record warns but does not stop a tick. `rates=unset`, `rates=partial`, or
+`rates=invalid` explains a missing Codex estimate. If non-JSON text appears in
+Codex's JSONL stdout, valid events are still used and `skipped_lines=N` makes the
+format drift visible.
 
 ## The three guards
 
