@@ -3661,3 +3661,117 @@ class LogsAreReadableByClients(unittest.TestCase):
             self.assertEqual(writer.write(payload), len(payload))
         finally:
             os.fchmod = real
+
+
+class RunDirGroupsFailClosed(unittest.TestCase):
+    """The defect: a daemon whose group lookup failed ran normally and wrote
+    output nobody could read.
+
+    MEASURED ON THE HOST, 2026-09-01. `Runner` resolves `qfrun`/`qfclient` ONCE
+    at construction; `_gid` returned None on that start; `prepare_run_dir`
+    skipped the `os.chown` because the gid was None, and did so in silence. The
+    result was 379 of 380 run directories owned `qfd:qfd` instead of
+    `qfd:qfclient`, `qf logs` returning EACCES to `research` for every one of
+    them, and no line in any journal. One start in four resolved correctly,
+    which is why it read as "fixed" after a single successful check.
+
+    Nothing here asserts WHY the lookup failed -- that was never established.
+    These assert that it cannot fail quietly again.
+    """
+
+    def setUp(self):
+        self._env = {k: os.environ.get(k) for k in
+                     ("QFD_ALLOW_UNGROUPED", "QFD_QFCLIENT_GID",
+                      "QFD_QFRUN_GID")}
+        for k in self._env:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_a_missing_qfclient_refuses_to_start(self):
+        with self.assertRaises(SystemExit) as caught:
+            qfd.require_run_dir_gids(10001, None)
+        message = str(caught.exception)
+        self.assertIn("qfclient", message)
+        # The message must name the remedies, because the operator hitting this
+        # is looking at a daemon that used to start.
+        self.assertIn("QFD_QFCLIENT_GID", message)
+        self.assertIn("QFD_ALLOW_UNGROUPED", message)
+
+    def test_a_missing_qfrun_refuses_to_start(self):
+        with self.assertRaises(SystemExit):
+            qfd.require_run_dir_gids(None, 10002)
+
+    def test_both_present_is_silent(self):
+        self.assertIsNone(qfd.require_run_dir_gids(10001, 10002))
+
+    def test_the_opt_out_is_explicit_and_not_the_default(self):
+        os.environ["QFD_ALLOW_UNGROUPED"] = "1"
+        self.assertIsNone(qfd.require_run_dir_gids(None, None))
+        # Anything other than exactly "1" is not an opt-out: a stray
+        # QFD_ALLOW_UNGROUPED=0 must not disable the check.
+        os.environ["QFD_ALLOW_UNGROUPED"] = "0"
+        with self.assertRaises(SystemExit):
+            qfd.require_run_dir_gids(None, None)
+
+    def test_the_override_is_only_consulted_after_the_lookup_fails(self):
+        # A group that DOES resolve must ignore the override, or the escape
+        # hatch becomes a way to silently reassign ownership.
+        import grp
+        real = grp.getgrnam
+        grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=4242)
+        try:
+            os.environ["QFD_QFCLIENT_GID"] = "9999"
+            self.assertEqual(qfd._gid("qfclient"), 4242)
+        finally:
+            grp.getgrnam = real
+
+    def test_the_override_supplies_a_gid_when_the_lookup_fails(self):
+        import grp
+        real = grp.getgrnam
+
+        def missing(name):
+            raise KeyError(name)
+
+        grp.getgrnam = missing
+        try:
+            os.environ["QFD_QFCLIENT_GID"] = "10002"
+            self.assertEqual(qfd._gid("qfclient"), 10002)
+            # Garbage must not become a gid: chowning to a wrong group is worse
+            # than not chowning, and None still reaches the startup refusal.
+            for bad in ("not-a-number", "-5", ""):
+                os.environ["QFD_QFCLIENT_GID"] = bad
+                self.assertIsNone(qfd._gid("qfclient"))
+        finally:
+            grp.getgrnam = real
+
+    def test_prepare_run_dir_applies_the_group_it_is_given(self):
+        # The mechanism the startup check protects: OWNERSHIP names a group per
+        # subdirectory and every one of them must reach os.chown.
+        wanted = {name: group for name, group, _ in qfd.Runner.OWNERSHIP}
+        self.assertEqual(wanted[None], "qfclient")
+        self.assertEqual(wanted["logs"], "qfclient")
+        self.assertEqual(wanted["artifacts"], "qfclient")
+        self.assertEqual(wanted["out"], "qfrun")
+
+        chowned = {}
+        real = os.chown
+        os.chown = lambda path, uid, gid: chowned.__setitem__(
+            os.path.basename(path), gid)
+        try:
+            with tempfile.TemporaryDirectory() as base:
+                runner = qfd.Runner.__new__(qfd.Runner)
+                runner.run_dir = lambda run_id: os.path.join(base, run_id)
+                runner.prepare_run_dir("probe-x", qfrun_gid=10001,
+                                       qfclient_gid=10002)
+        finally:
+            os.chown = real
+        self.assertEqual(chowned.get("logs"), 10002)
+        self.assertEqual(chowned.get("artifacts"), 10002)
+        self.assertEqual(chowned.get("out"), 10001)
+        self.assertEqual(chowned.get("probe-x"), 10002)

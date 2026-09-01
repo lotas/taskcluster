@@ -1379,18 +1379,86 @@ def _is_sha(value):
     return len(value) == 40 and all(c in "0123456789abcdef" for c in value)
 
 
+# An explicit override per group, for the failure this exists to survive.
+# MEASURED 2026-09-01: of four daemon starts, ONE resolved `qfclient` and three
+# did not, on a host where `getent group qfclient` and `sudo -u qfd python3 -c
+# "grp.getgrnam(...)"` both answered 10002 every time. The cause of the failed
+# lookups was never established -- which is the point. `Runner` resolves these
+# once at construction, so a single bad start leaves every run directory that
+# daemon creates group `qfd` instead of `qfclient`, and `qf logs` then returns
+# EACCES to `research` for the whole lifetime of the process. 379 of 380 run
+# directories on the host were in that state and nothing had reported it.
+_GID_ENV = {"qfrun": "QFD_QFRUN_GID", "qfclient": "QFD_QFCLIENT_GID",
+            "qfheavy": "QFD_QFHEAVY_GID", "qfeval": "QFD_QFEVAL_GID"}
+
+
 def _gid(name):
-    """The gid of a host group, or None when it does not exist.
+    """The gid of a host group, or None when it cannot be resolved.
 
     None means "leave ownership alone", which is right for the unit tests and in
     development. In production both groups exist -- `phase2-setup.sh
     dispatch-user` creates them and dies if `qfrun` is not gid 10001, because
-    the trusted image bakes 10001 in.
+    the trusted image bakes 10001 in. `require_run_dir_gids` turns a None for
+    `qfrun` or `qfclient` into a refusal to start, so production never runs on
+    the degraded path; `qfeval` is allowed to be absent by design.
+
+    The env override is consulted only AFTER the name lookup fails, so it
+    cannot mask a correct answer -- it is the escape hatch for a host where the
+    lookup is unreliable, not a way to reassign a group.
     """
     try:
         return grp.getgrnam(name).gr_gid
     except KeyError:
+        pass
+    raw = os.environ.get(_GID_ENV.get(name, ""), "").strip()
+    if not raw:
         return None
+    try:
+        value = int(raw)
+    except ValueError:
+        log.error("%s=%r is not an integer; ignoring", _GID_ENV[name], raw)
+        return None
+    if value < 0:
+        log.error("%s=%d is negative; ignoring", _GID_ENV[name], value)
+        return None
+    log.warning("group %r did not resolve; using %s=%d",
+                name, _GID_ENV[name], value)
+    return value
+
+
+def require_run_dir_gids(qfrun_gid, qfclient_gid):
+    """Refuse to start when a group every run directory depends on is missing.
+
+    FAIL CLOSED, and the reason is that the open failure is invisible. A daemon
+    whose `qfclient` lookup came back None still starts, still runs jobs, still
+    reports them SUCCEEDED -- and every artifact and log it writes is
+    unreadable by the only account meant to read them. The research loop's
+    leader diagnoses its own failures with `qf logs`, so the loop goes blind
+    without anything appearing in a journal.
+
+    `QFD_ALLOW_UNGROUPED=1` is the opt-out for a dev host or a test that has
+    neither group; it is deliberately not the default, because the whole defect
+    was a default that degraded quietly.
+    """
+    missing = [name for name, value in (("qfrun", qfrun_gid),
+                                        ("qfclient", qfclient_gid))
+               if value is None]
+    if not missing:
+        return
+    if os.environ.get("QFD_ALLOW_UNGROUPED") == "1":
+        log.warning("starting without %s: run directories will keep this"
+                    " process's own group and `qf logs` will fail for"
+                    " clients (QFD_ALLOW_UNGROUPED=1)", ", ".join(missing))
+        return
+    raise SystemExit(
+        f"qfd: cannot resolve host group(s) {', '.join(missing)}.\n"
+        f"Every run directory would be created with this process's own group,"
+        f" and `qf logs` would return EACCES to every client for as long as"
+        f" this daemon runs.\n"
+        f"  * missing groups:   sudo phase2-setup.sh dispatch-user\n"
+        f"  * present but not resolving here: set "
+        f"{' / '.join(_GID_ENV[n] for n in missing)} in qf-dispatch.service\n"
+        f"  * dev host with neither group: QFD_ALLOW_UNGROUPED=1")
 
 
 def dir_size_mb(path):
@@ -5025,6 +5093,9 @@ def main(argv=None):                                  # pragma: no cover
 
     disp = Dispatcher(cfg, db, docker=docker, src=src)
     runner = Runner(cfg, db, disp, docker=docker, src=src)
+    # BEFORE any worker starts, because the alternative is a daemon that runs
+    # normally and writes unreadable output for its whole lifetime.
+    require_run_dir_gids(runner.qfrun_gid, runner.qfclient_gid)
 
     # STARTUP RESOURCE RECONSTRUCTION, before any worker starts. Admitted memory
     # and the flock are both process-local, so a restart must rebuild them from
