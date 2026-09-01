@@ -729,5 +729,33 @@ class MaeIsAnImprovementNotAQuantity(unittest.TestCase):
         self.assertEqual(front["within_2x"]["config"], CFG_QCTX)
 
 
+class EvidenceForStructuralClaims(unittest.TestCase):
+    """The copilot must be able to check claims about probes, not just metrics.
+
+    Action-1 write-ups are mostly about the probe/evaluation relationship -- how
+    many evaluations re-score one probe, which probes carry no scoreboard, how
+    many distinct models the rows collapse to. The first live entry was escalated
+    over such a count (claimed six re-evaluations, actual three), and the copilot
+    could not have checked it: the JSON carried no probe ids.
+    """
+
+    def test_the_probe_id_reaches_the_report(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        entry = F.build(rows, EXTRACTS, CONTRACTS)["series"][0]
+        self.assertEqual(entry["rows"][0]["probe"], REF_PROBE)
+
+    def test_two_evaluations_of_one_probe_are_both_visible(self):
+        # This is the shape the escalated count was about: the same probe scored
+        # twice, once without a scoreboard.
+        rows = [row("eA", REF_PROBE, CFG_REF, {}, {}),
+                row("eB", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        entry = F.build(rows, EXTRACTS, CONTRACTS)["series"][0]
+        probes = [r["probe"] for r in entry["rows"]]
+        self.assertEqual(probes, [REF_PROBE, REF_PROBE])
+        unscored = [r for r in entry["rows"] if not r["metrics"]]
+        self.assertEqual(len(unscored), 1)
+        self.assertEqual(unscored[0]["evaluation"], "eA")
+
+
 if __name__ == "__main__":
     unittest.main()

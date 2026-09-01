@@ -552,7 +552,15 @@ def _series_out(key, entry):
         if entry["holdout"] else None,
         "runs": len(entry["rows"]),
         "frontier": entry["frontier"],
+        # `probe` IS CARRIED, because the claims that action 1 produces are
+        # mostly ABOUT the probe/evaluation relationship: which evaluations
+        # re-score the same probe, which probes have no scoreboard, how many
+        # distinct models the rows collapse to. The copilot is told to reject a
+        # figure it cannot check, and without the probe id it could not check any
+        # of those -- the first live entry was escalated over exactly such a
+        # count (claimed six re-evaluations, actual three).
         "rows": [{"evaluation": r.get("evaluation", ""),
+                  "probe": r.get("probe", ""),
                   "when": r.get("when", ""),
                   "config": r["config_label"],
                   "verdict": r.get("verdict", "-"),
