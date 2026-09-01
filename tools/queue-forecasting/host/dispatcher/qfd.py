@@ -781,12 +781,29 @@ class BoundedWriter:
 
     MARKER = b"\n[qfd] log truncated at cap; container killed\n"
 
+    # 0640: readable by the directory's group, which `prepare_run_dir` sets to
+    # `qfclient` precisely so `qf logs` can read these files. SET EXPLICITLY
+    # rather than inherited from the unit's umask, because a `umask 077` service
+    # produces 0600 and `qf logs` then fails with EACCES for every client -- the
+    # directory being group-readable is not enough if the file is not.
+    LOG_MODE = 0o640
+
     def __init__(self, path, cap_bytes):
         self.path = path
         self.cap = cap_bytes
         self.written = 0
         self.overflowed = False
         self._fh = open(path, "wb")
+        # AFTER open, on the descriptor: `os.chmod(path, ...)` would race with
+        # anything that replaced the file between the two calls, and there is no
+        # reason to name the path twice.
+        try:
+            os.fchmod(self._fh.fileno(), self.LOG_MODE)
+        except OSError as e:
+            # NOT FATAL. An unreadable log is a diagnosis problem; a run that
+            # refuses to start because of one is an availability problem, and
+            # the second is worse. Said out loud so it is not silent.
+            log.warning("cannot chmod %s to %04o: %s", path, self.LOG_MODE, e)
 
     def write(self, chunk):
         if self.overflowed:
@@ -2450,7 +2467,17 @@ class Runner:
         # shape would just be something a reader has to have explained.
         ("data",      "qfrun",    0o2770),
         ("artifacts", "qfclient", 0o750),   # the only thing a client reads
-        ("logs",      "qfclient", 0o750),   # `qf logs` reads the file directly
+        # SETGID, and it is load-bearing for the same reason it is on `out/`:
+        # without it a file created here takes qfd's PRIMARY group (`qfd`), not
+        # this directory's `qfclient` -- so `qf logs` got EACCES on every file
+        # while the directory itself looked correctly configured. The README
+        # records the identical trap for `/var/lib/qf-locks/intent.d`; this was
+        # the third instance.
+        #
+        # The group is only half of it: `BoundedWriter.LOG_MODE` sets 0640 on the
+        # file, because setgid fixes ownership and does nothing about a `umask
+        # 077` that would still produce 0600.
+        ("logs",      "qfclient", 0o2750),  # `qf logs` reads the file directly
     )
 
     def prepare_run_dir(self, run_id, *, qfrun_gid=None, qfclient_gid=None):

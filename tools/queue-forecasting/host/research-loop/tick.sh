@@ -181,7 +181,16 @@ if ! qf list --limit 500 --json >"$JOBS_JSON" 2>"$CTX/jobs.err"; then
   # an unenforced budget on an unattended loop is the whole risk.
   die "cannot read \`qf list\`, so the budget cannot be enforced: $(head -c 300 "$CTX/jobs.err")"
 fi
-read -r PROBES_TODAY EXTRACTS_TODAY <<EOF
+# JOBS STILL IN FLIGHT. The tick's header used to claim the leader "blocks on
+# `experiment.py run` for up to 90 minutes"; it does not. The leader is an agent
+# with its own tool timeouts, so it can submit a probe, return, and leave the
+# tick to exit while the dispatcher trains for half an hour. Two consecutive
+# ticks then found nothing to do and recorded nothing.
+#
+# So the leader is TOLD what is already running. Without it, action 4 looks
+# available while an experiment is mid-flight, and the only thing stopping a
+# second submission is the daily budget.
+read -r PROBES_TODAY EXTRACTS_TODAY IN_FLIGHT <<EOF
 $(python3 - "$JOBS_JSON" "$TODAY" <<'PY2'
 import json, sys
 jobs = (json.load(open(sys.argv[1])) or {}).get("jobs") or []
@@ -189,7 +198,14 @@ today = sys.argv[2]
 def n(kind):
     return sum(1 for j in jobs if j.get("kind") == kind
                and (j.get("submitted_at") or "").startswith(today))
-print(n("probe"), n("extract"))
+# `store.py:27`. Anything NOT terminal is still the dispatcher's business --
+# including BUILDING, whose omission from a state set has caused three silent
+# bugs in this project already.
+TERMINAL = {"SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED", "REFUSED"}
+live = sum(1 for j in jobs
+           if j.get("kind") in ("probe", "extract")
+           and j.get("state") not in TERMINAL)
+print(n("probe"), n("extract"), live)
 PY2
 )
 EOF
@@ -282,6 +298,15 @@ PENDING="$JOURNAL/PENDING.md"
   echo "Probes submitted today: $PROBES_TODAY of $MAX_RUNS."
   echo "Extracts submitted today: $EXTRACTS_TODAY of $MAX_EXTRACTS."
   echo "Ticks today: $TICKS of $MAX_TICKS."
+  if [ "${IN_FLIGHT:-0}" -gt 0 ]; then
+    echo
+    echo "**${IN_FLIGHT} job(s) are STILL RUNNING from an earlier tick.**"
+    echo "Actions 4 and 5 are unavailable: do not submit another experiment"
+    echo "while one is in flight. If nothing else applies, that is action 6 --"
+    echo "write the paragraph to your journal entry as usual."
+    qf list --limit 20 2>/dev/null | awk '$2 !~ /SUCCEEDED|FAILED|TIMEOUT|CANCELLED|REFUSED/ {print "  " $0}' \
+      || true
+  fi
   [ "$NO_MORE_EXTRACTS" = 0 ] \
     || echo "**The extract budget is spent: action 5 is unavailable this tick.**"
   echo

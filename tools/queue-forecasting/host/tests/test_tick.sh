@@ -922,6 +922,60 @@ printf '%s' "$out" | grep -q "non-negative integer" \
   && bad "an empty knob should fall back to the default, not abort -- $out" \
   || ok "an empty knob falls back to its default"
 
+# --------------------------------------------------------------------------
+setup inflight
+# A probe left RUNNING by an earlier tick. The leader must be TOLD -- the tick
+# does not hold across an in-flight experiment (the leader is an agent with its
+# own tool timeouts, so it submits, returns, and the tick exits), and without
+# this action 4 looks available while one is already training.
+cat >"$W/bin/qf" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" != "list" ] || python3 - "$TODAY" <<'PYL'
+import json, sys
+today = sys.argv[1]
+print(json.dumps({"jobs": [
+  {"run_id": "probe-live", "kind": "probe", "state": "RUNNING",
+   "submitted_at": f"{today}T09:00:00Z"},
+  {"run_id": "probe-done", "kind": "probe", "state": "SUCCEEDED",
+   "submitted_at": f"{today}T08:00:00Z"}]}))
+PYL
+EOF
+chmod +x "$W/bin/qf"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick)"
+present_in "$W/leader_prompt" "STILL RUNNING from an earlier tick" \
+  "the leader is told when a job is still in flight"
+present_in "$W/leader_prompt" "Actions 4 and 5 are unavailable" \
+  "...and told not to submit another experiment"
+
+# --------------------------------------------------------------------------
+setup noinflight
+# Nothing running: the warning must NOT appear, or it would suppress action 4
+# on every tick.
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick)"
+absent_from "$W/leader_prompt" "STILL RUNNING from an earlier tick" \
+  "no in-flight warning when nothing is running"
+
+# --------------------------------------------------------------------------
+setup inflightbuilding
+# BUILDING is not terminal. Its omission from a state set has caused three
+# silent bugs in this project already (store.py:27), so it is asserted.
+cat >"$W/bin/qf" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" != "list" ] || python3 - "$TODAY" <<'PYB'
+import json, sys
+print(json.dumps({"jobs": [
+  {"run_id": "probe-building", "kind": "probe", "state": "BUILDING",
+   "submitted_at": f"{sys.argv[1]}T09:00:00Z"}]}))
+PYB
+EOF
+chmod +x "$W/bin/qf"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick)"
+present_in "$W/leader_prompt" "STILL RUNNING from an earlier tick" \
+  "a BUILDING job counts as in flight"
+
 echo
 echo "pass=$pass fail=$fail skip=$skip"
 [ "$fail" = 0 ]

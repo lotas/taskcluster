@@ -3601,3 +3601,63 @@ class TestRound6TheHandoffChildIsManaged(Round6Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogsAreReadableByClients(unittest.TestCase):
+    """`qf logs` got EACCES on every file while its directory looked correct.
+
+    `OWNERSHIP` chowns `logs/` to `qfclient` with the comment "`qf logs` reads
+    the file directly", and `research` is in `qfclient` -- but the directory had
+    no setgid bit, so a file created inside took qfd's PRIMARY group (`qfd`)
+    instead. `BoundedWriter`'s plain `open(path, "wb")` then took its mode from
+    the unit's umask on top of that. Both halves are needed and both are checked
+    here; the README records the identical setgid trap for
+    `/var/lib/qf-locks/intent.d`, and this was the third instance.
+    """
+
+    def test_the_logs_directory_carries_setgid(self):
+        modes = {name: mode for name, _group, mode in qfd.Runner.OWNERSHIP}
+        self.assertEqual(modes["logs"] & 0o2000, 0o2000,
+                         "logs/ must be setgid or its files inherit qfd's"
+                         " primary group and no client can read them")
+        self.assertEqual(modes["logs"] & 0o777, 0o750)
+
+    def test_the_logs_directory_is_group_qfclient(self):
+        groups = {name: group for name, group, _mode in qfd.Runner.OWNERSHIP}
+        self.assertEqual(groups["logs"], "qfclient")
+
+    def test_a_log_file_is_group_readable_under_a_hostile_umask(self):
+        import stat
+        import tempfile
+        root = tempfile.mkdtemp()
+        previous = os.umask(0o077)          # the mode that produced the bug
+        try:
+            path = os.path.join(root, "stdout.log")
+            writer = qfd.BoundedWriter(path, 4096)
+            writer.write(b"hello\n")
+            mode = os.stat(path).st_mode
+            self.assertTrue(mode & stat.S_IRGRP,
+                            f"log file is {oct(mode & 0o777)}; a client in the"
+                            f" directory's group still cannot read it")
+            self.assertEqual(mode & 0o777, 0o640)
+        finally:
+            os.umask(previous)
+
+    def test_a_chmod_failure_does_not_kill_the_run(self):
+        # An unreadable log is a diagnosis problem; a run that refuses to start
+        # over one is an availability problem, and the second is worse.
+        import tempfile
+        root = tempfile.mkdtemp()
+        path = os.path.join(root, "stdout.log")
+        real = os.fchmod
+
+        def refuse(fd, mode):
+            raise OSError(1, "operation not permitted")
+
+        os.fchmod = refuse
+        try:
+            writer = qfd.BoundedWriter(path, 4096)
+            payload = b"still works\n"
+            self.assertEqual(writer.write(payload), len(payload))
+        finally:
+            os.fchmod = real

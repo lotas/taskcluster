@@ -31,8 +31,15 @@ problem you are here to stop making worse.
    extract request. Stop. (Unavailable once the extract budget is spent — the
    context above says so when it is. Extracts are capped at one per day because
    each is a long read against the production database.)
-6. **Nothing above applies.** Write one paragraph saying so and what would
-   unblock the loop. Stop.
+6. **Nothing above applies** — including when an experiment you started earlier
+   is still running. Write one paragraph saying so and what would unblock the
+   loop. Stop.
+
+**Waiting is action 6, and action 6 still writes an entry.** Two ticks were lost
+this way: the leader printed "the probe is training, I'll write it up when it
+lands" to its own output and wrote no file, so both ticks recorded nothing and
+the reasoning went to a log nobody keeps. Your final message is **not** the
+entry — only `journal/PENDING.md` is.
 
 ## How to run an experiment
 
@@ -112,11 +119,19 @@ promotion candidate, and say so in the write-up if you run one.
 - You may write **trainer configs** in your own checkout. One variable per
   config. A config that changes two things cannot be attributed.
 - One action. Do not start a second experiment because the first finished.
+- **`experiment.py run` outlives your tool timeout.** A probe takes tens of
+  minutes and the command will not return inside one tool call. That is expected
+  and the run is NOT lost -- the dispatcher owns it, and `qf status <run-id>`
+  reports it. Do not resubmit, and do not treat the timeout as a failure: record
+  what you submitted, with its run id, and stop. A later tick writes up the
+  result.
 
 ## Your output
 
-Write your entry to `journal/PENDING.md` in your checkout. Do not commit; the
-tick commits it after a second agent checks it. Structure:
+Write your entry to `journal/PENDING.md` in your checkout. **Every tick that is
+not a hard failure ends with that file written** — including a tick whose only
+finding is that an experiment is still running. Do not commit; the tick commits
+it after a second agent checks it. Structure:
 
 ```markdown
 # <one-line title>

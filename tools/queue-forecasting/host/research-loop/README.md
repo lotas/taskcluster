@@ -300,6 +300,38 @@ BH-FDR, disjoint-day decomposition), which is not built. It buys the one propert
 an unattended loop cannot do without — a win has to repeat on data it was not
 selected on — and buys it with arithmetic rather than a framework.
 
+## The tick does not hold across an in-flight experiment
+
+`tick.sh`'s design assumed the leader blocks on `experiment.py run` for the whole
+training. It does not: the leader is an agent with its own tool timeouts, so it
+submits a probe, returns, and the tick exits while the dispatcher trains for half
+an hour. The run is not lost — the dispatcher owns it — but "one action per tick"
+is weaker than it reads.
+
+So the context now reports jobs in a non-terminal state (`store.py:27`, and
+`BUILDING` counts — its omission from a state set has caused three silent bugs
+here already) and tells the leader that actions 4 and 5 are unavailable while one
+is in flight. The daily probe budget was the only thing preventing a second
+submission before.
+
+Related: **waiting is action 6, and action 6 still writes an entry.** Two ticks
+were lost printing "the probe is training, I'll write it up when it lands" to the
+leader's own output and writing no file — so both recorded nothing and the
+reasoning went to a log nobody keeps. The prompt now says the final message is
+not the entry, and that a tool timeout on `experiment.py run` is expected rather
+than a failure to be retried.
+
+## Deploying restarts the dispatcher, which kills in-flight probes
+
+`mirror-refresh` runs `systemctl restart qf-dispatch`, and qfd's startup recovery
+fails any job it finds LEASED or RUNNING with no live container
+(`qfd.py:4900-4908`, `error_class: reclaimed_at_startup`). A 31-minute hazard run
+was destroyed this way on 2026-09-01 — no OOM, no timeout, no exit code, just a
+deploy landing mid-experiment.
+
+`touch ~research/qf-research/PAUSE`, wait for the heavy lane to clear
+(`qf list` shows no non-terminal probe), then deploy.
+
 ## The prompt goes on stdin
 
 Both CLIs are fed their prompt on **stdin**, assembled into a file under the
