@@ -22,6 +22,7 @@ nowhere.
 | `verify-prompt.md` | the copilot's instructions — six ways to reject a claim |
 | `prereg.py` | the pre-registration format, written by `experiment.py`, read by `frontier.py` |
 | `frontier.py` | the progress artifact: per-series frontier, claims, confirm gate |
+| `agent-env.sh` | puts the nvm-installed CLIs and the proxy on PATH for a non-interactive shell |
 | `install.sh` | turns the loop on and off |
 | `qf-tick.{service,timer}` | hourly, as `research` |
 
@@ -220,6 +221,38 @@ This is deliberately cheaper than the design's Phase 3 (moving-block bootstrap,
 BH-FDR, disjoint-day decomposition), which is not built. It buys the one property
 an unattended loop cannot do without — a win has to repeat on data it was not
 selected on — and buys it with arithmetic rather than a framework.
+
+## `which claude` is not the question
+
+The first `install.sh once` on the host aborted with ``no `claude` on PATH`` while
+`which claude` as the research user printed
+`/home/research/.nvm/versions/node/v24.19.0/bin/claude`. Both were correct.
+
+nvm appends its init to `~/.bashrc`, and Debian's `~/.bashrc` opens with
+`case $- in *i*) ;; *) return;; esac`. A **login** shell is not necessarily an
+**interactive** one: `bash -lc` runs `~/.profile`, which sources `~/.bashrc`,
+which returns immediately. The CLIs are installed, on disk, and unreachable — and
+that reads as "not installed". `phase0-setup.sh:147` already had `NVM_PRELUDE`
+for its own invocations; nothing in the loop went through it.
+
+`agent-env.sh` is that one definition, sourced by `tick.sh` (so the timer,
+`install.sh once` and a hand-run tick all agree) and by `install.sh on`'s
+preflight (so it tests the shell the tick will actually use). It resolves the
+newest installed node by directory listing with `sort -V` — `nvm` is a shell
+function that does not exist in a script, and a hardcoded version breaks on the
+next `nvm install`.
+
+An inherited `NVM_DIR` is honoured **only if it is under `$HOME`**. A relocated
+nvm is set that way in the user's own profile; a value pointing into another home
+(via `sudo -E` or an `env_keep` entry) is not a hint but a wrong answer, and its
+symptom is exactly the abort above.
+
+To tell the two shells apart when diagnosing:
+
+```bash
+sudo -H -u research bash -lc 'command -v claude'   # what the tick sees
+sudo -H -u research bash -ic 'command -v claude'   # what you see over ssh
+```
 
 ## Running it
 

@@ -67,6 +67,13 @@ DRY_RUN=0
 say() { printf '[tick %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { say "ABORT: $*" >&2; exit 1; }
 
+# THE AGENT CLIs AND THE PROXY, before anything looks for them. Sourced here --
+# the single entry point -- so the timer, `install.sh once` and a hand-run tick
+# all get the same environment. See the file for why `which claude` succeeding in
+# an ssh session says nothing about whether this shell can find it.
+# shellcheck disable=SC1091
+[ ! -r "$HERE/agent-env.sh" ] || . "$HERE/agent-env.sh"
+
 # --------------------------------------------------------------------------
 # Guards. Every one of these is a way an unattended loop goes wrong.
 # --------------------------------------------------------------------------
@@ -288,7 +295,16 @@ fi
 # --------------------------------------------------------------------------
 # The leader.
 # --------------------------------------------------------------------------
-command -v claude >/dev/null 2>&1 || die "no \`claude\` on PATH (see phase0-setup.sh)"
+if ! command -v claude >/dev/null 2>&1; then
+  die "no \`claude\` on PATH.
+  This is almost never a missing install -- check the NON-INTERACTIVE path,
+  which is not the one an ssh session shows you:
+      sudo -H -u research bash -lc 'command -v claude'   # what the tick sees
+      sudo -H -u research bash -ic 'command -v claude'   # what you see
+  If the second finds it and the first does not, nvm's init is in ~/.bashrc,
+  which returns early for non-interactive shells. $HERE/agent-env.sh exists to
+  fix exactly that; check it is readable by the research user."
+fi
 say "leader starting"
 LEADER_LOG="$CTX/leader.log"
 # PATH="$LEADER_PATH": when the extract budget is spent this puts the refusing
@@ -351,6 +367,7 @@ STALE="${STALE:-}"
 if ! command -v codex >/dev/null 2>&1; then
   say "no \`codex\` on PATH: recording nothing, because an unverified claim is"
   say "  what this step exists to prevent. Escalating instead."
+  say "  (If \`bash -ic 'command -v codex'\` finds it, see agent-env.sh.)"
   VERDICT="DISAGREE"
   REASON="codex is not installed, so the claim could not be verified"
 else

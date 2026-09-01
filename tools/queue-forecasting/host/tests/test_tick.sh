@@ -603,6 +603,98 @@ EOF
                || bad "the commit holds only the verified file (got $n)"
 fi
 
+# --------------------------------------------------------------------------
+setup nvmonly
+# THE REAL 2026-09-01 FAILURE. Both CLIs installed via nvm and reachable from an
+# interactive shell; the tick aborted with "no `claude` on PATH". nvm's init is
+# in ~/.bashrc, which returns early for non-interactive shells, so `bash -lc`
+# never sees it. Here the stubs exist ONLY under $HOME/.nvm and nowhere on PATH.
+NVMBIN="$W/.nvm/versions/node/v24.19.0/bin"
+mkdir -p "$NVMBIN"
+mv "$W/bin/claude" "$NVMBIN/claude"
+mv "$W/bin/codex" "$NVMBIN/codex"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" run_tick)"
+printf '%s' "$out" | grep -q "no \`claude\` on PATH" \
+  && bad "agent-env.sh did not put the nvm bin dir on PATH -- $out" \
+  || ok "CLIs installed only under ~/.nvm are found (the 09-01 abort)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "the tick completes end to end with nvm-only CLIs" \
+  || bad "the tick completes with nvm-only CLIs -- $out"
+
+# --------------------------------------------------------------------------
+setup nvmnewest
+# Two node versions installed: the NEWEST must win, and `sort -V` is why -- a
+# lexical sort puts v9 above v24.
+mkdir -p "$W/.nvm/versions/node/v9.0.0/bin" \
+         "$W/.nvm/versions/node/v24.19.0/bin"
+cp "$W/bin/claude" "$W/.nvm/versions/node/v24.19.0/bin/claude"
+cp "$W/bin/codex" "$W/.nvm/versions/node/v24.19.0/bin/codex"
+cat >"$W/.nvm/versions/node/v9.0.0/bin/claude" <<EOF
+#!/usr/bin/env bash
+echo "WRONG NODE VERSION" >&2
+exit 9
+EOF
+chmod +x "$W/.nvm/versions/node/v9.0.0/bin/claude"
+rm -f "$W/bin/claude" "$W/bin/codex"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" run_tick)"
+printf '%s' "$out" | grep -q "WRONG NODE VERSION" \
+  && bad "the OLDEST node was chosen -- $out" \
+  || ok "the newest installed node wins (sort -V, not lexical)"
+
+# --------------------------------------------------------------------------
+setup pathnogrowth
+# tick.sh sources agent-env.sh and the leader inherits PATH; an unguarded
+# prepend would grow it every generation.
+NVMBIN="$W/.nvm/versions/node/v24.19.0/bin"
+mkdir -p "$NVMBIN"
+cp "$W/bin/codex" "$NVMBIN/codex"
+cat >"$NVMBIN/claude" <<EOF
+#!/usr/bin/env bash
+# Count how many times the nvm bin dir appears in the inherited PATH.
+printf '%s' "\$PATH" | tr ':' '\n' | grep -cxF "$NVMBIN" > "$W/path_count"
+echo "# a claim" > "$W/research/journal/PENDING.md"
+echo "leader done"
+EOF
+chmod +x "$NVMBIN/claude"
+rm -f "$W/bin/claude"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" run_tick)"
+[ "$(cat "$W/path_count" 2>/dev/null)" = 1 ] \
+  && ok "the nvm bin dir appears exactly once in the leader's PATH" \
+  || bad "PATH duplication: count=$(cat "$W/path_count" 2>/dev/null) -- $out"
+
+# --------------------------------------------------------------------------
+setup leakednvmdir
+# An operator's NVM_DIR carried into the research shell (sudo -E, env_keep, or a
+# hand-run tick). Pointing at another home must NOT be honoured, or the symptom
+# is "no claude on PATH" for a CLI that is installed.
+NVMBIN="$W/.nvm/versions/node/v24.19.0/bin"
+# OUTSIDE $HOME on purpose -- that is what makes it a leak. A path UNDER $HOME
+# is a legitimately relocated nvm and is honoured (next case).
+mkdir -p "$NVMBIN" "$ROOT/otherhome/.nvm/versions/node/v24.19.0/bin"
+mv "$W/bin/claude" "$NVMBIN/claude"
+mv "$W/bin/codex" "$NVMBIN/codex"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" NVM_DIR="$ROOT/otherhome/.nvm" run_tick)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "a leaked NVM_DIR from another home is ignored" \
+  || bad "a leaked NVM_DIR is ignored -- $out"
+
+# --------------------------------------------------------------------------
+setup relocatednvm
+# A legitimately relocated nvm, set by the user's own profile: still honoured,
+# because it is under $HOME.
+mkdir -p "$W/alt-nvm/versions/node/v24.19.0/bin"
+mv "$W/bin/claude" "$W/alt-nvm/versions/node/v24.19.0/bin/claude"
+mv "$W/bin/codex" "$W/alt-nvm/versions/node/v24.19.0/bin/codex"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" NVM_DIR="$W/alt-nvm" run_tick)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "a relocated nvm under \$HOME is honoured" \
+  || bad "a relocated nvm under \$HOME is honoured -- $out"
+
 echo
 echo "pass=$pass fail=$fail skip=$skip"
 [ "$fail" = 0 ]

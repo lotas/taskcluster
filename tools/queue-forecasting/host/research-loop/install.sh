@@ -38,9 +38,17 @@ on)
   # BOTH CLIs CHECKED AS THE IDENTITY THAT WILL RUN THEM, not as root. A CLI on
   # root's PATH and not on the research user's is exactly the failure this whole
   # block exists for, and `command -v` here would report it as fine.
+  # CHECKED THROUGH `agent-env.sh`, exactly as the tick will resolve them. A bare
+  # `bash -lc "command -v claude"` reported a missing CLI for a CLI that was
+  # installed: nvm's init lives in ~/.bashrc, which returns early in a
+  # non-interactive shell, so this check has to load the same environment the
+  # tick loads or it tests the wrong shell.
   for cli in claude codex; do
-    sudo -H -u research bash -lc "command -v $cli" >/dev/null 2>&1 \
-      || die "the research user has no \`$cli\` (see phase0-setup.sh)"
+    sudo -H -u research bash -lc \
+      ". '$TRUSTED/agent-env.sh'; command -v $cli" >/dev/null 2>&1 \
+      || die "the research user cannot reach \`$cli\` even with
+  $TRUSTED/agent-env.sh loaded. Install it (phase0-setup.sh agents) or check
+  that $TRUSTED/agent-env.sh is readable by the research user."
   done
   # EVERY STEP CHECKED. There is no `set -e` here, so an unchecked `systemctl`
   # let a D-Bus failure end with a cheerful "The loop is live" -- or, in `off`,
