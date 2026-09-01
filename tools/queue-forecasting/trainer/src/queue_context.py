@@ -14,17 +14,23 @@ deadline-exceeded before claim), ``exit = resolved_at``; else it is still
 pending. A reference run ``s`` is "pending at T" iff
 ``s.pending_at <= T and (exit is NULL or exit > T)``.
 
-Two implementations live here and MUST agree byte-for-byte:
+Three implementations live here and MUST agree byte-for-byte:
 
 * ``_add_queue_context_features_masked`` -- the original, per-target numpy-mask
   reference. O(targets x queue-size). Retained as the correctness oracle and is
   exercised by the equivalence test; do not change its logic.
-* ``add_queue_context_features`` -- an event-sweep implementation that produces
-  identical output in ~O((n+m) log n) per queue. This is the production path.
+* ``_sweep_queue_rowwise`` -- the event sweep with one binary search per target
+  ROW. ~O((n+m) log n) but with a ~150-searchsorted-per-row constant that made
+  a live 6M-row cohort take 50 minutes. Retained as the second reference,
+  because it is testable at scales the O(n x m) oracle cannot reach.
+* ``_sweep_queue`` -- the same event sweep with every binary search issued once
+  per (queue, rank) over the whole target VECTOR. This is the production path.
+  See its docstring for the measurements.
 """
 
 from __future__ import annotations
 
+import bisect
 import time
 
 import numpy as np
@@ -329,7 +335,7 @@ def _range_count(sorted_arr: np.ndarray, lo_excl: float, hi_incl: float) -> int:
     return right - left
 
 
-def _sweep_queue(
+def _sweep_queue_rowwise(
     g: pd.DataFrame,
     positions: list[int],
     out_t_ns: np.ndarray,
@@ -651,6 +657,384 @@ def _sweep_queue(
         if np.isfinite(queue_pending) and queue_pending > 0:
             n_pending_all = n_higher + n_lower + n_equal
             coverage_arr[pos] = (n_pending_all + 1) / queue_pending
+
+
+def _range_count_vec(
+    sorted_arr: np.ndarray, lo_excl: np.ndarray, hi_incl: np.ndarray
+) -> np.ndarray:
+    """Vector form of `_range_count`: count of lo_excl < v <= hi_incl per query."""
+    return (
+        np.searchsorted(sorted_arr, hi_incl, side="right").astype(np.int64)
+        - np.searchsorted(sorted_arr, lo_excl, side="right").astype(np.int64)
+    )
+
+
+def _sweep_queue(
+    g: pd.DataFrame,
+    positions: list[int],
+    out_t_ns: np.ndarray,
+    out_rank: np.ndarray,
+    out_tie: np.ndarray,
+    out_tid: np.ndarray,
+    out_rid: np.ndarray,
+    qp: np.ndarray,
+    higher_arr: np.ndarray,
+    same_arr: np.ndarray,
+    lower_arr: np.ndarray,
+    oldest_arr: np.ndarray,
+    arr15_arr: np.ndarray,
+    arr60_arr: np.ndarray,
+    arr15_he_arr: np.ndarray,
+    arr60_he_arr: np.ndarray,
+    starts_he_arr: np.ndarray,
+    fam_try_arr: np.ndarray,
+    fam_autoland_arr: np.ndarray,
+    fam_beta_arr: np.ndarray,
+    he_incl_self_arr: np.ndarray,
+    coverage_arr: np.ndarray,
+) -> None:
+    """Compute all sweep-derived features for one queue group, VECTORISED.
+
+    Byte-identical to `_sweep_queue_rowwise` (and so to the masked oracle); the
+    only difference is that every binary search is issued once per (queue, rank)
+    over the whole target vector instead of once per target ROW.
+
+    WHY THIS EXISTS, measured 2026-08-31. The row-wise version is
+    O((n+m) log n) -- the algorithm was never the problem -- but it pays ~150
+    SCALAR `np.searchsorted` calls per target row (8 rank classes x {pending,
+    exit} + 3 families x 2 + arrivals + starts + oldest). At production scale
+    each of those is a cache-missing binary search over a multi-million-element
+    array, and the per-call numpy overhead is paid 150 times per row:
+
+        reference rows      per target row
+             20,000              65 us
+            200,000              73 us
+          1,000,000             123 us
+          3,000,000             260 us
+
+    Live cohort, 6,019,770 target rows against a reference frame of the same
+    order: 502 us/row = 3019.7s. That is the whole reason the qctx probe could
+    not fit inside the dispatcher's `TIMEOUT_MAX` of 3600s -- the training
+    sweep alone took 50 minutes and the prediction pass then re-ran it.
+
+    HOW THE OLD PERFORMANCE TESTS MISSED IT. `test_sweep_stays_linear_at_
+    production_scale` pins `priority_at_pending` to a single value and
+    `repo_family` to a single value, so `distinct_ranks` has ONE element and
+    every per-rank loop above executes once instead of eight times; and its
+    100k-row reference set fits in cache, so the dominant term -- cache-missing
+    searches over millions of rows -- is absent by construction. It asserted
+    linearity, correctly, while the constant factor was ~8x understated.
+    `test_sweep_cost_is_flat_in_rank_cardinality` and
+    `test_sweep_at_production_reference_scale` now cover both axes.
+
+    WHAT IS STILL PER-ROW, deliberately, because each is cheap and bounded:
+      * the same-instant FIFO tie-break -- one `bisect_left` per row against a
+        block sorted ONCE per instant (see the loop below). Tuples cannot be
+        compared by numpy, and building order-preserving integer ordinals for
+        millions of tie keys costs more than it saves.
+      * `_oldest_he_excl_self`, reached only when the target's own row is the
+        single oldest pending peer at its instant.
+    """
+    pos = np.asarray(positions, dtype=np.int64)
+    npos = pos.size
+
+    p_ns = g["_pending_ns"].to_numpy()
+    s_ns = g["_started_ns"].to_numpy()
+    exit_ns = g["_exit_ns"].to_numpy()
+    ranks = g["_rank"].to_numpy().astype(np.int64)
+    ties = g["_tie"].to_numpy()
+    fams = g["repo_family"].to_numpy()
+    tids = g["task_id"].to_numpy()
+    rids = g["run_id"].to_numpy()
+
+    # Target vectors, all local and of length npos.
+    T = out_t_ns[pos].astype(np.int64)
+    tr = out_rank[pos].astype(np.int64)
+    tie_local = out_tie[pos]
+
+    p_sorted_all = np.sort(p_ns, kind="stable")
+    distinct_ranks = [int(r) for r in np.sort(np.unique(ranks))]
+
+    # Per-rank structures. Identical to the row-wise version's, plus
+    # `rank_zero_dur_p` (see the same_ahead correction below).
+    rank_p_sorted: dict[int, np.ndarray] = {}
+    rank_exit_sorted: dict[int, np.ndarray] = {}
+    rank_started_sorted: dict[int, np.ndarray] = {}
+    rank_p_byp: dict[int, np.ndarray] = {}
+    rank_exit_byp: dict[int, np.ndarray] = {}
+    rank_tie_byp: dict[int, np.ndarray] = {}
+    rank_prefix_max_exit: dict[int, np.ndarray] = {}
+    # Ascending pending_at of refs whose exit == pending (zero-duration).
+    rank_zero_dur_p: dict[int, np.ndarray] = {}
+    fam_keys = ("try", "autoland", "release_beta")
+    rank_fam_p: dict[tuple[int, str], np.ndarray] = {}
+    rank_fam_exit: dict[tuple[int, str], np.ndarray] = {}
+
+    # THREE SORTS PER RANK, not eleven. Once the per-row search cost is gone
+    # (above), this setup becomes the floor -- and at a 200k-target / 4M-
+    # reference shape it was ALL of the remaining time, hiding the speedup
+    # entirely. Every array below is derived from two orderings by GATHERING or
+    # by boolean-indexing an already-sorted array, both of which preserve
+    # order in O(m), instead of re-sorting the same values:
+    #
+    #   was: p, exit, started, argsort(p), zero-duration p,
+    #        3 families x {p, exit}                        = 11 sorts
+    #   now: argsort(p), argsort(exit), sort(started)      =  3
+    for rvi in distinct_ranks:
+        m = ranks == rvi
+        p_m = p_ns[m]
+        exit_m = exit_ns[m]
+        started_m = s_ns[m]
+        ties_m = ties[m]
+        fams_m = fams[m]
+
+        order_p = np.argsort(p_m, kind="stable")
+        order_e = np.argsort(exit_m, kind="stable")
+        p_by_p = p_m[order_p]
+        exit_by_p = exit_m[order_p]
+        fams_by_p = fams_m[order_p]
+        exit_by_e = exit_m[order_e]
+        fams_by_e = fams_m[order_e]
+
+        # `p_sorted` and `p_byp` are the same array: both are p ascending. The
+        # row-wise version built them with a separate sort and argsort.
+        rank_p_sorted[rvi] = p_by_p
+        rank_p_byp[rvi] = p_by_p
+        rank_exit_sorted[rvi] = exit_by_e
+        rank_exit_byp[rvi] = exit_by_p
+        rank_tie_byp[rvi] = ties_m[order_p]
+        rank_started_sorted[rvi] = np.sort(started_m, kind="stable")
+        rank_prefix_max_exit[rvi] = np.maximum.accumulate(exit_by_p)
+        # Boolean-indexing an ascending array yields an ascending array, so
+        # this needs no sort of its own.
+        rank_zero_dur_p[rvi] = p_by_p[exit_by_p == p_by_p]
+
+        for fk in fam_keys:
+            rank_fam_p[(rvi, fk)] = p_by_p[fams_by_p == fk]
+            rank_fam_exit[(rvi, fk)] = exit_by_e[fams_by_e == fk]
+
+    def pending_count_vec(p_arr, exit_arr, q):
+        """count(p <= q AND exit > q), using exit >= p so the two prefix counts
+        subtract. Same identity as the row-wise version, one call per rank."""
+        return (
+            np.searchsorted(p_arr, q, side="right").astype(np.int64)
+            - np.searchsorted(exit_arr, q, side="right").astype(np.int64)
+        )
+
+    # --- pending-at-T counts by rank class (raw, incl any self). ---
+    n_higher = np.zeros(npos, dtype=np.int64)
+    n_lower = np.zeros(npos, dtype=np.int64)
+    n_equal = np.zeros(npos, dtype=np.int64)
+    for rvi in distinct_ranks:
+        cnt = pending_count_vec(rank_p_sorted[rvi], rank_exit_sorted[rvi], T)
+        n_higher += np.where(rvi > tr, cnt, 0)
+        n_lower += np.where(rvi < tr, cnt, 0)
+        n_equal += np.where(rvi == tr, cnt, 0)
+    n_he_incl = n_higher + n_equal
+
+    # --- arrivals windows (raw): pending in (T-w, T]. ---
+    a15 = _range_count_vec(p_sorted_all, T - W15, T)
+    a60 = _range_count_vec(p_sorted_all, T - W60, T)
+
+    # --- rank >= target: he-arrivals, starts, family composition. ---
+    # Restricted to the rows the rank applies to (`idx`) rather than computed
+    # for all rows and masked, so the work stays O(rows) rather than
+    # O(rows x ranks).
+    a15_he = np.zeros(npos, dtype=np.int64)
+    a60_he = np.zeros(npos, dtype=np.int64)
+    starts_he = np.zeros(npos, dtype=np.int64)
+    f_try = np.zeros(npos, dtype=np.int64)
+    f_autoland = np.zeros(npos, dtype=np.int64)
+    f_beta = np.zeros(npos, dtype=np.int64)
+    fam_out = {"try": f_try, "autoland": f_autoland, "release_beta": f_beta}
+    for rvi in distinct_ranks:
+        idx = np.flatnonzero(rvi >= tr)
+        if idx.size == 0:
+            continue
+        Tm = T[idx]
+        ps = rank_p_sorted[rvi]
+        a15_he[idx] += _range_count_vec(ps, Tm - W15, Tm)
+        a60_he[idx] += _range_count_vec(ps, Tm - W60, Tm)
+        starts_he[idx] += _range_count_vec(
+            rank_started_sorted[rvi], Tm - W15, Tm
+        )
+        for fk in fam_keys:
+            fam_out[fk][idx] += pending_count_vec(
+                rank_fam_p[(rvi, fk)], rank_fam_exit[(rvi, fk)], Tm
+            )
+
+    # --- same-priority FIFO (raw). ---
+    same_ahead = np.zeros(npos, dtype=np.int64)
+    for rvi in distinct_ranks:
+        idx = np.flatnonzero(tr == rvi)
+        if idx.size == 0:
+            continue
+        Tm = T[idx]
+        p_byp = rank_p_byp[rvi]
+        exit_byp = rank_exit_byp[rvi]
+        tie_byp = rank_tie_byp[rvi]
+
+        lt = np.searchsorted(p_byp, Tm, side="left").astype(np.int64)
+        rt = np.searchsorted(p_byp, Tm, side="right").astype(np.int64)
+        # earlier: count(p<T & exit>T) = count(p<T) - count(exit<=T) + corr,
+        # where corr undoes the p==T & exit==T rows that count(exit<=T)
+        # included but count(p<T) did not. The row-wise version spells corr as
+        # `(exit_byp[lt:rt] == T).sum()`, a variable-length slice per row.
+        # Since exit >= p always, `p == T AND exit == T` is exactly
+        # `p == T AND exit == p` -- a T-INDEPENDENT property of the reference
+        # row -- so the same count comes from two searches on the pre-built
+        # ascending array of zero-duration pending instants.
+        count_exit_le = np.searchsorted(
+            rank_exit_sorted[rvi], Tm, side="right"
+        ).astype(np.int64)
+        zd = rank_zero_dur_p[rvi]
+        corr = np.searchsorted(zd, Tm, side="right").astype(np.int64) - \
+            np.searchsorted(zd, Tm, side="left").astype(np.int64)
+        # `corr` is 0 whenever there is no p==T block, so the row-wise
+        # version's `if rt > lt` guard around it is implied.
+        base = np.where(lt > 0, lt - count_exit_le + corr, 0)
+        same_ahead[idx] += base
+
+        # Same-instant cohort: refs with p == T, still pending, ordered before
+        # the target. Within the p==T block `exit > T` is `exit > p`, so the
+        # eligible block is T-independent and is sorted ONCE per instant --
+        # (lt, rt) identifies the instant, because rt > lt implies p_byp[lt]
+        # == T. This is what removes the row-wise version's O(cohort) scan per
+        # row, i.e. its O(cohort^2) cost per push-sized batch of identical
+        # pending_at.
+        have = np.flatnonzero(rt > lt)
+        if have.size == 0:
+            continue
+        block_cache: dict[tuple[int, int], list] = {}
+        for j in have:
+            key = (int(lt[j]), int(rt[j]))
+            blk = block_cache.get(key)
+            if blk is None:
+                a, b = key
+                e = exit_byp[a:b]
+                blk = sorted(tie_byp[a:b][e > Tm[j]])
+                block_cache[key] = blk
+            if blk:
+                same_ahead[idx[j]] += bisect.bisect_left(blk, tie_local[idx[j]])
+
+    # --- oldest higher-or-equal pending age (raw min pending, rank>=r,
+    # pending-at-T). ---
+    INF = np.iinfo(np.int64).max
+    oldest = np.full(npos, INF, dtype=np.int64)
+    found = np.zeros(npos, dtype=bool)
+    for rvi in distinct_ranks:
+        idx = np.flatnonzero(rvi >= tr)
+        if idx.size == 0:
+            continue
+        Tm = T[idx]
+        p_byp = rank_p_byp[rvi]
+        hi = np.searchsorted(p_byp, Tm, side="right").astype(np.int64)
+        # Same monotonic prefix-max trick as the row-wise version: the smallest
+        # index whose own exit exceeds T.
+        first = np.searchsorted(
+            rank_prefix_max_exit[rvi], Tm, side="right"
+        ).astype(np.int64)
+        ok = np.flatnonzero((hi > 0) & (first < hi))
+        if ok.size == 0:
+            continue
+        sel = idx[ok]
+        cand = p_byp[first[ok]]
+        cur = oldest[sel]
+        oldest[sel] = np.where(cand < cur, cand, cur)
+        found[sel] = True
+
+    # --- subtract self contributions (mirror oracle not_self). ---
+    # (task_id, run_id) is unique per PRIMARY KEY on queue_forecast_task_runs,
+    # so at most one reference row can match a given target's own key.
+    self_by_key: dict[tuple, int] = {
+        (t, r): i for i, (t, r) in enumerate(zip(tids, rids))
+    }
+    self_idx = np.fromiter(
+        (self_by_key.get((t, r), -1) for t, r in zip(out_tid[pos], out_rid[pos])),
+        dtype=np.int64,
+        count=npos,
+    )
+    has_self = self_idx >= 0
+    if has_self.any():
+        gi = np.where(has_self, self_idx, 0)
+        sp = p_ns[gi]
+        se = exit_ns[gi]
+        sst = s_ns[gi]
+        sr = ranks[gi]
+        sf = fams[gi]
+
+        pend_self = has_self & (sp <= T) & (se > T)
+        n_higher -= (pend_self & (sr > tr)).astype(np.int64)
+        n_lower -= (pend_self & (sr < tr)).astype(np.int64)
+        n_equal -= (pend_self & (sr == tr)).astype(np.int64)
+        he_self = pend_self & (sr >= tr)
+        n_he_incl -= he_self.astype(np.int64)
+        for fk in fam_keys:
+            fam_out[fk] -= (he_self & (sf == fk)).astype(np.int64)
+
+        # Same-priority-ahead self removal. The row-wise version tests
+        # `sp < T or (sp == T and self_tie < target_tie)`; the second disjunct
+        # is UNREACHABLE and is therefore not evaluated here. The self row is
+        # matched BY (task_id, run_id), so its `_tie` -- `(str(task_id),
+        # run_id)` -- is equal to the target's, never less. Asserted by
+        # `test_self_tie_is_never_ahead_of_itself`.
+        same_ahead -= (pend_self & (sr == tr) & (sp < T)).astype(np.int64)
+
+        # arrivals: pending in window, regardless of pending-at-T state.
+        in15 = has_self & (sp > T - W15) & (sp <= T)
+        in60 = has_self & (sp > T - W60) & (sp <= T)
+        a15 -= in15.astype(np.int64)
+        a60 -= in60.astype(np.int64)
+        a15_he -= (in15 & (sr >= tr)).astype(np.int64)
+        a60_he -= (in60 & (sr >= tr)).astype(np.int64)
+        # starts: started in window, rank>=r.
+        starts_he -= (
+            has_self & (sst > T - W15) & (sst <= T) & (sr >= tr)
+        ).astype(np.int64)
+
+        # Recompute oldest with self excluded only where self IS the current
+        # minimum -- reached when the target's own row is the single oldest
+        # pending peer at its instant.
+        redo = np.flatnonzero(found & pend_self & (sr >= tr) & (sp == oldest))
+        for j in redo:
+            got = _oldest_he_excl_self(
+                p_ns, exit_ns, ranks, tids, rids,
+                out_tid[pos[j]], out_rid[pos[j]], int(tr[j]), int(T[j]),
+            )
+            if got is None:
+                oldest[j] = INF
+                found[j] = False
+            else:
+                oldest[j] = got
+
+    # --- store. ---
+    higher_arr[pos] = n_higher
+    lower_arr[pos] = n_lower
+    same_arr[pos] = same_ahead
+    he_incl_self_arr[pos] = n_he_incl + 1
+    arr15_arr[pos] = a15
+    arr60_arr[pos] = a60
+    arr15_he_arr[pos] = a15_he
+    arr60_he_arr[pos] = a60_he
+    starts_he_arr[pos] = starts_he
+
+    # Family counts and the oldest age are published ONLY where there is at
+    # least one higher-or-equal pending peer, exactly as the row-wise version
+    # gates them behind `if n_he_incl > 0`.
+    he_pos = n_he_incl > 0
+    fam_sel = pos[he_pos]
+    fam_try_arr[fam_sel] = f_try[he_pos]
+    fam_autoland_arr[fam_sel] = f_autoland[he_pos]
+    fam_beta_arr[fam_sel] = f_beta[he_pos]
+    age_ok = he_pos & found
+    oldest_arr[pos[age_ok]] = (T[age_ok] - oldest[age_ok]) / 1_000_000_000.0
+
+    qpv = qp[pos]
+    cov_ok = np.isfinite(qpv) & (qpv > 0)
+    n_pending_all = n_higher + n_lower + n_equal
+    coverage_arr[pos[cov_ok]] = (
+        (n_pending_all[cov_ok] + 1) / qpv[cov_ok]
+    )
 
 
 def _oldest_he_excl_self(

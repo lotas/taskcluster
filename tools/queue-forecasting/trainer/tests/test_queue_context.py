@@ -3,11 +3,14 @@ import time
 import numpy as np
 import pandas as pd
 
+import src.queue_context as qc
 from src.queue_context import (
     FEATURE_COLUMNS,
     PRIORITY_RANK,
     QUEUE_CONTEXT_FEATURE_VERSION,
+    REPO_FAMILIES,
     _add_queue_context_features_masked,
+    _tie_key,
     add_queue_context_features,
 )
 
@@ -546,3 +549,206 @@ def test_sweep_stays_linear_at_production_scale():
     sweep_s = time.perf_counter() - t0
     print(f"\n[timing] sweep 100k/100k (self-referencing) = {sweep_s:.2f}s")
     assert sweep_s < 20.0, f"100k/100k sweep too slow: {sweep_s:.2f}s (was 56s pre-fix)"
+
+
+# ---------------------------------------------------------------------------
+# Vectorised sweep: the axes the original production-scale test flattened.
+#
+# `test_sweep_stays_linear_at_production_scale` above pins ONE priority and ONE
+# repo_family and uses a 100k reference set that fits in cache. Under those
+# conditions `distinct_ranks` has a single element, so every per-rank loop runs
+# once instead of eight times, and no binary search misses cache. It asserted
+# linearity correctly while the constant factor was ~9x understated -- the live
+# consequence was a 6,019,770-row cohort taking 3019.7s (502 us/row), which
+# does not fit the dispatcher's 3600s TIMEOUT_MAX once the prediction pass
+# re-runs the sweep. These tests cover both flattened axes.
+# ---------------------------------------------------------------------------
+
+def _prod_scenario(rng, n_targets, n_ref, *, n_ranks, n_families, n_queues,
+                   rows_per_instant):
+    """A scenario shaped like the live cohort: many priorities, many repo
+    families, skewed queue sizes, and pushes that share one pending_at."""
+    base = pd.Timestamp("2026-06-01T00:00:00Z").value
+    span = 14 * 24 * 3600 * 1_000_000_000
+    prios = list(PRIORITY_RANK)[:n_ranks]
+    fams = REPO_FAMILIES[:n_families]
+    # Zipf-ish queue weights: a handful of hot queues hold most rows, as in the
+    # live sweep where 26 of 529 queues accounted for 907s of 3019s.
+    weights = 1.0 / (np.arange(1, n_queues + 1) ** 1.4)
+    weights /= weights.sum()
+    queues = np.array([f"q/{i}" for i in range(n_queues)])
+
+    def instants(n):
+        k = max(1, n // rows_per_instant)
+        got = np.repeat(base + rng.integers(0, span, size=k), rows_per_instant)
+        if len(got) < n:
+            got = np.concatenate([got, np.full(n - len(got), got[0])])
+        return got[:n]
+
+    p_ref = instants(n_ref)
+    runs = pd.DataFrame({
+        "task_id": [f"r{i}" for i in range(n_ref)],
+        "run_id": 0,
+        "pending_at": pd.to_datetime(p_ref, utc=True),
+        "started_at": pd.to_datetime(
+            p_ref + rng.integers(1, span, size=n_ref), utc=True),
+        "resolved_at": pd.NaT,
+        "priority_at_pending": rng.choice(prios, size=n_ref),
+        "task_queue_id": rng.choice(queues, size=n_ref, p=weights),
+        "repo_family": rng.choice(fams, size=n_ref),
+    })
+    p_tgt = instants(n_targets)
+    df = pd.DataFrame({
+        "task_id": [f"t{i}" for i in range(n_targets)],
+        "run_id": 0,
+        "pending_at": pd.to_datetime(p_tgt, utc=True),
+        "priority_at_pending": rng.choice(prios, size=n_targets),
+        "task_queue_id": rng.choice(queues, size=n_targets, p=weights),
+        "repo_family": rng.choice(fams, size=n_targets),
+        "queue_pending": 10,
+    })
+    wc = pd.DataFrame(columns=[
+        "task_queue_id", "sampled_at", "running_workers", "existing_capacity",
+        "claimed_tasks",
+    ])
+    return df, runs, wc
+
+
+def _time_sweep(df, runs, wc):
+    t0 = time.perf_counter()
+    add_queue_context_features(df.copy(), runs.copy(), wc.copy())
+    return time.perf_counter() - t0
+
+
+def test_sweep_cost_is_flat_in_rank_cardinality():
+    """Per-row cost must not scale with the number of distinct priorities.
+
+    THE AXIS THAT HID THE REGRESSION. The row-wise sweep issued two binary
+    searches per rank class per target row for the pending counts, and six more
+    per rank for the rank>=r family/arrivals/starts aggregates -- so eight
+    priorities cost ~8x one priority. Measured on this box, 40k rows: 26 us/row
+    at 1 rank vs 67 us/row at 8 ranks (2.6x) before, 5 vs 7 us/row (1.4x)
+    after. Every search is now issued once per (queue, rank) over the whole
+    target vector, so rank cardinality adds vector calls, not per-row calls.
+    """
+    rng = np.random.default_rng(11)
+    n = 40_000
+    flat = _prod_scenario(rng, n, n, n_ranks=1, n_families=1, n_queues=1,
+                          rows_per_instant=1)
+    wide = _prod_scenario(rng, n, n, n_ranks=8, n_families=6, n_queues=1,
+                          rows_per_instant=1)
+    t_flat = _time_sweep(*flat)
+    t_wide = _time_sweep(*wide)
+    ratio = t_wide / t_flat
+    print(f"\n[timing] rank cardinality: 1 rank {t_flat:.2f}s, "
+          f"8 ranks {t_wide:.2f}s, ratio {ratio:.2f}x")
+    assert ratio < 2.0, (
+        f"8 priorities cost {ratio:.1f}x one priority ({t_flat:.2f}s -> "
+        f"{t_wide:.2f}s). The per-rank searches are being issued per target "
+        f"ROW again; they must be issued per (queue, rank) over the target "
+        f"vector. Was 2.6x pre-fix."
+    )
+
+
+def test_sweep_at_production_reference_scale():
+    """An ABSOLUTE per-row budget at the live cohort's shape.
+
+    The bound is what the other tests here cannot express: a shape with eight
+    priorities, six repo families, 529 skewed queues, push-sized batches of
+    identical pending_at, and a reference frame far too large to sit in cache.
+    Measured on this box: 64.5 us/row row-wise, 6.9 us/row vectorised. The
+    budget leaves ~3.5x margin over the vectorised measurement for slower CI
+    hardware while still failing loudly if the row-wise cost returns.
+    """
+    rng = np.random.default_rng(12)
+    n_targets, n_ref = 200_000, 600_000
+    df, runs, wc = _prod_scenario(
+        rng, n_targets, n_ref, n_ranks=8, n_families=6, n_queues=529,
+        rows_per_instant=50,
+    )
+    elapsed = _time_sweep(df, runs, wc)
+    per_row_us = elapsed / n_targets * 1e6
+    print(f"\n[timing] production shape {n_targets:,} targets / {n_ref:,} refs"
+          f" = {elapsed:.2f}s, {per_row_us:.1f} us/row")
+    assert per_row_us < 25.0, (
+        f"{per_row_us:.1f} us/row at production shape (row-wise was 64.5, "
+        f"vectorised 6.9). At this rate the live 6,019,770-row cohort takes "
+        f"{per_row_us * 6_019_770 / 1e6 / 60:.0f} min and the probe cannot fit "
+        f"the dispatcher's 3600s TIMEOUT_MAX."
+    )
+
+
+def test_vectorised_matches_rowwise_at_scale():
+    """Equivalence at a scale the O(targets x queue-size) oracle cannot reach.
+
+    `test_sweep_matches_masked_oracle` is the authority on semantics but caps
+    out around 2k reference rows. The vectorised sweep's two riskiest pieces --
+    the zero-duration correction that replaces a per-row `exit_byp[lt:rt] == T`
+    slice, and the same-instant tie block that is sorted once per instant and
+    then bisected -- only engage when many rows share a pending_at, which is
+    exactly what push-sized batches produce. So this pins the vectorised path
+    against the row-wise one on heavily-tied, multi-rank, multi-family data.
+    """
+    rng = np.random.default_rng(13)
+    for rows_per_instant in (1, 7, 60):
+        df, runs, wc = _prod_scenario(
+            rng, 12_000, 36_000, n_ranks=8, n_families=6, n_queues=15,
+            rows_per_instant=rows_per_instant,
+        )
+        vectorised = add_queue_context_features(df.copy(), runs.copy(), wc.copy())
+        original = qc._sweep_queue
+        qc._sweep_queue = qc._sweep_queue_rowwise
+        try:
+            rowwise = add_queue_context_features(df.copy(), runs.copy(), wc.copy())
+        finally:
+            qc._sweep_queue = original
+        _assert_equal_features(vectorised, rowwise)
+
+
+def test_self_tie_is_never_ahead_of_itself():
+    """Pins the assumption the vectorised self-exclusion relies on.
+
+    The row-wise version removes the target's own contribution to
+    `pending_same_priority_same_queue` when `sp < T or (sp == T and self_tie <
+    target_tie)`. The vectorised version drops the second disjunct as
+    unreachable: the self row is matched BY (task_id, run_id), so its `_tie` is
+    built from the same two values as the target's and can never sort before
+    it. This asserts that directly, including the dtype mismatch that actually
+    occurs -- the reference frame arrives from Postgres with a numpy int64
+    run_id while the target frame can carry a Python int.
+    """
+    assert _tie_key("abc", 0) == _tie_key("abc", np.int64(0))
+    assert not (_tie_key("abc", np.int64(0)) < _tie_key("abc", 0))
+    assert not (_tie_key("abc", 3) < _tie_key("abc", np.int64(3)))
+    # And end-to-end: a target that is its own reference at its own instant,
+    # sharing a queue and priority with peers, still matches the oracle.
+    base = pd.Timestamp("2026-06-01T00:00:00Z")
+    rows = [("t1", 0), ("t2", 0), ("t3", 0)]
+    runs = pd.DataFrame({
+        "task_id": [t for t, _ in rows],
+        "run_id": [np.int64(r) for _, r in rows],
+        "pending_at": [base] * 3,
+        "started_at": [base + pd.Timedelta(minutes=5)] * 3,
+        "resolved_at": pd.NaT,
+        "priority_at_pending": "medium",
+        "task_queue_id": "q/a",
+        "repo_family": "try",
+    })
+    df = pd.DataFrame({
+        "task_id": [t for t, _ in rows],
+        "run_id": [int(r) for _, r in rows],
+        "pending_at": [base] * 3,
+        "priority_at_pending": "medium",
+        "task_queue_id": "q/a",
+        "repo_family": "try",
+        "queue_pending": 3,
+    })
+    wc = pd.DataFrame(columns=[
+        "task_queue_id", "sampled_at", "running_workers", "existing_capacity",
+        "claimed_tasks",
+    ])
+    got = add_queue_context_features(df.copy(), runs.copy(), wc.copy())
+    oracle = _add_queue_context_features_masked(df.copy(), runs.copy(), wc.copy())
+    _assert_equal_features(got, oracle)
+    # t1 sorts first, so it has nobody ahead of it and never counts itself.
+    assert got["pending_same_priority_same_queue"].tolist() == [0, 1, 2]
