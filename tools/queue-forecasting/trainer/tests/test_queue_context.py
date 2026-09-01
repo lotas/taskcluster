@@ -752,3 +752,36 @@ def test_self_tie_is_never_ahead_of_itself():
     _assert_equal_features(got, oracle)
     # t1 sorts first, so it has nobody ahead of it and never counts itself.
     assert got["pending_same_priority_same_queue"].tolist() == [0, 1, 2]
+
+
+def test_chunk_boundaries_do_not_change_results():
+    """`SWEEP_CHUNK` must be a pure memory knob, not a semantic one.
+
+    Chunking exists because every vector inside the sweep is as long as the
+    slice being processed, and a hot queue sized the peak -- the live probe
+    that motivated it reported `rss_high_water_kb` 20,971,476 against a
+    `mem_limit` of 20g and died with exit 137. But a chunk boundary is a place
+    where per-slice state could leak: `oldest`/`found`, the self-exclusion
+    gathers and the same-instant block cache are all rebuilt per chunk, and any
+    one of them accumulating across the whole queue instead would show up only
+    on queues larger than the chunk. The default is 250k, so no test scenario
+    would ever cross a boundary at all; this shrinks it until every row does.
+    """
+    rng = np.random.default_rng(14)
+    df, runs, wc = _prod_scenario(
+        rng, 4_000, 12_000, n_ranks=8, n_families=6, n_queues=3,
+        rows_per_instant=30,
+    )
+    whole = add_queue_context_features(df.copy(), runs.copy(), wc.copy())
+    original = qc.SWEEP_CHUNK
+    try:
+        # 1 forces a boundary between every pair of rows; the others land
+        # mid-instant, which is where the same-instant cohort logic could split.
+        for chunk in (1, 7, 100, 999):
+            qc.SWEEP_CHUNK = chunk
+            _assert_equal_features(
+                add_queue_context_features(df.copy(), runs.copy(), wc.copy()),
+                whole,
+            )
+    finally:
+        qc.SWEEP_CHUNK = original
