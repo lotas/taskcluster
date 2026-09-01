@@ -56,13 +56,43 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import prereg                                                  # noqa: E402
 import experiment                                              # noqa: E402
 
-# MIRRORS the contract's `direction` per metric, used ONLY to rank two measured
-# values against each other. Pass/fail is never computed here -- the scoreboard's
-# `passed` comes from the root-owned evaluator, and recomputing it in agent-side
-# code would create a second answer to a question that already has an
-# authoritative one. `band` metrics have no "better", only "inside".
-RANK = {"mae": "lower", "p90_miss_tail": "lower", "within_2x": "higher",
-        "p90_coverage": "band"}
+# HOW TO ORDER TWO `measured` VALUES -- DERIVED FROM THE CONTRACT, never
+# hardcoded here.
+#
+# This replaces a hardcoded map that had `mae: lower`, which was WRONG and
+# inverted every mae comparison the frontier made. `verdict.py:48-60` is the
+# authority: for `relative_improvement` and `absolute_improvement` the scoreboard
+# stores an IMPROVEMENT DELTA, computed as `baseline - value` for a
+# lower-is-better metric -- so the metric's own `direction` has ALREADY been
+# applied and higher is always better. Only `absolute` and `band` kinds store the
+# raw metric value.
+#
+# The old map read `direction: lower_is_better` off the contract and concluded
+# "lower measured is better", which is true of MAE the quantity and false of the
+# number the scoreboard actually holds. A second source of truth about metric
+# semantics is what made that possible, so there is no map any more.
+_RANK_BY_KIND = {"relative_improvement": "higher",
+                 "absolute_improvement": "higher",
+                 "band": "band"}
+
+
+def metric_ranks(contract):
+    """`{metric: 'higher'|'lower'|'band'}` for this contract's metrics.
+
+    A metric absent from the result is UNRANKABLE, and callers must treat that
+    as "no ordering" rather than guessing one -- guessing is the bug above.
+    """
+    out = {}
+    for name, spec in ((contract.get("metrics") or {}).items()):
+        bar = (spec or {}).get("bar") or {}
+        kind = bar.get("kind")
+        if kind in _RANK_BY_KIND:
+            out[name] = _RANK_BY_KIND[kind]
+        elif kind == "absolute":
+            # The raw metric, so its own direction decides.
+            out[name] = "lower" if (spec or {}).get(
+                "direction") == "lower_is_better" else "higher"
+    return out
 
 
 def load_contract(contracts, contract_hash):
@@ -213,18 +243,23 @@ def series_key(row):
             row.get("contract", ""))
 
 
-def better(name, value, incumbent):
-    """Is `value` a better measurement of `name` than `incumbent`?"""
+def better(value, incumbent, how):
+    """Is `value` a better measurement than `incumbent`, given its ranking?
+
+    `how` comes from `metric_ranks`. `None` means the contract could not be read,
+    and then there is NO ordering: the first measurement stands and the report
+    says the series is unordered. Inventing a direction here is exactly the
+    defect this signature exists to prevent.
+    """
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
     if incumbent is None:
         return True
-    how = RANK.get(name)
     if how == "lower":
         return value < incumbent
     if how == "higher":
         return value > incumbent
-    return False        # `band`: no ordering, so the first measurement stands
+    return False        # `band` or unknown: the first measurement stands
 
 
 def _band_distance(value, band):
@@ -237,7 +272,7 @@ def _band_distance(value, band):
     return 0.0
 
 
-def judge_claim(row, index, band=None):
+def judge_claim(row, index, rank=None, band=None):
     """Did the pre-registered claim come true? Judged against `vs`, not the bar.
 
     AGAINST `vs` AND NOT AGAINST THE CONTRACT, because that is the discipline the
@@ -289,7 +324,7 @@ def judge_claim(row, index, band=None):
     if not isinstance(theirs, (int, float)) or isinstance(theirs, bool):
         return "unjudgeable: vs has no such metric"
 
-    how = RANK.get(bar)
+    how = rank
 
     if reg["direction"] == "hold":
         # NUMERIC, not pass/fail-status. Status equality was wrong in both
@@ -300,6 +335,8 @@ def judge_claim(row, index, band=None):
         #
         # The tolerance is in the immutable note, so the slack was claimed before
         # the number existed. Default 0 means strictly not worse.
+        if how is None:
+            return "unjudgeable: no contract, so the metric has no ordering"
         if how == "band":
             # A BAND STILL HAS A "WORSE": distance to the nearest edge. Reading it
             # as pass/fail alone repeated the very bug this direction was rewritten
@@ -325,6 +362,11 @@ def judge_claim(row, index, band=None):
             return "kept" if mine <= theirs + reg["tol"] else "broken"
         return "kept" if mine >= theirs - reg["tol"] else "broken"
 
+    if how is None:
+        # NO CONTRACT, NO ORDERING. Without knowing whether `measured` is a raw
+        # metric or an improvement delta, "improve" cannot be checked -- and
+        # guessing inverted every mae claim once already.
+        return "unjudgeable: no contract, so the metric has no ordering"
     if how == "band":
         # No ordering inside a band, so the only legible improvement is having
         # entered it.
@@ -347,7 +389,8 @@ def build(rows, extracts, contracts, journaled=()):
         key = series_key(row)
         entry = series.setdefault(key, {
             "extract": key[0], "baseline": key[1], "contract": key[2],
-            "rows": [], "frontier": {}, "as_of": "", "holdout": None})
+            "rows": [], "frontier": {}, "as_of": "", "holdout": None,
+            "ordered": False, "ranks": {}})
         entry["rows"].append(row)
 
     # Decoded first, ACROSS every series, because a pre-registration's `vs=` may
@@ -381,13 +424,17 @@ def build(rows, extracts, contracts, journaled=()):
         extract = by_hash.get(entry["extract"], {})
         entry["as_of"] = extract.get("as_of_date") or ""
         entry["holdout"] = holdout_window(extract, contract)
+        ranks = metric_ranks(contract)
         bands = _band_bounds(contract)
+        entry["ordered"] = bool(ranks)
+        entry["ranks"] = ranks
         for row in entry["rows"]:
             row["claim"] = judge_claim(row, index,
+                                       rank=ranks.get(row["prereg"]["bar"]),
                                        band=bands.get(row["prereg"]["bar"]))
             for name, value in (row.get("metrics") or {}).items():
                 slot = entry["frontier"].get(name)
-                if better(name, value, (slot or {}).get("value")):
+                if better(value, (slot or {}).get("value"), ranks.get(name)):
                     entry["frontier"][name] = {
                         "value": value, "config": row["config_label"],
                         "evaluation": row.get("evaluation", ""),
@@ -499,6 +546,8 @@ def _series_out(key, entry):
     return {
         "extract": key[0], "baseline": key[1], "contract": key[2],
         "as_of": entry["as_of"],
+        "ordered": entry["ordered"],
+        "ranks": entry["ranks"],
         "holdout": [d.date().isoformat() for d in entry["holdout"]]
         if entry["holdout"] else None,
         "runs": len(entry["rows"]),
@@ -582,12 +631,23 @@ def render(report):
                    else "holdout UNKNOWN — this series cannot confirm anything,"
                         " because non-overlap cannot be shown")
         out.append("")
+        if not entry["ordered"]:
+            # LOUD, because a frontier that cannot order its metrics is not a
+            # frontier. The contract is what says whether `measured` is a raw
+            # metric or an improvement delta, so without it "best" is a guess.
+            out.append("")
+            out.append("WARNING this series' contract could not be read, so no"
+                       " metric can be ordered. The rows below are unranked and"
+                       " every claim on them is unjudgeable.")
+        out.append("")
         out.append("| bar | best | config | passed |")
         out.append("|---|---|---|---|")
         for name in sorted(entry["frontier"]):
             best = entry["frontier"][name]
             mark = {True: "yes", False: "NO"}.get(best["passed"], "?")
-            note = " (band: first seen)" if RANK.get(name) == "band" else ""
+            note = {"band": " (band: first seen)",
+                    None: " (unordered: first seen)"}.get(
+                        entry["ranks"].get(name), "")
             out.append(f"| {name} | {best['value']:.4g}{note} |"
                        f" {best['config']} | {mark} |")
         out.append("")

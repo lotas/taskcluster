@@ -128,9 +128,21 @@ tick commits it after a second agent checks it. Structure:
 **Confidence and what would change it:** <the honest version>
 
 **Not concluded:** <what a reader might wrongly infer from this, spelled out>
+
+**Evidence:** <for every figure NOT in the frontier JSON: the exact command and
+the relevant lines of its output, pasted>
 ```
 
-Every number you cite must appear in the frontier JSON or in the output of a
-command you ran in this tick. A number you remember is a number you invented —
-a second agent checks this entry against the frontier before it is recorded, and
-an unsupported figure means the entry is not recorded at all.
+Every number you cite must appear in the frontier JSON **or** in a pasted command
+output in your `Evidence:` block. A number you remember is a number you invented.
+
+**The Evidence block is not optional book-keeping — it is the only way a
+command-derived figure can be verified.** The second agent that checks this entry
+receives your entry and the frontier JSON, and *nothing else*: it cannot see the
+commands you ran or their output, and it is instructed to reject a central result
+it cannot check. So a figure from `qf status`, `qf list`, `experiment.py plan` or
+any other command must be pasted here, or the entry will be escalated rather than
+recorded — however sound the research behind it was.
+
+Paste the minimum that supports the claim: the command, and the lines carrying the
+numbers. Not whole transcripts.

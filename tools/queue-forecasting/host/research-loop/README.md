@@ -92,6 +92,22 @@ instead of advancing — and `broken` is a permanent state, so refutations had t
 same problem. **Escalations are excluded**: an escalated entry was rejected, so
 the run it describes is still unwritten.
 
+### What the copilot can and cannot see
+
+It receives the leader's entry and the frontier JSON, and nothing else — not the
+leader's transcript, not the commands it ran. The first live tick (2026-09-01)
+escalated a **correct** entry because of this: the leader had read `qf status`
+pins and cited `predictions_sha256` values, RSS and wall-clock figures that no
+frontier JSON contains, so the copilot applied its "a figure with no source"
+rule exactly as written.
+
+That was a prompt gap, not a copilot fault. `tick-prompt.md` now requires an
+`Evidence:` block pasting the command and its relevant output for any figure the
+JSON does not carry, and `verify-prompt.md` says a pasted output counts as a
+source. Rejecting a sound entry for lack of a paste is a cost; recording an
+unverifiable central result is a worse one, so the rule stays strict and the
+leader carries the burden of showing its work.
+
 ### Why the copilot checks the claim and not the arithmetic
 
 The design (`auto-research-loop-design.md` §6) specifies an "independent
@@ -183,6 +199,40 @@ have two different models confirmed under one name, which is precisely what the
 second cohort exists to rule out. A row with no digest can never reach
 CONFIRMED; it says so in `blocked_by`.
 
+## `measured` is not the metric
+
+The scoreboard's `measured` field is **not** always the underlying quantity, and
+conflating the two produced the worst defect in this directory so far —
+found by the loop's own first tick, in the loop's own code.
+
+`verdict.py:48-72` is the authority:
+
+| bar `kind` | `measured` holds | ordering |
+|---|---|---|
+| `relative_improvement` | improvement fraction, `(baseline-value)/baseline` | **higher** |
+| `absolute_improvement` | improvement in points | **higher** |
+| `absolute` | the raw metric | by the metric's `direction` |
+| `band` | the raw metric | in / out only |
+
+For the improvement kinds the metric's own `direction` has **already been
+applied** inside the computation. `frontier.py` originally hardcoded
+`RANK = {"mae": "lower", ...}`, reading the contract's `direction:
+lower_is_better` as a statement about the scoreboard value. It is a statement
+about MAE the quantity. So every mae comparison was inverted: the frontier named
+the config that *failed* the bar as the series best, `--dir improve` on a real
+26.9% improvement reported `broken`, and a 22.8-point regression registered as
+`hold` reported `kept`.
+
+The map is gone. `metric_ranks(contract)` derives ordering from `bar.kind`, and a
+series whose contract cannot be read is reported **unordered** with every claim
+on it `unjudgeable` — rather than guessing a direction, which is what made this
+possible. The test fixtures now carry real `measured` values from the first live
+tick; the old ones put absolute seconds in `mae`, which is the `value` field, and
+that agreement with the wrong rank is why 43 tests passed over it.
+
+**Pre-registrations are immutable**, so any `--bar mae` note written before this
+fix reads inverted permanently. Those runs are not recoverable as mae claims.
+
 ## The confirm gate
 
 `frontier.py` never reports `CONFIRMED` from one cohort. A config that clears
@@ -222,6 +272,35 @@ BH-FDR, disjoint-day decomposition), which is not built. It buys the one propert
 an unattended loop cannot do without — a win has to repeat on data it was not
 selected on — and buys it with arithmetic rather than a framework.
 
+## The prompt goes on stdin
+
+Both CLIs are fed their prompt on **stdin**, assembled into a file under the
+tick's context directory. It was originally a single argv argument, which has two
+problems:
+
+- **`MAX_ARG_STRLEN` is 131072 bytes** on Linux — 32 pages, not tunable. The
+  assembled leader prompt is ~27KB today, but the frontier grows with scored
+  history at roughly 240 bytes per run across its two tables. Measured
+  projection: ~75KB at 200 runs, over the cliff at ~430. At four runs a day that
+  is about three months out — an `E2BIG` that nothing in the loop explains.
+- **Argv is world-readable in `ps`.** The entire prompt, queue excerpt included,
+  was visible to every account on the host. That is how this was noticed.
+
+`claude -p` reads the prompt from stdin when no positional is given (verified
+against the installed CLI). `codex exec` is passed an explicit `-`, because its
+documented behaviour is that a prompt argument *plus* piped stdin wraps the stdin
+in a `<stdin>` block rather than using it as the prompt — so passing both would
+silently reshape the request.
+
+Stdin removes the hard limit, which changes the failure mode from a crash to a
+quietly over-long prompt. So the tick **reports** the assembled size every run,
+warns above 100KB, and bounds the queue excerpt by bytes
+(`QF_TICK_MAX_QUEUE_BYTES`, default 24KiB). When that excerpt is trimmed the
+leader is told so explicitly, because the queue's ranked list lives at the *end*
+of the file and a silent cut would make a real entry look nonexistent. The
+frontier is never truncated: dropping rows from it is a research decision, not a
+plumbing one, so it warns instead.
+
 ## `which claude` is not the question
 
 The first `install.sh once` on the host aborted with ``no `claude` on PATH`` while
@@ -242,10 +321,22 @@ newest installed node by directory listing with `sort -V` — `nvm` is a shell
 function that does not exist in a script, and a hardcoded version breaks on the
 next `nvm install`.
 
-An inherited `NVM_DIR` is honoured **only if it is under `$HOME`**. A relocated
-nvm is set that way in the user's own profile; a value pointing into another home
-(via `sudo -E` or an `env_keep` entry) is not a hint but a wrong answer, and its
-symptom is exactly the abort above.
+Three details in it are load-bearing, all found by review rather than by use:
+
+- **It selects version directories that actually contain a CLI**, not the newest
+  by name. `nvm install 24` does not migrate global packages, so `v24/bin`
+  routinely exists without `claude` while `v22/bin` still has it — and picking
+  newest-by-name then hides an installed CLI, which is the very failure this file
+  was written to fix. The two CLIs may also live under different node versions;
+  both are found.
+- **An inherited `NVM_DIR` is honoured only if it is under `$HOME`.** A relocated
+  nvm is set that way in the user's own profile; a value pointing into another
+  home (via `sudo -E` or an `env_keep` entry) is not a hint but a wrong answer.
+- **`$HOME` is validated and normalised first**, because both checks are built
+  from it. An empty `HOME` turned the under-`$HOME` pattern into `/*`, trusting
+  *every* absolute `NVM_DIR` including another account's; a trailing slash
+  produced `/home/research//*`, which rejects a legitimate relocation. An
+  unusable `HOME` now leaves `PATH` untouched and says so.
 
 To tell the two shells apart when diagnosing:
 

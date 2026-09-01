@@ -22,6 +22,28 @@ ok()   { echo "ok    $1"; pass=$((pass + 1)); }
 bad()  { echo "FAIL  $1"; fail=$((fail + 1)); }
 skip() { echo "skip  $1 ($2)"; skip=$((skip + 1)); }
 
+# A NEGATIVE ASSERTION ON A MISSING FILE PROVES NOTHING. `grep -q X missing` and
+# `grep -q X present-but-lacking-X` both "succeed" as absences, so every
+# must-not-contain check first requires the file to exist and be non-empty.
+absent_from() {  # absent_from <file> <pattern> <label>
+  if [ ! -s "$1" ]; then
+    bad "$3 -- $1 is missing or empty, so the absence proves nothing"
+  elif grep -q "$2" "$1"; then
+    bad "$3 -- found '$2' in $1"
+  else
+    ok "$3"
+  fi
+}
+present_in() {  # present_in <file> <pattern> <label>
+  if [ ! -s "$1" ]; then
+    bad "$3 -- $1 is missing or empty"
+  elif grep -q "$2" "$1"; then
+    ok "$3"
+  else
+    bad "$3 -- '$2' not in $1"
+  fi
+}
+
 # WHETHER `git commit` WORKS HERE AT ALL. Some sandboxes refuse outright
 # ("Commits are disabled in devtainer"), which makes the publish half of the tick
 # untestable there. Skipped rather than deleted, and skipped LOUDLY: the same
@@ -84,7 +106,8 @@ EOF
   cat >"$W/bin/claude" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\${QF_REQUIRE_PREREG:-unset}" > "$W/leader_prereg_env"
-printf '%s\n' "\$@" > "$W/leader_prompt"
+printf '%s\n' "\$@" > "$W/leader_argv"
+cat > "$W/leader_prompt"
 [ ! -f "$W/leader_fails" ] || exit 3
 if [ -f "$W/leader_entry" ]; then
   cat "$W/leader_entry" > "$W/research/journal/PENDING.md"
@@ -94,7 +117,8 @@ EOF
   # `codex`: replies with whatever $W/codex_reply holds.
   cat >"$W/bin/codex" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "\$@" > "$W/codex_prompt"
+printf '%s\n' "\$@" > "$W/codex_argv"
+cat > "$W/codex_prompt"
 [ ! -f "$W/codex_fails" ] || { echo "boom"; exit 4; }
 cat "$W/codex_reply" 2>/dev/null || echo "VERDICT: AGREE"
 EOF
@@ -410,6 +434,7 @@ else
   cat >"$W/bin/claude" <<EOF
 #!/usr/bin/env bash
 echo "# a claim" > "$W/research/journal/PENDING.md"
+cat > "$W/leader_prompt"
 echo "REWRITTEN" > "$W/research/journal/20260101T000000Z.md"
 echo "leader done"
 EOF
@@ -477,7 +502,8 @@ setup codexagreethencrash
 # crashed.
 cat >"$W/bin/codex" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "\$@" > "$W/codex_prompt"
+printf '%s\n' "\$@" > "$W/codex_argv"
+cat > "$W/codex_prompt"
 echo "VERDICT: AGREE"
 exit 4
 EOF
@@ -507,6 +533,7 @@ echo 1 >"$W/extracts_today"
 # The leader tries to submit an extract anyway, as an untrusted leader would.
 cat >"$W/bin/claude" <<EOF
 #!/usr/bin/env bash
+cat > "$W/leader_prompt"
 qf extract --target wait_time --as-of 2026-07-27T00:00:00Z >/dev/null 2>&1
 echo "\$?" > "$W/extract_rc"
 qf probe --sha abc --extract c179c7f5b961 >/dev/null 2>&1
@@ -529,6 +556,7 @@ setup shimoffwhenbudgetleft
 echo 0 >"$W/extracts_today"
 cat >"$W/bin/claude" <<EOF
 #!/usr/bin/env bash
+cat > "$W/leader_prompt"
 qf extract --target wait_time --as-of 2026-07-27T00:00:00Z >/dev/null 2>&1
 echo "\$?" > "$W/extract_rc"
 echo "# a claim" > "$W/research/journal/PENDING.md"
@@ -587,6 +615,7 @@ else
   # changes, and `git commit` commits the whole index.
   cat >"$W/bin/claude" <<EOF
 #!/usr/bin/env bash
+cat > "$W/leader_prompt"
 echo "REWRITTEN" > "$W/research/journal/20260101T000000Z.md"
 git -C "$W/research" add journal/20260101T000000Z.md
 echo "# a claim" > "$W/research/journal/PENDING.md"
@@ -639,12 +668,48 @@ chmod +x "$W/.nvm/versions/node/v9.0.0/bin/claude"
 rm -f "$W/bin/claude" "$W/bin/codex"
 echo "VERDICT: AGREE" >"$W/codex_reply"
 out="$(TICK_PATH="$W/bin:/usr/bin:/bin" run_tick)"
+# BOTH HALVES. Rejecting only "WRONG NODE VERSION" passes vacuously if claude
+# never ran at all -- e.g. if agent detection were removed and the tick aborted.
 printf '%s' "$out" | grep -q "WRONG NODE VERSION" \
   && bad "the OLDEST node was chosen -- $out" \
   || ok "the newest installed node wins (sort -V, not lexical)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "...and the tick actually completed, so that absence means something" \
+  || bad "the tick did not complete, so the version assertion is vacuous -- $out"
+
+# --------------------------------------------------------------------------
+setup nvmnewestmissingcli
+# THE CASE CODEX FOUND. `nvm install 24` does not migrate global packages, so
+# the newest version dir routinely exists WITHOUT the CLIs while an older one
+# still has them. Picking newest-by-name then hides an installed CLI.
+mkdir -p "$W/.nvm/versions/node/v22.0.0/bin" \
+         "$W/.nvm/versions/node/v24.19.0/bin"
+mv "$W/bin/claude" "$W/.nvm/versions/node/v22.0.0/bin/claude"
+mv "$W/bin/codex" "$W/.nvm/versions/node/v22.0.0/bin/codex"
+printf '#!/bin/sh\necho node\n' >"$W/.nvm/versions/node/v24.19.0/bin/node"
+chmod +x "$W/.nvm/versions/node/v24.19.0/bin/node"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" run_tick)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "a CLI in an OLDER node version is still found" \
+  || bad "a CLI in an older node version is found -- $out"
+
+# --------------------------------------------------------------------------
+setup nvmsplitversions
+# The two CLIs under DIFFERENT node versions -- also legitimate.
+mkdir -p "$W/.nvm/versions/node/v22.0.0/bin" \
+         "$W/.nvm/versions/node/v24.19.0/bin"
+mv "$W/bin/codex" "$W/.nvm/versions/node/v22.0.0/bin/codex"
+mv "$W/bin/claude" "$W/.nvm/versions/node/v24.19.0/bin/claude"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(TICK_PATH="$W/bin:/usr/bin:/bin" run_tick)"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "CLIs split across two node versions are both reachable" \
+  || bad "CLIs split across node versions are both reachable -- $out"
 
 # --------------------------------------------------------------------------
 setup pathnogrowth
+AGENT_ENV="$HERE/../research-loop/agent-env.sh"
 # tick.sh sources agent-env.sh and the leader inherits PATH; an unguarded
 # prepend would grow it every generation.
 NVMBIN="$W/.nvm/versions/node/v24.19.0/bin"
@@ -653,6 +718,12 @@ cp "$W/bin/codex" "$NVMBIN/codex"
 cat >"$NVMBIN/claude" <<EOF
 #!/usr/bin/env bash
 # Count how many times the nvm bin dir appears in the inherited PATH.
+cat > "$W/leader_prompt"
+# SOURCED AGAIN, TWICE, from inside the child -- which is what proves the
+# duplicate-prepend guard works. Sourcing once and counting one occurrence would
+# still report 1 with the guard deleted.
+. "$AGENT_ENV"
+. "$AGENT_ENV"
 printf '%s' "\$PATH" | tr ':' '\n' | grep -cxF "$NVMBIN" > "$W/path_count"
 echo "# a claim" > "$W/research/journal/PENDING.md"
 echo "leader done"
@@ -694,6 +765,105 @@ out="$(TICK_PATH="$W/bin:/usr/bin:/bin" NVM_DIR="$W/alt-nvm" run_tick)"
 [ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
   && ok "a relocated nvm under \$HOME is honoured" \
   || bad "a relocated nvm under \$HOME is honoured -- $out"
+
+# --------------------------------------------------------------------------
+setup stdinnotargv
+# THE PROMPT GOES ON STDIN, NOT IN ARGV. A single argv entry is capped at
+# MAX_ARG_STRLEN = 131072 bytes, and the frontier grows with every scored run --
+# so argv would eventually fail with E2BIG for a reason nothing in the loop
+# explains. Argv is also world-readable in `ps`.
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick)"
+grep -q "research leader" "$W/leader_prompt" 2>/dev/null \
+  && ok "the leader receives the prompt on stdin" \
+  || bad "the leader receives the prompt on stdin -- $out"
+absent_from "$W/leader_argv" "research leader" \
+  "the prompt is not in argv (not visible in ps, no 128KiB cap)"
+grep -q "Reject the entry" "$W/codex_prompt" 2>/dev/null \
+  && ok "the copilot receives its prompt on stdin" \
+  || bad "the copilot receives its prompt on stdin"
+grep -qx -- "-" "$W/codex_argv" 2>/dev/null \
+  && ok "codex is invoked with an explicit \`-\` for stdin" \
+  || bad "codex should get an explicit \`-\` (else a piped prompt is wrapped)"
+printf '%s' "$out" | grep -qE "leader input: [0-9][0-9]* bytes" \
+  && ok "the assembled prompt size is reported" \
+  || bad "the assembled prompt size is reported"
+
+# --------------------------------------------------------------------------
+setup queuecap
+# A queue file far larger than the cap must be trimmed AND the leader told, so a
+# missing entry never reads as an entry that does not exist.
+python3 - "$W/queue/experiment-queue.md" <<'PYQ'
+import sys
+with open(sys.argv[1], "w") as fh:
+    fh.write("# queue head marker\n")
+    fh.write("filler line\n" * 4000)
+    fh.write("## THE RANKED LIST IS HERE at the very end\n")
+PYQ
+out="$(run_tick QF_TICK_MAX_QUEUE_BYTES=2048)"
+grep -q "TRUNCATED" "$W/leader_prompt" 2>/dev/null \
+  && ok "an oversized queue excerpt is trimmed with a visible notice" \
+  || bad "an oversized queue excerpt announces the trim -- $out"
+grep -q "queue head marker" "$W/leader_prompt" 2>/dev/null \
+  && ok "the head of the queue survives the trim" \
+  || bad "the head of the queue survives the trim"
+absent_from "$W/leader_prompt" "RANKED LIST IS HERE" \
+  "the trim really bounded the excerpt"
+
+# --------------------------------------------------------------------------
+setup queuenocap
+# Under the cap: passed through whole, with no misleading truncation notice.
+# THE SAME FIXTURE as the trim case -- `setup` rebuilds a fresh world each time,
+# so without re-creating it this case was asserting the absence of a marker that
+# was never written. The added positive assertion is what exposed that.
+python3 - "$W/queue/experiment-queue.md" <<'PYQ2'
+import sys
+with open(sys.argv[1], "w") as fh:
+    fh.write("# queue head marker\n")
+    fh.write("filler line\n" * 200)
+    fh.write("## THE RANKED LIST IS HERE at the very end\n")
+PYQ2
+out="$(run_tick QF_TICK_MAX_QUEUE_BYTES=65536)"
+absent_from "$W/leader_prompt" "TRUNCATED" \
+  "a queue under the cap does not claim truncation"
+# THE POSITIVE HALF, without which the above passes when the queue -- or the
+# whole prompt -- was simply omitted.
+present_in "$W/leader_prompt" "RANKED LIST IS HERE" \
+  "...and the whole queue really is present"
+
+# --------------------------------------------------------------------------
+setup badknobs
+# Every numeric knob bounds what the loop may spend, and a malformed bound is
+# not a smaller bound -- it is no bound. `head -c bogus` failed silently inside a
+# `{ ... }` block that still succeeded, so the leader ran with no queue excerpt
+# and a notice claiming otherwise; GNU `head -c -1` means "all but the last
+# byte", so a negative value REMOVED the cap it was setting.
+for knob in QF_TICK_MAX_QUEUE_BYTES QF_TICK_MAX_RUNS QF_TICK_MAX_TICKS \
+            QF_TICK_MAX_EXTRACTS QF_TICK_MAX_DISAGREE; do
+  for value in bogus -1 3.5; do
+    out="$(run_tick "$knob=$value" 2>&1)"
+    if printf '%s' "$out" | grep -q "non-negative integer"; then
+      :
+    else
+      bad "$knob=$value is refused -- got: $(printf '%s' "$out" | head -1)"
+      continue 2
+    fi
+  done
+  ok "$knob refuses bogus, negative and fractional values"
+done
+[ ! -s "$W/research/journal/PENDING.md" ] \
+  && ok "a malformed knob stops the tick before the leader runs" \
+  || bad "a malformed knob stops the tick before the leader runs"
+
+# --------------------------------------------------------------------------
+setup emptyknob
+# An EMPTY value is not malformed: `${VAR:-default}` treats it as unset, which is
+# the documented shell behaviour and the right one.
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick QF_TICK_MAX_QUEUE_BYTES= 2>&1)"
+printf '%s' "$out" | grep -q "non-negative integer" \
+  && bad "an empty knob should fall back to the default, not abort -- $out" \
+  || ok "an empty knob falls back to its default"
 
 echo
 echo "pass=$pass fail=$fail skip=$skip"

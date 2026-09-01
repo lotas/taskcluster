@@ -11,8 +11,15 @@ the numbers, not the numbers.
 
 ## Reject the entry if any of these is true
 
-1. **A cited figure is not in the JSON** and was not shown by a command in the
-   entry. A remembered number is an invented number.
+1. **A cited figure is not in the JSON** and is not pasted in the entry's
+   `Evidence:` block. A remembered number is an invented number.
+
+   You receive the entry and the JSON and nothing else — you cannot see the
+   commands the leader ran. That is why the leader is required to paste the
+   command and its relevant output for any figure the JSON does not carry. A
+   figure supported by a pasted command output **is** supported; treat it as
+   checkable and judge whether the conclusion follows from it. Only reject when
+   a figure has neither source.
 
    **If the evidence is labelled as predating the leader's action**, then a
    figure from that action is missing for a benign reason rather than fabricated

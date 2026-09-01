@@ -48,16 +48,29 @@ def row(evaluation, probe, config, metrics, passed, note=None,
             "note": note if note is not None else f"cfg={config}"}
 
 
-REFERENCE_M = {"mae": 225.1, "within_2x": 0.6375,
-               "p90_coverage": 0.8901, "p90_miss_tail": 0.2946}
+# THE SCOREBOARD'S `measured`, NOT THE UNDERLYING METRIC -- and the distinction
+# is the whole reason these fixtures were wrong before. `verdict.py:48-60`:
+#
+#   mae            relative_improvement -> the improvement FRACTION (higher good)
+#   within_2x      absolute_improvement -> improvement in POINTS   (higher good)
+#   p90_coverage   band                 -> the raw coverage
+#   p90_miss_tail  absolute             -> the raw miss rate       (lower good)
+#
+# The earlier fixtures put absolute seconds in `mae` (225.1, 171.6). That is the
+# `value` field, not `measured` -- and because it happened to agree with a
+# hardcoded `RANK["mae"] = "lower"`, 43 tests passed over an inverted comparison.
+# These are the real numbers from the first live tick, 2026-09-01, series
+# bd29b39a.
+REFERENCE_M = {"mae": 0.04038, "within_2x": 0.04417,
+               "p90_coverage": 0.8901, "p90_miss_tail": 0.29457}
 REFERENCE_P = {"mae": False, "within_2x": False,
                "p90_coverage": True, "p90_miss_tail": True}
-QCTX_M = {"mae": 171.6, "within_2x": 0.6884,
-          "p90_coverage": 0.8821, "p90_miss_tail": 0.3108}
+QCTX_M = {"mae": 0.26856, "within_2x": 0.09506,
+          "p90_coverage": 0.8821, "p90_miss_tail": 0.31078}
 QCTX_P = {"mae": True, "within_2x": True,
           "p90_coverage": True, "p90_miss_tail": False}
-QCTX_D_M = {"mae": 173.95, "within_2x": 0.6801,
-            "p90_coverage": 0.8870, "p90_miss_tail": 0.3042}
+QCTX_D_M = {"mae": 0.25853, "within_2x": 0.08680,
+            "p90_coverage": 0.8870, "p90_miss_tail": 0.30425}
 QCTX_D_P = dict(QCTX_P)
 
 REF_PROBE = "probe-20260830T202842Z-4a2ae967d664-5418"
@@ -103,16 +116,42 @@ class Series(unittest.TestCase):
         report = F.build(rows, EXTRACTS, CONTRACTS)
         self.assertIsNone(report["series"][0]["holdout"])
 
-    def test_frontier_ranks_by_direction_not_by_recency(self):
+    def test_frontier_ranks_by_the_contract_not_by_recency(self):
         rows = [row("e1", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P),
                 row("e2", "p-qctx", CFG_QCTX, QCTX_M, QCTX_P)]
         front = F.build(rows, EXTRACTS, CONTRACTS)["series"][0]["frontier"]
-        self.assertEqual(front["mae"]["value"], 171.6)          # lower is better
-        self.assertEqual(front["within_2x"]["value"], 0.6884)   # higher is better
-        # The reference holds the tail, because lower is better there and it is
-        # the only row that passes that bar.
-        self.assertEqual(front["p90_miss_tail"]["value"], 0.2946)
+        # mae's `measured` is an IMPROVEMENT, so the BIGGER number wins. The old
+        # hardcoded rank made this the reference's 0.04038 -- naming the config
+        # that FAILED the bar as the series best while a passing row sat beside
+        # it, which is exactly what the first live tick reported.
+        self.assertEqual(front["mae"]["value"], 0.26856)
+        self.assertEqual(front["mae"]["config"], CFG_QCTX)
+        self.assertEqual(front["within_2x"]["value"], 0.09506)
+        # The tail is an `absolute` bar, so `measured` is the raw miss rate and
+        # lower really is better -- the reference holds it.
+        self.assertEqual(front["p90_miss_tail"]["value"], 0.29457)
         self.assertEqual(front["p90_miss_tail"]["config"], CFG_REF)
+
+    def test_the_ranks_come_from_the_contract(self):
+        import json
+        with open(os.path.join(HOST, "contracts",
+                               "wait_time.v1.json")) as fh:
+            contract = json.load(fh)
+        self.assertEqual(F.metric_ranks(contract),
+                         {"mae": "higher", "within_2x": "higher",
+                          "p90_coverage": "band", "p90_miss_tail": "lower"})
+
+    def test_an_unreadable_contract_leaves_the_series_unordered(self):
+        rows = [row("e1", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P),
+                row("e2", "p-qctx", CFG_QCTX, QCTX_M, QCTX_P)]
+        report = F.build(rows, EXTRACTS, {"contracts": [], "dir": "/nonexistent"})
+        entry = report["series"][0]
+        self.assertFalse(entry["ordered"])
+        # First-seen stands; no direction is invented.
+        self.assertEqual(entry["frontier"]["mae"]["value"], 0.04038)
+        text = F.render(report)
+        self.assertIn("could not be read", text)
+        self.assertIn("unordered", text)
 
 
 class ConfirmGate(unittest.TestCase):
@@ -183,11 +222,11 @@ class ConfirmGate(unittest.TestCase):
 
 class Claims(unittest.TestCase):
     def test_improve_is_judged_against_vs_not_against_the_bar(self):
-        # The reference cut MAE 4% against the baseline and still MISSES the
-        # -15% bar. Judged against the bar this would read as a broken claim;
-        # judged against `vs` -- which is the discipline the queue runs on -- it
-        # is kept.
-        worse = dict(REFERENCE_M, mae=300.0)
+        # The reference improved MAE 4% against the baseline and still MISSES the
+        # 15% bar. Judged against the bar this would read as a broken claim;
+        # judged against `vs` -- the discipline the queue runs on -- it is kept.
+        # `worse` means a SMALLER improvement, mae's `measured` being a delta.
+        worse = dict(REFERENCE_M, mae=0.01)
         rows = [row("e0", "p0", CFG_REF, worse, REFERENCE_P),
                 row("e1", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P,
                     note=P.encode(CFG_REF, "mae", "improve",
@@ -635,6 +674,59 @@ class VsResolution(unittest.TestCase):
         claims = {r["evaluation"]: r["claim"]
                   for entry in report["series"] for r in entry["rows"]}
         self.assertEqual(claims["eC"], "unjudgeable: vs is another series")
+
+
+class MaeIsAnImprovementNotAQuantity(unittest.TestCase):
+    """Regression for the defect the first live tick found.
+
+    `frontier.py` hardcoded `RANK["mae"] = "lower"`, reading the contract's
+    `direction: lower_is_better` as a statement about the SCOREBOARD value. It is
+    a statement about MAE the quantity; the scoreboard stores
+    `baseline - value / baseline`, an improvement, so higher is better. Every mae
+    comparison in the frontier was inverted, and -- because pre-registrations live
+    in an immutable note -- any `--bar mae` claim written before the fix would
+    read backwards permanently.
+    """
+
+    def _claim(self, ref_mae, mine_mae, direction, tol=0.0):
+        rows = [row("e1", "p1", CFG_REF, dict(REFERENCE_M, mae=ref_mae),
+                    dict(REFERENCE_P, mae=ref_mae >= 0.15)),
+                row("e2", "p2", CFG_QCTX, dict(QCTX_M, mae=mine_mae),
+                    dict(QCTX_P, mae=mine_mae >= 0.15),
+                    note=P.encode(CFG_QCTX, "mae", direction, "qctx cuts error",
+                                  vs="e1", tol=tol))]
+        report = F.build(rows, EXTRACTS, CONTRACTS)
+        return {r["evaluation"]: r["claim"]
+                for r in report["series"][0]["rows"]}["e2"]
+
+    def test_a_real_improvement_is_kept(self):
+        # 4.0% -> 26.9%, the actual qctx result. Reported `broken` before.
+        self.assertEqual(self._claim(0.04038, 0.26856, "improve"), "kept")
+
+    def test_a_regression_is_broken(self):
+        self.assertEqual(self._claim(0.26856, 0.04038, "improve"), "broken")
+
+    def test_hold_is_not_satisfied_by_a_collapse(self):
+        # A 22.8-point MAE regression pre-registered as `hold` reported `kept`
+        # before, which is the same inversion seen from the other side.
+        self.assertEqual(self._claim(0.26856, 0.04038, "hold"), "broken")
+
+    def test_hold_accepts_an_equal_or_better_improvement(self):
+        self.assertEqual(self._claim(0.25853, 0.26856, "hold"), "kept")
+        self.assertEqual(self._claim(0.25853, 0.25853, "hold"), "kept")
+
+    def test_hold_tolerance_applies_in_the_improvement_direction(self):
+        # `tol` is how much WORSE it may get: a smaller improvement.
+        self.assertEqual(self._claim(0.26856, 0.26000, "hold", tol=0.01), "kept")
+        self.assertEqual(self._claim(0.26856, 0.25000, "hold", tol=0.01),
+                         "broken")
+
+    def test_within_2x_is_also_an_improvement_and_ranks_higher(self):
+        rows = [row("e1", "p1", CFG_REF, REFERENCE_M, REFERENCE_P),
+                row("e2", "p2", CFG_QCTX, QCTX_M, QCTX_P)]
+        front = F.build(rows, EXTRACTS, CONTRACTS)["series"][0]["frontier"]
+        self.assertEqual(front["within_2x"]["value"], 0.09506)
+        self.assertEqual(front["within_2x"]["config"], CFG_QCTX)
 
 
 if __name__ == "__main__":

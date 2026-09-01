@@ -43,6 +43,10 @@ MAX_TICKS="${QF_TICK_MAX_TICKS:-12}"
 # production database, and it is the only action here that touches it.
 MAX_EXTRACTS="${QF_TICK_MAX_EXTRACTS:-1}"
 NO_MORE_EXTRACTS=0
+# How much of `experiment-queue.md` goes into the prompt. 24KiB fits the file as
+# it stands (~17KiB) with room to grow; past that the leader is told it was cut
+# rather than left to assume it saw everything.
+MAX_QUEUE_BYTES="${QF_TICK_MAX_QUEUE_BYTES:-24576}"
 # Consecutive verification failures before the loop stops itself. Not 1: two
 # agents disagreeing once is the mechanism working. Repeatedly is a leader whose
 # reasoning has drifted, and it must not keep pushing.
@@ -66,6 +70,28 @@ DRY_RUN=0
 
 say() { printf '[tick %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { say "ABORT: $*" >&2; exit 1; }
+
+# EVERY NUMERIC KNOB IS VALIDATED, because each is used BOTH in an arithmetic
+# test and as an argument to something else, and neither position fails safely
+# under `set -uo pipefail` (there is no `errexit`).
+#
+# `QF_TICK_MAX_QUEUE_BYTES=bogus` made `[ ... -le bogus ]` and `head -c bogus`
+# both fail while the surrounding `{ ... }` block still succeeded -- so the
+# leader ran with NO queue excerpt and a notice claiming it had been given the
+# "first bogus bytes". And on GNU `head`, `-c -1` means "all but the last byte",
+# so a negative value silently REMOVED the cap it was setting.
+for _knob in MAX_RUNS MAX_TICKS MAX_EXTRACTS MAX_DISAGREE MAX_QUEUE_BYTES; do
+  _value="${!_knob}"
+  case "$_value" in
+    ''|*[!0-9]*)
+      die "$_knob must be a non-negative integer, got '$_value'. Refusing to
+  run: this value bounds what the loop may spend, and a malformed bound is not
+  a smaller bound -- it is no bound." ;;
+  esac
+done
+unset _knob _value
+[ "$MAX_QUEUE_BYTES" -gt 0 ] \
+  || die "MAX_QUEUE_BYTES must be greater than zero"
 
 # THE AGENT CLIs AND THE PROXY, before anything looks for them. Sourced here --
 # the single entry point -- so the timer, `install.sh once` and a hand-run tick
@@ -283,7 +309,29 @@ PENDING="$JOURNAL/PENDING.md"
   echo
   echo "## The queue (read-only; you cannot write this file)"
   echo
-  sed -n '1,400p' "$QUEUE" 2>/dev/null || echo "(unreadable: $QUEUE)"
+  # BOUNDED BY BYTES, NOT ONLY BY LINES. `sed -n '1,400p'` bounds nothing useful:
+  # a 400-line markdown table is small and 400 lines of prose is not, and this
+  # file only ever grows. Stdin removed the hard argv cliff, so an overlong
+  # prompt no longer CRASHES the tick -- it quietly degrades the leader instead,
+  # which is harder to notice.
+  #
+  # TRIMMED FROM THE END and SAID SO. The queue's ranked list is at the end, so
+  # losing it silently would remove the one thing the leader is asked to act on.
+  if [ ! -r "$QUEUE" ]; then
+    echo "(unreadable: $QUEUE)"
+  else
+    QUEUE_BYTES="$(wc -c <"$QUEUE")"
+    if [ "$QUEUE_BYTES" -le "$MAX_QUEUE_BYTES" ]; then
+      cat "$QUEUE"
+    else
+      head -c "$MAX_QUEUE_BYTES" "$QUEUE"
+      echo
+      echo "**[TRUNCATED: this excerpt is the first $MAX_QUEUE_BYTES of"
+      echo "$QUEUE_BYTES bytes. The ranked list of entries is at the END of that"
+      echo "file, so it may be missing here -- read it by absolute path before"
+      echo "concluding that an entry does not exist.]**"
+    fi
+  fi
 } >"$CTX/context.md"
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -307,14 +355,36 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 say "leader starting"
 LEADER_LOG="$CTX/leader.log"
+# ON STDIN, NOT IN ARGV, and this is not cosmetic:
+#
+#   1. A single argv entry is capped at MAX_ARG_STRLEN = 131072 bytes on Linux
+#      (32 pages, not tunable). The assembled prompt is ~26KB today, but the
+#      frontier grows with every scored run -- roughly 240 bytes per run across
+#      its two tables -- so a few hundred experiments would have hit E2BIG and
+#      the loop would have started failing for a reason nothing here explains.
+#   2. Argv is world-readable in `ps`. The whole prompt, including the queue
+#      excerpt, was visible to every account on the host.
+#
+# Both CLIs support it: `claude -p` reads the prompt from stdin when no
+# positional is given, and `codex exec -` is documented to do the same.
+cat "$HERE/tick-prompt.md" >"$CTX/leader-input.md"
+printf '\n\n' >>"$CTX/leader-input.md"
+cat "$CTX/context.md" >>"$CTX/leader-input.md"
+LEADER_BYTES="$(wc -c <"$CTX/leader-input.md")"
+say "leader input: $LEADER_BYTES bytes"
+# REPORTED AND WARNED, never truncated wholesale: the frontier is the part that
+# grows with history, and dropping rows from it is a research decision rather
+# than a plumbing one. If this fires, bound the frontier deliberately.
+[ "$LEADER_BYTES" -lt 100000 ] \
+  || say "WARNING the leader prompt is $LEADER_BYTES bytes and growing with
+  scored history. Nothing is truncated, but consider bounding the frontier."
+
 # PATH="$LEADER_PATH": when the extract budget is spent this puts the refusing
 # shim ahead of the real `qf` for the leader and everything it spawns, including
 # `experiment.py`, whose own `qf` calls (probe, evaluate, extracts, contracts)
 # pass through untouched.
 if ! PATH="$LEADER_PATH" claude -p "${LEADER_FLAGS[@]}" \
-      "$(cat "$HERE/tick-prompt.md")
-
-$(cat "$CTX/context.md")" >"$LEADER_LOG" 2>&1; then
+      <"$CTX/leader-input.md" >"$LEADER_LOG" 2>&1; then
   say "leader exited non-zero; its output:"
   tail -c 2000 "$LEADER_LOG"
   # Not an escalation: a crashed leader made no claim, so there is nothing to
@@ -372,18 +442,28 @@ if ! command -v codex >/dev/null 2>&1; then
   REASON="codex is not installed, so the claim could not be verified"
 else
   say "copilot verifying"
+  # ASSEMBLED TO A FILE for the same two reasons as the leader's, and the
+  # evidence JSON is the part that grows -- it carries every scored row.
+  {
+    cat "$HERE/verify-prompt.md"
+    echo
+    echo "## The claim to check"
+    echo
+    cat "$PENDING"
+    echo
+    echo "## The numbers it must be consistent with$STALE"
+    echo
+    echo '```json'
+    cat "$EVIDENCE"
+    echo '```'
+  } >"$CTX/verify-input.md"
+  say "copilot input: $(wc -c <"$CTX/verify-input.md") bytes"
   CODEX_OK=1
-  CHECK="$(codex exec "${COPILOT_FLAGS[@]}" "$(cat "$HERE/verify-prompt.md")
-
-## The claim to check
-
-$(cat "$PENDING")
-
-## The numbers it must be consistent with$STALE
-
-\`\`\`json
-$(cat "$EVIDENCE")
-\`\`\`" 2>&1)" || CODEX_OK=0
+  # `-` IS EXPLICIT: `codex exec` reads stdin when the prompt is `-` or absent,
+  # but "if stdin is piped AND a prompt is also provided, stdin is appended as a
+  # <stdin> block" -- so passing both would silently reshape the prompt.
+  CHECK="$(codex exec "${COPILOT_FLAGS[@]}" - <"$CTX/verify-input.md" 2>&1)" \
+    || CODEX_OK=0
   printf '%s\n' "$CHECK" >"$CTX/verify.log"
   REASON="$(printf '%s' "$CHECK" | tail -c 1200)"
   if [ "$CODEX_OK" = 0 ]; then
