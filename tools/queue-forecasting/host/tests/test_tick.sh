@@ -976,6 +976,99 @@ out="$(run_tick)"
 present_in "$W/leader_prompt" "STILL RUNNING from an earlier tick" \
   "a BUILDING job counts as in flight"
 
+# --------------------------------------------------------------------------
+# The idle gate. Two ticks on 2026-09-01 cost $2.74 to conclude "the probe is
+# still training" and recorded nothing; paying an agent turn to be told to wait
+# is the one cost here with no upside.
+idle_world() {  # idle_world <case> -- in-flight job, no scored rows
+  setup "$1"
+  cat >"$W/bin/qf" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" != "list" ] || python3 - "$TODAY" <<'PYI'
+import json, sys
+print(json.dumps({"jobs": [
+  {"run_id": "probe-live", "kind": "probe", "state": "RUNNING",
+   "submitted_at": f"{sys.argv[1]}T09:00:00Z"}]}))
+PYI
+EOF
+  chmod +x "$W/bin/qf"
+  cat >"$W/trusted/results.sh" <<'EOF'
+#!/usr/bin/env bash
+echo '[]'
+EOF
+  chmod +x "$W/trusted/results.sh"
+  echo "VERDICT: AGREE" >"$W/codex_reply"
+}
+
+idle_world idlegate
+out="$(run_tick)"
+[ ! -e "$W/leader_prompt" ] \
+  && ok "the leader is NOT invoked when the only action is to wait" \
+  || bad "the leader was invoked with nothing to do -- $out"
+printf '%s' "$out" | grep -q "leader is not invoked" \
+  && ok "...and the tick says why" \
+  || bad "the tick explains why it skipped -- $out"
+[ "$(cat "$W/state/ticks-$TODAY" 2>/dev/null)" = 0 ] \
+  && ok "a skipped tick does not consume the daily tick budget" \
+  || bad "a skipped tick consumed budget (counter=$(cat "$W/state/ticks-$TODAY" 2>/dev/null))"
+
+# --------------------------------------------------------------------------
+idle_world idlegateoverride
+out="$(run_tick QF_TICK_ALWAYS_LEAD=1)"
+[ -e "$W/leader_prompt" ] \
+  && ok "QF_TICK_ALWAYS_LEAD=1 overrides the idle gate" \
+  || bad "QF_TICK_ALWAYS_LEAD=1 overrides the idle gate -- $out"
+
+# --------------------------------------------------------------------------
+idle_world idlegateunrecorded
+# An unwritten scored result is action 1, so the leader IS worth invoking even
+# with a probe in flight.
+cat >"$W/trusted/results.sh" <<EOF
+#!/usr/bin/env bash
+python3 - "$TODAY" <<'PYU'
+import json, sys
+print(json.dumps([{
+    "evaluation": "evaluate-20260101T000000Z-aaaaaaaaaaaa-1",
+    "probe": "probe-20260101T000000Z-aaaaaaaaaaaa-1",
+    "when": f"{sys.argv[1]} 01:00", "verdict": "no-go",
+    "extract": "e" * 16, "baseline": "b" * 16, "contract": "c" * 16,
+    "metrics": {"mae": 0.26}, "passed": {"mae": True},
+    "note": "cfg=configs/x.yaml | unwritten"}]))
+PYU
+EOF
+chmod +x "$W/trusted/results.sh"
+out="$(run_tick)"
+[ -e "$W/leader_prompt" ] \
+  && ok "an unrecorded result still invokes the leader" \
+  || bad "an unrecorded result still invokes the leader -- $out"
+
+# --------------------------------------------------------------------------
+idle_world idlegatenoflight
+# Nothing in flight: actions 4 and 5 are available, so never skip.
+cat >"$W/bin/qf" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != "list" ] || echo '{"jobs": []}'
+EOF
+chmod +x "$W/bin/qf"
+out="$(run_tick)"
+[ -e "$W/leader_prompt" ] \
+  && ok "with nothing in flight the leader always runs" \
+  || bad "with nothing in flight the leader always runs -- $out"
+
+# --------------------------------------------------------------------------
+idle_world idlegatebadjson
+# An unreadable frontier must FAIL OPEN. Skipping on a reporting glitch would
+# turn it into a silently stalled loop.
+cat >"$W/trusted/results.sh" <<'EOF'
+#!/usr/bin/env bash
+echo 'not json'
+EOF
+chmod +x "$W/trusted/results.sh"
+out="$(run_tick)"
+printf '%s' "$out" | grep -q "leader is not invoked" \
+  && bad "an unreadable frontier must not skip the leader -- $out" \
+  || ok "an unreadable frontier fails open"
+
 echo
 echo "pass=$pass fail=$fail skip=$skip"
 [ "$fail" = 0 ]

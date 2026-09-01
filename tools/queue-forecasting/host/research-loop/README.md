@@ -321,6 +321,53 @@ reasoning went to a log nobody keeps. The prompt now says the final message is
 not the entry, and that a tool timeout on `experiment.py run` is expected rather
 than a failure to be retried.
 
+### The idle gate
+
+Invoking the leader is the expensive part of a tick. Measured 2026-09-01: two
+consecutive ticks whose only possible conclusion was "the probe is still
+training" cost **$1.48 and $1.26** — 2.4M tokens, ~94% of it cache reads — and
+recorded nothing.
+
+So the tick asks *before* spending anything: is a job in flight (actions 4 and 5
+unavailable), **and** is nothing unrecorded (1 and 2), **and** is nothing
+PROMISING (3)? Then only "wait" remains, its content is already known, and the
+leader is not invoked. A skipped tick also rolls its own counter back — it cost
+nothing, so it should not consume the daily tick budget.
+
+It fails **open**: an unreadable frontier runs the leader, because skipping on a
+reporting glitch would turn it into a silently stalled loop. `QF_TICK_ALWAYS_LEAD=1`
+overrides.
+
+## A qctx probe does not fit the probe timeout
+
+`spec.py` caps `timeout_s` at **3600** for every kind, and the cap is
+deliberately subordinate to the dispatcher's hold deadline:
+
+```
+TIMEOUT_MAX + BUILD_TIMEOUT_S + BUILD_LOCK_WAIT_S + HANDOFF_TIMEOUT_S
+  + setup/teardown  <  JOB_HOLD_DEADLINE_S  <  LOCK_WAIT_S
+```
+
+*"those numbers move together or not at all"*, and `phase2-setup.sh discover`
+fails if the chain inverts.
+
+Measured on `wait_hazard_qctx_d_priority_flow` (2026-09-01, extract
+`8734690f4cd8`, 6.02M rows): queue-context features took **3019.7s** for the
+training split; the model then trained and reported `30m+ p90 miss 13.3% guarded
+(bar 34.49%)`; then a **second** qctx sweep began for the 1.94M-row prediction
+pass, and the job hit TIMEOUT. Feature work alone is ~4000s against a 3600s
+ceiling, because the sweep is recomputed per split rather than once.
+
+So no qctx-enabled config can currently complete a probe. Two ways out, neither
+of which should be chosen quietly:
+
+1. **Raise the chain.** The observed hold deadline was 7800s, so headroom exists,
+   but it is a coordinated constant change in the trusted dispatcher.
+2. **Compute the sweep once.** `[queue_context]` timings show heavy skew — 26 of
+   529 queues took 907s of the 3019s — so caching across splits, or sweeping the
+   union once, is the real fix. That is trainer work, and it is the rare case
+   where platform work unblocks the science rather than displacing it.
+
 ## Deploying restarts the dispatcher, which kills in-flight probes
 
 `mirror-refresh` runs `systemctl restart qf-dispatch`, and qfd's startup recovery

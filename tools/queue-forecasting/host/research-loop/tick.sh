@@ -281,6 +281,48 @@ frontier() {  # frontier <results.json> <out-prefix>
 frontier "$CTX/results.json" "$CTX/frontier" \
   || die "frontier.py failed: $(head -c 300 "$CTX/frontier.err")"
 
+# IS THERE ANYTHING TO DO? Asked BEFORE the leader is invoked, because invoking
+# it is the expensive part. Measured on 2026-09-01: two consecutive ticks whose
+# only possible conclusion was "the probe is still training" cost $1.48 and
+# $1.26 -- 2.4M tokens, 94% of it cache reads -- and recorded nothing. Paying
+# an agent turn to be told to wait is the one cost here with no upside.
+#
+# The condition is deliberately narrow: a job is in flight (so actions 4 and 5
+# are unavailable), AND no scored run is unwritten (actions 1 and 2), AND nothing
+# is PROMISING (action 3). Then only action 6 remains, and its content is already
+# known -- so it is written here rather than bought.
+NOTHING_TO_DO=0
+if [ "${IN_FLIGHT:-0}" -gt 0 ] && [ "${QF_TICK_ALWAYS_LEAD:-0}" != 1 ]; then
+  read -r UNRECORDED PROMISING <<EOF
+$(python3 - "$CTX/frontier.json" <<'PYIDLE'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        report = json.load(fh)
+except (OSError, ValueError):
+    # UNREADABLE MEANS RUN THE LEADER. Skipping a tick on a parse failure would
+    # turn a reporting glitch into a silently stalled loop.
+    print("1 1")
+else:
+    configs = (report.get("configs") or {}).values()
+    print((report.get("health") or {}).get("unrecorded_runs", 1),
+          sum(1 for c in configs if c.get("status") == "PROMISING"))
+PYIDLE
+)
+EOF
+  if [ "${UNRECORDED:-1}" = 0 ] && [ "${PROMISING:-1}" = 0 ]; then
+    NOTHING_TO_DO=1
+  fi
+fi
+
+if [ "$NOTHING_TO_DO" = 1 ]; then
+  say "$IN_FLIGHT job(s) in flight, nothing unrecorded, nothing PROMISING:"
+  say "  the only available action is 'wait', so the leader is not invoked."
+  say "  (override with QF_TICK_ALWAYS_LEAD=1)"
+  set_counter "$TICKS_FILE" "$TICKS"     || say "note: could not roll the tick counter back"
+  exit 0
+fi
+
 say "checking the host"
 if ! "$TRUSTED/experiment.py" doctor >"$CTX/doctor.txt" 2>&1; then
   # NOT fatal by itself. `doctor` reports notes as well as blockers, and its exit
