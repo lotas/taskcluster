@@ -88,13 +88,11 @@ off)
   echo "timer disabled."
   ;;
 once)
-  # `cd /` FIRST, and it is not tidiness. `sudo -H` sets HOME and deliberately
-  # leaves the working directory alone, so a `once` run from an operator's home
-  # handed the tick a cwd the research user cannot traverse -- and both agents
-  # then failed to spawn ANY process, with empty output and no error (measured
-  # 2026-09-02, one $0.79 tick that concluded it had no shell). `/` is what the
-  # systemd unit gets by default, so this makes the two paths agree; `tick.sh`
-  # moves to the workspace itself.
+  # `cd /` so this path and the timer agree on cwd: `sudo -H` sets HOME and
+  # deliberately leaves the working directory alone, while the systemd unit sets
+  # no `WorkingDirectory=` and so gets `/`. `tick.sh` moves to the workspace
+  # itself. This is consistency, not a fix -- the 2026-09-02 tool failures were
+  # a transient agent fault and a codex config error, not a cwd problem.
   cd / || die "cannot cd /"
   [ "$(id -un)" = research ] \
     && exec "$TRUSTED/tick.sh" \

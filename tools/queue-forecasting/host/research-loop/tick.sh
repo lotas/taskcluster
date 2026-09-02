@@ -79,12 +79,18 @@ die() { say "ABORT: $*" >&2; exit 1; }
 # Under `install.sh once` it is the operator's shell cwd, because `sudo -H`
 # sets HOME and deliberately does NOT change directory.
 #
-# MEASURED 2026-09-02: run from an operator's home, which `research` cannot
-# traverse, the leader's every shell call returned exit 1 with EMPTY output --
-# `true` and `/bin/echo` included -- and `codex` exited 1 before emitting any
-# usage. A process cannot be spawned from a cwd it cannot resolve, and the
-# failure surfaces as a tool that is simply broken, with no error to read. The
-# tick spent $0.79 to conclude it had no shell.
+# This is HARDENING, not a fix for anything observed. It was written while
+# chasing a 2026-09-02 tick in which the leader's every shell call returned exit
+# 1 with empty output; an inherited-unreadable-cwd was the hypothesis and it was
+# WRONG -- `sudo -H -u research bash -lc` from that same operator directory runs
+# fine. That failure was a transient agent tool-layer fault and was gone the
+# next tick; the copilot failure beside it was `codex` erroring on
+# "cloud config bundle (workspace-managed policies)". Neither involved cwd.
+#
+# It stays because an inherited working directory is still an unpinned input to
+# every command both agents run, and the two entry points disagreed about it:
+# systemd gives `/` (no `WorkingDirectory=`), `install.sh once` gives the
+# operator's shell. Do not cite this block as the cause of a tool failure.
 #
 # The workspace is also the RIGHT cwd, not merely a reachable one: it is the
 # repository the leader writes its journal into, so a relative path in an agent

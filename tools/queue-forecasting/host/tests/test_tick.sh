@@ -1098,9 +1098,10 @@ present_in "$W/codex_prompt" "Jobs in flight" \
 # persisted as TICKS + 1, so printing it said "0 of 12" during the first tick.
 present_in "$W/codex_prompt" "This is tick 1 of" \
   "the tick reports its own ordinal, not the count before it"
-# THE LEADER'S CWD IS SET, NOT INHERITED. Run from a directory the research user
-# cannot traverse, every command both agents spawn fails with empty output --
-# the tick.sh cwd was only set at publish time, long after both had run.
+# THE LEADER'S CWD IS SET, NOT INHERITED. tick.sh used to set it only at publish
+# time, long after both agents had run, so it was whatever the caller had:
+# `/` under systemd, the operator's shell under `install.sh once`. Pinning an
+# input, not fixing a known failure -- see the block in tick.sh.
 if [ "$(cat "$W/leader_cwd" 2>/dev/null)" = "$W/research" ]; then
   ok "the leader runs in the workspace, whatever cwd the tick inherited"
 else
