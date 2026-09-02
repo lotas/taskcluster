@@ -45,6 +45,43 @@ observed healthy.
    Then re-run `agent-cli`. Afterwards, `auth-check` is the standing probe:
    SSO tokens refresh against an auth endpoint, and if the allowlist blocks it
    the agents work for days and then stop silently.
+
+   **That happened, on 2026-09-02.** `auth.openai.com` was not on the list, so
+   `codex` refused to start — `Error loading configuration: Failed to load cloud
+   config bundle (workspace-managed policies)` — and `codex login` failed at the
+   token exchange against `https://auth.openai.com/oauth/token`. It cost a day
+   of the research loop: a copilot that cannot start counts as a disagreement,
+   so every entry escalated and nothing was recorded, while the leader ran
+   normally and produced good work that was then discarded.
+
+   Two things made it hard to read. `reqwest` reports a filtered `CONNECT` as
+   *"error sending request for url"*, which looks like a network fault rather
+   than a policy denial; and the config-bundle load happens **before** auth, so
+   the first symptom is not an auth error. `LogLevel Connect` in
+   `tinyproxy.conf` logs the refused hostname, which names the domain instead of
+   guessing:
+
+   ```bash
+   sudo grep -iE 'denied|filter' /var/log/tinyproxy/tinyproxy.log | tail -20
+   ```
+
+   Two rules follow. **Add the host, never relax the filter** —
+   `FilterDefaultDeny Yes` is the property worth keeping, and one domain is a
+   decision while a widened filter is an unbounded one. And **add it to the
+   heredoc in `phase0-setup.sh`, not just to `/etc`**: that block `tee`s over
+   `allowlist.txt`, so a line appended during an incident is erased by the next
+   `phase0-setup.sh egress` and the failure returns with no trace of the fix.
+
+   On a VM there is no browser for the OAuth redirect to `localhost:1455`, so
+   re-authentication is `codex login --device-auth` — and it must be a **login**
+   shell, because the proxy variables live in `~/.profile` and a non-login shell
+   bypasses them into a uid-scoped nftables refusal that surfaces as a ~5ms
+   connection failure:
+
+   ```bash
+   sudo -H -u research bash -lc 'codex login --device-auth'
+   sudo -H -u research bash -lc 'codex exec --skip-git-repo-check "reply with the single word: ready"'
+   ```
 2. **Fix `password_encryption=md5`.** It stops. Setting passwords in the wrong
    scheme and then flipping `pg_hba` locks the services out.
 3. **Decide about unexpected tables.** Grants are derived from the live table

@@ -693,9 +693,24 @@ cmd_egress() {
   fi
 
   if would "write the domain allowlist"; then
+    # THIS HEREDOC IS THE LIST. It `tee`s over the file, so a domain appended by
+    # hand during an incident is silently erased the next time anyone runs
+    # `egress` -- and the agent then breaks again with no trace of the fix. Any
+    # host added on the box must be added HERE, in the same change.
+    #
+    # AUTH HOSTS ARE NOT OPTIONAL, and are easy to miss because a fresh login
+    # happens before the lock-down. Token refresh and policy loading happen
+    # later, from inside it. MEASURED 2026-09-02: `auth.openai.com` was absent,
+    # so `codex` died with "Failed to load cloud config bundle
+    # (workspace-managed policies)" and `codex login` failed at the token
+    # exchange -- reqwest reports a filtered CONNECT as "error sending request
+    # for url", which reads like a network fault, not a policy denial. The
+    # research loop's copilot was down for a day and every journal entry
+    # escalated, because a crashed verifier counts as a disagreement.
     sudo tee /etc/tinyproxy/allowlist.txt >/dev/null <<'LIST'
 ^api\.anthropic\.com$
 ^api\.openai\.com$
+^auth\.openai\.com$
 ^chatgpt\.com$
 ^github\.com$
 ^api\.github\.com$
