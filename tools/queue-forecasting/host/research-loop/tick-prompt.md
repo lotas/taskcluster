@@ -82,6 +82,33 @@ point. Write down what you actually believe, including when you are unsure.
   missing field, and the frontier reports such rows as `reference` rather than
   as a kept claim. Do not reach for it to avoid picking a reference.
 
+## Naming the variable, before attributing anything to it
+
+**A difference is only one variable if you diffed the two configs and it is.**
+This is this project's signature error and it has now cost it three times: a
+six-key, ~19-feature difference was read for weeks as "capacity actively dilutes
+the model"; `experiment-queue.md`'s Finding 1 is entirely about three ideas that
+were recorded as tried-and-dismissed on configs that were never one-variable
+tests; and on 2026-09-02 an entry called a qctx_d-vs-reference comparison
+"one-variable, unconfounded" while the 12-feature delta it cited described
+qctx-vs-qctx_d — the reference has `qctx=no`, so the real difference is the whole
+queue-context block.
+
+So, whenever you attribute an effect to a change:
+
+- **Diff the configs you are actually comparing**, key by key, and say how many
+  keys and features differ. `--vs` names that pair; the delta you cite must be
+  the delta between *those two*, not between some other pair you also have
+  numbers for.
+- If they differ in more than the thing you are claiming, **say so and weaken the
+  claim to match**. "X is better than Y here" is always available and always
+  sound; "X is better *because of* Z" needs Z to be the only difference.
+- A three-way comparison is three claims. Keep them separate, and label which
+  pair each number belongs to.
+
+Paste the diff in `Evidence:`. A key count asserted without one is a figure with
+no source.
+
 ## Reading the frontier
 
 - A **series** is one `(extract, baseline, contract)`. Never compare across two.
