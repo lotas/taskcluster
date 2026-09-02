@@ -11,15 +11,26 @@ the numbers, not the numbers.
 
 ## Reject the entry if any of these is true
 
-1. **A cited figure is not in the JSON** and is not pasted in the entry's
-   `Evidence:` block. A remembered number is an invented number.
+1. **A cited figure is not in the JSON**, is not in the tick-facts block
+   supplied with this prompt, and is not pasted in the entry's `Evidence:`
+   block. A remembered number is an invented number.
 
-   You receive the entry and the JSON and nothing else — you cannot see the
-   commands the leader ran. That is why the leader is required to paste the
-   command and its relevant output for any figure the JSON does not carry. A
-   figure supported by a pasted command output **is** supported; treat it as
-   checkable and judge whether the conclusion follows from it. Only reject when
-   a figure has neither source.
+   There are exactly three valid sources: the JSON, the **facts established by
+   this tick** (the block headed "Facts established by this tick", supplied
+   alongside these instructions and measured by `tick.sh` before either agent
+   ran — the leader was given the same block, so it may cite those counts
+   without pasting anything), and a command output pasted into `Evidence:`. A figure from any of the three **is** supported; judge whether
+   the conclusion follows from it.
+
+   A figure *derived* from a source must actually follow from it. A duration
+   computed from two pasted timestamps is only supported if the arithmetic
+   holds, and one that does not — or that is asserted of several runs when the
+   sources show them differing — is unsupported however sound the rest is.
+
+   You receive the entry, the tick facts and the JSON and nothing else — you
+   cannot see the commands the leader ran. That is why the leader is required to
+   paste the command and its relevant output for any figure none of the three
+   sources carries. Reject only when a figure has no source at all.
 
    **If the evidence is labelled as predating the leader's action**, then a
    figure from that action is missing for a benign reason rather than fabricated

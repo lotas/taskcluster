@@ -1069,6 +1069,42 @@ printf '%s' "$out" | grep -q "leader is not invoked" \
   && bad "an unreadable frontier must not skip the leader -- $out" \
   || ok "an unreadable frontier fails open"
 
+# --------------------------------------------------------------------------
+# THE EVIDENCE GAP. The tick measures the daily probe count and used to tell only
+# the LEADER, so an entry saying "this spends probe 3 of 4" cited a true figure
+# the copilot had no way to check -- and correctly escalated it (2026-09-01,
+# journal/escalations/20260901T113305Z.md). A fact given to one agent and
+# withheld from the other makes a sound entry unrecordable.
+setup tickfacts
+echo 2 >"$W/probes_today"
+echo 1 >"$W/extracts_today"
+# A REAL MARKER IN THE QUEUE, so the "copilot does not get the briefing"
+# assertions below are refutable. Against the default stub queue they would pass
+# without the split existing at all -- the failure mode `absent_from` exists for.
+echo "# QUEUE-ONLY-MARKER" >"$W/queue/experiment-queue.md"
+out="$(run_tick)"
+present_in "$W/leader_prompt" "QUEUE-ONLY-MARKER" \
+  "the leader does receive the queue excerpt"
+present_in "$W/leader_prompt" "Probes submitted today: 2 of" \
+  "the leader is told the probe budget"
+present_in "$W/codex_prompt" "Probes submitted today: 2 of" \
+  "the copilot is told the SAME probe budget"
+present_in "$W/codex_prompt" "Extracts submitted today: 1 of" \
+  "the copilot is told the extract budget"
+present_in "$W/codex_prompt" "Jobs in flight" \
+  "the copilot is told the in-flight count"
+# THE ORDINAL, NOT THE PRE-COUNT. `TICKS` is read before the counter is
+# persisted as TICKS + 1, so printing it said "0 of 12" during the first tick.
+present_in "$W/codex_prompt" "This is tick 1 of" \
+  "the tick reports its own ordinal, not the count before it"
+# ONLY THE FACTS, NOT THE BRIEFING. Handing the verifier the leader's whole
+# context would have it check the entry against the leader's instructions rather
+# than against the numbers -- and the queue is the bulkiest part of that.
+absent_from "$W/codex_prompt" "QUEUE-ONLY-MARKER" \
+  "the copilot does NOT receive the queue excerpt"
+absent_from "$W/codex_prompt" "use these exact paths" \
+  "the copilot does NOT receive the leader's command list"
+
 echo
 echo "pass=$pass fail=$fail skip=$skip"
 [ "$fail" = 0 ]

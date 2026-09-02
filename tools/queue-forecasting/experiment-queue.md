@@ -240,8 +240,9 @@ and superseded.
 **The gap is now 0.42pp on one metric.** That is inside the range where entry 4
 stops being academic.
 
-**3. `wait_hazard_qctx_d_priority_flow` — BLOCKED on the trio, unblocked by a
-different one.** First attempt refused:
+**3. `wait_hazard_qctx_d_priority_flow` — RAN 2026-09-01 on `8734690f`; clears
+the tail bar, fails the centre. Needs a comparator, not a rerun.** First attempt
+refused:
 `probe-20260831T135844Z-18c7eb6ed0db-5632`,
 `ExtractError: the extract's train_start is 2026-08-07, but this cohort needs
 train_start <= 2026-08-01`. The config's documented `validation_days: 7` (vs 1
@@ -255,14 +256,63 @@ Do NOT fix this by cutting `validation_days` to 1. That number is measured (val
 AUC on bins 3-4 went 0.711/0.574 → 0.915/0.909), and shrinking it to fit an
 extract sabotages the experiment to make it runnable.
 
-The fix needs no new extract: **`c179c7f5b961` is already published, gen=2 (so it
-has `task_created`), and spans 2026-07-21..2026-08-26** — wide enough for every
-config including hazard. `run_cohort.py:92` reads `as_of` off the extract
-manifest, so pointing at it shifts the cohort to as_of=2026-08-26 with no code
-change. Its holdout is one day earlier than the current series, so **re-run
-qctx_d on it too** and compare the pair within that trio rather than across.
-Watch memory: 8.6M runs vs 5.0M (+71%), and Bet 2's hazard peaked at 99.9% of
-`mem_limit` on the smaller data. Raise `PROBE_MEM`.
+~~The fix needs no new extract: `c179c7f5b961` is already published, gen=2 (so it
+has `task_created`), and spans 2026-07-21..2026-08-26.~~ **CORRECTED 2026-09-01
+— that sentence is wrong, and the run it recommended cannot happen.**
+`experiment.py plan` refuses `c179c7f5b961`: *"qctx_runs has no `task_created`,
+and this config enables queue_context_features"*. The check at
+`host/experiment.py:190` reads the extract's actual `qctx_runs` columns; it does
+not infer them from the generation number, so "gen=2, therefore it has
+`task_created`" was an inference the manifest does not support. The same reason
+rules out `8e94d833d4c6`, and `cd467b4bd869` fails on both that and the window.
+
+**`8734690f4cd8` is the only extract that can currently serve this config**
+(published 2026-08-31; `plan` reports it as gen=1). Nothing else in the
+published set clears both the `task_created` requirement and the
+`train_start <= 2026-08-01` window.
+
+**The reference run on it already exists — do not create another.** The
+"NO scored run has used this extract yet" line quoted above was `plan`'s output
+at 11:29Z on 2026-09-01 and is now stale. `probe-20260901T171159Z-61dd1b700db5-6004`
+ran this very config on `8734690f` and scored at 17:58Z:
+
+| metric | value | bar | |
+|---|---|---|---|
+| mae | 0.007302 | rel_improve 0.15 | FAIL |
+| p90_coverage | 0.9409 | band 0.85–0.95 | pass |
+| p90_miss_tail | **0.1631** | absolute 0.30 | **PASS** |
+| within_2x | −0.1616 | abs_improve +0.05 | FAIL |
+
+Verdict `no-go`, but it is the first config in the program to clear
+`p90_miss_tail` — 59% below the baseline's 0.3989, and 46% better than qctx_d's
+0.3042.
+
+So this entry is no longer blocked, and the run it asked for has happened. **What
+is missing is a comparator, not a reference.** `results.sh` reports exactly one
+row on `extract=8734690f baseline=e51a3210 contract=f740716d`, so the hazard
+result currently sits in a series of one and `plan` will keep calling anything
+there "comparable to NOTHING". The next run on this extract should be **qctx_d**,
+so the two configs can be read as a pair inside one series rather than across
+extracts. (They already agree on baseline and contract and report identical
+baseline values to 4 s.f., which makes the cross-extract reading sound enough to
+reason from — but not a series, and the frontier is right not to treat it as
+one.)
+
+Memory, now measured rather than predicted (the earlier "8.6M runs vs 5.0M
+(+71%)" warning described `c179c7f5b961`, which is ruled out above and is not
+the extract in play). On `8734690f`'s 6.02M rows this config was OOM-killed at
+20g — `probe-20260831T155907Z-1ecbb864be31-5709`, exit 137, `rss_high_water_kb`
+20,636,960 after 54.7 min — and completed at 22g. `--mem 22g` is therefore
+required and is also the ceiling (`spec.py:43 MEM_CEILING_MB`);
+`experiment.py`'s auto-retry fires only on a *refusal*, and 20g is under the
+ceiling so it is never refused — the flag is necessary, not decorative, and it
+is a TOP-LEVEL flag placed before `run`.
+
+*Provenance: this correction was derived by the research loop's leader on
+2026-09-01 and verified here against `host/experiment.py:190`. The entry it came
+from was escalated over unrelated defects and remains NOT RECORDED
+(`journal/escalations/20260901T113305Z.md`); nothing about that escalation is
+reversed by repeating a check that stands on its own.*
 
 **4. The guardrail-width diagnostic (see above).** Not a promotion candidate.
 Bounds how much of the 1.08pp is information versus inflation, which tells us

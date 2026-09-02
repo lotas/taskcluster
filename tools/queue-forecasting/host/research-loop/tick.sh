@@ -334,14 +334,43 @@ fi
 PENDING="$JOURNAL/PENDING.md"
 : >"$PENDING"
 
+# THE FACTS THIS TICK ESTABLISHED, in one file given to BOTH agents.
+#
+# The leader used to be told "Probes submitted today: 2 of 4" and the copilot
+# was not, so a leader that faithfully repeated the number was rejected for
+# citing a figure with no source -- and it was right, and so was the copilot.
+# The tick computed that number; withholding it from the verifier made a true,
+# tick-authored fact unciteable, and the leader had no way to win.
+#
+# This is deliberately NOT "give the copilot the leader's context". The queue,
+# the frontier prose, the doctor output and the command list are instructions to
+# the leader, and handing them to the verifier would invite it to check the
+# entry against the leader's own briefing rather than against the numbers. Only
+# figures the TICK ITSELF measured belong here.
+{
+  echo "## Facts established by this tick (authored by tick.sh, not by an agent)"
+  echo
+  echo "These counts are measured by the tick before either agent runs. They are"
+  echo "a valid source: an entry may cite them without pasting a command."
+  echo
+  echo "- Probes submitted today: $PROBES_TODAY of $MAX_RUNS."
+  echo "- Extracts submitted today: $EXTRACTS_TODAY of $MAX_EXTRACTS."
+  # `TICKS` IS THE COUNT BEFORE THIS ONE. The counter is persisted as TICKS + 1
+  # above, before any work, so by the time this file is written the slot is
+  # already spent -- printing $TICKS said "0 of 12" during the first tick of the
+  # day. The probe and extract counts above are NOT adjusted the same way: they
+  # come from `qf list` and count jobs already submitted, so they correctly
+  # exclude anything this tick is about to do.
+  echo "- This is tick $((TICKS + 1)) of $MAX_TICKS today."
+  echo "- Jobs in flight at the start of this tick: ${IN_FLIGHT:-0}."
+} >"$CTX/tick-facts.md"
+
 {
   echo "# Tick context — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo
-  echo "Probes submitted today: $PROBES_TODAY of $MAX_RUNS."
-  echo "Extracts submitted today: $EXTRACTS_TODAY of $MAX_EXTRACTS."
-  echo "Ticks today: $TICKS of $MAX_TICKS."
+  cat "$CTX/tick-facts.md"
+  echo
   if [ "${IN_FLIGHT:-0}" -gt 0 ]; then
-    echo
     echo "**${IN_FLIGHT} job(s) are STILL RUNNING from an earlier tick.**"
     echo "Actions 4 and 5 are unavailable: do not submit another experiment"
     echo "while one is in flight. If nothing else applies, that is action 6 --"
@@ -523,6 +552,11 @@ else
   # evidence JSON is the part that grows -- it carries every scored row.
   {
     cat "$HERE/verify-prompt.md"
+    echo
+    # THE SAME FILE THE LEADER GOT, so a count the tick measured is citeable by
+    # the entry and checkable by the verifier. Before this, only the leader saw
+    # it and "this spends probe 3 of 4" read as a figure with no source.
+    cat "$CTX/tick-facts.md"
     echo
     echo "## The claim to check"
     echo

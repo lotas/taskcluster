@@ -136,6 +136,35 @@ source. Rejecting a sound entry for lack of a paste is a cost; recording an
 unverifiable central result is a worse one, so the rule stays strict and the
 leader carries the burden of showing its work.
 
+### The facts the tick itself measured go to BOTH agents
+
+The second escalation (`journal/escalations/20260901T113305Z.md`) rejected
+*"this spends probe 3 of 4"* as a figure with no source — and was right on the
+rule as written, because the copilot had never been shown it. But the tick
+computed that number itself and printed it into the leader's context. A fact
+handed to one agent and withheld from the other is not a claim the leader can
+support, however honest it is.
+
+So the counts are written once to `$CTX/tick-facts.md` — probes, extracts and
+ticks used against their caps, plus the in-flight count — and that same file is
+concatenated into both the leader's and the copilot's input. `verify-prompt.md`
+names it as the third valid source alongside the JSON and a pasted `Evidence:`
+block.
+
+**This is not "show the copilot the leader's context", and the distinction is
+the point.** The queue excerpt, the frontier prose, the doctor output and the
+command list are *instructions*; handing them to the verifier would invite it to
+check the entry against the leader's briefing instead of against the numbers.
+Only figures the tick measured are shared, and `test_tick.sh` asserts both
+halves — that the budget line reaches the copilot, and that the queue excerpt
+and command list do not.
+
+The same escalation's *other* objection was a genuine leader error: it said both
+reclaimed probes ran "~31 minutes" when the pasted timestamps show 31.1 and
+26.8. That rejection is correct and stays — `verify-prompt.md` now says outright
+that a figure derived from a source must follow from it arithmetically. Closing
+the evidence gap must not soften the arithmetic.
+
 ### Why the copilot checks the claim and not the arithmetic
 
 The design (`auto-research-loop-design.md` §6) specifies an "independent
@@ -338,7 +367,7 @@ It fails **open**: an unreadable frontier runs the leader, because skipping on a
 reporting glitch would turn it into a silently stalled loop. `QF_TICK_ALWAYS_LEAD=1`
 overrides.
 
-## A qctx probe does not fit the probe timeout
+## A qctx probe did not fit the probe timeout (optimisation landed 2026-09-01; verification pending)
 
 `spec.py` caps `timeout_s` at **3600** for every kind, and the cap is
 deliberately subordinate to the dispatcher's hold deadline:
@@ -358,8 +387,8 @@ training split; the model then trained and reported `30m+ p90 miss 13.3% guarded
 pass, and the job hit TIMEOUT. Feature work alone is ~4000s against a 3600s
 ceiling, because the sweep is recomputed per split rather than once.
 
-So no qctx-enabled config can currently complete a probe. Two ways out, neither
-of which should be chosen quietly:
+That was the state until 2026-09-01. Two ways out existed, neither to be chosen
+quietly:
 
 1. **Raise the chain.** The observed hold deadline was 7800s, so headroom exists,
    but it is a coordinated constant change in the trusted dispatcher.
@@ -367,6 +396,42 @@ of which should be chosen quietly:
    529 queues took 907s of the 3019s — so caching across splits, or sweeping the
    union once, is the real fix. That is trainer work, and it is the rare case
    where platform work unblocks the science rather than displacing it.
+
+### What was done, and what that does and does not establish
+
+Route 2 was taken; `TIMEOUT_MAX` was deliberately left alone. The per-row sweep
+issued ~150 scalar `np.searchsorted` calls per target row; it now issues every
+search once per (queue, rank) over the target vector, chunked at
+`SWEEP_CHUNK = 250_000` targets to keep peak memory independent of queue skew
+(`379e372`, `fc88650`).
+
+**The timeout above is not evidence about the current trainer.** That run,
+`probe-20260901T112900Z-a78cdab1a997-5837`, was submitted at 11:29Z; the sweep
+change was committed at 14:06Z, two and a half hours later. It ran the old code
+and could not have run anything else.
+
+What is established: two qctx-enabled probes submitted *after* both commits —
+`probe-20260901T152934Z-fe8755f5c4f2-5941` (15:29Z, `wait_qctx_d_priority_flow`)
+and `probe-20260901T171159Z-61dd1b700db5-6004` (17:11Z,
+`wait_hazard_qctx_d_priority_flow`) — both reached the scoreboard with full
+metrics, so both finished inside the 3600s ceiling. Under the old cost, feature
+work alone was ~4000s, so completion is not something the pre-fix code could
+have done.
+
+What is **not** established from the repo alone: that those two runs executed the
+fixed trainer rather than merely a faster-than-usual old one. `experiment.py run`
+does not sync the trainer — `experiment.py sync` is a separate step after
+`mirror-refresh` — so the deploy is the unverified link, not the completion.
+Settle it against the **commit**, never the working tree:
+
+```sh
+qf status <probe-id> --json | grep source_sha
+git -C ~/qf-research show <sha>:trainer/src/queue_context.py | grep SWEEP_CHUNK
+```
+
+Until that is checked, state the status as "two post-fix qctx probes completed
+and scored", which is observed, rather than "qctx now completes", which is an
+inference about code identity.
 
 ## Deploying restarts the dispatcher, which kills in-flight probes
 
