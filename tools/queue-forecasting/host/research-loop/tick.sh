@@ -71,6 +71,27 @@ DRY_RUN=0
 say() { printf '[tick %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { say "ABORT: $*" >&2; exit 1; }
 
+# THE WORKING DIRECTORY, SET BEFORE ANYTHING RUNS -- not inherited.
+#
+# This used to be set only at publish time, hundreds of lines below, so both
+# agents ran in whatever directory the tick was started from. Under systemd that
+# is `/` (no `WorkingDirectory=`, so the default applies) and nothing broke.
+# Under `install.sh once` it is the operator's shell cwd, because `sudo -H`
+# sets HOME and deliberately does NOT change directory.
+#
+# MEASURED 2026-09-02: run from an operator's home, which `research` cannot
+# traverse, the leader's every shell call returned exit 1 with EMPTY output --
+# `true` and `/bin/echo` included -- and `codex` exited 1 before emitting any
+# usage. A process cannot be spawned from a cwd it cannot resolve, and the
+# failure surfaces as a tool that is simply broken, with no error to read. The
+# tick spent $0.79 to conclude it had no shell.
+#
+# The workspace is also the RIGHT cwd, not merely a reachable one: it is the
+# repository the leader writes its journal into, so a relative path in an agent
+# command means what the prompt says it means.
+cd "$QF_RESEARCH" || die "no workspace at $QF_RESEARCH (cwd would be inherited,
+  and an unreadable one silently breaks every command both agents run)"
+
 # EVERY NUMERIC KNOB IS VALIDATED, because each is used BOTH in an arithmetic
 # test and as an argument to something else, and neither position fails safely
 # under `set -uo pipefail` (there is no `errexit`).
@@ -668,6 +689,8 @@ fi
 # `qf-research` and nothing else -- the loop has no credential on the monorepo,
 # which is why `experiment-queue.md` arrives read-only.
 # --------------------------------------------------------------------------
+# Re-asserted rather than assumed: cwd was set at startup, and this step is a
+# `git` push that means the wrong thing from the wrong directory.
 cd "$QF_RESEARCH" || die "no workspace at $QF_RESEARCH"
 
 # ONLY THE FILE THAT WAS JUST VERIFIED IS STAGED. `git add -A journal` staged

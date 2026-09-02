@@ -108,6 +108,7 @@ EOF
 printf '%s\n' "\${QF_REQUIRE_PREREG:-unset}" > "$W/leader_prereg_env"
 printf '%s\n' "\$@" > "$W/leader_argv"
 cat > "$W/leader_prompt"
+pwd > "$W/leader_cwd"
 [ ! -f "$W/leader_fails" ] || exit 3
 if [ -f "$W/leader_entry" ]; then
   cat "$W/leader_entry" > "$W/research/journal/PENDING.md"
@@ -1097,6 +1098,14 @@ present_in "$W/codex_prompt" "Jobs in flight" \
 # persisted as TICKS + 1, so printing it said "0 of 12" during the first tick.
 present_in "$W/codex_prompt" "This is tick 1 of" \
   "the tick reports its own ordinal, not the count before it"
+# THE LEADER'S CWD IS SET, NOT INHERITED. Run from a directory the research user
+# cannot traverse, every command both agents spawn fails with empty output --
+# the tick.sh cwd was only set at publish time, long after both had run.
+if [ "$(cat "$W/leader_cwd" 2>/dev/null)" = "$W/research" ]; then
+  ok "the leader runs in the workspace, whatever cwd the tick inherited"
+else
+  bad "the leader runs in the workspace -- got '$(cat "$W/leader_cwd" 2>/dev/null)'"
+fi
 # ONLY THE FACTS, NOT THE BRIEFING. Handing the verifier the leader's whole
 # context would have it check the entry against the leader's instructions rather
 # than against the numbers -- and the queue is the bulkiest part of that.

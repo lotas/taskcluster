@@ -88,6 +88,14 @@ off)
   echo "timer disabled."
   ;;
 once)
+  # `cd /` FIRST, and it is not tidiness. `sudo -H` sets HOME and deliberately
+  # leaves the working directory alone, so a `once` run from an operator's home
+  # handed the tick a cwd the research user cannot traverse -- and both agents
+  # then failed to spawn ANY process, with empty output and no error (measured
+  # 2026-09-02, one $0.79 tick that concluded it had no shell). `/` is what the
+  # systemd unit gets by default, so this makes the two paths agree; `tick.sh`
+  # moves to the workspace itself.
+  cd / || die "cannot cd /"
   [ "$(id -un)" = research ] \
     && exec "$TRUSTED/tick.sh" \
     || exec sudo -H -u research bash -lc "exec '$TRUSTED/tick.sh'"
