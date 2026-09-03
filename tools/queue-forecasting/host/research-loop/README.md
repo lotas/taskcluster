@@ -193,6 +193,25 @@ Two properties, both asserted in `test_tick.sh`:
 This adds no invocation, no revise round and no change to the gate. It is one
 file read.
 
+### The copilot may not reject the leader's reason for choosing an experiment
+
+Three of the five rejections on 2026-09-02 were unanswerable. The leader said
+"the queue's top unblocked entry asks for the `qctx_d` comparator"; the copilot
+said that is in neither the JSON nor the tick facts nor a pasted command, which
+was true — the queue is the leader's briefing and the copilot is deliberately
+not given it. No rewrite could have satisfied that objection, so the entry could
+only escalate, and three of those in a row is the auto-`PAUSE` threshold.
+
+`verify-prompt.md` now scopes the gate to what it was for: a sentence that would
+change what a reader believes about a **model, a feature or a bar** gets checked
+against the sources; a sentence about which action this tick took is narrative,
+and the human reading the escalation judges it. A *count* remains a figure — the
+fifth rejection ("all four attempts failed identically", three pasted) stands.
+
+This is the same shape as the tick-facts gap above: a rule that is correct as
+written and that the leader cannot possibly satisfy is a broken gate, not a
+strict one.
+
 ### Why the copilot checks the claim and not the arithmetic
 
 The design (`auto-research-loop-design.md` §6) specifies an "independent

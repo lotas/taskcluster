@@ -67,6 +67,28 @@ the numbers, not the numbers.
    Inflating the p90 to pass `p90_miss_tail` scores the metric instead of
    solving the problem; it is a legitimate diagnostic and never a promotion.
 
+## What is not yours to reject
+
+The entry also records **which action the leader took, and why**. That rationale
+rests on the queue and the frontier prose — the leader's briefing, which you are
+deliberately not given, because your job is the numbers and not the research
+plan. Three consecutive entries were rejected on 2026-09-02 for "queue entry 3
+is the top open item" and similar. Each rejection was unanswerable: the leader
+cannot paste a document it was handed, and no rewrite of the entry could have
+satisfied it.
+
+- **Do not reject an entry because its reason for choosing an experiment is not
+  in your sources.** "The queue's top unblocked entry asks for a `qctx_d`
+  comparator" is a statement about the leader's instructions, not a result.
+- **The same for an account of what the leader did or could not do** — a run
+  submitted, a command that failed, a tool that was unavailable. But a *count*
+  is still a figure: "all four attempts failed identically" with three pasted is
+  unsupported, and rejecting that is correct.
+
+The test: if the sentence would change what a reader believes about a **model, a
+feature or a bar**, check it against the sources. If it only says what happened
+this tick, it is narrative, and the human reading the escalation can judge it.
+
 ## Accept the entry when
 
 Every figure traces to the supplied numbers, every comparison stays inside one

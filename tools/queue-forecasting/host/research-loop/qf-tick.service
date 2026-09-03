@@ -45,6 +45,24 @@ PrivateDevices=yes
 # credentials and `~/.profile` all live in the research user's home, and this
 # unit is the one thing that legitimately reads all four.
 ReadWritePaths=/home/research
+# /tmp, AND THIS IS WHAT BROKE THE LOOP ON 2026-09-02. `ProtectSystem=strict`
+# mounts the WHOLE hierarchy read-only bar /dev, /proc and /sys -- /tmp is not
+# exempt, and with `PrivateTmp=no` it is the host's real, read-only /tmp. The
+# `claude` CLI puts its per-workspace scratch in `os.tmpdir()/claude-<uid>/<cwd
+# slug>`, so every Bash call the leader made returned, before running anything:
+#
+#   EROFS: read-only file system, mkdir '/tmp/claude-1001/-home-research-qf-research'
+#
+# It was hidden for a day because a hand-run `install.sh once` is NOT sandboxed,
+# so it created that directory and the sandboxed ticks quietly reused it; when
+# /tmp was cleaned the loop lost its shell and five ticks in a row escalated with
+# no evidence they could possibly have pasted.
+#
+# /tmp AND NOT A PRIVATE ONE: `PrivateTmp=yes` would isolate this unit from the
+# /tmp the hand-run and the dispatcher see, which is the coordination the comment
+# below is about. And this grants nothing: /tmp is world-writable with the sticky
+# bit, so any login shell as `research` already has exactly this.
+ReadWritePaths=/tmp
 # PrivateTmp=no, deliberately. The dispatcher's lock lives at
 # /var/lib/qf-locks and the README's "The lock, and PrivateTmp=no" records why a
 # private namespace here breaks coordination between units.
