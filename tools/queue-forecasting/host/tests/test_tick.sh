@@ -1115,6 +1115,71 @@ absent_from "$W/codex_prompt" "QUEUE-ONLY-MARKER" \
 absent_from "$W/codex_prompt" "use these exact paths" \
   "the copilot does NOT receive the leader's command list"
 
+# --------------------------------------------------------------------------
+# THE COPILOT'S LAST REASON, BACK TO THE LEADER. Without this the leader
+# rewrote the same entry against an objection it had never seen -- three rounds
+# of that is the auto-PAUSE threshold, so a fixable entry could stop the loop.
+setup feedback
+# NOTHING TO FEED BACK is the common case on a clean journal, and it must
+# produce no block at all rather than an empty heading.
+out="$(run_tick)"
+absent_from "$W/leader_prompt" "NOT recorded (feedback" \
+  "with no previous rejection there is no feedback block"
+
+mkdir -p "$W/research/journal/escalations"
+cat >"$W/research/journal/escalations/20260902T190320Z.md" <<'ESC'
+# a rejected entry
+
+Evidence:
+
+```
+$ results.sh --json
+ENTRY-FENCE-MARKER
+```
+
+---
+
+## NOT RECORDED — the copilot did not agree
+
+```
+COPILOT-REASON-MARKER: the 12-feature delta describes qctx vs qctx_d
+```
+ESC
+out="$(run_tick)"
+present_in "$W/leader_prompt" "COPILOT-REASON-MARKER" \
+  "the newest rejection's reason reaches the leader"
+present_in "$W/leader_prompt" "20260902T190320Z.md" \
+  "the leader is told which entry was rejected"
+# THE REASON, NOT THE ENTRY. Anchoring on the first fence in the file would have
+# quoted the rejected entry's own `Evidence:` block back instead.
+absent_from "$W/leader_prompt" "ENTRY-FENCE-MARKER" \
+  "the block quotes the reason, not the rejected entry's evidence"
+# NEVER THE VERIFIER. Showing a copilot its own previous verdict anchors it; it
+# must judge this entry on this tick's numbers.
+absent_from "$W/codex_prompt" "COPILOT-REASON-MARKER" \
+  "the copilot is NOT shown its own previous verdict"
+
+# --------------------------------------------------------------------------
+setup feedbackcap
+mkdir -p "$W/research/journal/escalations"
+{
+  echo "# a rejected entry"
+  echo
+  echo "## NOT RECORDED — the copilot did not agree"
+  echo
+  echo '```'
+  # ~7KB of reason, well past the 4096-byte cap.
+  for i in $(seq 0 599); do printf 'PADLINE-%03d\n' "$i"; done
+  echo '```'
+} >"$W/research/journal/escalations/20260902T200000Z.md"
+out="$(run_tick)"
+present_in "$W/leader_prompt" "PADLINE-000" \
+  "an overlong reason is still quoted"
+absent_from "$W/leader_prompt" "PADLINE-599" \
+  "an overlong reason is cut at the cap"
+present_in "$W/leader_prompt" "TRUNCATED at 4096 bytes" \
+  "the leader is told the reason was cut"
+
 echo
 echo "pass=$pass fail=$fail skip=$skip"
 [ "$fail" = 0 ]

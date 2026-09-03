@@ -52,6 +52,10 @@ MAX_QUEUE_BYTES="${QF_TICK_MAX_QUEUE_BYTES:-24576}"
 # agents disagreeing once is the mechanism working. Repeatedly is a leader whose
 # reasoning has drifted, and it must not keep pushing.
 MAX_DISAGREE="${QF_TICK_MAX_DISAGREE:-3}"
+# How much of the previous tick's rejection is quoted back to the leader. Small
+# on purpose: it is one verdict's reason, not a transcript, and it competes for
+# the leader's attention with the numbers it is supposed to be reading.
+MAX_FEEDBACK_BYTES="${QF_TICK_MAX_FEEDBACK_BYTES:-4096}"
 
 # Configurable behaviour flags live here. The structured-output flags remain at
 # the two call sites because usage logging requires them and is not optional.
@@ -107,7 +111,8 @@ cd "$QF_RESEARCH" || die "no workspace at $QF_RESEARCH (cwd would be inherited,
 # leader ran with NO queue excerpt and a notice claiming it had been given the
 # "first bogus bytes". And on GNU `head`, `-c -1` means "all but the last byte",
 # so a negative value silently REMOVED the cap it was setting.
-for _knob in MAX_RUNS MAX_TICKS MAX_EXTRACTS MAX_DISAGREE MAX_QUEUE_BYTES; do
+for _knob in MAX_RUNS MAX_TICKS MAX_EXTRACTS MAX_DISAGREE MAX_QUEUE_BYTES \
+              MAX_FEEDBACK_BYTES; do
   _value="${!_knob}"
   case "$_value" in
     ''|*[!0-9]*)
@@ -119,6 +124,8 @@ done
 unset _knob _value
 [ "$MAX_QUEUE_BYTES" -gt 0 ] \
   || die "MAX_QUEUE_BYTES must be greater than zero"
+[ "$MAX_FEEDBACK_BYTES" -gt 0 ] \
+  || die "MAX_FEEDBACK_BYTES must be greater than zero"
 
 # THE AGENT CLIs AND THE PROXY, before anything looks for them. Sourced here --
 # the single entry point -- so the timer, `install.sh once` and a hand-run tick
@@ -392,6 +399,68 @@ PENDING="$JOURNAL/PENDING.md"
   echo "- Jobs in flight at the start of this tick: ${IN_FLIGHT:-0}."
 } >"$CTX/tick-facts.md"
 
+# THE PREVIOUS TICK'S REJECTION, HANDED BACK TO THE LEADER -- and to the leader
+# only.
+#
+# Until this existed every tick was a blind attempt. The copilot's reason went
+# into an escalation file the leader never reads, so the same entry could be
+# rewritten three ticks running against an objection it had never seen, and the
+# streak counter treated that as a drifting leader and paused the loop. This
+# closes that one loop and nothing else: no extra invocation, no revise round,
+# no change to the gate or to what counts as a disagreement.
+#
+# NOT TO THE COPILOT, deliberately. Showing a verifier its own previous verdict
+# anchors it: the question is whether THIS entry is supported by THIS tick's
+# numbers, and a copy of what it said last time is an argument, not a number.
+#
+# NOT EVIDENCE, and said so in-band. This is another agent's prose about a run
+# that is over. A figure quoted here has no more standing than a remembered one,
+# and the copilot -- which cannot see this block -- will reject any number whose
+# only source is it.
+: >"$CTX/prev-escalation.md"
+PREV_ESC="$(ls -1 "$JOURNAL/escalations"/*.md 2>/dev/null | LC_ALL=C sort | tail -1)"
+if [ -n "$PREV_ESC" ]; then
+  # The fenced block this script itself writes after the NOT RECORDED heading,
+  # which is the copilot's reason verbatim. Anchored on that heading rather than
+  # on the first fence in the file, because the rejected entry above it usually
+  # contains fences of its own -- an `Evidence:` block is pasted command output.
+  awk '
+    /^## NOT RECORDED/         { seen = 1; next }
+    seen && !inblock && /^```/ { inblock = 1; next }
+    inblock && /^```/          { exit }
+    inblock                    { print }
+  ' "$PREV_ESC" >"$CTX/prev-reason.txt" 2>/dev/null || : >"$CTX/prev-reason.txt"
+  if [ -s "$CTX/prev-reason.txt" ]; then
+    {
+      echo "## Your previous entry was NOT recorded (feedback, NOT evidence)"
+      echo
+      echo "The copilot returned VERDICT: DISAGREE on the last entry"
+      echo "($(basename "$PREV_ESC")). Its reason, verbatim:"
+      echo
+      echo '```'
+      head -c "$MAX_FEEDBACK_BYTES" "$CTX/prev-reason.txt"
+      # A NEWLINE OF OUR OWN before the closing fence: `head -c` cuts mid-line.
+      echo
+      echo '```'
+      if [ "$(wc -c <"$CTX/prev-reason.txt")" -gt "$MAX_FEEDBACK_BYTES" ]; then
+        echo
+        echo "**[TRUNCATED at $MAX_FEEDBACK_BYTES bytes. The whole text is in"
+        echo "$PREV_ESC.]**"
+      fi
+      echo
+      echo "Read that as feedback on how to write THIS tick's entry, and not as"
+      echo "a source. No figure appearing in it may be cited: to use one, obtain"
+      echo "it again from the JSON, from the tick facts above, or from a command"
+      echo "you paste into \`Evidence:\`. The copilot has NOT been shown this"
+      echo "block and will judge your new entry on its own."
+      echo
+      echo "The rejected entry itself is at $PREV_ESC. It is NOT a finding and"
+      echo "must not be cited as one -- if its claim still holds, re-establish it"
+      echo "here from the numbers rather than referring back to it."
+    } >"$CTX/prev-escalation.md"
+  fi
+fi
+
 {
   echo "# Tick context — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo
@@ -408,6 +477,12 @@ PENDING="$JOURNAL/PENDING.md"
   [ "$NO_MORE_EXTRACTS" = 0 ] \
     || echo "**The extract budget is spent: action 5 is unavailable this tick.**"
   echo
+  # Leader-only, and placed before the briefing so it is read before the entry
+  # is planned rather than after it is written.
+  if [ -s "$CTX/prev-escalation.md" ]; then
+    cat "$CTX/prev-escalation.md"
+    echo
+  fi
   # ABSOLUTE PATHS, SUPPLIED. The leader runs as `research`, whose PATH does not
   # carry the trusted host directory, and a leader that guesses `./experiment.py`
   # spends its one action discovering that. The workspace is named for the same

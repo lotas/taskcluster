@@ -165,6 +165,34 @@ reclaimed probes ran "~31 minutes" when the pasted timestamps show 31.1 and
 that a figure derived from a source must follow from it arithmetically. Closing
 the evidence gap must not soften the arithmetic.
 
+### The previous rejection goes back to the leader, and only to the leader
+
+A rejected entry went into `journal/escalations/` and the leader never read it,
+so every tick was a blind attempt: the same entry could be rewritten three ticks
+running against an objection it had never seen. `consecutive-disagreements`
+counts those rounds as a drifting leader, so an entry that was one sentence away
+from being recordable could instead auto-`PAUSE` the loop.
+
+The tick now extracts the fenced reason block from the newest
+`journal/escalations/*.md` and puts it in the leader's context, capped at
+`QF_TICK_MAX_FEEDBACK_BYTES` (4096) with an in-band truncation notice. It is
+anchored on the `## NOT RECORDED` heading rather than on the file's first fence,
+because the rejected entry's own `Evidence:` block is fenced too.
+
+Two properties, both asserted in `test_tick.sh`:
+
+- **It is labelled as feedback and not as evidence, in-band.** The quoted text
+  is another agent's prose about a finished run; a figure appearing in it must
+  be obtained again from the JSON, the tick facts or a pasted command. The
+  copilot cannot see the block, so it will reject any number whose only source
+  is it — which is the correct outcome, not a bug.
+- **The copilot never receives it.** Showing a verifier its own previous verdict
+  anchors it. The question is whether *this* entry is supported by *this* tick's
+  numbers, and a copy of what it said last time is an argument, not a number.
+
+This adds no invocation, no revise round and no change to the gate. It is one
+file read.
+
 ### Why the copilot checks the claim and not the arithmetic
 
 The design (`auto-research-loop-design.md` §6) specifies an "independent
