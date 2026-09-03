@@ -56,6 +56,12 @@ MAX_DISAGREE="${QF_TICK_MAX_DISAGREE:-3}"
 # on purpose: it is one verdict's reason, not a transcript, and it competes for
 # the leader's attention with the numbers it is supposed to be reading.
 MAX_FEEDBACK_BYTES="${QF_TICK_MAX_FEEDBACK_BYTES:-4096}"
+# How many times the copilot may be INVOKED before the tick gives up on it, and
+# the base of the linear backoff between attempts. Retries cover a crash, never
+# a verdict -- see the loop for why re-asking an answered question is not a
+# retry.
+COPILOT_TRIES="${QF_TICK_COPILOT_TRIES:-3}"
+COPILOT_BACKOFF="${QF_TICK_COPILOT_BACKOFF_S:-30}"
 
 # Configurable behaviour flags live here. The structured-output flags remain at
 # the two call sites because usage logging requires them and is not optional.
@@ -112,7 +118,7 @@ cd "$QF_RESEARCH" || die "no workspace at $QF_RESEARCH (cwd would be inherited,
 # "first bogus bytes". And on GNU `head`, `-c -1` means "all but the last byte",
 # so a negative value silently REMOVED the cap it was setting.
 for _knob in MAX_RUNS MAX_TICKS MAX_EXTRACTS MAX_DISAGREE MAX_QUEUE_BYTES \
-              MAX_FEEDBACK_BYTES; do
+              MAX_FEEDBACK_BYTES COPILOT_TRIES COPILOT_BACKOFF; do
   _value="${!_knob}"
   case "$_value" in
     ''|*[!0-9]*)
@@ -126,6 +132,9 @@ unset _knob _value
   || die "MAX_QUEUE_BYTES must be greater than zero"
 [ "$MAX_FEEDBACK_BYTES" -gt 0 ] \
   || die "MAX_FEEDBACK_BYTES must be greater than zero"
+[ "$COPILOT_TRIES" -gt 0 ] \
+  || die "COPILOT_TRIES must be at least 1: zero would skip verification
+  entirely and publish whatever the leader wrote."
 
 # THE AGENT CLIs AND THE PROXY, before anything looks for them. Sourced here --
 # the single entry point -- so the timer, `install.sh once` and a hand-run tick
@@ -671,17 +680,57 @@ else
     echo '```'
   } >"$CTX/verify-input.md"
   say "copilot input: $(wc -c <"$CTX/verify-input.md") bytes"
-  CODEX_RC=0
-  # `-` IS EXPLICIT: `codex exec` reads stdin when the prompt is `-` or absent,
-  # but "if stdin is piped AND a prompt is also provided, stdin is appended as a
-  # <stdin> block" -- so passing both would silently reshape the prompt.
   CODEX_RAW="$CTX/codex.jsonl"
   CODEX_ERR="$CTX/codex.err"
-  codex exec "${COPILOT_FLAGS[@]}" --json - <"$CTX/verify-input.md" \
-    >"$CODEX_RAW" 2>"$CODEX_ERR" || CODEX_RC=$?
-  python3 "$HERE/usage.py" codex "$CODEX_RAW" "$USAGE_LOG" \
-    "$CODEX_RC" >"$CTX/verify.log" \
-    || say "WARNING: could not append Codex usage to $USAGE_LOG"
+  # RETRIED, because a copilot that could not START is the single most common
+  # way this loop has failed: `codex` has died on `Failed to load cloud config
+  # bundle` twice -- once the tinyproxy allowlist, once with no proxy entry at
+  # all, so upstream -- and each time an entry that might have been recordable
+  # escalated instead.
+  #
+  # ONLY ON A NON-ZERO EXIT. A copilot that ran and returned DISAGREE, or that
+  # returned prose with no verdict, has ANSWERED; re-asking it until it says
+  # something else is not a retry, it is shopping for a verdict.
+  #
+  # USAGE IS LOGGED PER ATTEMPT, not once at the end: a failed attempt can still
+  # have spent tokens, and the cost log is the only place that is visible.
+  ATTEMPT=1
+  while :; do
+    CODEX_RC=0
+    # `-` IS EXPLICIT: `codex exec` reads stdin when the prompt is `-` or
+    # absent, but "if stdin is piped AND a prompt is also provided, stdin is
+    # appended as a <stdin> block" -- so passing both would silently reshape
+    # the prompt.
+    codex exec "${COPILOT_FLAGS[@]}" --json - <"$CTX/verify-input.md" \
+      >"$CODEX_RAW" 2>"$CODEX_ERR" || CODEX_RC=$?
+    python3 "$HERE/usage.py" codex "$CODEX_RAW" "$USAGE_LOG" \
+      "$CODEX_RC" >"$CTX/verify.log" \
+      || say "WARNING: could not append Codex usage to $USAGE_LOG"
+    [ "$CODEX_RC" -ne 0 ] || break
+    [ "$ATTEMPT" -lt "$COPILOT_TRIES" ] || break
+    # AND ONLY WHEN IT NEVER ANSWERED. A non-zero exit AFTER a verdict was
+    # produced is not a startup failure: the copilot ran, judged, and then died,
+    # and its verdict is still not trusted (see below) -- but re-asking it is
+    # verdict shopping and costs a full invocation to do it.
+    # THE RAW STREAM, not the parsed log: `usage.py` cannot always render the
+    # output of a run that died, and an empty parsed log would read as "never
+    # answered" for a copilot that plainly did. The verdict text survives in the
+    # JSONL either way, escaped inside a string or bare.
+    if grep -q "VERDICT:" "$CODEX_RAW" 2>/dev/null; then
+      say "copilot exited $CODEX_RC but had already produced a verdict;"
+      say "  not retrying -- that would be re-asking an answered question"
+      break
+    fi
+    say "copilot exited $CODEX_RC on attempt $ATTEMPT of $COPILOT_TRIES:"
+    say "  $(tail -c 200 "$CODEX_ERR" | tr '\n' ' ')"
+    # LINEAR BACKOFF, not exponential: the failures seen so far are either
+    # instant (misconfiguration, which no wait fixes) or a provider outage
+    # measured in minutes, and the tick has hours of TimeoutStartSec to spend.
+    say "  retrying in $((COPILOT_BACKOFF * ATTEMPT))s"
+    sleep "$((COPILOT_BACKOFF * ATTEMPT))"
+    ATTEMPT=$((ATTEMPT + 1))
+  done
+  [ "$CODEX_RC" -eq 0 ] || say "copilot failed $ATTEMPT time(s); giving up"
   CHECK="$(cat "$CTX/verify.log")"
   if [ "$CODEX_RC" -ne 0 ] && [ -s "$CODEX_ERR" ]; then
     CHECK="$CHECK
@@ -694,6 +743,9 @@ $(cat "$CODEX_ERR")"
     # trailing `VERDICT: AGREE` out of the partial output, so a copilot that
     # printed AGREE and then crashed published the entry as verified.
     VERDICT="DISAGREE"
+    # The streak is not advanced for this; see the block after the escalation
+    # is written for why a verifier that never ran is not a leader that drifted.
+    VERIFIER_FAILED=1
     REASON="codex exited non-zero; its output is NOT trusted as a verdict:
 $REASON"
   else
@@ -714,6 +766,7 @@ fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DISAGREE_FILE="$STATE/consecutive-disagreements"
+VERIFIER_FAILED="${VERIFIER_FAILED:-0}"
 if [ "$VERDICT" = "AGREE" ]; then
   mv "$PENDING" "$JOURNAL/$STAMP.md"
   RECORDED="$JOURNAL/$STAMP.md"
@@ -743,6 +796,15 @@ else
   # counter meant every disagreement recorded "1" and the threshold was never
   # reached, so the one automatic brake on a drifting leader silently did not
   # exist. Not being able to count to three is a reason to stop, not to continue.
+  #
+  # A CRASHED VERIFIER COUNTS, and that is deliberate even though it means an
+  # infrastructure fault can pause the loop. The retry above absorbs the
+  # transient case, which is the one that kept costing entries; what is left
+  # after three failed attempts is a copilot that is DOWN, and a loop that
+  # cannot verify anything must not keep spending a leader turn an hour --
+  # twelve a day, recording nothing -- because the reason it cannot verify is
+  # the network rather than the research. PAUSE is exactly the right response to
+  # "this cannot work right now"; the escalation says which kind it was.
   if PREV="$(counter "$DISAGREE_FILE")" && set_counter "$DISAGREE_FILE" \
        "$((PREV + 1))"; then
     N=$((PREV + 1))
@@ -752,6 +814,8 @@ else
     say "  persisted, so the streak cannot be tracked. Pausing now."
   fi
   say "NOT verified ($N consecutive); escalated to escalations/$STAMP.md"
+  [ "$VERIFIER_FAILED" = 0 ] \
+    || say "  the copilot did not run: this streak is infrastructure, not drift"
   if [ "$N" -ge "$MAX_DISAGREE" ]; then
     if ! printf 'auto-paused %s: %s consecutive unverified claims\nsee %s\n' \
          "$STAMP" "$N" "$RECORDED" >"$QF_RESEARCH/PAUSE"; then

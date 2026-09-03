@@ -13,6 +13,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import experiment as X                                          # noqa: E402
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dispatcher"))
+import spec                                                      # noqa: E402
 
 
 def can_commit():
@@ -672,6 +675,38 @@ class PushDiagnosis(unittest.TestCase):
     def test_empty_output_does_not_crash(self):
         for empty in (None, "", "   "):
             self.assertTrue(X.push_fix(empty))
+
+
+class TestClientWaitOutlastsTheJob(unittest.TestCase):
+    """The `qf --wait` timeout must exceed what the dispatcher will let a job run.
+
+    These two numbers live in different privilege domains and looked unrelated
+    until they collided: `--timeout` was 5400 while `spec.TIMEOUT_MAX` was 3600,
+    which was fine, and raising the ceiling to 5400 made them EQUAL. A probe
+    that ran to its ceiling then outlived the client waiting on it, so the host
+    finished the work and `experiment.py` never submitted the evaluation.
+    """
+
+    def _default_timeout(self):
+        # READ FROM THE SOURCE, because the parser is built inside `main()` and
+        # there is no seam to ask it. Restating the number here instead would
+        # make this test pass by agreeing with itself. The assert below is the
+        # guard: if the line is ever reshaped, this fails loudly rather than
+        # quietly checking nothing.
+        import re
+        src = open(X.__file__).read()
+        m = re.search(r'add_argument\("--timeout", type=int, default=(\d+)\)', src)
+        self.assertIsNotNone(m, "could not find --timeout's default in experiment.py")
+        return int(m.group(1))
+
+    def test_client_wait_exceeds_the_probe_execution_ceiling(self):
+        self.assertGreater(self._default_timeout(), spec.TIMEOUT_MAX)
+
+    def test_client_wait_covers_the_whole_job_hold_deadline(self):
+        # Not just the execution ceiling: a job may also spend BUILD_TIMEOUT_S
+        # and the build-lock wait before it starts running, and the dispatcher's
+        # own guarantee is the hold deadline rather than the timeout.
+        self.assertGreaterEqual(self._default_timeout(), 9600)
 
 
 if __name__ == "__main__":

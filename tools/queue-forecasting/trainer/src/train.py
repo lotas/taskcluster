@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import resource
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -513,9 +514,23 @@ def main(argv: list[str] | None = None) -> int:
 
     models: dict[float, LightGBMQuantileModel] = {}
     for q in c.quantiles:
-        print(f"  training quantile={q} …")
+        print(f"  training quantile={q} …", flush=True)
+        # TIMED, because until 2026-09-03 this was the only unmeasured stage in
+        # the run and it turned out to be the one that decided whether a probe
+        # finished. Two probes died at the dispatcher ceiling: the loads and the
+        # queue-context sweep were within 6% of the run that succeeded, while
+        # the fits took 833s and 690s against its 389s -- dropping the residual
+        # model's baseline feature lets early stopping run far longer. That was
+        # only recoverable by subtracting heartbeat timestamps after the fact.
+        _t0 = time.monotonic()
         m = _make_model(q)
         m.fit(train.X, train.y, val.X, val.y)
+        # The tree count is the WHY behind the seconds: a config that early-stops
+        # late is doing more work, not running on a slower host.
+        _b = getattr(m, "booster", None)
+        _trees = f", {_b.num_trees():,} trees" if _b is not None else ""
+        print(f"  [train] quantile={q} fit: {time.monotonic() - _t0:.1f}s{_trees}",
+              flush=True)
         models[q] = m
 
     # Save models + sidecars + manifest.

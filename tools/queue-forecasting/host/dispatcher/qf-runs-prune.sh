@@ -21,7 +21,7 @@
 # not as "lost".
 #
 # NO DB LOOKUP, DELIBERATELY. A live run must never be pruned, and the guarantee
-# is arithmetic rather than a query: QFD_JOB_HOLD_DEADLINE_S is ~2.2h, so nothing
+# is arithmetic rather than a query: QFD_JOB_HOLD_DEADLINE_S is ~2.7h, so nothing
 # older than MIN_AGE_HOURS=6 can still be running. That avoids opening the
 # dispatcher's SQLite database from a second process under a hardened unit, where
 # a read-only open of a WAL database still wants to create the -shm file.

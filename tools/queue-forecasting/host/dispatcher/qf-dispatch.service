@@ -33,7 +33,7 @@ Environment=QFD_BUILD_LOCK=/var/lib/qf-platform/build.lock
 Environment=QFD_BUILD_TIMEOUT_S=1800
 Environment=QFD_BUILD_LOCK_WAIT_S=900
 Environment=QFD_BUILD_SETTLE_S=30
-Environment=QFD_JOB_HOLD_DEADLINE_S=7800
+Environment=QFD_JOB_HOLD_DEADLINE_S=9600
 Environment=QFD_KILL_CONFIRM_S=300
 Environment=QFD_STOP_TIMEOUT_S=10
 # One QFD_SOCKET only. The plan's revision 12 text set it twice -- first
@@ -81,8 +81,8 @@ Environment=QFD_SETUP_TEARDOWN_ALLOWANCE_S=600
 Environment=QFD_MARKER_STALE_MARGIN_S=900
 Environment=QFD_LOCK_MIGRATED_MARKER=/etc/qf-dispatch/lock-migrated
 Environment=QFD_ADMITTED_MEM_BUDGET_MB=22528
-Environment=QFD_TIMEOUT_MAX_S=3600
-Environment=QFD_LOCK_WAIT_S=9000
+Environment=QFD_TIMEOUT_MAX_S=5400
+Environment=QFD_LOCK_WAIT_S=11400
 Environment=QFD_IMAGE_BUILD_MEM_MB=2048
 Environment=QFD_LIGHT_WORKERS=2
 Environment=QFD_LOG_CAP_MB=16
@@ -90,7 +90,7 @@ Environment=QFD_ARTIFACT_CAP_MB=2048
 Environment=QFD_HANDOFF_TIMEOUT_S=120
 Environment=QFD_DISK_FLOOR_GB=20
 Environment=QFD_QUEUED_CAP_PER_UID=20
-# The lease is much shorter than a job may run (TIMEOUT_MAX is 3600), so the
+# The lease is much shorter than a job may run (TIMEOUT_MAX is 5400), so the
 # runner renews at a third of it; without renewal the reclaimer eats live work.
 Environment=QFD_LEASE_S=300
 RuntimeDirectory=qf-dispatch qf-dispatch/client qf-dispatch/admin

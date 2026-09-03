@@ -128,6 +128,12 @@ EOF
 printf '%s\n' "\$@" > "$W/codex_argv"
 cat > "$W/codex_prompt"
 [ ! -f "$W/codex_fails" ] || { echo "boom"; exit 4; }
+_n=\$(cat "$W/codex_attempts" 2>/dev/null || echo 0); _n=\$((_n + 1))
+echo "\$_n" > "$W/codex_attempts"
+if [ -f "$W/codex_fail_first_n" ] \
+   && [ "\$_n" -le "\$(cat "$W/codex_fail_first_n")" ]; then
+  echo "transient boom" >&2; exit 5
+fi
 [ ! -f "$W/codex_noise" ] || echo "npm notice: cosmetic stdout noise"
 python3 - "$W/codex_reply" <<'PYAGENT'
 import json, pathlib, sys
@@ -175,6 +181,7 @@ run_tick() {  # run_tick [extra env assignments...]
       QF_TRUSTED_HOST="$W/trusted" \
       QF_QUEUE_FILE="$W/queue/experiment-queue.md" \
       QF_TICK_STATE="$W/state" \
+      QF_TICK_COPILOT_BACKOFF_S="${TEST_BACKOFF:-1}" \
       "$@" \
       timeout 30 bash "$TICK" 2>&1
   # A HARD TIMEOUT, so a hang in the tick is a failing assertion rather than a
@@ -553,6 +560,7 @@ cat >"$W/bin/codex" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$@" > "$W/codex_argv"
 cat > "$W/codex_prompt"
+echo x >> "$W/codex_calls"
 echo "VERDICT: AGREE"
 exit 4
 EOF
@@ -561,6 +569,11 @@ out="$(run_tick)"
 [ -n "$(find "$W/research/journal/escalations" -name '2*.md')" ] \
   && ok "a copilot that prints AGREE then crashes does NOT publish" \
   || bad "a copilot that prints AGREE then crashes does not publish -- $out"
+# NOR IS IT RE-ASKED. It answered and then died; the answer is not trusted, but
+# retrying it is shopping for a verdict at the price of a whole invocation.
+[ "$(wc -l <"$W/codex_calls" | tr -d ' ')" = 1 ] \
+  && ok "a copilot that answered before crashing is not retried" \
+  || bad "a copilot that answered before crashing is not retried -- $(wc -l <"$W/codex_calls") call(s)"
 [ -z "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
   && ok "the crashed-copilot entry is not recorded as a finding" \
   || bad "the crashed-copilot entry is not recorded as a finding"
@@ -1179,6 +1192,50 @@ absent_from "$W/leader_prompt" "PADLINE-599" \
   "an overlong reason is cut at the cap"
 present_in "$W/leader_prompt" "TRUNCATED at 4096 bytes" \
   "the leader is told the reason was cut"
+
+# --------------------------------------------------------------------------
+# A COPILOT THAT COULD NOT START IS RETRIED. It has died on `Failed to load
+# cloud config bundle` twice for two different reasons, and each time an entry
+# that might have been recordable escalated instead.
+setup copilotretry
+echo 2 >"$W/codex_fail_first_n"
+out="$(run_tick)"
+[ "$(cat "$W/codex_attempts" 2>/dev/null)" = 3 ] \
+  && ok "a crashed copilot is retried" \
+  || bad "a crashed copilot is retried -- got $(cat "$W/codex_attempts" 2>/dev/null) attempt(s): $out"
+[ -n "$(find "$W/research/journal" -maxdepth 1 -name '2*.md')" ] \
+  && ok "the retry's verdict is the one that counts" \
+  || bad "the retry's verdict is the one that counts -- $out"
+
+# ONLY A CRASH IS RETRIED. A copilot that answered DISAGREE has ANSWERED;
+# re-asking until it says something else is shopping for a verdict.
+setup copilotnoretry
+echo "VERDICT: DISAGREE" >"$W/codex_reply"
+out="$(run_tick)"
+[ "$(cat "$W/codex_attempts" 2>/dev/null)" = 1 ] \
+  && ok "a copilot that disagreed is NOT re-asked" \
+  || bad "a copilot that disagreed is NOT re-asked -- $(cat "$W/codex_attempts" 2>/dev/null) attempts"
+
+# A COPILOT THAT IS DOWN, not merely flaky, MUST STILL PAUSE THE LOOP. The retry
+# above absorbs the transient case; what survives three attempts is a verifier
+# that cannot verify, and a loop that keeps spending a leader turn an hour while
+# recording nothing is the thing PAUSE exists to stop. The escalation says which
+# kind of failure it was; the brake does not care.
+setup copilotstreak
+mkdir -p "$W/state"; echo 2 >"$W/state/consecutive-disagreements"
+: >"$W/codex_fails"
+out="$(run_tick QF_TICK_MAX_DISAGREE=3)"
+[ -n "$(find "$W/research/journal/escalations" -name '2*.md')" ] \
+  && ok "a copilot that never ran still escalates the entry" \
+  || bad "a copilot that never ran still escalates the entry -- $out"
+[ "$(cat "$W/state/consecutive-disagreements")" = 3 ] \
+  && ok "exhausted copilot retries advance the streak like any other failure" \
+  || bad "exhausted copilot retries advance the streak -- got $(cat "$W/state/consecutive-disagreements")"
+[ -f "$W/research/PAUSE" ] \
+  && ok "a copilot that stays down pauses the loop" \
+  || bad "a copilot that stays down pauses the loop -- $out"
+present_in "$W/state/usage.log" "codex.*exit=4" \
+  "every failed copilot attempt is charged to the cost log"
 
 echo
 echo "pass=$pass fail=$fail skip=$skip"

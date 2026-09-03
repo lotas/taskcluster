@@ -155,10 +155,10 @@ class Base(unittest.TestCase):
             lock_file=self.lock_path, intent_dir=self.intent,
             build_lock=os.path.join(root, "build.lock"),
             build_timeout_s=1800, build_lock_wait_s=900, build_settle_s=0,
-            job_hold_deadline_s=7800, kill_confirm_s=1, stop_timeout_s=0,
+            job_hold_deadline_s=9600, kill_confirm_s=1, stop_timeout_s=0,
             reap_interval_s=60, setup_teardown_allowance_s=600,
             marker_stale_margin_s=900, lock_migrated_marker="",
-            mem_budget_mb=22528, timeout_max_s=3600, lock_wait_s=9000,
+            mem_budget_mb=22528, timeout_max_s=5400, lock_wait_s=11400,
             image_build_mem_mb=2048, light_workers=2, log_cap_mb=16,
             artifact_cap_mb=2048, handoff_timeout_s=120, disk_floor_gb=0,
             queued_cap_per_uid=20, lease_s=300)
@@ -2599,7 +2599,10 @@ class TestRound6BudgetsSurviveTheSynchronousCreate(Round6Base):
         def launch(hold, effective, paths, argv, out_w, err_w, budget):
             # Enough that the HOLD becomes the binding constraint rather than
             # the spec's own timeout_s, which is what the argument carries.
-            self.spend_during_create(hold, 7000)
+            # TRACKS job_hold_deadline_s: this must leave LESS than the job's
+            # own timeout_s remaining, so it moved with the deadline when that
+            # went 7800 -> 9600 on 2026-09-03. Leaves 800s, as it always did.
+            self.spend_during_create(hold, 8800)
             seen["passed_in"] = budget
 
             def spawn(a, **kw):

@@ -87,10 +87,10 @@ class TestLimits(unittest.TestCase):
         # to exactly TIMEOUT_MAX + BUILD_TIMEOUT_S, leaving nothing for either.
         # This assertion is here so the coupling breaks a test rather than a
         # night's training.
-        self.assertEqual(spec.TIMEOUT_MAX, 3600)
+        self.assertEqual(spec.TIMEOUT_MAX, 5400)
 
     def test_timeout_and_cpu_ranges(self):
-        for bad in [0, 59, 3601, "1800", 1800.5, True]:
+        for bad in [0, 59, 5401, "1800", 1800.5, True]:
             with self.assertRaises(spec.SpecError):
                 spec.normalize(base(timeout_s=bad))
         for bad in [0, 0.1, 16, "4"]:

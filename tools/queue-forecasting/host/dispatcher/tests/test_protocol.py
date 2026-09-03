@@ -91,11 +91,11 @@ class ProtocolCase(unittest.TestCase):
             lock_file=os.path.join(root, "lock"), intent_dir=self.intent,
             build_lock=os.path.join(root, "build.lock"),
             build_timeout_s=1800, build_lock_wait_s=900, build_settle_s=30,
-            job_hold_deadline_s=7800, kill_confirm_s=300, stop_timeout_s=10,
+            job_hold_deadline_s=9600, kill_confirm_s=300, stop_timeout_s=10,
             reap_interval_s=60, setup_teardown_allowance_s=600,
             marker_stale_margin_s=900,
             lock_migrated_marker=os.path.join(root, "migrated"),
-            mem_budget_mb=22528, timeout_max_s=3600, lock_wait_s=9000,
+            mem_budget_mb=22528, timeout_max_s=5400, lock_wait_s=11400,
             image_build_mem_mb=2048, light_workers=2, log_cap_mb=16,
             artifact_cap_mb=2048, handoff_timeout_s=120, disk_floor_gb=1,
             queued_cap_per_uid=5)
@@ -421,7 +421,7 @@ class TestIntentGate(ProtocolCase):
 
     def test_an_unreadable_intent_dir_fails_closed(self):
         gate = qfd.IntentGate(os.path.join(self.tmp.name, "gone"),
-                              lock_wait_s=9000, stale_margin_s=900)
+                              lock_wait_s=11400, stale_margin_s=900)
         blocked, notes = gate.scan(1000)
         self.assertTrue(blocked)
         self.assertIn("failing closed", " ".join(notes))
@@ -656,21 +656,21 @@ class TestConfig(unittest.TestCase):
                          f" config-only={sorted(set(qfd.Config.ENV_KEYS) - in_unit)}")
 
     def test_the_deadline_chain_must_fit(self):
-        kw = dict(timeout_max_s=3600, build_timeout_s=1800,
+        kw = dict(timeout_max_s=5400, build_timeout_s=1800,
                   build_lock_wait_s=900, handoff_timeout_s=120,
-                  setup_teardown_allowance_s=600, job_hold_deadline_s=7800,
-                  kill_confirm_s=300, lock_wait_s=9000)
+                  setup_teardown_allowance_s=600, job_hold_deadline_s=9600,
+                  kill_confirm_s=300, lock_wait_s=11400)
         qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **kw).check_deadline_chain()          # the shipped figures
         with self.assertRaises(qfd.ConfigError):
-            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **{**kw, "job_hold_deadline_s": 7000}).check_deadline_chain()
+            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **{**kw, "job_hold_deadline_s": 8800}).check_deadline_chain()
         with self.assertRaises(qfd.ConfigError):
-            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **{**kw, "lock_wait_s": 8000}).check_deadline_chain()
+            qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **{**kw, "lock_wait_s": 9800}).check_deadline_chain()
 
     def test_the_timeout_ceiling_must_agree_with_spec(self):
         kw = dict(timeout_max_s=1800, build_timeout_s=1800,
                   build_lock_wait_s=900, handoff_timeout_s=120,
-                  setup_teardown_allowance_s=600, job_hold_deadline_s=7800,
-                  kill_confirm_s=300, lock_wait_s=9000)
+                  setup_teardown_allowance_s=600, job_hold_deadline_s=9600,
+                  kill_confirm_s=300, lock_wait_s=11400)
         with self.assertRaises(qfd.ConfigError):
             qfd.Config(extract_socket="/nonexistent/extract.sock", settlement_lag_s=48 * 3600, **kw).check_deadline_chain()
 

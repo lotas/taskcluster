@@ -1051,7 +1051,20 @@ def main(argv=None):
                              " against")
     parser.add_argument("--trusted-research", default=TRUSTED_RESEARCH,
                         help="the deployed run_cohort.py and AGENTS.md")
-    parser.add_argument("--timeout", type=int, default=5400)
+    # THE CLIENT WAIT MUST OUTLAST THE JOB, and 5400 stopped doing that the
+    # moment `spec.TIMEOUT_MAX` was raised to 5400 on 2026-09-03: a probe that
+    # legitimately ran to its ceiling outlived the `qf --wait` that submitted
+    # it, so the run finished on the host and the evaluation was never
+    # submitted -- a scored result silently lost to a client-side clock.
+    #
+    # 9900 TRACKS QFD_JOB_HOLD_DEADLINE_S (9600) plus margin, because that is
+    # the dispatcher's own guarantee: a job is finished or killed by then. Time
+    # spent QUEUED behind another heavy job is not bounded by it and not
+    # bounded here either -- a wait that expires while the probe is still
+    # queued costs nothing but the wait, since the job runs on regardless.
+    # `test_experiment.py` pins this above `spec.TIMEOUT_MAX`; the two move
+    # together.
+    parser.add_argument("--timeout", type=int, default=9900)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="can this host run an experiment unattended?")
     one = sub.add_parser("sync", help="port the trusted trainer into the"

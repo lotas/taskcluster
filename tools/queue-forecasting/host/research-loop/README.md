@@ -414,10 +414,11 @@ It fails **open**: an unreadable frontier runs the leader, because skipping on a
 reporting glitch would turn it into a silently stalled loop. `QF_TICK_ALWAYS_LEAD=1`
 overrides.
 
-## A qctx probe did not fit the probe timeout (optimisation landed 2026-09-01; verification pending)
+## A qctx probe did not fit the probe timeout (sweep optimised 2026-09-01; ceiling raised 2026-09-03)
 
-`spec.py` caps `timeout_s` at **3600** for every kind, and the cap is
-deliberately subordinate to the dispatcher's hold deadline:
+`spec.py` caps `timeout_s` at **5400** for every kind — 3600 until 2026-09-03,
+see "The ceiling was raised too" below — and the cap is deliberately subordinate
+to the dispatcher's hold deadline:
 
 ```
 TIMEOUT_MAX + BUILD_TIMEOUT_S + BUILD_LOCK_WAIT_S + HANDOFF_TIMEOUT_S
@@ -437,8 +438,9 @@ ceiling, because the sweep is recomputed per split rather than once.
 That was the state until 2026-09-01. Two ways out existed, neither to be chosen
 quietly:
 
-1. **Raise the chain.** The observed hold deadline was 7800s, so headroom exists,
-   but it is a coordinated constant change in the trusted dispatcher.
+1. **Raise the chain.** The hold deadline was 7800s, so headroom existed, but it
+   is a coordinated constant change in the trusted dispatcher. (Taken later, on
+   2026-09-03, once route 2 turned out not to be enough on its own.)
 2. **Compute the sweep once.** `[queue_context]` timings show heavy skew — 26 of
    529 queues took 907s of the 3019s — so caching across splits, or sweeping the
    union once, is the real fix. That is trainer work, and it is the rare case
@@ -446,7 +448,7 @@ quietly:
 
 ### What was done, and what that does and does not establish
 
-Route 2 was taken; `TIMEOUT_MAX` was deliberately left alone. The per-row sweep
+Route 2 was taken first, and `TIMEOUT_MAX` was left alone at the time. The per-row sweep
 issued ~150 scalar `np.searchsorted` calls per target row; it now issues every
 search once per (queue, rank) over the target vector, chunked at
 `SWEEP_CHUNK = 250_000` targets to keep peak memory independent of queue skew
@@ -479,6 +481,47 @@ git -C ~/qf-research show <sha>:trainer/src/queue_context.py | grep SWEEP_CHUNK
 Until that is checked, state the status as "two post-fix qctx probes completed
 and scored", which is observed, rather than "qctx now completes", which is an
 inference about code identity.
+
+### The ceiling was raised too (2026-09-03), because the sweep fix was not enough
+
+Route 2 bought a lot and did not buy enough. Measured on three probes against
+the live 6.0M-row cohort:
+
+| stage | 6082 (scored) | 6189 (TIMEOUT) | 6246 (TIMEOUT) |
+|---|---|---|---|
+| loads, pass 1 | 178s | 213s | 226s |
+| qctx sweep 1 | 2515s | 2481s | 2631s |
+| quantile fits | ~389s | ~833s | ~690s |
+| loads, pass 2 | 79s | 86s | 68s |
+| qctx sweep 2 | 230s | killed at start | killed at start |
+
+The fixed cost is within 6% across all three. What varies is **the fit**:
+dropping the residual model's `bl_wait_p90` more than doubled it, and adding a
+categorical nearly did, because early stopping runs much longer when the model
+has to work harder. Both failures died at wall ≈3614s needing ~3950s. So the
+programme sat at 95–110% of the ceiling and which configs were runnable depended
+on how hard their fit happened to be — not a property anyone can predict before
+submitting.
+
+`TIMEOUT_MAX` is now **5400**, and the chain moved with it:
+`JOB_HOLD_DEADLINE_S` 7800 → 9600, `LOCK_WAIT_S` 9000 → 11400, giving
+`5400+1800+900+120+600 = 8820 < 9600` and `9600+300 < 11400`. Five files change
+together — `spec.py`, `qfd.py`'s defaults, `qf-dispatch.service`,
+`phase2-setup.sh`, and the tests that pin the shipped figures, `test_spec.py:90`
+existing precisely so this cannot be done quietly.
+
+**And the client wait had to move with it.** `experiment.py --timeout` was 5400,
+which was headroom over a 3600s job and became *exactly equal* to a 5400s one: a
+probe running to its ceiling would outlive the `qf --wait` that submitted it, so
+the host would finish the work and the evaluation would never be submitted — a
+scored result lost to a client-side clock. It is now 9900, tracking the hold
+deadline, and `test_experiment.py` pins it above `spec.TIMEOUT_MAX`.
+
+None of this makes the sweep cheap. Sweep 1 runs at **2410 rows/s** and sweep 2
+at **8703 rows/s** — same code, same host, differing only in reference-frame
+size per queue (13.2k rows vs 3.8k). Chunking sweep 1 temporally should recover
+most of that ~1800s. The ceiling is headroom to do that work in, not a
+substitute for it.
 
 ## Deploying restarts the dispatcher, which kills in-flight probes
 

@@ -49,7 +49,16 @@ CPU_MIN, CPU_MAX = 0.5, 8.0
 # TIMEOUT_MAX + BUILD_TIMEOUT_S + BUILD_LOCK_WAIT_S + HANDOFF_TIMEOUT_S + setup
 # and teardown < JOB_HOLD_DEADLINE_S < LOCK_WAIT_S, and those numbers move
 # together or not at all. `phase2-setup.sh discover` fails if the chain inverts.
-TIMEOUT_MIN, TIMEOUT_MAX = 60, 3600
+# RAISED 3600 -> 5400 on 2026-09-03, and the whole chain moved with it. Measured
+# on three probes against the live 6.0M-row cohort: the fixed cost before the
+# model is fitted is ~2700s (a 2500s queue-context sweep plus ~180s of loads),
+# and the quantile fits then take 389s for the reference config but 833s for the
+# `bl_wait_p90` ablation and 690s with an added categorical. So the whole
+# programme sat at 95-110% of 3600 and WHICH configs were runnable depended on
+# how hard their fit happened to be -- two probes died at wall 3614s having
+# reached the prediction sweep, needing ~3950s. This ceiling buys the research
+# room while the sweep is made cheaper; it is not a substitute for that.
+TIMEOUT_MIN, TIMEOUT_MAX = 60, 5400
 MAX_PATHS = 20
 
 KINDS = {
@@ -76,7 +85,7 @@ KINDS = {
     # nightly for the same host and must serialise against it. Nothing about the
     # kind forces that; the memory does, and a probe that only reads a manifest
     # can ask for 1g and stay light.
-    "probe":    dict(timeout_s=3600, mem_limit="8g", cpus=4.0),
+    "probe":    dict(timeout_s=5400, mem_limit="8g", cpus=4.0),
     # An evaluation runs in the trusted evaluator (D24), in its own privilege
     # domain, so -- like `extract` -- none of these numbers describes a
     # container. `mem_limit` is a slot reservation: 512m keeps it in the LIGHT

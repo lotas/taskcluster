@@ -109,10 +109,10 @@ class RunnerCase(unittest.TestCase):
             build_lock=os.path.join(root, "build.lock"),
             build_timeout_s=1800, build_lock_wait_s=900,
             build_settle_s=0,                    # no real sleeping in tests
-            job_hold_deadline_s=7800, kill_confirm_s=1, stop_timeout_s=0,
+            job_hold_deadline_s=9600, kill_confirm_s=1, stop_timeout_s=0,
             reap_interval_s=60, setup_teardown_allowance_s=600,
             marker_stale_margin_s=900, lock_migrated_marker="",
-            mem_budget_mb=22528, timeout_max_s=3600, lock_wait_s=9000,
+            mem_budget_mb=22528, timeout_max_s=5400, lock_wait_s=11400,
             image_build_mem_mb=2048, light_workers=2, log_cap_mb=16,
             artifact_cap_mb=2048, handoff_timeout_s=120, disk_floor_gb=0,
             queued_cap_per_uid=20, lease_s=300)
