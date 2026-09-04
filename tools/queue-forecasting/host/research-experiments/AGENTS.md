@@ -19,6 +19,26 @@ for improvement -- it is a tail-coverage problem with three bars already banked,
 and a change that trades any of them away for tail coverage has to trade at a
 rate the contract survives.
 
+**This campaign is wait time only, and that is a scope decision, not a finished
+result.** Run duration is a second target, with its own configs
+(`run_duration.yaml`, `run_duration_residual.yaml`) and its own contract, and it
+is **deferred, not solved**. Do not propose duration experiments here; a run that
+spends a probe on the wrong target costs a day of the budget and produces a row
+in a series nobody is reading.
+
+What is known about it, so you do not have to guess: centrally it is strong --
+within-2x around 87-92%, and the MAE bar it faces is 5% rather than wait's 15%
+because its percentile baseline is good. The long tail is not. Live serving
+measured the completed-run p90 miss at 8.9% overall but 28.8% for 30-60m runs
+and 32.7% for 60m+. That snapshot is **not a usable reference**: its window
+(2026-05-15..05-27) straddles the day the duration p90 guardrail went live
+(2026-05-20), so the number blends a guarded and an unguarded model and measures
+neither. The duration contract also has no tail bar and no within-2x bar at all,
+and the evaluator's bucket vocabulary is wait-only, so nothing about that tail
+can currently be scored. Establishing a duration reference is a separate campaign
+with its own extract, and it comes before any group-ETA work -- not before the
+bar in front of you.
+
 **The ranked list of what to run and why is at**
 
 ```
@@ -256,6 +276,23 @@ change (Policy B) that had fixed the model's regime fragility. Fifteen cohorts o
 compute produced a number nobody can attribute to anything. Diff your config
 against the one you are comparing to, and if the diff is more than one idea,
 split it.
+
+### If the signal is not in the data, write BLOCKED_DATA and stop
+
+A hypothesis that needs something the extract does not carry is not a hypothesis
+you can test this tick. Say so in the entry -- `BLOCKED_DATA:` followed by the
+signal, the error slice it would explain, and whether it could be backfilled from
+the database or would have to be collected live from here on. Then pick something
+else from the queue.
+
+**Do not substitute a proxy for it, and do not keep tuning the features that ARE
+present around the gap.** Both produce runs that look like work: a proxy scores,
+so it enters the record as a tested idea when the idea was never tested; and
+rearranging the existing columns can absorb weeks without the tail moving,
+because the reason the tail is not moving is that the information is not in the
+frame. A `BLOCKED_DATA` note is worth more than either -- it is the only thing
+that turns "we tried and it did not help" into "we cannot try yet, and here is
+what it would take".
 
 The config name is recorded on every run, so `results.sh` can tell your rows
 apart. If you add a config, give it a name whose ENDING says what is different --
