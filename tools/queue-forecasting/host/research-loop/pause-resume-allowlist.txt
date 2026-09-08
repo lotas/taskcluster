@@ -1,0 +1,11 @@
+# GitHub logins permitted to release an auto-PAUSE by closing its issue.
+#
+# NORMAL-WORKFLOW POLICY, NOT ENFORCEMENT. `research` can already remove the
+# PAUSE file outright and the pause token can close the issue it filed, so this
+# is about who is EXPECTED to release a pause, not who is ABLE to -- see design
+# §4 and §4.5. What it buys is that the ordinary release path leaves an
+# attributable, timestamped GitHub event instead of an `rm`.
+#
+# One login per line; `#` comments and blank lines ignored; matched
+# case-insensitively, because GitHub logins are.
+lotas

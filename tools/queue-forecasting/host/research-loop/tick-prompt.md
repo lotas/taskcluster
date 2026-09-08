@@ -22,6 +22,13 @@ problem you are here to stop making worse.
 2. **A pre-registered claim came out false.** The frontier shows `broken` and
    `written up: NO`. Write what that rules out. A refuted hypothesis is a
    result, and the copilot is told to accept refutations readily. Stop.
+
+**`retired` is not `NO`.** A row whose `written up` column says `retired` was
+written up twice and rejected twice, and is deliberately no longer available:
+actions 1 and 2 must skip it. It is listed under `RETIRED:` so a human can see
+what was given up on, and only a human can bring it back. Picking it anyway is
+how three ticks were spent on one run on 2026-09-04.
+
 3. **A config is PROMISING and one cohort short of CONFIRMED.** Run it on a
    cohort whose holdout does not overlap. This is the highest-value action
    available whenever it applies. Stop.
@@ -163,6 +170,8 @@ it after a second agent checks it. Structure:
 ```markdown
 # <one-line title>
 
+**Target run:** <the `evaluate-` id this entry is ABOUT, or the literal `none`>
+
 **Action taken:** <which of the six, and the exact command you ran>
 
 **Claim:** <what you assert, with the numbers it rests on and the run ids>
@@ -174,6 +183,44 @@ it after a second agent checks it. Structure:
 **Evidence:** <for every figure NOT in the frontier JSON: the exact command and
 the relevant lines of its output, pasted>
 ```
+
+**`Target run:` is machine-read and has exactly one job: name the single
+`evaluate-` id this entry is about** — the row being written up, or the
+evaluation of a run you just submitted. Nothing else reads this field for
+meaning; it does not need to be readable prose, only the one id.
+
+- **Nothing follows the id on that line.** The value is the rest of the line
+  after the label, so the line must end right after the id — no parenthetical,
+  no trailing comment, no second id, nothing but the id. Append so much as
+  `" (the row this entry is about)"` to a perfectly valid id and the line does
+  not match at all: it is read exactly as if you had written no target line —
+  the same drift reading as below, not a decorated version of the valid one.
+- **Never a `probe-` id.** One probe can be evaluated under two contracts, so a
+  probe id does not identify a single row — it identifies up to two, and
+  whatever consumes this field would have to guess which. Put the `evaluate-`
+  id, not the probe it came from.
+- **Never a comparator**, however central to the argument. If your claim rests
+  on `--vs`, that id belongs in `Claim:` like any other — this field is only
+  for the row the entry is about.
+- **`none` is the right answer for a tick that wrote up no run** — action 6's
+  waiting entry is the usual case. It is a perfectly good answer, not a
+  fallback you should feel bad about reaching for.
+- **Do not write this field more than once with different values.** An entry
+  that names two different targets resolves to `none` — not to either one, not
+  to "whichever comes first."
+- **Never reproduce a `Target run:` line anywhere else in the entry**,
+  including inside `Evidence:`. Every line in the file is searched, not just
+  the one under the heading, so a pasted transcript or a quoted entry that
+  happens to contain one collides with your real line exactly like writing the
+  field twice yourself — and a collision with a different value resolves to
+  `none`. If quoting another entry is unavoidable, elide its `Target run:`
+  line.
+- **Getting this wrong is not a rejection, it is something worse.** The loop
+  uses this field to tell "the same run is being rewritten" from "the agent is
+  drifting across different runs" — the first is a stuck item, the second is a
+  pattern worth stopping. An id that names nothing is read as the second, so a
+  slip here does not just fail to help — it reads as drift even when you were
+  working the same run the whole time.
 
 Every number you cite must appear in the frontier JSON **or** in a pasted command
 output in your `Evidence:` block. A number you remember is a number you invented.

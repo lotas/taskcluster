@@ -84,6 +84,9 @@ satisfied it.
   submitted, a command that failed, a tool that was unavailable. But a *count*
   is still a figure: "all four attempts failed identically" with three pasted is
   unsupported, and rejecting that is correct.
+- **`Target run:` is not a claim.** It is a machine-read field the loop uses to
+  identify which row the entry is about. It is not a figure, it is not evidence,
+  and its presence, absence or value is never a reason to reject.
 
 The test: if the sentence would change what a reader believes about a **model, a
 feature or a bar**, check it against the sources. If it only says what happened
@@ -102,17 +105,24 @@ hedging.
 
 ## Your reply
 
-Reasoning first if you want it, then end with exactly one line:
+Reasoning first if you want it, then **end with exactly one of these two
+lines, with nothing after it** — no closing fence, no sign-off, no postscript:
 
-```
 VERDICT: AGREE
-```
 
 or
 
-```
 VERDICT: DISAGREE
-```
+
+**It must be the last non-blank line of your reply**, and it is shown here
+unfenced on purpose: a reply that mirrors a code fence ends on ``` rather than
+on the verdict, and the tick then reads it as a verifier that did not answer.
+
+A verdict followed by anything else is not read as a verdict at all. The entry
+escalates unrecorded, and three replies like that pause the loop on the
+infrastructure brake. This is not pedantry: an `AGREE` followed by "correction:
+the central figure is absent" used to publish the entry, because the parser
+took the last *matching* line rather than the last line.
 
 If you disagree, the two or three lines before that verdict must name the
 specific figure, comparison or overreach that failed — the entry becomes an

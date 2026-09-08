@@ -163,32 +163,347 @@ def windows_overlap(left, right):
 # code fence must all count.
 _RUN_ID = re.compile(r"\b(?:probe|evaluate)-[0-9A-Za-z]+-[0-9a-f]+-\d+\b")
 
+# RETIREMENT NEEDS A TARGET, NOT A MENTION. `_RUN_ID` is loose on purpose --
+# scraping IDS out of prose is right for "has this run been written up at all",
+# but wrong for "which run does THIS rejection count against": a rejected entry
+# names its target, its comparator (`vs=`), the probe the evaluation came from
+# AND the evaluation of it in the same paragraph, so scraping would retire up to
+# four runs off one rejection, and a harmless rewrite that started citing the
+# evaluation instead of the probe would look like a change of target. So exactly
+# one declared field decides, and everything else in the file is evidence, never
+# a target.
+#
+# BYTE-EXACT ON PURPOSE. `**Target run**:` (colon outside the bold) or
+# `**target run:**` would not match, and that is deliberate rather than an
+# oversight: the label is emitted by `tick-prompt.md`'s fixed template, not
+# typed freehand, so the one spelling the template produces is the only one
+# that needs to match.
+_TARGET = re.compile(r"^\*\*Target run:\*\*[ \t]*(\S+)[ \t]*$", re.M)
 
-def _tracked_journal_files(journal_dir):
-    """Basenames of the git-tracked `.md` files directly in `journal_dir`.
+# EVALUATION IDS ONLY. `build()`'s `index` maps an id to a LIST of rows because
+# one probe can be scored under two contracts -- a probe id does not identify a
+# single row, so a target expressed as a probe id would retire two series' worth
+# of work off one rejection. A malformed or probe-shaped target is refused by
+# `target_of`, not coerced.
+_EVAL_ID = re.compile(r"^evaluate-[0-9A-Za-z]+-[0-9a-f]+-\d+$")
 
-    `None` means the question could not be answered -- no repository, no git, or
-    a failed call -- and every caller must treat that as "nothing is tracked"
-    rather than as "everything is".
+# ONLY A REAL REJECTION RETIRES. The tick also escalates when the verifier never
+# returned a usable verdict at all -- an infrastructure outage, not a judgement --
+# and two `codex` timeouts must never retire a write-up nobody actually read. A
+# file with no parseable line here is `unknown`: NOT defaulted to `rejection`,
+# because the historical files this reads predate the line and include exactly
+# the outages this exists to exclude, and defaulting them in would cause the
+# harm retirement exists to prevent.
+_KIND = re.compile(r"^Escalation kind:[ \t]*(rejection|verifier-failure)[ \t]*$",
+                   re.M)
+
+# A WAIVER STARTS A NEW EPISODE; IT DOES NOT SUBTRACT. Three rejections against a
+# threshold of two, minus one waiver, must still retire -- subtraction would
+# revive the one case retirement exists for. So a waiver only moves the FLOOR: an
+# escalation committed at or before the latest waiver for its target does not
+# count, and one committed after does, in full.
+_WAIVER = re.compile(r"^\*\*Waiver:\*\*[ \t]*(\S+)[ \t]*$", re.M)
+
+# `YYYYMMDDTHHMMSSZ` SORTS LEXICOGRAPHICALLY LIKE A TIMESTAMP -- that is what the
+# naming convention buys, and it is why a waiver's ordering against an escalation
+# can be a string comparison instead of a datetime parse.
+#
+# BUT THE SHAPE IS NOT A DATE, and for a WAIVER that difference was Critical:
+# `20270908T000000Z.md` (a typo'd year, or a box whose clock is skewed) matches
+# this exactly, sets `floor[rid]` above every stamp the loop will produce for a
+# year, and waives every rejection episode there is or will be -- so the row
+# stays `unrecorded` and therefore both selectable AND suppressible, the drift
+# streak never advances past the stored `last-reject-target`, every usable
+# verdict resets the verifier-failure counter, and retirement never reaches its
+# threshold. The 2026-09-04 hourly livelock with BOTH brakes off, from one
+# mistyped filename, with nothing on any surface saying so. `_as_time` and
+# `_WAIVER_LEAD` below are what a waiver stamp must now survive.
+_STAMP = re.compile(r"^(\d{8}T\d{6}Z)")
+
+# HOW FAR AHEAD OF THE JOURNAL'S OWN NEWEST COMMITTED FILE A WAIVER STAMP MAY
+# SIT AND STILL BE BELIEVED. Not "ahead of now": `escalation_targets` decides
+# what work the loop offers, so it stays a pure function of committed content --
+# a wall-clock check would make one journal answer differently on two boxes, and
+# on the box whose clock is wrong (the failure being defended against) it would
+# answer wrongly. The journal's own stamps are the only clock available that is
+# part of the input.
+#
+# ZERO SLACK IS NOT AN OPTION: a real waiver is always the newest file in the
+# journal at the moment it is written, so "ahead at all" would void every
+# legitimate revival. THE SLACK IS SMALL ON PURPOSE, because it is also the
+# window a believed stamp can eat out of the FUTURE -- every hour inside it is an
+# hour of rejections waived before they happen. Seven days covers the 2026-09-04
+# shape (silent 2.5 days, human notices, writes a waiver) with margin, and caps
+# the damage of a plausible-looking typo at a week instead of a year. Being
+# wrong the tight way costs a named report line and a re-stamped filename;
+# being wrong the loose way costs that many days of hourly livelock.
+_WAIVER_LEAD = datetime.timedelta(days=7)
+
+# A HUMAN-AUTHORED MIGRATION RECORD, not a second escalation format. Historical
+# escalations predate `Escalation kind:` entirely, and some of those are the very
+# outages this file exists to exclude -- so a missing line must read as
+# `unknown`, never as `rejection`. `escalation-kinds.md` lets a human classify
+# those old files after the fact without rewriting committed journal entries.
+_KIND_LINE = re.compile(r"^(\d{8}T\d{6}Z)[ \t]+(rejection|verifier-failure)$",
+                        re.M)
+
+
+def _stamp_of(name):
+    """The `YYYYMMDDTHHMMSSZ` prefix of a committed basename, or `""`.
+
+    `""` sorts before every real stamp, so a name this cannot parse never wins a
+    floor comparison and never overrides a classification -- it is simply
+    unordered, the same "cannot answer" convention as the rest of this file.
+    """
+    m = _STAMP.match(name)
+    return m.group(1) if m else ""
+
+
+def _as_time(stamp):
+    """A `YYYYMMDDTHHMMSSZ` stamp as a datetime, or `None` if it names no real
+    instant.
+
+    `_stamp_of` answers "does this filename carry a stamp"; this answers "does
+    that stamp exist as a moment in time". `20261345T996000Z` passes the first
+    and fails the second, and it sorts above every real 2026 stamp -- which is
+    the same hole as a typo'd year, reached without the filename ever looking
+    like a plausible date. `None` is the file's usual "cannot answer", and every
+    caller must read it as "do not believe this stamp".
+    """
+    try:
+        return datetime.datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def target_of(text):
+    """The declared target of a journal entry: a canonical evaluation id, or
+    `""` when the entry does not declare one, declares one that is not an
+    evaluation id, or declares it more than once WITH DISAGREEMENT.
+
+    Exactly one line is meant to decide this -- see `_TARGET` above for why
+    scraping the body would be wrong four different ways. But "exactly one" is
+    a claim about a well-formed file, not something the regex enforces by
+    itself: an escalation that quotes a PREVIOUS entry's `**Target run:**` line
+    inside a fenced evidence block -- entirely plausible, since the copilot's
+    job is to show its work -- has two matches, and `.search` taking the first
+    one would resolve to whichever happens to come first in the file. That is
+    exactly the failure this field exists to prevent, just moved from "which
+    field" to "which occurrence".
+
+    So EVERY match is collected, not the first: identical repeats (a file
+    quoting its own target line) are harmless and resolve normally, but
+    DISAGREEING matches return `""` -- ambiguous, retires nothing -- rather
+    than being resolved by position. Position is exactly the thing an
+    agent-written markdown file does not guarantee, so refusing is the only
+    safe reading; the drift shows up as the run staying unretired, never as a
+    wrong run being retired.
+
+    `_EVAL_ID` is checked on the (single, agreed) candidate, not just matched
+    loosely by `_TARGET`, so a `**Target run:** probe-...` line (or a typo, or
+    a comparator pasted into the wrong field) reads as NO target rather than as
+    a wrong one.
+    """
+    matches = set(_TARGET.findall(text or ""))
+    if len(matches) != 1:
+        return ""
+    candidate = next(iter(matches))
+    return candidate if _EVAL_ID.match(candidate) else ""
+
+
+def _committed_blobs(journal_dir, subdir=None):
+    """`{basename: text}` for every `.md` blob committed at HEAD, one namespace.
+
+    `subdir=None` means the flat journal root; `subdir="escalations"` means that
+    directory and no deeper. `None` is returned when the question cannot be
+    answered -- no repository, no git, no HEAD, a malformed listing or a failed
+    call -- and EVERY caller must read that as "nothing counts" rather than
+    "everything counts": the alternative silently retires results.
+
+    BLOB OIDS, NEVER PATHS. `ls-tree` run with `-C <journal_dir>` prints paths
+    relative to that directory, while `cat-file`'s path syntax resolves from the
+    repository root, so `HEAD:<path>` from here is `fatal: path ... does not
+    exist in 'HEAD'`. An oid needs no prefix and cannot be misresolved.
+
+    LINE ENDINGS ARE NORMALIZED HERE, ONCE, because this is the one place
+    journal TEXT enters the module -- `_parse_batch` hands back exact blob
+    bytes decoded, on purpose, since its job is byte-accurate framing, not
+    content semantics. Every regex below is anchored with `$` under `re.M`,
+    which matches before `\n` but NOT before a `\r` that a CRLF-saved file
+    would leave in front of it, so a `\r\n`-authored file would silently
+    fail every one of them: `target_of` would return `""`, the escalation
+    would `continue` before its kind was even classified, and it would count
+    toward NEITHER `targets` NOR `unclassified` -- the one invisible failure
+    mode in this file, where everywhere else "cannot answer" is plumbed into
+    a counter an operator can see. Normalizing at this single choke point
+    means a future regex added here inherits the fix for free, rather than
+    needing its own `\r?$` that is easy to forget.
     """
     import subprocess
     try:
-        done = subprocess.run(
-            ["git", "-C", journal_dir, "ls-files", "-z", "--", "."],
+        listed = subprocess.run(
+            ["git", "-C", journal_dir, "ls-tree", "-z", "-r", "HEAD"],
             capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+
+    parsed = _parse_ls_tree(listed.stdout, subdir)
+    if parsed is None:
+        return None
+    oids, names = parsed
+    if not oids:
+        return {}
+    try:
+        done = subprocess.run(
+            ["git", "-C", journal_dir, "cat-file", "--batch"],
+            input=("\n".join(oids) + "\n").encode(),
+            capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
         return None
-    out = set()
-    for raw in done.stdout.split(b"\0"):
-        path = raw.decode("utf-8", "replace")
-        # `ls-files -- .` from inside the directory prints paths relative to it,
-        # so a bare name is a file directly here and anything with a slash is in
-        # a subdirectory (`escalations/`), which does not count.
-        if path and "/" not in path:
-            out.add(path)
+    blobs = _parse_batch(done.stdout, names)
+    if blobs is None:
+        return None
+    return {name: text.replace("\r\n", "\n").replace("\r", "\n")
+            for name, text in blobs.items()}
+
+
+def _parse_ls_tree(stdout, subdir):
+    """`(oids, names)` for the `.md` blobs in one flat namespace, or `None`.
+
+    `stdout` is `git ls-tree -z -r HEAD` run from inside `journal_dir`, so every
+    path is relative to it: a bare name is the journal root, `escalations/x.md`
+    is one level down. `None` on any framing surprise -- a NUL-delimited record
+    with no tab, or a `<mode> <type> <oid>` header that is not exactly three
+    fields -- for the same reason `_parse_batch` refuses rather than guesses: a
+    malformed listing must read as "answer unknown", never as "empty".
+
+    A TAB OR NEWLINE INSIDE A FILENAME DOES NOT DESYNCHRONISE THIS, and that
+    rests on two properties, not one: `-z` NUL-delimits each ENTRY, so a stray
+    tab or newline byte inside a path can never be mistaken for the separator
+    between entries, and `partition(b"\t")` splits on the FIRST tab only, so a
+    literal tab inside the filename itself stays part of `path` rather than
+    truncating it.
+    """
+    oids, names = [], []
+    for raw in stdout.split(b"\0"):
+        if not raw:
+            continue
+        meta, tab, path = raw.partition(b"\t")
+        if not tab:
+            return None                     # not the documented format: refuse
+        fields = meta.split(b" ")
+        if len(fields) != 3:
+            return None
+        if fields[1] != b"blob":
+            continue
+        name = path.decode("utf-8", "replace")
+        if not name.endswith(".md"):
+            continue
+        # DEPTH IS ENFORCED ON THE RETURNED PATHS, not by a pathspec: a pathspec
+        # of `.` still returns nested entries (verified), so the filter has to
+        # be here or `escalations/` would leak into the journal root's reader.
+        parts = name.split("/")
+        if subdir is None:
+            if len(parts) != 1:
+                continue
+        elif len(parts) != 2 or parts[0] != subdir:
+            continue
+        oids.append(fields[2].decode("ascii", "replace"))
+        names.append(parts[-1])
+    return oids, names
+
+
+def _parse_batch(buf, names):
+    """Pair `cat-file --batch` output with the names it was asked about.
+
+    `--batch` answers IN INPUT ORDER, so pairing by index is sound. Each answer
+    is `<oid> SP <type> SP <size> LF <bytes> LF`.
+
+    `None` on ANY framing surprise, and that is the whole point: slicing past the
+    end of `bytes` does not raise in Python, so an unchecked parser answers a
+    truncated response with partial content spliced together from two records --
+    a silently wrong answer about whether a result was already written up.
+    """
+    out, pos = {}, 0
+    for name in names:
+        nl = buf.find(b"\n", pos)
+        if nl < 0:
+            return None
+        fields = buf[pos:nl].split(b" ")
+        if len(fields) != 3:
+            return None
+        _oid, kind, size_s = fields
+        # `blob` IS CHECKED, because `--batch`'s framing is uniform across
+        # object types but only a blob's size means "content bytes"; a
+        # desynchronised pairing that happens to land on a `commit` or `tree`
+        # header would otherwise be read as if it were one.
+        if kind != b"blob":
+            return None
+        try:
+            size = int(size_s)
+        except ValueError:
+            return None
+        if size < 0:
+            return None
+        start = nl + 1
+        end = start + size
+        # THE FRAMING ASSERTION THAT CATCHES A WRONG SIZE EVEN WHEN ENOUGH BYTES
+        # HAPPEN TO BE PRESENT. `--batch` always appends exactly one trailing
+        # newline after the content, so if the byte at `end` is not it, `size`
+        # was wrong -- and slicing `buf[start:end]` without this check does not
+        # raise, it just returns fewer bytes than promised, silently splicing in
+        # a fragment of the next record.
+        if buf[end:end + 1] != b"\n":
+            return None
+        out[name] = buf[start:end].decode("utf-8", "replace")
+        pos = end + 1
     return out
+
+
+# THE JOURNAL ROOT'S CONTRACT IS "EVERY COMMITTED `.md` HERE IS AN ENTRY" --
+# `journaled_run_ids` reads the whole root and scrapes every blob with the
+# deliberately loose `_RUN_ID` regex, so anything committed there that is NOT
+# an entry has to be enumerated as an exception, not discovered by discipline.
+# Two are known today: `PENDING.md` (never committed, guarded cheaply anyway)
+# and `escalation-kinds.md` (a human-authored control file -- see
+# `journaled_run_ids` for the hazard of leaving it unguarded). Collected into
+# one set rather than two separate `if name ==` sites so a third control file
+# has exactly one place to be added -- and `RootEntryNaming`'s test below
+# turns forgetting to add it into a loud, failing assertion instead of a
+# silent repeat of this exact bug, which is how `escalation-kinds.md` arrived
+# in the root in the first place: the same hazard, reasoned through for
+# `waivers/` and then not re-applied here.
+_NOT_ENTRIES = {"PENDING.md", "escalation-kinds.md"}
+
+# AN ENTRY'S NAME, for the same tripwire: `<stamp>.md`, nothing else. Used only
+# to recognise a root file as an entry for the invariant check above, never to
+# gate `journaled_run_ids` itself -- that function reads EVERY entry's text
+# regardless of naming, and tightening it to require this shape is a
+# different, larger change than the one this pattern exists for.
+_ENTRY_NAME = re.compile(r"^\d{8}T\d{6}Z\.md$")
+
+
+def _unrecognized_root_names(names):
+    """Journal-root basenames that are neither a stamped entry (`_ENTRY_NAME`)
+    nor a known control file (`_NOT_ENTRIES`).
+
+    THE FIXTURE-LEVEL SUBSTITUTE FOR A REPO-LEVEL ASSERTION THAT CANNOT BE
+    WRITTEN: the real journal lives on the host this loop runs on, not in this
+    repository, so there is no shipped `journal/` tree here to check against
+    directly. This function is the same check with the root's contents
+    supplied by a test instead of by disk, and it exists so that a THIRD
+    control file -- added the way `escalation-kinds.md` was, by reasoning
+    through the hazard for one file and not re-running that reasoning for the
+    next one -- shows up here as unrecognized rather than silently being
+    scraped by `journaled_run_ids` like an entry. It does not gate anything by
+    itself; it is a name for the invariant a test can pin.
+    """
+    return sorted(n for n in names
+                  if n not in _NOT_ENTRIES and not _ENTRY_NAME.match(n))
 
 
 def journaled_run_ids(journal_dir):
@@ -205,37 +520,278 @@ def journaled_run_ids(journal_dir):
     come round again. Counting escalations here would let a rejected claim
     silently retire the result it was about, which is the worst possible reading
     of a failed verification.
+
+    RETIREMENT IS NOT A RELAXATION OF THIS. `escalation_targets` (added in a
+    later task) counts escalations separately and marks a run `retired` in its
+    own state; an escalated entry still never makes a run look recorded here.
     """
+    blobs = _committed_blobs(journal_dir)
+    if blobs is None:
+        # CANNOT TELL COMMITTED FROM UNCOMMITTED: count NOTHING. Every run then
+        # reads as unrecorded, which is noisy and safe; the opposite default --
+        # treating an unreadable journal as fully written up -- would silently
+        # retire results nobody ever committed.
+        return set()
     seen = set()
-    try:
-        names = sorted(os.listdir(journal_dir))
-    except OSError:
-        return seen
-
-    # ONLY TRACKED FILES COUNT. `os.listdir` alone read the working tree, and the
-    # leader shares the uid that owns it -- so dropping a `journal/anything.md`
-    # citing a run id marked that run "written up" without any entry ever being
-    # verified or committed. Retiring a result is exactly what an unverified file
-    # must not be able to do.
-    tracked = _tracked_journal_files(journal_dir)
-    if tracked is None:
-        # Cannot tell tracked from untracked: count NOTHING. Every run then reads
-        # as unrecorded, which is noisy and safe; the opposite default would
-        # silently retire results on the strength of files nobody reviewed.
-        return seen
-
-    for name in names:
-        if not name.endswith(".md") or name == "PENDING.md":
+    for name, text in blobs.items():
+        # `PENDING.md` CANNOT BE COMMITTED (a cheap guard anyway) and
+        # `escalation-kinds.md` IS A CONTROL FILE, NOT AN ENTRY, but it lives
+        # in the journal root rather than its own subdirectory -- unlike
+        # `waivers/`, which got a subdirectory of its own for exactly this
+        # reason. `_RUN_ID` is loose on purpose (see its own comment) and
+        # reads the WHOLE file, not just the `<stamp> <kind>` lines the
+        # classifier cares about, so a run id anywhere in it -- a header
+        # comment, a note above the table, prose explaining a decision --
+        # gets scraped out identically to one in a real entry. For example:
+        #
+        #   # classified 2026-09-04, per the postmortem for
+        #   # evaluate-20260904T090941Z-0a217f40da8f-6446
+        #   20260904T101126Z rejection
+        #
+        # Without this guard, that comment alone would make the named run
+        # read as RECORDED -- not retired, RECORDED -- so the leader never
+        # picks it up again and the finding is lost silently and permanently.
+        # That is a worse outcome than the escalation exclusion two paragraphs
+        # up exists to prevent, and reachable by the file's ordinary use: a
+        # human classifying escalations by hand will very plausibly leave a
+        # note like this for their own benefit. (A run id typed directly onto
+        # the classified line itself, as `_KIND_LINE` requires it, would not
+        # even classify -- that line is fully anchored, so trailing prose
+        # makes it fail to match at all, silently, rather than leak. Both are
+        # real failure modes of this file; they are just different ones.)
+        #
+        # NAME-SKIP CHOSEN OVER A SUBDIRECTORY: moving the file to its own
+        # subdirectory (`_committed_blobs(journal_dir, "kinds")`, mirroring
+        # `waivers/`) would also close this, and the migration itself is a
+        # bigger reason to prefer NOT doing it than the migration's cost: for
+        # however long the root copy is deleted and a reader for the new
+        # subdirectory is not yet deployed, EVERY override silently
+        # disappears, every already-classified historical escalation reverts
+        # to `unknown`, and retirement quietly stops happening -- fail-safe in
+        # direction (nothing gets wrongly retired) but entirely invisible,
+        # which is the same character of bug this guard exists to close, just
+        # relocated to a deploy window instead of a comment. One line, for the
+        # one well-known file that exists today, has no such window.
+        if name in _NOT_ENTRIES:
             continue
-        if name not in tracked:
-            continue
-        try:
-            with open(os.path.join(journal_dir, name),
-                      encoding="utf-8", errors="replace") as fh:
-                seen.update(_RUN_ID.findall(fh.read()))
-        except OSError:
-            continue
+        seen.update(_RUN_ID.findall(text))
     return seen
+
+
+def escalation_targets(journal_dir):
+    """`({run id: {rejections, latest}}, {"unclassified": [...],
+    "unparseable_waivers": [...], "misdated_waivers": [...]})`,
+    the three problem lists holding BASENAMES (`20260904T101126Z.md`, not
+    `escalations/20260904T101126Z.md`) rather than counts -- see the note
+    below the counting rules for why a count alone is not enough. Bare, not
+    prefixed with their directory: the caller (`render()`) already says which
+    directory once, for the whole list, so a per-name prefix would repeat it.
+
+    This is the counting half of retirement (task 3 turns it into a
+    `recorded|unrecorded|retired` state per row). Every rule below exists
+    because of a specific way a naive count would retire the wrong thing:
+
+    ONE FILE IS ONE EPISODE. A rejection is counted once per escalation file
+    regardless of how many times its target is repeated inside it (a table, a
+    quoted diff, a restated hypothesis) -- the copilot rejected the write-up
+    once, not once per mention.
+
+    ONLY `rejection` COUNTS. `verifier-failure` (the verifier never returned a
+    usable verdict -- an infrastructure outage) is skipped entirely: it is not
+    evidence the claim was wrong, so it must not touch the count OR
+    `problems["unclassified"]`. `unknown` (no parseable kind line, which is
+    every escalation from before the line existed) counts toward the GLOBAL
+    `problems["unclassified"]` so it is visible to an operator, but never
+    toward any run's `rejections` -- historical escalations include exactly
+    the outages this function exists not to retire on, and defaulting an
+    unparseable line to `rejection` would cause that harm.
+
+    UNCLASSIFIED IS COUNTED ONLY GLOBALLY, DELIBERATELY, NOT PER RUN. There is
+    no per-id `unknown` field: an `unknown` escalation names a run whose
+    write-up may never have actually been judged, so attributing it to that run
+    would claim something this file cannot establish -- and a run whose
+    escalations are ALL `unknown` would get no record at all, so a per-id count
+    would be silently wrong for exactly the runs it matters most for (it would
+    read as zero rather than as "unknown"). The global total is honest about
+    what it knows: that many escalations could not be classified, full stop.
+
+    A WAIVER STARTS A NEW EPISODE, IT DOES NOT SUBTRACT. Only escalations
+    committed strictly after the latest waiver for a target count; that is
+    a floor on the timeline, not arithmetic against the running total, so a
+    waiver can never revive a run that racked up more rejections than the
+    threshold before it was granted.
+
+    `latest` IS CARRIED because the report needs to name the newest qualifying
+    file, and a bare count cannot reconstruct that -- particularly across a
+    waiver, where the newest ESCALATION is not the newest QUALIFYING one.
+
+    A WAIVER CANNOT OUTRUN THE JOURNAL. The stamp is a filename, typed by a
+    human, and `_stamp_of` only ever checked its SHAPE -- so a typo'd year or a
+    skewed clock (`waivers/20270908T000000Z.md`) put the floor above every stamp
+    the loop would produce for a year and waived every episode there was or
+    would be, leaving the row `unrecorded` (still selectable, still
+    suppressible), the drift streak stuck on a stored `last-reject-target`, the
+    verifier counter reset by every usable verdict, and retirement unreachable:
+    the 2026-09-04 livelock with both brakes off. So a waiver stamp must name a
+    real instant AND sit within `_WAIVER_LEAD` of the journal's own newest
+    committed entry or escalation; one that does not is `misdated_waivers` and
+    revives NOTHING, the same way an undateable filename always has. NO CLOCK IS
+    READ: the comparison is between two committed stamps, so this function stays
+    a pure function of committed content -- it decides what work the loop
+    offers, and that must not depend on which box asks.
+
+    THE SECOND RETURN VALUE IS A DICT OF LISTS, NOT A DICT OF COUNTS. A count
+    told an operator "1 file(s), go find it" and left the finding to `ls` or a
+    hand-diff against `escalation-kinds.md` -- the same silence one level up
+    from what this function exists to end. `unclassified` keeps its exact
+    meaning above but now NAMES each escalation, and `unparseable_waivers`
+    likewise names each waiver file whose basename does not start with a stamp
+    `_stamp_of` can read -- the ONE file type whose entire purpose is
+    operator-initiated revival was, before this counter existed, the one kind
+    of malformed input with no operator-visible trace at all: a misnamed
+    waiver revives nothing, however many valid `**Waiver:**` lines it holds,
+    and the floor loop's `continue` used to make that failure as silent as
+    success. Callers that only want the count take `len(...)` -- `build()`
+    does exactly that for `health`, whose shape stays int-valued.
+    """
+    esc = _committed_blobs(journal_dir, "escalations")
+    waivers = _committed_blobs(journal_dir, "waivers")
+    root = _committed_blobs(journal_dir)
+    if esc is None:
+        # CANNOT TELL COMMITTED FROM UNCOMMITTED: count NOTHING, the same
+        # convention as `journaled_run_ids` -- an unreadable journal must never
+        # read as "no rejections happened".
+        return {}, {"unclassified": [], "unparseable_waivers": [],
+                    "misdated_waivers": []}
+
+    # THE OVERRIDE WINS WHENEVER IT IS PRESENT, even over a file that also
+    # carries its own `Escalation kind:` line -- the code checks
+    # `overrides.get(stamp)` first and only falls back to the file's line when
+    # that lookup misses. This is deliberate, not merely "fills the gap for
+    # files that predate the line": `escalation-kinds.md` exists so a human can
+    # CORRECT a classification, not only supply one that is missing, and a
+    # record that could never override an existing line would not be able to
+    # do that job.
+
+    overrides = {}
+    for stamp, kind in _KIND_LINE.findall((root or {}).get(
+            "escalation-kinds.md", "")):
+        overrides[stamp] = kind
+
+    # THE WAIVER FLOOR, keyed by target and kept at the LATEST stamp seen --
+    # because a second waiver for the same run only ever extends the window it
+    # protects, never shrinks it.
+    #
+    # A WAIVER CAN ONLY WAIVE INSIDE THE TIMELINE THE JOURNAL ITSELF SHOWS. The
+    # journal's newest committed stamp -- newest entry or newest escalation, NOT
+    # newest waiver, because a mistyped waiver must never be the thing that
+    # certifies the next one -- is the only clock in this function's INPUT, and
+    # a waiver more than `_WAIVER_LEAD` past it is not a grant time, it is a
+    # typo or a skewed clock. See `_STAMP` for what believing one cost.
+    #
+    # WAIVERS ARE EXCLUDED FROM THE MARK, ESCALATIONS AND ENTRIES ARE NOT,
+    # because those two are written by the loop, one per tick, and are therefore
+    # the record of how far the loop has actually got.
+    latest_committed = None
+    for name in list(root or {}) + list(esc):
+        when = _as_time(_stamp_of(name))
+        if when and (latest_committed is None or when > latest_committed):
+            latest_committed = when
+
+    problems = {"unclassified": [], "unparseable_waivers": [],
+                "misdated_waivers": []}
+    floor = {}
+    for name, text in (waivers or {}).items():
+        stamp = _stamp_of(name)
+        if not stamp:
+            # SURFACED, NOT SWALLOWED -- see the docstring. A waiver that
+            # cannot be dated cannot set a floor, and silently doing nothing
+            # is exactly the failure mode this counter exists to end. THE
+            # BASENAME IS KEPT, not just the count -- `render()` says "in
+            # waivers/" once and lists names underneath it.
+            problems["unparseable_waivers"].append(name)
+            continue
+        when = _as_time(stamp)
+        if when is None or (latest_committed is not None and
+                            when - latest_committed > _WAIVER_LEAD):
+            # NOT BELIEVED, AND NOT CLAMPED. Clamping the floor down to the
+            # newest escalation for the id looks safer and is not: that ceiling
+            # is recomputed from whatever is committed AT READ TIME, so every
+            # NEW escalation raises it to its own stamp and `<=` then waives
+            # that one too -- the count sits at zero permanently, where the
+            # un-clamped defect at least expired when the typo'd year arrived.
+            # Nor is it fatal: a misnamed waiver must not be able to refuse the
+            # whole frontier, because the report is what a human reads when the
+            # loop is stuck. So it does exactly what an undateable waiver has
+            # always done -- revives NOTHING -- and says which file, by name,
+            # for the one person who can re-stamp it.
+            problems["misdated_waivers"].append(name)
+            continue
+        for rid in _WAIVER.findall(text):
+            if _EVAL_ID.match(rid) and stamp > floor.get(rid, ""):
+                floor[rid] = stamp
+
+    targets = {}
+    for name in sorted(esc):
+        rid = target_of(esc[name])
+        if not rid:
+            continue
+        stamp = _stamp_of(name)
+        kind = overrides.get(stamp)
+        if not kind:
+            m = _KIND.search(esc[name])
+            kind = m.group(1) if m else "unknown"
+        if kind == "verifier-failure":
+            continue                 # an outage, not a verdict: not evidence
+        if kind == "unknown":
+            # GLOBAL ONLY. See the docstring: no per-id field exists to put
+            # this in, and that is on purpose. NAMED (basename, see the
+            # docstring) rather than merely counted.
+            problems["unclassified"].append(name)
+            continue
+        # kind == "rejection"
+        rec = targets.setdefault(rid, {"rejections": 0, "latest": ""})
+        # `<=`, NOT `<`, ON PURPOSE: the design says an escalation counts only
+        # when committed AFTER the latest waiver, so a stamp exactly equal to
+        # the waiver's is still waived. `test_a_waiver_with_the_same_stamp_...`
+        # pins this so it stays a decision rather than an accident of whichever
+        # operator got typed here.
+        if stamp and stamp <= floor.get(rid, ""):
+            continue                 # waived: this episode predates the grant
+        rec["rejections"] += 1
+        rec["latest"] = f"escalations/{name}"
+    return targets, problems
+
+
+class FrontierError(Exception):
+    """A frontier input that violates an invariant this file enforces.
+
+    Mirrors `prereg.PreregError`'s reasoning: a value that violates an
+    invariant should fail loudly rather than be silently coerced. Not
+    `SystemExit` -- this module is imported, not just run as a script, and
+    `SystemExit` is a `BaseException` that `except Exception` (and every test
+    that does not know to look for it) would let straight through.
+    """
+
+
+def retire_after():
+    """How many rejection episodes retire a run. Never zero.
+
+    A `0` would retire every unrecorded row on sight, so an out-of-range or
+    unparseable value is FATAL rather than a silent fallback: this number is one
+    of the two things that decide whether the loop keeps offering work, and a
+    typo in a systemd unit must not quietly switch it off.
+    """
+    raw = os.environ.get("QF_FRONTIER_RETIRE_AFTER", "2")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise FrontierError(
+            f"QF_FRONTIER_RETIRE_AFTER must be an integer >= 1, got {raw!r}")
+    if n < 1:
+        raise FrontierError(
+            f"QF_FRONTIER_RETIRE_AFTER must be an integer >= 1, got {n!r}")
+    return n
 
 
 def series_key(row):
@@ -380,8 +936,25 @@ def judge_claim(row, index, rank=None, band=None):
     return "kept" if mine > theirs else "broken"
 
 
-def build(rows, extracts, contracts, journaled=()):
-    """Group into series, then roll configs up across them."""
+def build(rows, extracts, contracts, journaled=(), escalations=None,
+          problems=None, retire_after_n=None):
+    """Group into series, then roll configs up across them.
+
+    `retire_after_n` is the resolved threshold, not the environment: `build()`
+    is otherwise pure, taking every external input as an argument (`journaled`,
+    `escalations`, `problems` are the same shape), and reading `os.environ`
+    directly here would be the one exception. `None` (the default, and what
+    `main()` never has to pass explicitly) resolves it via `retire_after()`, so
+    a caller that doesn't care about the threshold still gets the systemd-unit
+    behaviour, and a test that does care can pass a value directly instead of
+    mutating process environment.
+
+    Raises `FrontierError` -- not `SystemExit` -- if the threshold is
+    unparseable or out of range; see `retire_after()` and `FrontierError`.
+    """
+    # COMPUTED FIRST, BEFORE ANY WORK: an out-of-range or unparseable threshold
+    # must fail before a single row is processed, not partway through.
+    limit = retire_after() if retire_after_n is None else retire_after_n
     by_hash = {e.get("request_hash"): e for e in extracts.get("extracts") or []}
 
     series = {}
@@ -415,6 +988,19 @@ def build(rows, extracts, contracts, journaled=()):
         row["recorded"] = any(i in journaled
                               for i in (row.get("evaluation"), row.get("probe"))
                               if i)
+        # THE STATE THE WHOLE LOOP STEERS ON. Two values could not express
+        # "rejected twice, not written up, and not to be offered again", which
+        # is the livelock of 2026-09-04: `tick-prompt.md` action 1 matches
+        # `written up: NO` forever, so one unrecordable run consumed every tick.
+        esc = (escalations or {}).get(row.get("evaluation") or "") or {}
+        row["rejections"] = esc.get("rejections", 0)
+        row["escalation_latest"] = esc.get("latest", "")
+        if row["recorded"]:
+            row["handling"] = "recorded"
+        elif row["rejections"] >= limit:
+            row["handling"] = "retired"
+        else:
+            row["handling"] = "unrecorded"
         for ident in (row.get("evaluation"), row.get("probe")):
             if ident:
                 index.setdefault(ident, []).append(row)
@@ -490,10 +1076,29 @@ def build(rows, extracts, contracts, journaled=()):
 
     scored = len(rows)
     registered = sum(1 for r in rows if r["prereg"]["registered"])
+    # `escalation_targets` NOW RETURNS NAMES, NOT COUNTS (see its docstring):
+    # "1 file(s), go find it" made an operator go `ls` or hand-diff every
+    # escalation to find the one that mattered. `health` stays INT-VALUED --
+    # nothing downstream of the JSON shape has to change -- so the names are
+    # carried separately, in `problems`, for `render()` to spell out.
+    unclassified = sorted((problems or {}).get("unclassified") or [])
+    unparseable_waivers = sorted((problems or {}).get(
+        "unparseable_waivers") or [])
+    # A WAIVER THE READER REFUSED TO BELIEVE (a stamp that names no real instant,
+    # or one implausibly ahead of the journal's own newest file) revives nothing
+    # -- and a waiver is the one file type whose entire purpose is
+    # operator-initiated revival, so it travels the same named route as an
+    # unparseable one rather than being clamped in silence.
+    misdated_waivers = sorted((problems or {}).get("misdated_waivers") or [])
     return {
         "series": [_series_out(k, v) for k, v in
                    sorted(series.items(), key=lambda kv: kv[1]["as_of"])],
         "configs": configs,
+        "problems": {
+            "unclassified": unclassified,
+            "unparseable_waivers": unparseable_waivers,
+            "misdated_waivers": misdated_waivers,
+        },
         "health": {
             "scored_runs": scored,
             "pre_registered": registered,
@@ -520,7 +1125,21 @@ def build(rows, extracts, contracts, journaled=()):
             # THE COUNTER THE LOOP STEERS ON. Zero unrecorded means the first
             # action in the leader's prompt no longer matches, which is how a
             # tick becomes a NOOP instead of re-narrating yesterday's row.
-            "unrecorded_runs": sum(1 for r in rows if not r.get("recorded")),
+            # RETIRED ROWS ARE EXCLUDED HERE ON PURPOSE: this is the counter
+            # that used to make a twice-rejected, unwritable run look like
+            # unfinished work forever (the 2026-09-04 livelock), and a retired
+            # row is no longer offered, so it must stop inflating this number
+            # the same way a recorded one does.
+            "unrecorded_runs": sum(1 for r in rows
+                                   if r.get("handling") == "unrecorded"),
+            "retired_runs": sum(1 for r in rows
+                                if r.get("handling") == "retired"),
+            # INT-VALUED, DELIBERATELY: the health JSON shape does not change
+            # just because the source data grew names. See `problems` above
+            # for the list a report renderer actually names files from.
+            "unclassified_escalations": len(unclassified),
+            "unparseable_waivers": len(unparseable_waivers),
+            "misdated_waivers": len(misdated_waivers),
         },
     }
 
@@ -568,11 +1187,62 @@ def _series_out(key, entry):
                   "direction": r["prereg"]["direction"],
                   "claim": r.get("claim", "unregistered"),
                   "recorded": bool(r.get("recorded")),
+                  "handling": r.get("handling", "unrecorded"),
+                  "rejections": r.get("rejections", 0),
+                  "escalation_latest": r.get("escalation_latest", ""),
+                  # PROJECTED BECAUSE THE RETRY TEMPLATE CITES THEM. They were
+                  # decoded into `prereg` all along and never reached the JSON,
+                  # so a retry entry had no citable source for its own
+                  # pre-registration -- which is the exact rejection it must
+                  # avoid.
+                  "config_digest": r["prereg"]["cfgh"],
+                  "vs": r["prereg"]["vs"],
+                  "tol": r["prereg"]["tol"],
                   "hypothesis": r["prereg"]["hypothesis"],
                   "metrics": r.get("metrics") or {},
                   "passed": r.get("passed") or {}}
                  for r in entry["rows"]],
     }
+
+
+# `yes`/`NO` could not say "rejected twice and not to be offered again", which
+# is the whole reason `handling` exists (see `build()`).
+#
+# `.get(h, f"?{h}?")`, NOT `[h]`, AND NOT `.get(h, "?")` EITHER. This report is
+# what a human reads when the loop is stuck -- the diagnostic tool for exactly
+# the moment something has gone wrong -- and `render()` has no surrounding
+# try/except, so a `KeyError` here does not fail loudly at one cell, it kills
+# the WHOLE report: no table, no health summary, nothing on stdout, right when
+# the reader needed it most. A bad cell must cost the reader one odd cell, not
+# the report. The neighbouring frontier cell a few lines below already makes
+# this call -- `{True: "yes", False: "NO"}.get(best["passed"], "?")` -- and
+# this follows it, except the fallback carries the value (`?weird?`, not bare
+# `?`) so a reader or a `grep '?'` can tell WHICH state was unmodeled.
+# `handling` is assigned in `build()` from a closed set of three literals, so
+# reaching this fallback at all means a later task added a fourth state and
+# forgot to teach this map about it -- that is a real bug, but the fix is to
+# extend the dict, not to make this line able to take the report down.
+_HANDLING_CELL = {"recorded": "yes", "unrecorded": "NO", "retired": "retired"}
+
+
+def _named_files(directory, noun, names):
+    """`"N {noun} in {directory}: a.md, b.md, c.md, and 4 more"`.
+
+    NAMES A PROBLEM RATHER THAN COUNTING IT -- the whole point of Important-2:
+    `"1 file(s), go find it"` sent an operator to `ls` the directory or
+    hand-diff every escalation against `escalation-kinds.md` to learn which
+    one. `escalation_targets` now returns the basenames for exactly this.
+
+    CAPPED AT 5, SORTED, because the fix for "you don't know which file" must
+    not become "the report is now one line per file in a large backlog" --
+    that is a new way to make the report unreadable, not a smaller version of
+    the old failure. The directory is stated ONCE, here, rather than once per
+    name, because the names are bare basenames precisely so this is the only
+    place their location needs to be said.
+    """
+    shown = sorted(names)[:5]
+    tail = f", and {len(names) - len(shown)} more" if len(names) > 5 else ""
+    return f"{len(names)} {noun} in {directory}: " + ", ".join(shown) + tail
 
 
 def render(report):
@@ -604,17 +1274,84 @@ def render(report):
     out.append("")
     out.append(f"Unrecorded scored runs: {h['unrecorded_runs']}."
                " A run stays unrecorded until a RECORDED journal entry cites its"
-               " id; an escalated entry does not count.")
+               " id; an escalated entry does not count, and a RETIRED row is"
+               " excluded from this count too -- it is no longer offered, so"
+               " it must not keep inflating the number that used to make it"
+               " look like unfinished work forever.")
     if h["unrecorded_runs"]:
         out.append("")
         out.append("| run | config | claim | needs writing up |")
         out.append("|---|---|---|---|")
         for entry in report["series"]:
             for r in entry["rows"]:
-                if r["recorded"]:
+                # THE LEADER'S SHORTLIST. Filtering on `recorded` alone let a
+                # retired row -- written up twice, rejected twice -- keep
+                # appearing here as "needs writing up: yes", which is the
+                # 2026-09-04 livelock all over again. Only `unrecorded` rows
+                # are still offered; `retired` gets its own visible line
+                # below instead.
+                if r.get("handling") != "unrecorded":
                     continue
                 out.append(f"| {r['evaluation']} | {r['config']} |"
                            f" {r['claim']} | yes |")
+    if h["retired_runs"]:
+        out.append("")
+        for entry in report["series"]:
+            for r in entry["rows"]:
+                if r.get("handling") != "retired":
+                    continue
+                # NOT `RETIRED UNRECORDED:` -- that reused the exact word
+                # `Unrecorded scored runs:` (and action 1's "a finished run is
+                # unrecorded") use for the bucket the leader is supposed to
+                # act on, which is the ambiguity `tick-prompt.md` now has to
+                # spend a paragraph overriding. The label says only `RETIRED:`
+                # -- the fact that it was never written up moves into the
+                # sentence instead of the header, so cold reading does not
+                # mistake it for "dealt with".
+                #
+                # PATH CONVENTION: journal-relative everywhere in this
+                # sentence, matching what `escalation_latest` already stores
+                # (`escalations/<name>`) -- so the revival instruction below
+                # is `waivers/<stamp>.md`, not `journal/waivers/<stamp>.md`.
+                #
+                # `escalation_latest` IS ALWAYS SET HERE, not defaulted: a row
+                # only reaches `handling == "retired"` by way of `rejections
+                # >= limit` in `build()`, and a counted rejection is exactly
+                # what populates `latest` in `escalation_targets` -- there is
+                # no path that retires a row without also recording where its
+                # newest counted rejection lives. So there is no fallback text
+                # to write or test for; asserting one would pin a case this
+                # file cannot reach.
+                out.append(
+                    f"RETIRED: {r['evaluation']} — {r['rejections']}"
+                    " rejections, never written up, latest"
+                    f" {r['escalation_latest']}. Not selectable; revive with a"
+                    " committed waivers/<stamp>.md carrying"
+                    f" `**Waiver:** {r['evaluation']}`.")
+    if h["unparseable_waivers"]:
+        out.append("")
+        out.append("UNPARSEABLE WAIVERS " + _named_files(
+                   "waivers/", "file(s)",
+                   report["problems"]["unparseable_waivers"]) +
+                   " -- no `<stamp>` filename prefix, so they revive NOTHING."
+                   " Rename them `YYYYMMDDTHHMMSSZ.md` and commit.")
+    if h["misdated_waivers"]:
+        out.append("")
+        out.append("MISDATED WAIVERS " + _named_files(
+                   "waivers/", "file(s)",
+                   report["problems"]["misdated_waivers"]) +
+                   f" -- stamped more than {_WAIVER_LEAD.days} day(s) ahead of"
+                   " the journal's newest committed entry, or naming no real"
+                   " instant, so they revive NOTHING. A typo'd year or a"
+                   " skewed clock; re-stamp `YYYYMMDDTHHMMSSZ` and commit.")
+    if h["unclassified_escalations"]:
+        out.append("")
+        out.append("UNCLASSIFIED ESCALATIONS " + _named_files(
+                   "escalations/", "escalation(s)",
+                   report["problems"]["unclassified"]) +
+                   " -- no `Escalation kind:` line, so they are NOT counted"
+                   " toward retirement. Classify them in"
+                   " journal/escalation-kinds.md.")
 
     out.append("")
     out.append("## Configs that cleared every bar")
@@ -663,9 +1400,15 @@ def render(report):
         out.append("|---|---|---|---|---|---|")
         for row in entry["rows"]:
             claimed = f"{row['direction']} {row['bar']}" if row["bar"] else "—"
+            # `_HANDLING_CELL` REPLACES `'yes' if row['recorded'] else 'NO'`:
+            # those two values could not say "rejected twice and not to be
+            # offered again", which is the whole reason `handling` exists. See
+            # the dict's own comment for why the lookup is `.get(h, f"?{h}?")`
+            # rather than `[h]`.
+            handling = row.get("handling", "unrecorded")
             out.append(f"| {row['when']} | {row['config']} |"
                        f" {row['verdict']} | {claimed} | {row['claim']} |"
-                       f" {'yes' if row['recorded'] else 'NO'} |")
+                       f" {_HANDLING_CELL.get(handling, f'?{handling}?')} |")
     return "\n".join(out)
 
 
@@ -689,6 +1432,17 @@ def main(argv):
         print("expected a list of scored rows", file=sys.stderr)
         return 2
 
+    # RESOLVED ONCE, HERE, THE SAME WAY `journaled`/`escalations`/`problems`
+    # ARE: `build()` takes the world as arguments rather than reading it, so a
+    # bad `QF_FRONTIER_RETIRE_AFTER` is caught at this boundary and reported
+    # the same controlled way as bad stdin, rather than as an uncaught
+    # `FrontierError` traceback.
+    try:
+        retire_after_n = retire_after()
+    except FrontierError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
     # A frontier without the extract windows cannot compute the confirm gate, so
     # it says so instead of quietly reporting every distinct hash as a cohort.
     extracts, contracts = {}, {}
@@ -707,7 +1461,13 @@ def main(argv):
     # runs as handled when the journal cannot be read -- would silently retire
     # results the loop never wrote up.
     journaled = journaled_run_ids(journal) if journal else set()
-    report = build(rows, extracts, contracts, journaled=journaled)
+    # NO --journal MEANS NOTHING IS RECORDED AND NOTHING IS RETIRED, which
+    # makes the report noisy rather than wrong, in both directions.
+    escalations, problems = (escalation_targets(journal) if journal
+                             else ({}, {}))
+    report = build(rows, extracts, contracts, journaled=journaled,
+                   escalations=escalations, problems=problems,
+                   retire_after_n=retire_after_n)
     if "--json" in argv:
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
         return 0

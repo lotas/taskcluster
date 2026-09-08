@@ -11,6 +11,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 HOST = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HOST, "research-loop"))
@@ -433,8 +434,63 @@ class HoldSemantics(unittest.TestCase):
         self.assertEqual(claims["e2"], "broken")
 
 
+def _make_journal(files, commit=True, then_edit=None):
+    """A journal directory inside a real git repo, committed by plumbing.
+
+    `git commit` IS REFUSED IN THE DEV CONTAINER, so the fixture uses
+    write-tree/commit-tree/update-ref. `commit=False` leaves the files
+    staged but unreachable from HEAD; `then_edit` rewrites a file in the
+    WORKING TREE after the commit, which is the tamper the reader must
+    ignore.
+
+    Module-level so both `Recorded` and `Retirement` share one fixture rather
+    than keeping two copies in step by hand.
+    """
+    import subprocess
+    import tempfile
+    root = tempfile.mkdtemp()
+    subprocess.run(["git", "init", "-q", "-b", "main", root],
+                   capture_output=True)
+    d = os.path.join(root, "journal")
+    os.makedirs(os.path.join(d, "escalations"), exist_ok=True)
+    os.makedirs(os.path.join(d, "waivers"), exist_ok=True)
+    for name, body in files.items():
+        path = os.path.join(d, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(body)
+    subprocess.run(["git", "-C", root, "add", "-A"], capture_output=True)
+    if commit:
+        def git(*args):
+            # IDENTITY SUPPLIED, NOT INHERITED. `commit-tree` needs an author,
+            # and left to itself it takes the ambient global git config -- so
+            # this fixture passed on a developer box and failed everywhere
+            # else with `Author identity unknown ... unable to auto-detect
+            # email address (got 'dev@<container-id>.(none)')`. It cost 25
+            # green tests the moment a container came back with a new hostname
+            # and no global config. `test_tick.sh`'s commit probe already does
+            # it this way; a hermetic fixture depends on nothing it did not set.
+            done = subprocess.run(
+                ["git", "-C", root,
+                 "-c", "user.name=qf-fixture",
+                 "-c", "user.email=qf-fixture@queue-forecasting.invalid",
+                 *args],
+                capture_output=True)
+            assert done.returncode == 0, done.stderr
+            return done.stdout.decode().strip()
+        tree = git("write-tree")
+        head = git("commit-tree", tree, "-m", "fixture")
+        git("update-ref", "refs/heads/main", head)
+    for name, body in (then_edit or {}).items():
+        with open(os.path.join(d, name), "w") as fh:
+            fh.write(body)
+    return d
+
+
 class Recorded(unittest.TestCase):
     """A result the loop already wrote up must stop matching action 1."""
+
+    _journal = staticmethod(_make_journal)
 
     def test_a_run_cited_by_a_journal_entry_is_recorded(self):
         rows = [row("evaluate-20260831T130111Z-51b862ebf4de-5568",
@@ -451,30 +507,6 @@ class Recorded(unittest.TestCase):
         self.assertFalse(report["series"][0]["rows"][0]["recorded"])
         self.assertEqual(report["health"]["unrecorded_runs"], 1)
         self.assertIn("needs writing up", F.render(report))
-
-    def _journal(self, files, track=True):
-        """A journal directory inside a real git repo.
-
-        A REAL REPO, because only tracked files count now -- `git add` is enough
-        (no commit needed), which is why this works even where commits are
-        refused.
-        """
-        import subprocess
-        import tempfile
-        root = tempfile.mkdtemp()
-        subprocess.run(["git", "init", "-q", "-b", "main", root],
-                       capture_output=True)
-        d = os.path.join(root, "journal")
-        os.makedirs(os.path.join(d, "escalations"))
-        for name, body in files.items():
-            path = os.path.join(d, name)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
-                fh.write(body)
-        if track:
-            subprocess.run(["git", "-C", root, "add", "-A"],
-                           capture_output=True)
-        return d
 
     def test_run_ids_are_scraped_out_of_prose_and_tables(self):
         d = self._journal({"20260831T140000Z.md":
@@ -493,7 +525,7 @@ class Recorded(unittest.TestCase):
         # be able to do.
         d = self._journal({"fake.md":
                            "probe-20260831T130111Z-51b862ebf4de-5568 is fine"},
-                          track=False)
+                          commit=False)
         self.assertEqual(F.journaled_run_ids(d), set())
 
     def test_outside_a_repository_nothing_counts(self):
@@ -518,8 +550,210 @@ class Recorded(unittest.TestCase):
                            "probe-20260831T130111Z-51b862ebf4de-5568"})
         self.assertEqual(F.journaled_run_ids(d), set())
 
+    def test_a_run_id_in_escalation_kinds_md_does_not_count_as_recorded(self):
+        # THE SELF-DEFEAT `waivers/` WAS GIVEN ITS OWN DIRECTORY TO AVOID,
+        # reproduced for `escalation-kinds.md`: it lives in the journal root,
+        # its format is `<stamp> <kind>`, but a human classifying escalations
+        # by hand will very plausibly leave a trailing comment naming the run
+        # for their own benefit -- and `_RUN_ID` is loose enough to scrape it
+        # out of that comment. Before the fix, that made the run read as
+        # RECORDED (not retired -- recorded, so the leader never picks it up
+        # again) with no diagnostic anywhere. This is reachable by the file's
+        # ordinary, intended use, not a crafted adversarial input.
+        rid = "evaluate-20260904T090941Z-0a217f40da8f-6446"
+        d = self._journal({"escalation-kinds.md":
+                           f"20260904T101126Z rejection   # {rid}, tail run\n"})
+        self.assertEqual(F.journaled_run_ids(d), set())
+
     def test_a_missing_journal_directory_is_not_an_error(self):
         self.assertEqual(F.journaled_run_ids("/nonexistent/journal"), set())
+
+    def test_a_working_tree_edit_to_a_committed_entry_is_ignored(self):
+        # THE TAMPER THIS CHANGE EXISTS TO STOP. The leader shares the uid, so
+        # it can rewrite a committed entry; only HEAD counts.
+        d = self._journal(
+            {"20260831T140000Z.md": "wrote up eA-1\n"},
+            then_edit={"20260831T140000Z.md":
+                       "cites evaluate-20260904T090941Z-0a217f40da8f-6446\n"})
+        self.assertEqual(F.journaled_run_ids(d), set())
+
+    def test_a_staged_but_uncommitted_entry_does_not_count(self):
+        d = self._journal({"20260831T140000Z.md":
+                           "evaluate-20260904T090941Z-0a217f40da8f-6446\n"},
+                          commit=False)
+        self.assertEqual(F.journaled_run_ids(d), set())
+
+    def test_a_committed_entry_in_the_journal_root_counts(self):
+        rid = "evaluate-20260904T090941Z-0a217f40da8f-6446"
+        d = self._journal({"20260831T140000Z.md": f"wrote up `{rid}` today\n"})
+        self.assertEqual(F.journaled_run_ids(d), {rid})
+
+    def test_blobs_resolve_from_a_journal_subdirectory(self):
+        # REGRESSION FOR THE cat-file PATH TRAP: `ls-tree -C journal` prints
+        # `escalations/x.md`, but `cat-file HEAD:escalations/x.md` resolves from
+        # the REPO ROOT and fails. Blob oids have no prefix to get wrong.
+        d = self._journal({"escalations/20260904T101126Z.md": "body\n"})
+        blobs = F._committed_blobs(d, "escalations")
+        self.assertEqual(blobs, {"20260904T101126Z.md": "body\n"})
+
+    def test_no_repository_counts_nothing(self):
+        import tempfile
+        d = os.path.join(tempfile.mkdtemp(), "journal")
+        os.makedirs(d)
+        self.assertIsNone(F._committed_blobs(d))
+        self.assertEqual(F.journaled_run_ids(d), set())
+
+
+class RootEntryNaming(unittest.TestCase):
+    """The journal root's contract -- every committed `.md` is a stamped
+    entry or a name in `_NOT_ENTRIES` -- pinned by a fixture rather than by a
+    check against the real journal, which lives on the host this loop runs
+    on and is not shipped in this repository. `escalation-kinds.md` reached
+    the root by exactly this gap: the hazard was reasoned through for
+    `waivers/` and not re-applied to the next control file. This is the
+    tripwire that catches a third one."""
+
+    def test_a_third_control_file_is_flagged_as_unrecognized(self):
+        names = ["20260831T140000Z.md", "PENDING.md", "escalation-kinds.md",
+                 "notes.md"]
+        self.assertEqual(F._unrecognized_root_names(names), ["notes.md"])
+
+    def test_stamped_entries_and_known_control_files_are_not_flagged(self):
+        names = ["20260831T140000Z.md", "20260904T101126Z.md",
+                 "PENDING.md", "escalation-kinds.md"]
+        self.assertEqual(F._unrecognized_root_names(names), [])
+
+
+def _batch_record(oid, kind, content):
+    """One `cat-file --batch` answer: `<oid> SP <type> SP <size> LF <bytes> LF`."""
+    return (oid.encode() + b" " + kind + b" " + str(len(content)).encode()
+            + b"\n" + content + b"\n")
+
+
+class ParseBatch(unittest.TestCase):
+    """`_parse_batch` in isolation -- no git, just the bytes `--batch` prints.
+
+    Reached directly rather than through `_committed_blobs`+monkeypatching,
+    because that indirection was exactly how the defect below went unnoticed: a
+    parser only reachable by mocking a subprocess is not a parser anyone tests.
+    """
+
+    def test_a_well_formed_two_record_buffer_parses(self):
+        buf = _batch_record("aaaa", b"blob", b"AB\n") + \
+            _batch_record("bbbb", b"blob", b"CD")
+        self.assertEqual(F._parse_batch(buf, ["a.md", "b.md"]),
+                         {"a.md": "AB\n", "b.md": "CD"})
+
+    def test_a_size_longer_than_the_remaining_bytes_returns_none_not_mixed_content(self):
+        # THE REVIEWER'S REPRODUCTION. The header declares 4 content bytes but
+        # only 3 are actually there before the next record starts with a `d` --
+        # the unchecked parser spliced that byte in and returned
+        # `{'a.md': 'AB\nd'}` instead of refusing. Confirmed against the old
+        # (unguarded) slicing logic before this fix: it produced exactly that
+        # string.
+        buf = b"a1oid blob 4\nAB\nd2oid blob 1\nX\n"
+        result = F._parse_batch(buf, ["a.md"])
+        self.assertIsNone(result)
+        self.assertNotEqual(result, {"a.md": "AB\nd"})
+
+    def test_a_size_one_byte_short_so_the_trailing_newline_lands_on_content_returns_none(self):
+        # Declared size 3 but the real content is 4 bytes ("ABCD"), so the byte
+        # at the position the trailing newline must occupy is `D`, not `\n`.
+        # This is the check that catches a wrong size even when the buffer has
+        # PLENTY of bytes left -- the failure above is only "too few bytes",
+        # this one is "framing landed in the wrong place".
+        buf = b"oid blob 3\nABCD\n"
+        self.assertIsNone(F._parse_batch(buf, ["a.md"]))
+
+    def test_a_missing_object_header_with_two_fields_returns_none(self):
+        # `--batch` prints `<oid> missing` (no size, no content) for an oid it
+        # cannot find -- not the documented 3-field format.
+        buf = b"deadbeefdeadbeef missing\n"
+        self.assertIsNone(F._parse_batch(buf, ["a.md"]))
+
+    def test_a_non_integer_size_returns_none(self):
+        buf = b"oid blob notanumber\nX\n"
+        self.assertIsNone(F._parse_batch(buf, ["a.md"]))
+
+    def test_an_empty_buffer_with_names_expected_returns_none(self):
+        self.assertIsNone(F._parse_batch(b"", ["a.md"]))
+
+    def test_a_zero_length_blob_parses_as_the_empty_string(self):
+        buf = _batch_record("aaaa", b"blob", b"")
+        self.assertEqual(F._parse_batch(buf, ["empty.md"]), {"empty.md": ""})
+
+    def test_a_negative_size_returns_none(self):
+        # `int()` accepts a leading `-`, so this is not caught by the
+        # non-integer check above; it needs its own guard.
+        buf = b"oid blob -1\nX\n"
+        self.assertIsNone(F._parse_batch(buf, ["a.md"]))
+
+
+def _ls_entry(mode, kind, oid, path):
+    """One `git ls-tree -z` record: `<mode> SP <type> SP <oid> TAB <path> NUL`.
+
+    `path` is bytes, so a test can embed a literal tab or newline in a filename
+    without Python's own string handling getting in the way.
+    """
+    return mode.encode() + b" " + kind + b" " + oid.encode() + b"\t" + path + b"\0"
+
+
+class ParseLsTree(unittest.TestCase):
+    """`_parse_ls_tree` in isolation -- no git, just the bytes `ls-tree -z` prints.
+
+    Extracted for the same reason `_parse_batch` was: framing logic reachable
+    only by mocking a subprocess is logic nothing tests, and the reviewer's
+    confidence that this side handles adversarial filenames rested on
+    inspection alone until now.
+    """
+
+    def test_a_well_formed_two_entry_listing_parses(self):
+        stdout = (_ls_entry("100644", b"blob", "aaaa", b"a.md")
+                  + _ls_entry("100644", b"blob", "bbbb", b"b.md"))
+        self.assertEqual(F._parse_ls_tree(stdout, None),
+                         (["aaaa", "bbbb"], ["a.md", "b.md"]))
+
+    def test_subdir_none_excludes_an_escalations_entry(self):
+        stdout = (_ls_entry("100644", b"blob", "aaaa", b"a.md")
+                  + _ls_entry("100644", b"blob", "bbbb", b"escalations/b.md"))
+        self.assertEqual(F._parse_ls_tree(stdout, None), (["aaaa"], ["a.md"]))
+
+    def test_subdir_escalations_includes_only_its_own_direct_entries(self):
+        stdout = (_ls_entry("100644", b"blob", "aaaa", b"x.md")
+                  + _ls_entry("100644", b"blob", "bbbb", b"escalations/x.md")
+                  + _ls_entry("100644", b"blob", "cccc",
+                             b"escalations/deeper/x.md"))
+        self.assertEqual(F._parse_ls_tree(stdout, "escalations"),
+                         (["bbbb"], ["x.md"]))
+
+    def test_a_non_md_entry_is_excluded(self):
+        stdout = _ls_entry("100644", b"blob", "aaaa", b"a.txt")
+        self.assertEqual(F._parse_ls_tree(stdout, None), ([], []))
+
+    def test_a_tree_entry_is_excluded(self):
+        stdout = _ls_entry("040000", b"tree", "aaaa", b"escalations")
+        self.assertEqual(F._parse_ls_tree(stdout, None), ([], []))
+
+    def test_a_record_with_no_tab_returns_none(self):
+        stdout = b"100644 blob aaaa a.md\0"
+        self.assertIsNone(F._parse_ls_tree(stdout, None))
+
+    def test_a_header_without_three_fields_returns_none(self):
+        stdout = b"100644 aaaa\ta.md\0"
+        self.assertIsNone(F._parse_ls_tree(stdout, None))
+
+    def test_a_literal_tab_inside_the_filename_does_not_desynchronise_the_split(self):
+        # `partition(b"\t")` splits on the FIRST tab only, so a tab embedded in
+        # the filename itself must stay part of the path rather than truncating
+        # it or being read as a second field.
+        stdout = _ls_entry("100644", b"blob", "aaaa", b"we\tird.md")
+        self.assertEqual(F._parse_ls_tree(stdout, None), (["aaaa"], ["we\tird.md"]))
+
+    def test_a_literal_newline_inside_the_filename_does_not_desynchronise_the_split(self):
+        # `-z` NUL-delimits ENTRIES, so a newline byte inside the path is just
+        # more path, never a record boundary.
+        stdout = _ls_entry("100644", b"blob", "aaaa", b"we\nird.md")
+        self.assertEqual(F._parse_ls_tree(stdout, None), (["aaaa"], ["we\nird.md"]))
 
 
 class ConfirmationInputs(unittest.TestCase):
@@ -755,6 +989,575 @@ class EvidenceForStructuralClaims(unittest.TestCase):
         unscored = [r for r in entry["rows"] if not r["metrics"]]
         self.assertEqual(len(unscored), 1)
         self.assertEqual(unscored[0]["evaluation"], "eA")
+
+
+ESC_TARGET = "evaluate-20260904T090941Z-0a217f40da8f-6446"
+OTHER = "evaluate-20260903T101010Z-1111111111aa-1"
+
+
+def escalation(target, kind="rejection", extra=""):
+    return (f"# Retry\n\n**Target run:** {target}\n\n{extra}\n"
+            "## NOT RECORDED — the copilot did not agree\n\n"
+            f"Escalation kind: {kind}\n\n```\nreason\n```\n")
+
+
+class Retirement(unittest.TestCase):
+    """Counting rejection episodes per target -- the input to task 3's
+    `recorded|unrecorded|retired` state. Each test below is one load-bearing
+    decision in `escalation_targets`, including two the quality review found:
+    CRLF line endings and ambiguous target lines both used to make a rejection
+    vanish -- counted toward neither a run nor `unclassified` -- rather than
+    fail loudly or safely."""
+
+    def test_one_rejection_is_counted_with_its_path(self):
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET)})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+        self.assertEqual(problems["unclassified"], [])
+        self.assertEqual(targets[ESC_TARGET]["latest"],
+                         "escalations/20260904T101126Z.md")
+
+    def test_a_file_naming_the_run_three_times_counts_once(self):
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET,
+                                     extra=f"{ESC_TARGET} {ESC_TARGET}")})
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+
+    def test_a_comparator_in_evidence_is_never_a_target(self):
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET, extra=f"vs {OTHER}")})
+        targets, _ = F.escalation_targets(d)
+        self.assertNotIn(OTHER, targets)
+
+    def test_a_probe_id_target_counts_nothing(self):
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(REF_PROBE)})
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets, {})
+
+    def test_verifier_failure_does_not_count(self):
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET, kind="verifier-failure")})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets, {})
+        self.assertEqual(problems["unclassified"], [])
+
+    def test_a_missing_kind_line_is_unknown_and_names_the_file(self):
+        # NAMED, NOT JUST COUNTED (quality review): an operator reading "1
+        # escalation(s)" still has to go find which one; the basename is the
+        # whole fix.
+        body = escalation(ESC_TARGET).replace("Escalation kind: rejection\n",
+                                              "")
+        d = _make_journal({"escalations/20260904T101126Z.md": body})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets, {})
+        self.assertEqual(problems["unclassified"], ["20260904T101126Z.md"])
+
+    def test_the_migration_record_classifies_a_historical_file(self):
+        body = escalation(ESC_TARGET).replace("Escalation kind: rejection\n",
+                                              "")
+        d = _make_journal({"escalations/20260904T101126Z.md": body,
+                           "escalation-kinds.md":
+                               "20260904T101126Z rejection\n"})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(problems["unclassified"], [])
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+
+    def test_the_kind_override_still_works_even_though_journaled_run_ids_skips_the_file(self):
+        # NOT FIXED BY BREAKING THE FEATURE. `journaled_run_ids` now skips
+        # `escalation-kinds.md` by name so a run id in it cannot read as
+        # recorded (see `Recorded`'s equivalent test) -- but the file is still
+        # a real input to `escalation_targets`, which reads it through its own
+        # `_committed_blobs(journal_dir)` call, untouched by that skip. Both
+        # must hold at once: invisible to `journaled_run_ids`, still load-
+        # bearing for `escalation_targets`.
+        body = escalation(ESC_TARGET).replace("Escalation kind: rejection\n",
+                                              "")
+        d = _make_journal({"escalations/20260904T101126Z.md": body,
+                           "escalation-kinds.md":
+                               "20260904T101126Z rejection\n"})
+        self.assertEqual(F.journaled_run_ids(d), set())
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(problems["unclassified"], [])
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+
+    def test_a_waiver_starts_a_new_episode_rather_than_subtracting(self):
+        d = _make_journal({
+            "escalations/20260901T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260902T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260903T101126Z.md": escalation(ESC_TARGET),
+            "waivers/20260905T000000Z.md":
+                f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, _ = F.escalation_targets(d)
+        # Presence with rejections: 0 is as valid a shape as absence --
+        # retirement compares against a threshold, not against presence.
+        self.assertEqual(targets.get(ESC_TARGET, {}).get("rejections", 0), 0)
+
+    def test_a_rejection_after_a_waiver_counts_again(self):
+        d = _make_journal({
+            "escalations/20260901T101126Z.md": escalation(ESC_TARGET),
+            "waivers/20260905T000000Z.md":
+                f"**Waiver:** {ESC_TARGET}\n",
+            "escalations/20260906T101126Z.md": escalation(ESC_TARGET),
+        })
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+        self.assertEqual(targets[ESC_TARGET]["latest"],
+                         "escalations/20260906T101126Z.md")
+
+    def test_a_waiver_with_the_same_stamp_as_an_escalation_waives_it(self):
+        # THE BOUNDARY, PINNED ON PURPOSE. The design says an escalation counts
+        # only when committed AFTER the latest waiver -- a stamp EQUAL to the
+        # waiver's is not after it, so this must still read as waived. Without
+        # this test, "equal excluded" is only true by accident of `<=` vs `<`
+        # in the implementation.
+        stamp = "20260905T000000Z"
+        d = _make_journal({
+            f"escalations/{stamp}.md": escalation(ESC_TARGET),
+            f"waivers/{stamp}.md": f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets.get(ESC_TARGET, {}).get("rejections", 0), 0)
+
+    def test_a_waiver_does_not_make_the_run_recorded(self):
+        d = _make_journal({"waivers/20260905T000000Z.md":
+                           f"**Waiver:** {ESC_TARGET}\n"})
+        self.assertEqual(F.journaled_run_ids(d), set())
+
+    def test_an_unreadable_journal_yields_no_targets(self):
+        import tempfile
+        d = os.path.join(tempfile.mkdtemp(), "journal")
+        os.makedirs(d)
+        self.assertEqual(F.escalation_targets(d),
+                         ({}, {"unclassified": [], "unparseable_waivers": [],
+                               "misdated_waivers": []}))
+
+    def test_an_override_wins_over_the_files_own_kind_line(self):
+        # PRECEDENCE, PINNED. The file's own line says `verifier-failure`; the
+        # migration record says `rejection`. The record must win -- it exists
+        # to CORRECT a classification, not just to fill in one that is
+        # missing, so a file that already has a line is not exempt from it.
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET, kind="verifier-failure"),
+                           "escalation-kinds.md":
+                               "20260904T101126Z rejection\n"})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+        self.assertEqual(problems["unclassified"], [])
+
+    def test_a_misnamed_waiver_revives_nothing_and_names_the_file(self):
+        # THE ONE FILE TYPE WHOSE JOB IS REVIVAL gets no silent failure: a
+        # waiver file whose name does not start with a stamp cannot set a
+        # floor, so it must not revive `ESC_TARGET`'S count -- but unlike the
+        # old behaviour, that failure is now visible in `unparseable_waivers`,
+        # BY NAME (basename, not directory-prefixed -- `render()` states the
+        # directory once for the whole list).
+        d = _make_journal({
+            "escalations/20260901T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260902T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260903T101126Z.md": escalation(ESC_TARGET),
+            "waivers/not-a-stamp.md": f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 3)
+        self.assertEqual(problems["unparseable_waivers"], ["not-a-stamp.md"])
+
+    def test_a_waiver_stamped_far_ahead_of_the_journal_revives_nothing(self):
+        # THE CRITICAL DEFECT, FOUND BY AN INDEPENDENT REVIEW. `_stamp_of`
+        # validates a FILENAME SHAPE, not an instant -- so a typo'd year (or a
+        # box with a skewed clock) put `floor[rid]` above every stamp the loop
+        # would produce for a year, and `stamp <= floor` then waived EVERY
+        # episode: the row stayed `unrecorded` (so still selectable AND still
+        # suppressible), same-target suppression stopped the drift streak
+        # advancing, every usable verdict reset the verifier-failure counter,
+        # and retirement could never reach its threshold. The 2026-09-04 hourly
+        # livelock with BOTH brakes off, from one mistyped filename, silently.
+        #
+        # A WAIVER THIS FAR AHEAD OF THE JOURNAL'S OWN NEWEST COMMITTED FILE IS
+        # NOT BELIEVED AT ALL -- it waives nothing, exactly like a waiver with
+        # no parseable stamp, and it is named for an operator to re-stamp.
+        d = _make_journal({
+            "escalations/20260901T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260902T101126Z.md": escalation(ESC_TARGET),
+            "waivers/20270908T000000Z.md": f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 2)
+        self.assertEqual(problems["misdated_waivers"],
+                         ["20270908T000000Z.md"])
+        self.assertEqual(problems["unparseable_waivers"], [])
+
+    def test_a_future_dated_waiver_leaves_retirement_reachable(self):
+        # THE CONSEQUENCE THAT MADE IT CRITICAL, end to end through `build()`:
+        # rejections committed AFTER a bad waiver must still retire the run, or
+        # the loop re-narrates it hourly with nothing able to stop it.
+        #
+        # THIS IS ALSO THE ASSERTION A PER-ID CLAMP CANNOT PASS. Clamping
+        # `floor[rid]` down to "the newest escalation committed for this id"
+        # looks like it spends only episodes that exist, but the ceiling is
+        # recomputed from whatever is committed AT READ TIME: each new
+        # escalation raises the ceiling to its own stamp, and `<=` then waives
+        # it. Count 0 forever -- worse than the un-clamped defect, which at
+        # least expires when the typo'd year arrives.
+        d = _make_journal({
+            "escalations/20260901T101126Z.md": escalation(ESC_TARGET),
+            "waivers/20270908T000000Z.md": f"**Waiver:** {ESC_TARGET}\n",
+            "escalations/20260909T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260910T101126Z.md": escalation(ESC_TARGET),
+        })
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 3)
+        self.assertEqual(targets[ESC_TARGET]["latest"],
+                         "escalations/20260910T101126Z.md")
+        rows = [row(ESC_TARGET, REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        report = F.build(rows, EXTRACTS, CONTRACTS, escalations=targets,
+                         retire_after_n=2)
+        self.assertEqual(report["series"][0]["rows"][0]["handling"], "retired")
+
+    def test_a_stamp_that_names_no_real_instant_revives_nothing(self):
+        # `_STAMP` IS A SHAPE: `20261345T996000Z` matches it and sorts above
+        # every real 2026 stamp, so a fat-fingered filename is the same hole as
+        # a typo'd year without ever looking like a date. Parsed, not just
+        # matched -- and an unparseable instant is reported, never believed.
+        d = _make_journal({
+            "escalations/20260901T101126Z.md": escalation(ESC_TARGET),
+            "escalations/20260902T101126Z.md": escalation(ESC_TARGET),
+            "waivers/20261345T996000Z.md": f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 2)
+        self.assertEqual(problems["misdated_waivers"],
+                         ["20261345T996000Z.md"])
+
+    def test_a_freshly_granted_waiver_is_not_reported_for_postdating_its_escalations(self):
+        # WHY THE ALARM IS NOT "NEWER THAN THE NEWEST ESCALATION FOR THIS ID".
+        # Every real waiver postdates the rejection it answers -- a human reads
+        # the escalation and then writes the waiver -- so that predicate fires
+        # on EVERY legitimate revival, and on a successful one (the run is
+        # written up and never escalated again) it fires forever. A report line
+        # that is always present for correct operation is not a signal. The
+        # predicate is instead "ahead of the journal's newest committed file by
+        # more than `_WAIVER_LEAD`", which a real grant never is.
+        d = _make_journal({
+            "20260908T090000Z.md": "# tick\n",
+            "escalations/20260908T080000Z.md": escalation(ESC_TARGET),
+            "waivers/20260908T100000Z.md": f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets.get(ESC_TARGET, {}).get("rejections", 0), 0)
+        self.assertEqual(problems["misdated_waivers"], [])
+
+    def test_a_waiver_for_a_run_with_no_escalations_waives_only_the_future(self):
+        # THE DECISION, PINNED. A waiver naming a run with NO committed
+        # escalation (a wrong id, or one written pre-emptively) has nothing to
+        # waive, so it waives nothing and is NOT reported: a redundant waiver is
+        # not evidence of a bad stamp. Its floor is unobservable except against
+        # LATER escalations, and `_WAIVER_LEAD` is what bounds how much of the
+        # future that floor can eat -- without a bound this is the typo'd-year
+        # hole again, one run id over, and with one it is at most the slack a
+        # real grant needs.
+        d = _make_journal({
+            "20260908T090000Z.md": "# tick\n",
+            "waivers/20260908T100000Z.md": f"**Waiver:** {ESC_TARGET}\n",
+        })
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets, {})
+        self.assertEqual(problems["misdated_waivers"], [])
+        # AND THE NEXT REJECTION STILL COUNTS IN FULL: the floor is a window
+        # over what came before it, so a rejection stamped after the waiver is
+        # episode one of the new window rather than a waived leftover.
+        d = _make_journal({
+            "20260908T090000Z.md": "# tick\n",
+            "waivers/20260908T100000Z.md": f"**Waiver:** {ESC_TARGET}\n",
+            "escalations/20260908T110000Z.md": escalation(ESC_TARGET),
+        })
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+
+    def test_a_waiver_in_a_journal_with_no_committed_stamps_is_not_reported(self):
+        # THE "CANNOT JUDGE" BRANCH. With no committed entry and no escalation,
+        # the journal has no clock of its own to measure the waiver against --
+        # and nothing to waive either, so believing the stamp costs nothing and
+        # calling it misdated would be an accusation this journal cannot
+        # support. Same convention as the rest of the file: an absence is
+        # "unknown", never "wrong".
+        d = _make_journal({"waivers/20270908T000000Z.md":
+                           f"**Waiver:** {ESC_TARGET}\n"})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets, {})
+        self.assertEqual(problems["misdated_waivers"], [])
+
+    def test_crlf_line_endings_do_not_hide_a_rejection(self):
+        # THE REVIEWER'S REPRODUCTION. `_TARGET` and `_KIND` are anchored with
+        # `$` under `re.M`, which stops before `\n` but not before a `\r` a
+        # CRLF-saved file leaves in front of it -- so before normalization,
+        # `target_of` returned `""`, the loop `continue`d before the kind was
+        # even classified, and the escalation counted toward NEITHER `targets`
+        # NOR `unclassified`: an invisible failure, unlike every other
+        # "cannot answer" path in this file.
+        body = escalation(ESC_TARGET).replace("\n", "\r\n")
+        d = _make_journal({"escalations/20260904T101126Z.md": body})
+        targets, problems = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+        self.assertEqual(problems["unclassified"], [])
+
+    def test_two_identical_target_lines_still_count_as_one_episode(self):
+        # A file quoting its OWN target line (an evidence block echoing the
+        # header, say) is harmless: both matches agree, so this resolves
+        # exactly like a single mention.
+        extra = f"**Target run:** {ESC_TARGET}\n"
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET, extra=extra)})
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets[ESC_TARGET]["rejections"], 1)
+
+    def test_two_disagreeing_target_lines_retire_nothing(self):
+        # AMBIGUOUS, SO REFUSED -- not resolved by position, which an
+        # agent-written file does not guarantee. Neither id is retired on;
+        # the drift shows up as this run staying unretired, which is the safe
+        # direction, never as the wrong run being retired.
+        extra = f"**Target run:** {OTHER}\n"
+        d = _make_journal({"escalations/20260904T101126Z.md":
+                           escalation(ESC_TARGET, extra=extra)})
+        targets, _ = F.escalation_targets(d)
+        self.assertEqual(targets, {})
+
+    def test_a_quoted_prior_target_before_the_real_one_is_not_picked_by_position(self):
+        # THE REVIEWER'S REPRODUCTION. A rejection quoting a PREVIOUS entry's
+        # `**Target run:**` line inside a fenced evidence block, with the
+        # real target line later in the file -- `.search` alone would resolve
+        # to the quoted (wrong) one. Since the two disagree, this must retire
+        # NEITHER id: not the quoted one (never its target) and not
+        # `ESC_TARGET` (the rejection could not be attributed to it either).
+        body = (f"# Retry\n\nEvidence:\n```\n**Target run:** {OTHER}\n```\n\n"
+                f"**Target run:** {ESC_TARGET}\n\n"
+                "## NOT RECORDED — the copilot did not agree\n\n"
+                "Escalation kind: rejection\n\n```\nreason\n```\n")
+        d = _make_journal({"escalations/20260904T101126Z.md": body})
+        targets, _ = F.escalation_targets(d)
+        self.assertNotIn(ESC_TARGET, targets)
+        self.assertNotIn(OTHER, targets)
+
+
+class RetirementState(unittest.TestCase):
+    """`build()`'s `recorded|unrecorded|retired` state per row -- task 3. This is
+    the consumer of `escalation_targets`' counts: two rejections retire a run
+    that has not been written up, one does not, `recorded` always wins, and an
+    absent record reads exactly like `rejections: 0` (see the note above
+    `escalation_targets` about why an id with only unclassified escalations has
+    no record at all)."""
+
+    def test_two_rejections_retire_a_row(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 2, "latest": "escalations/z.md"}}
+        report = F.build(rows, EXTRACTS, CONTRACTS, escalations=esc)
+        r = report["series"][0]["rows"][0]
+        self.assertEqual(r["handling"], "retired")
+        self.assertEqual(r["rejections"], 2)
+        self.assertEqual(r["escalation_latest"], "escalations/z.md")
+        self.assertEqual(report["health"]["unrecorded_runs"], 0)
+        self.assertEqual(report["health"]["retired_runs"], 1)
+
+    def test_one_rejection_does_not_retire(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 1, "latest": "escalations/z.md"}}
+        report = F.build(rows, EXTRACTS, CONTRACTS, escalations=esc)
+        self.assertEqual(report["series"][0]["rows"][0]["handling"],
+                         "unrecorded")
+        self.assertEqual(report["health"]["unrecorded_runs"], 1)
+
+    def test_a_row_with_no_escalation_record_is_unrecorded(self):
+        # ABSENT AND `rejections: 0` ARE THE SAME THING (see Task 2): only a
+        # counted rejection allocates a record, so a run whose only escalations
+        # were verifier outages has none at all.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        report = F.build(rows, EXTRACTS, CONTRACTS, escalations={})
+        self.assertEqual(report["series"][0]["rows"][0]["handling"],
+                         "unrecorded")
+        self.assertEqual(report["series"][0]["rows"][0]["rejections"], 0)
+
+    def test_recorded_beats_retired(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 9, "latest": "escalations/z.md"}}
+        report = F.build(rows, EXTRACTS, CONTRACTS, journaled={"eA"},
+                         escalations=esc)
+        self.assertEqual(report["series"][0]["rows"][0]["handling"], "recorded")
+
+    def test_the_env_var_path_rejects_a_bad_threshold_end_to_end(self):
+        # THE ONE TEST OF THE `os.environ` PATH. `build()` is otherwise pure --
+        # `retire_after_n` lets every other test pass the threshold directly --
+        # but the systemd unit configures this via the environment, so that path
+        # still needs coverage, exercised all the way through `build()` (default
+        # `retire_after_n=None` reads it via `retire_after()`).
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        for bad in ("0", "-1", "x", ""):
+            with self.subTest(bad=bad):
+                with patch.dict(os.environ, {"QF_FRONTIER_RETIRE_AFTER": bad}):
+                    with self.assertRaises(F.FrontierError):
+                        F.build(rows, EXTRACTS, CONTRACTS)
+
+    def test_a_valid_threshold_is_honoured(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 2, "latest": "escalations/z.md"}}
+        report = F.build(rows, EXTRACTS, CONTRACTS, escalations=esc,
+                         retire_after_n=3)
+        self.assertEqual(report["series"][0]["rows"][0]["handling"],
+                         "unrecorded")
+
+    def test_the_prereg_fields_reach_the_rows(self):
+        note = P.encode(CFG_REF, "p90_miss_tail", "hold",
+                        "the categorical helps the tail", vs="eB",
+                        cfgh=CFGH_A, tol=0.0011238)
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P,
+                    note=note)]
+        r = F.build(rows, EXTRACTS, CONTRACTS)["series"][0]["rows"][0]
+        self.assertEqual(r["config_digest"], CFGH_A)
+        self.assertEqual(r["vs"], "eB")
+        self.assertAlmostEqual(r["tol"], 0.0011238)
+
+    def test_a_misdated_waiver_reaches_health_and_the_json(self):
+        # THE NEW KEY TRAVELS THE SAME ROUTE AS THE OLD ONES: names in
+        # `problems` (so the report can say WHICH file), an int in `health` (so
+        # the JSON shape stays int-valued). A clamped-or-ignored waiver that
+        # reached neither would be the silence this whole counter exists to end.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        report = F.build(rows, EXTRACTS, CONTRACTS,
+                         problems={"misdated_waivers":
+                                   ["20270908T000000Z.md"]})
+        self.assertEqual(report["health"]["misdated_waivers"], 1)
+        self.assertEqual(report["problems"]["misdated_waivers"],
+                         ["20270908T000000Z.md"])
+
+    def test_the_problems_dict_reaches_health(self):
+        # `problems` HOLDS NAMES NOW (basenames), not counts -- `build()` is
+        # the one place that turns them into the ints `health` carries, via
+        # `len(...)`, so the JSON shape of `health` itself does not change.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        report = F.build(rows, EXTRACTS, CONTRACTS,
+                         problems={"unclassified": ["a.md", "b.md", "c.md"],
+                                  "unparseable_waivers": ["not-a-stamp.md"]})
+        self.assertEqual(report["health"]["unclassified_escalations"], 3)
+        self.assertEqual(report["health"]["unparseable_waivers"], 1)
+
+
+class RetiredRendering(unittest.TestCase):
+    """Task 4: the report's human/agent-facing surfaces agree with `handling`.
+    `health["unrecorded_runs"]` alone is not what the leader steers on -- the
+    per-series table, the shortlist and a visible RETIRED line all have to say
+    the same thing, or retirement is not an escape from the livelock."""
+
+    def test_a_retired_row_is_named_in_the_report_and_not_offered(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 2,
+                      "latest": "escalations/20260904T111002Z.md"}}
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS, escalations=esc))
+        # NOT `RETIRED UNRECORDED:` -- quality review, item 1: that label
+        # reused the exact word (`Unrecorded scored runs:`, action 1's "a
+        # finished run is unrecorded") that names the bucket the leader is
+        # supposed to act on, which is exactly the ambiguity the new
+        # tick-prompt.md paragraph has to spend a sentence overriding.
+        self.assertIn("RETIRED: eA", text)
+        self.assertIn("escalations/20260904T111002Z.md", text)
+        self.assertIn("| retired |", text)
+        self.assertIn("Unrecorded scored runs: 0.", text)
+
+    def test_a_retired_row_is_not_in_the_needs_writing_up_table(self):
+        # THE LEADER'S SHORTLIST. A retired row listed here is the livelock
+        # again, whatever the counter says.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 2, "latest": "escalations/z.md"}}
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS, escalations=esc))
+        self.assertNotIn("needs writing up", text)
+
+    def test_an_unrecorded_row_is_still_offered(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS))
+        self.assertIn("needs writing up", text)
+        self.assertIn("| NO |", text)
+
+    def test_a_recorded_row_renders_yes(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS, journaled={"eA"}))
+        self.assertIn("| yes |", text)
+
+    def test_a_mixed_series_lists_only_the_unrecorded_row(self):
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P),
+                row("eB", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        esc = {"eA": {"rejections": 2, "latest": "escalations/z.md"}}
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS, escalations=esc))
+        self.assertIn("needs writing up", text)
+        self.assertIn("| eB |", text)
+        # NOT AMBIGUOUS: the shortlist is the only table anywhere in this
+        # report that prints a bare evaluation id as a cell -- the per-series
+        # "written up" table keys its rows on `when`/`config`, never on the
+        # evaluation id, and the RETIRED line uses `RETIRED: eA` (no leading
+        # pipe). So "| eA | " can only ever come from the shortlist, and this
+        # assertion is exactly "eA is not on it".
+        self.assertNotIn("| eA | ", text)
+        self.assertIn("RETIRED: eA", text)
+
+    def test_unclassified_escalations_are_named_not_just_counted(self):
+        # Quality review item 2: a count told an operator "3 escalation(s), go
+        # find them"; the basenames are the fix.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS,
+                                problems={"unclassified":
+                                          ["a.md", "b.md", "c.md"]}))
+        self.assertIn("UNCLASSIFIED ESCALATIONS 3 escalation(s) in"
+                     " escalations/: a.md, b.md, c.md", text)
+
+    def test_unclassified_escalations_are_capped_at_five_with_a_tally(self):
+        # A LARGE BACKLOG MUST NOT SWAMP THE REPORT -- the fix for "you don't
+        # know which file" is not allowed to become "the report is now one
+        # line per file in the backlog".
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        names = [f"{n:02d}.md" for n in range(7)]
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS,
+                                problems={"unclassified": names}))
+        self.assertIn("UNCLASSIFIED ESCALATIONS 7 escalation(s) in"
+                     " escalations/: 00.md, 01.md, 02.md, 03.md, 04.md,"
+                     " and 2 more", text)
+
+    def test_an_unparseable_waiver_is_named_not_just_counted(self):
+        # A MISNAMED WAIVER REVIVES NOTHING, and a waiver is the one file whose
+        # whole purpose is operator-initiated revival -- so silence here is the
+        # worst possible place for it. The basename is the fix, not the count.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS,
+                                problems={"unparseable_waivers":
+                                          ["not-a-stamp.md"]}))
+        self.assertIn("UNPARSEABLE WAIVERS 1 file(s) in waivers/:"
+                     " not-a-stamp.md", text)
+
+    def test_a_misdated_waiver_is_named_in_the_report(self):
+        # A WAIVER THE READER REFUSED TO BELIEVE MUST SAY SO BY NAME. The
+        # operator who typed the year is the only person who can fix it, and the
+        # only surface they read is this report -- clamping or ignoring the file
+        # quietly would leave a retired row un-revived with no stated reason,
+        # which is the 2.5-day silence of 2026-09-04 in miniature.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        text = F.render(F.build(rows, EXTRACTS, CONTRACTS,
+                                problems={"misdated_waivers":
+                                          ["20270908T000000Z.md"]}))
+        self.assertIn("MISDATED WAIVERS 1 file(s) in waivers/:"
+                      " 20270908T000000Z.md", text)
+
+    def test_an_unmodeled_handling_renders_visibly_instead_of_raising(self):
+        # `render()` has no surrounding try/except, and this report is what a
+        # human reads when the loop is STUCK -- exactly the moment a `KeyError`
+        # costing the whole report (no table, no health summary, nothing on
+        # stdout) is most expensive. `handling` is code-assigned from a closed
+        # set inside `build()`, so reaching this at all means a later task
+        # added a state and forgot to teach `_HANDLING_CELL` about it; the
+        # report must still print, with the bad value visible for a grep.
+        rows = [row("eA", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P)]
+        report = F.build(rows, EXTRACTS, CONTRACTS)
+        report["series"][0]["rows"][0]["handling"] = "quarantined"
+        text = F.render(report)          # must not raise
+        self.assertIn("?quarantined?", text)
 
 
 if __name__ == "__main__":

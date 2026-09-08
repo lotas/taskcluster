@@ -48,7 +48,8 @@ RUNS_REQUIRED = {"task_id", "run_id", "task_queue_id", "priority_at_pending", "p
 CAPACITY_REQUIRED = {"task_queue_id", "sampled_at"}
 
 SQL = r"""-- runs.csv (psql: \copy (...) TO 'runs.csv' CSV HEADER)
-SELECT r.task_id, r.run_id, t.task_queue_id, r.priority_at_pending,
+SELECT r.task_id, r.run_id, t.task_queue_id,
+       COALESCE(r.priority_at_pending, t.original_priority) AS priority_at_pending,
        r.pending_at, r.started_at, r.resolved_at, r.reason_resolved,
        r.run_duration_s, t.normalized_name, t.max_run_time_s
 FROM queue_forecast_task_runs r
@@ -247,6 +248,7 @@ def policies_arg(value: str) -> list[Policy]:
 def load_tasks(path: Path, queue_filter: set[str] | None) -> list[Task]:
     tasks: list[Task] = []
     seen: set[tuple[str, int]] = set()
+    ignored_terminal_without_priority = 0
     try:
         handle = path.open(newline="", encoding="utf-8")
     except OSError as exc:
@@ -261,9 +263,6 @@ def load_tasks(path: Path, queue_filter: set[str] | None) -> list[Task]:
             queue = row["task_queue_id"].strip()
             if not queue or (queue_filter is not None and queue not in queue_filter):
                 continue
-            priority = row["priority_at_pending"].strip()
-            if priority not in PRIORITY_RANK:
-                raise ValueError(f"{path}:{row_number}: unknown priority {priority!r}")
             try:
                 run_id = int(row["run_id"])
                 pending = parse_time(row["pending_at"], field_name="pending_at")
@@ -274,6 +273,26 @@ def load_tasks(path: Path, queue_filter: set[str] | None) -> list[Task]:
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{path}:{row_number}: {exc}") from exc
             assert pending is not None
+            priority = row["priority_at_pending"].strip()
+            # The collector can create a zero-lifetime pending record from a
+            # deadline-exceeded event without ever observing its priority.  It
+            # could not have competed at a claim opportunity, so omitting it is
+            # exact rather than an imputation.
+            if (
+                not priority and started is None and resolved is not None
+                and resolved <= pending
+            ):
+                ignored_terminal_without_priority += 1
+                continue
+            # Taskcluster accepts the legacy API spelling but queues it at the
+            # modern default priority.
+            if priority == "normal":
+                priority = "lowest"
+            if priority not in PRIORITY_RANK:
+                raise ValueError(
+                    f"{path}:{row_number}: unknown priority {priority!r}; "
+                    "use COALESCE(priority_at_pending, original_priority) in the export"
+                )
             key = (row["task_id"], run_id)
             if key in seen:
                 raise ValueError(f"{path}:{row_number}: duplicate run {key[0]}/{key[1]}")
@@ -291,6 +310,12 @@ def load_tasks(path: Path, queue_filter: set[str] | None) -> list[Task]:
             ))
     if not tasks:
         raise ValueError("no tasks remain after reading input and applying queue filters")
+    if ignored_terminal_without_priority:
+        print(
+            f"warning: ignored {ignored_terminal_without_priority} zero-lifetime terminal "
+            "runs with no recorded priority",
+            file=sys.stderr,
+        )
     return tasks
 
 

@@ -5,6 +5,29 @@ Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/auto-researc
 # dispatcher is up would fail on its first `results.sh`.
 After=qf-dispatch.service
 Wants=qf-dispatch.service
+# THE ALARM FOR A TICK THAT DIED BEFORE IT COULD PAUSE ITSELF. `tick.sh` has
+# around twenty-five `die` sites and a `die` writes no `PAUSE` and files no
+# issue: it exits non-zero and the timer tries again in an hour. A broken
+# install -- an unreadable prompt file, a missing workspace, an unset HOME --
+# therefore left the loop retrying hourly forever with NOTHING raising an alarm,
+# which is the 2026-09-04 silence by a different route. systemd is the only
+# party that sees the exit status of a unit nobody is watching.
+#
+# It files the same issue `pause-issue.sh open` files and writes the same
+# `PAUSE`, so the release is the one a human already knows.
+#
+# IT MAY FIRE ON EVERY FAILED TICK, AND THAT IS FINE -- but not because of the
+# exit code, and the earlier version of this comment claimed a guarantee the
+# code does not provide. `OnFailure=` triggers on the unit entering FAILED, and
+# `tick.sh` has `die` sites ABOVE its PAUSE check (tick.sh:202) -- workspace and
+# HOME resolution, CTX creation -- which are precisely the broken-install faults
+# this alarm exists for and which exit non-zero every hour with `PAUSE` already
+# on disk. What keeps that to ONE issue rather than twenty-four a day is
+# `pause-issue.sh`'s idempotency: the stamp is searched across `--state all` and
+# `tick-failure-alarm.sh` never rewrites an existing `PAUSE`, so the stamp
+# cannot change. The brake is what quietens the LOG; the stamp is what quietens
+# the ALARM. See tick-failure-alarm.sh.
+OnFailure=qf-tick-failure.service
 
 [Service]
 Type=oneshot
@@ -36,7 +59,33 @@ TimeoutStopSec=90
 Environment=QF_REQUIRE_PREREG=1
 Environment=QF_TICK_MAX_RUNS=4
 Environment=QF_TICK_MAX_TICKS=12
+# BOTH BRAKES, and neither is raised. 2026-09-04 auto-paused correctly on the
+# first and mis-attributed nothing to the second because the second did not yet
+# exist: a verifier outage counted as drift.
+#
+# THE COMMITTED VALUE STAYS 3. A `systemctl edit` drop-in raising it to 5 ran
+# live for weeks -- unreviewed, invisible to `unit_matches`, which compares unit
+# FILES, and found only while investigating that pause. It is NOT blessed by
+# being written down here: every rejection it fired on was locally correct, so
+# the drop-in is undocumented drift for a human to remove
+# (`sudo systemctl revert qf-tick`), which `env_matches` in phase2-setup.sh now
+# reports on every refresh.
 Environment=QF_TICK_MAX_DISAGREE=3
+Environment=QF_TICK_MAX_VERIFIER_FAILS=3
+# Two rejection episodes retire a run (design section 1.3). Never 0: frontier.py
+# refuses to build rather than treat 0 as "retire everything".
+Environment=QF_FRONTIER_RETIRE_AFTER=2
+# PINNED HERE, IN ROOT-OWNED CONFIGURATION, and never derived from the
+# checkout's `git remote`: that checkout is research-writable, so deriving the
+# repository from it would let the identity being watched choose who gets told.
+Environment=QF_PAUSE_ISSUE_REPO=lotas/qf-research
+# THE TOKEN PATH IS UNIT CONFIGURATION TOO, even though `pause-issue.sh`
+# defaults it to `$HOME/.config/qf/pause-issue-token`: the default is INVISIBLE.
+# A deploy that puts the token elsewhere fails at the one moment the alarm is
+# needed, and the failure reads as `PAUSE exists; stopping` -- the 2026-09-04
+# silence exactly. Pinned so the path is reviewable in one place, and so an
+# unset HOME cannot root it at `/`.
+Environment=QF_PAUSE_TOKEN_FILE=/home/research/.config/qf/pause-issue-token
 
 NoNewPrivileges=yes
 ProtectSystem=strict

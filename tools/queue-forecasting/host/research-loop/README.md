@@ -7,8 +7,8 @@ and both agent CLIs are installed and authenticated for the `research` user with
 `api.anthropic.com` and `api.openai.com` on the egress allowlist. **The only
 thing missing was that nothing ever invoked an agent.**
 
-So this is deliberately small — seven files against the dispatcher's 21,000 lines
-— and it must stay that way. The ratio that got this project into trouble was
+So this is deliberately small — sixteen files against the dispatcher's 21,000
+lines — and it must stay that way. The ratio that got this project into trouble was
 65,000 lines of platform against 2,700 lines of trainer. Anything here that is
 not "invoke an agent" or "stop an agent that is wrong" belongs somewhere else, or
 nowhere.
@@ -20,12 +20,18 @@ nowhere.
 | `tick.sh` | one turn: lock, budget, context, leader, copilot, publish |
 | `tick-prompt.md` | the leader's instructions — six actions, first match wins |
 | `verify-prompt.md` | the copilot's instructions — six ways to reject a claim |
+| `retry-prompt.md` | the leader's REDUCED instructions when a tick is a retry — one action, one target, four bans |
 | `prereg.py` | the pre-registration format, written by `experiment.py`, read by `frontier.py` |
 | `frontier.py` | the progress artifact: per-series frontier, claims, confirm gate |
 | `agent-env.sh` | puts the nvm-installed CLIs and the proxy on PATH for a non-interactive shell |
 | `usage.py` | extracts structured CLI usage and appends the central log |
 | `install.sh` | turns the loop on and off |
+| `pause-issue.sh` | files the pause issue (`open`) and reads it back (`check`): the alarm, and the handle a human releases the brake with |
+| `pause-resume-allowlist.txt` | the GitHub logins whose *close* of a pause issue resumes the loop |
+| `state-names.sh` | the three state-file basenames `tick.sh` and `pause-issue.sh` must agree on |
+| `tick-failure-alarm.sh` | `OnFailure=`: files the pause issue for a tick that died before it could pause itself |
 | `qf-tick.{service,timer}` | hourly, as `research` |
+| `qf-tick-failure.service` | runs `tick-failure-alarm.sh`; reached only by `qf-tick.service`'s `OnFailure=`, never enabled |
 
 ## Token and cost log
 
@@ -110,15 +116,46 @@ through with a note.
 ### The journal is an input too
 
 `frontier.py --journal <dir>` scrapes run ids out of recorded entries, so a
-result the loop already wrote up stops matching the leader's first action. **Only
-git-tracked files count** — the leader owns that directory, so dropping an
-untracked `journal/anything.md` citing a run id would otherwise retire a result
-nothing had verified or committed. If tracked-ness cannot be determined (no repo,
-no git), nothing counts: every run reads as unrecorded, which is noisy and safe.
+result the loop already wrote up stops matching the leader's first action.
 Without it that action matches forever and every tick re-narrates the same row
 instead of advancing — and `broken` is a permanent state, so refutations had the
 same problem. **Escalations are excluded**: an escalated entry was rejected, so
 the run it describes is still unwritten.
+
+**Only content committed at `HEAD` counts.** Not "tracked", which is what this
+read used to mean and what an earlier version of this section said: the paths
+came from `git ls-files` and the bytes came from the **working tree**, so a
+tracked entry could be edited in place and change what counted as written up
+with nothing committed. Staging it did not count either way and still does not.
+The reader is now `git ls-tree -r HEAD` for the listing and `git cat-file
+--batch` on the resulting **blob oids** for the bytes, in all three of the flat
+namespaces it reads — `journal/`, `journal/escalations/` and `journal/waivers/`.
+
+The reason is the uid. **The leader runs as `research` and `research` owns the
+journal**, so anything the loop steers on that is readable from the working tree
+is forgeable by the identity being steered: an untracked `journal/anything.md`
+citing a run id, a one-word edit to a committed entry, a `git add` with no
+commit. What counts as written up — and, since retirement and waivers read
+through the same primitive, what counts as rejected and what counts as revived —
+therefore has to be a thing that got committed and pushed, which is a thing a
+human can see in `git log`.
+
+If the question cannot be answered at all — no repository, no `git`, no `HEAD`,
+a failed call, a listing that will not parse — **nothing counts**: every run
+reads as unrecorded, no rejection is counted against any run, and no waiver
+revives anything. Noisy and safe, in that order, and it is the same convention
+everywhere in `frontier.py`. The opposite default would silently retire results
+nobody ever committed.
+
+One consequence of reading the whole journal root, and it is guarded rather
+than left to discipline: `journal/escalation-kinds.md` (below) sits in that
+root, and `_RUN_ID` is loose on purpose — so a run id typed into it, as a
+trailing comment naming the run for your own benefit, would have made that run
+read as **recorded**. `journaled_run_ids` now skips that file by name, so only
+`escalation_targets` reads it. Keep to stamps and kinds anyway: the classifier
+line is fully anchored, so a trailing comment does not fail loudly, it just
+fails to classify. Waivers avoid the whole question by living in their own
+directory, which is why they have one.
 
 ### What the copilot can and cannot see
 
@@ -531,7 +568,7 @@ fails any job it finds LEASED or RUNNING with no live container
 was destroyed this way on 2026-09-01 — no OOM, no timeout, no exit code, just a
 deploy landing mid-experiment.
 
-`touch ~research/qf-research/PAUSE`, wait for the heavy lane to clear
+`sudo -H -u research touch ~research/qf-research/PAUSE`, wait for the heavy lane to clear
 (`qf list` shows no non-terminal probe), then deploy.
 
 ## The prompt goes on stdin
@@ -607,6 +644,675 @@ sudo -H -u research bash -lc 'command -v claude'   # what the tick sees
 sudo -H -u research bash -ic 'command -v claude'   # what you see over ssh
 ```
 
+## The pause-issue token
+
+`pause-issue.sh` files the alarm and reads it back with a **fine-grained PAT on
+`lotas/qf-research`, Issues: read and write, and nothing else** — specifically
+**not Contents**, so the token cannot touch the journal, which keeps its own
+`.git-credentials`. Stored mode **0600**, owned by `research`, at
+`/home/research/.config/qf/pause-issue-token`; the path is pinned in
+`qf-tick.service` (`QF_PAUSE_TOKEN_FILE`) because the default is invisible and a
+token somewhere else fails at the one moment the alarm is needed.
+
+Four distinct permissions are exercised — label create, issue create, issue
+read, events read — and **only the first two fail loudly**. A too-narrow token
+therefore presents as *a pause nobody can release*, not as an error: the issue
+exists, closing it changes nothing, and the loop stays down. Check the scopes
+before concluding the release path is broken.
+
+`QF_PAUSE_ISSUE_REPO` is pinned in the same root-owned unit and never derived
+from the checkout's `git remote`: that checkout is research-writable, so
+deriving it would let the identity being watched choose who gets told.
+
+## The two brakes, and what resets them
+
+Two counters in `~research/.local/state/qf-tick/`, either of which pauses the
+loop. They are separate because a drifting leader and a dead verifier are
+different mornings, and one counter absorbing both meant a `codex` outage
+reported itself as research drift.
+
+| brake / state file | what it counts | knob (committed value) | what resets it |
+|---|---|---|---|
+| `consecutive-disagreements` | one **rejected target episode** per tick: a usable `DISAGREE` whose target is not a repeat of the last one. A repeat of the *same* suppressible target does **not** advance it — retirement bounds that instead. A target that is missing, malformed, a `probe-` id, ambiguous across two rows, already recorded, retired, or gone from the scoreboard is not suppressible and **always** advances it, as does `none` | `QF_TICK_MAX_DISAGREE` = **3** | an `AGREE`, or an allowlisted close of the pause issue |
+| `consecutive-verifier-failures` | one tick that produced no **usable verdict** — exit 0 *and* an anchored final `VERDICT:` line, both halves required. `QF_TICK_COPILOT_TRIES` (3) is **not** part of this: the retry loop retries only on a non-zero exit and breaks at once if the raw output already contains `VERDICT:`, so *one* invocation is enough in the two ordinary cases — exit 0 with prose and no anchored line, and a non-zero exit that had already printed a verdict. Do not go looking in the journal for three attempts | `QF_TICK_MAX_VERIFIER_FAILS` = **3** | any usable verdict, `AGREE` or `DISAGREE` alike, or an allowlisted close |
+
+A third knob is not a brake but decides when a run stops being offered:
+`QF_FRONTIER_RETIRE_AFTER` = **2**, the number of counted rejection episodes
+that retire a run. It is validated as an integer ≥ 1 and `frontier.py` **refuses
+to build the report** on `0`, `-1` or a non-number rather than falling back —
+`0` would retire every unrecorded row on sight.
+
+`last-reject-target` is the third state file: the id the drift streak is
+currently suppressed against, or the literal `none`. Cleared on `AGREE`,
+on a resume, and whenever the stored target stops being suppressible. It is
+never written for a verifier failure — an entry nobody judged is no evidence
+about which run the leader is stuck on.
+
+Neither counter is ever inferred. A counter that cannot be read or written stops
+the tick or pauses it immediately, and the log says which file and why; a
+threshold reached because the file was unreadable says so too, so a pause
+reading `consecutive-disagreements at 3` cannot hide a broken state directory.
+
+## When the loop pauses
+
+An auto-PAUSE writes `~research/qf-research/PAUSE` and files an issue on
+`lotas/qf-research` titled `PAUSED <stamp>: <brake> at <n>`. The brake name in
+the title is the diagnosis, and it is there so the tab title alone tells you
+which of three mornings this is:
+
+- **`consecutive-disagreements`** — the leader kept being rejected on targets
+  that were not a bounded repeat. Research drift. Read the escalations: the
+  issue body quotes the reason block of the **three newest files** in
+  `journal/escalations/` verbatim under "The last three rejections", so you do
+  not have to clone anything to find out why the loop stopped. (Newest three
+  *files* — if a verifier outage escalated in between, one of them is that.)
+- **`consecutive-verifier-failures`** — three consecutive ticks produced no
+  usable verdict. Three *ticks*, not three attempts within one: see the brake
+  table for why a single invocation can be the whole failure.
+  Infrastructure, not research: check the tinyproxy
+  allowlist (`api.openai.com`), `codex login` as the research user, and whether
+  `codex` is reachable through `agent-env.sh` at all. Nothing was judged, so no
+  finding is in question.
+- **`tick-unit-failure`** — the tick died before it could pause itself, and
+  systemd's `OnFailure=` filed the alarm. A broken install: an unreadable prompt
+  file, a missing workspace, an unset `HOME`, a malformed knob. Here `<n>` is
+  **not a count** — it is `MONITOR_SERVICE_RESULT`, the word systemd used
+  (`exit-code`, `timeout`, `signal`, or `unknown` on a systemd older than 250),
+  and `timeout` versus `exit-code` is the difference between a tick that hung
+  past `TimeoutStartSec=4h` holding the training mutex and a `die`. The reason
+  itself is not in the issue: `journalctl -u qf-tick.service -n 200`.
+
+**To release it: close the issue.** Comment first if you want to steer the next
+tick. The next tick reads the *closing actor* from the issue-events REST API and
+resumes only if that login is in `pause-resume-allowlist.txt` — the issue body
+lists the authorised logins, precisely so a colleague does not click Close and
+achieve nothing. A close by anyone else is logged and the loop stays paused, as
+is an open issue, a repo that disagrees with the pinned `QF_PAUSE_ISSUE_REPO`, a
+`PAUSE` whose stamp is not in the issue's body, and every API error.
+
+**Closing is the only release gesture — a comment alone changes nothing.**
+Comments from allowlisted logins become `human-directive.md`, handed to the
+**leader only**, labelled an instruction and explicitly not evidence; the
+verifier never sees it, so a figure you type into a comment still cannot be
+cited and will be rejected if the leader tries. Comments from anyone else are
+counted and mentioned, never promoted — the pause token can author comments too,
+and an unfiltered fetch would let the loop write its own instructions.
+
+On an authorised close the resume zeroes both counters, sets
+`last-reject-target` to `none`, reads all three back, and removes `PAUSE`
+**last**. Any failure before that leaves the brake on and retries next tick;
+the reverse order is the one that must never happen, because `PAUSE` gone with a
+streak still at its threshold re-pauses on the first rejection.
+
+Two things worth knowing before you close one:
+
+- **A `tick-unit-failure` you have not actually fixed comes straight back.** The
+  resume removes `PAUSE`, the next tick dies in the same place, `OnFailure=`
+  writes a fresh `PAUSE` with a fresh stamp, and that is a **new** issue. One
+  new issue per failed fix attempt, not one per hour — the stamp is what bounds
+  it.
+- **`systemctl stop qf-tick.service` over a running probe can file one.** A
+  clean stop ends `inactive (dead)` and alarms nothing, but a cgroup that does
+  not die inside `TimeoutStopSec=90` is SIGKILLed, the result becomes `timeout`,
+  the unit enters `failed` and the alarm fires. Recoverable: close the issue.
+  `install.sh off` cannot do this — it stops the **timer**, and a timer cannot
+  put the service into `failed`.
+
+## When a run is retired
+
+A run that was written up and **rejected twice** stops being offered. The report
+carries one line per retired row:
+
+```text
+RETIRED: evaluate-… — 2 rejections, never written up, latest
+escalations/20260904T111002Z.md. Not selectable; revive with a committed
+waivers/<stamp>.md carrying `**Waiver:** evaluate-…`.
+```
+
+The `written up` column renders `retired` rather than `NO`, the row is dropped
+from the "needs writing up" shortlist the leader actually picks from, the JSON
+row carries `handling: "retired"`, and `tick-prompt.md` says a `retired` row is
+not `NO` and must not be chosen. Every steering surface, because retirement is
+only an escape if all of them agree — a retired row left in the shortlist is
+the livelock again whatever the counter says, and that shortlist is the table
+the leader picks from.
+
+This is deliberate, and it has a cost that is also deliberate: **a correct
+finding can be given up on.** Three ticks on 2026-09-04 each rewrote the same
+finished run and were each rejected on incidental prose — a rounding word, then
+a false superlative — while the central result (`p90_miss_tail` 0.298876182 →
+0.280830734) was never disputed and is still sitting in an escalation file. The
+loop cannot be made to record a finding the gate keeps refusing. It can only be
+made to stop paying for the attempt.
+
+To revive one, commit a waiver. Only the run id line is machine-read; the rest
+is for whoever reads `git log`:
+
+**As `research`, never as root.** The journal is research-owned and keeps its
+own `.git-credentials`; the pause token deliberately has no Contents scope, so
+a root `git push` has no credential at all and the commit leaves root-owned
+objects in `research`'s `.git` — a repository the loop can no longer push to,
+whose remedy is the `sudo chown -R` that `phase2-setup.sh` already has a die
+message for. Every block below is wrapped for that reason.
+
+```bash
+sudo -H -u research bash -lc '
+  set -e
+  cd ~/qf-research
+  mkdir -p journal/waivers
+  printf "**Waiver:** %s\n\n%s\n" \
+    evaluate-20260904T090941Z-0a217f40da8f-6446 \
+    "Reopening: the tail result is real and both rejections were about prose." \
+    > "journal/waivers/$(date -u +%Y%m%dT%H%M%SZ).md"
+  git add journal/waivers
+  git commit -m "waiver: reopen the 09-04 tail result"
+  git push'
+```
+
+Four things it will not tolerate, each of which fails silently or nearly so:
+
+- **The filename must start with a `YYYYMMDDTHHMMSSZ` stamp.** That prefix is
+  the waiver's date, and the date is the whole mechanism. A file without one
+  revives nothing and is reported as `UNPARSEABLE WAIVERS` (below).
+- **The stamp must name a real instant, and must not run ahead of the
+  journal.** `20261345T996000Z` has the right shape and sorts above every real
+  2026 stamp; a typo'd year does the same. Either one would put the waiver's
+  floor above every escalation that will ever exist, so the run stays
+  `unrecorded`, the leader keeps being told to retry it, the drift streak never
+  advances because the target never changes, and **retirement can never reach
+  its threshold** — the 2026-09-04 livelock with both brakes disabled, from one
+  filename. So a stamp is refused unless it parses as a real timestamp and sits
+  within **7 days** of the journal's own newest committed stamp (entries and
+  escalations, never other waivers — one mistyped waiver must not certify the
+  next). No clock is read: two committed stamps are compared, so the answer is
+  the same on any box, including one whose clock is wrong. A refused stamp
+  revives nothing and is reported as `MISDATED WAIVERS` (below).
+- **The id must be an `evaluate-` id**, matched whole. A `probe-` id, a
+  comparator, or a typo waives nothing — one probe can be evaluated under two
+  contracts, so a probe id does not identify a row.
+- **One anchored line, spelled `**Waiver:** <id>`** — the label in bold with
+  the colon inside it, the id after it, nothing else on the line. Prose
+  mentioning the run id anywhere else in the file does nothing.
+- **It must be committed** (and, in practice, pushed — the loop reads its own
+  checkout, but a waiver only you have is a waiver nobody can see). An
+  uncommitted file in `journal/waivers/` is invisible for the reason the section
+  above gives: the leader shares this uid.
+
+**A waiver starts a new episode; it does not decrement a total.** It moves a
+floor: escalations committed **at or before** the waiver's stamp stop counting,
+and escalations committed after it count in full. So rejections already on file
+are spent, and **two fresh rejections retire the run again** — which is the
+point. Subtraction would fail in the only case that matters: three rejections
+against a threshold of two, minus one, still retires.
+
+And plainly: **do not delete or move escalation files to un-retire a run.** They
+are the record of what the gate refused, and both 2026-09-04 refusals were
+correct. Thinning that trail to change the loop's behaviour destroys the only
+evidence that the refusals were right — and it is the reason the waiver is a
+separate committed file in its own directory rather than an edit to anything.
+
+### `UNCLASSIFIED ESCALATIONS` and `UNPARSEABLE WAIVERS`
+
+Two report lines, both naming their files rather than counting them, because
+"classify them" and "rename them" are not actionable without knowing which:
+
+```text
+UNCLASSIFIED ESCALATIONS 4 escalation(s) in escalations/: 20260902T…Z.md, …
+  -- no `Escalation kind:` line, so they are NOT counted toward retirement.
+  Classify them in journal/escalation-kinds.md.
+```
+
+Every escalation the tick writes now carries `Escalation kind: rejection` or
+`Escalation kind: verifier-failure`, and **only `rejection` retires anything**.
+Files written before that line existed are `unknown`, and `unknown` counts
+toward nothing — **deliberately, and it is not a bug to be tidied away**. That
+backlog contains both real rejections and `codex` outages, and defaulting them
+to `rejection` would retire runs nobody ever judged, which is the precise harm
+retirement exists to prevent. The visible line is the compromise: retirement is
+disabled for the runs they name, and you can see that it is.
+
+Classify them in `journal/escalation-kinds.md` — one `<stamp> <kind>` per line,
+tab or spaces, nothing else on the line, committed:
+
+```bash
+sudo -H -u research bash -lc '
+  set -e
+  cd ~/qf-research
+  cat >> journal/escalation-kinds.md <<EOF
+20260904T101126Z rejection
+20260904T111002Z rejection
+20260902T113305Z verifier-failure
+EOF
+  git add journal/escalation-kinds.md
+  git commit -m "classify the pre-kind-line escalations"
+  git push'
+```
+
+**Classifying can retire the run you were about to revive, immediately.** Two
+`rejection` lines against one run *is* the threshold, and the two stamps above
+are the 2026-09-04 pair — the same run the section above argues is worth
+reviving. That is not a bug in either half; it is retirement working on
+evidence it could not previously read. So **re-read the `RETIRED:` lines after
+you commit a classification**, and if one of them is a run you want back, the
+undo is a waiver — committed after the classification, so its floor covers it.
+
+The stamp is the escalation's filename without `.md`. This record **overrides**
+a file's own `Escalation kind:` line when both exist, on purpose: it is there so
+a human can correct a classification, not only supply a missing one. Remember
+the trap from "The journal is an input too" — no run ids in this file, ever.
+
+```text
+UNPARSEABLE WAIVERS 1 file(s) in waivers/: reopen-the-tail-result.md
+  -- no `<stamp>` filename prefix, so they revive NOTHING. Rename them
+  `YYYYMMDDTHHMMSSZ.md` and commit.
+```
+
+```text
+MISDATED WAIVERS 1 file(s) in waivers/: 20270908T000000Z.md
+  -- stamped more than 7 day(s) ahead of the journal's newest committed
+  stamp, so they revive NOTHING. Re-stamp and commit.
+```
+
+Same remedy as the line above — `git mv` it to a real stamp and commit. Do not
+"fix" it by back-dating an escalation instead: the escalations are the record of
+what the gate refused, and the waiver's date is the only thing that says which
+of them a human has forgiven.
+
+```bash
+sudo -H -u research bash -lc '
+  set -e
+  cd ~/qf-research
+  git mv journal/waivers/reopen-the-tail-result.md \
+         "journal/waivers/$(date -u +%Y%m%dT%H%M%SZ).md"
+  git commit -m "waiver: give it a stamp so it does something"
+  git push'
+```
+
+## Knobs the unit pins, and the two places they can be overridden
+
+`qf-tick.service` pins the `QF_*` knobs, and two separate checks exist because
+the unit is not the only thing that sets them. Both **report**; neither refuses,
+because a forgotten override must not block the deploy that ships its fix.
+
+**A `systemctl edit` drop-in** is invisible to a file comparison — that is how
+the box ran `QF_TICK_MAX_DISAGREE=5` against a committed `3` for weeks.
+`mirror-refresh --check` now compares the *effective* environment and prints:
+
+```text
+qf-tick.service effective-environment drift: DRIFT QF_TICK_MAX_DISAGREE repo=3 live=5
+```
+
+Remedy: `systemctl cat qf-tick` to see the drop-in, `systemctl revert qf-tick`
+to drop it. A declared knob's value is printed because it is a reviewed
+threshold; an unexpected `QF_*` key is printed **by name only**, because its
+value is unreviewed and could be anything.
+
+**`~research/.profile` is the other one, and it wins.** `ExecStart` is
+`/bin/bash -lc` deliberately — the proxy variables and the agent CLIs' paths
+live in that profile, and without it git fails with a fake five-millisecond
+connection error. But a login shell runs *after* systemd has set the unit's
+environment, so `export QF_TICK_MAX_DISAGREE=5` in the profile silently beats
+the unit. The same refresh now scans it:
+
+```text
+PROFILE-OVERRIDE   QF_TICK_MAX_DISAGREE ~/.profile unit=3 profile=5
+PROFILE-DUPLICATE  QF_FRONTIER_RETIRE_AFTER ~/.profile value=2 (matches today)
+PROFILE-UNEXPECTED QF_EXPERIMENTAL_THING ~/.profile (name only)
+PROFILE-UNSCANNED  ~/.profile (1 source line(s) cannot be resolved literally)
+```
+
+A `DUPLICATE` is not an error today — it is a second source of truth for the
+same value, and it will diverge the moment one side changes. `UNSCANNED` is the
+honest half: this is a textual scan, so it follows `source` lines it can resolve
+literally (three levels deep) and says so when it cannot. It does not see a
+value set by `eval`, by command substitution, or through `$BASH_ENV`, and it
+deliberately skips `/etc/profile*` — root-owned, the same trust domain as the
+unit, whereas `~research` is writable by the identity being watched.
+
+**So the tick also checks itself.** Because the scan runs at deploy and the tick
+runs hourly, `tick.sh` compares its own effective `QF_*` against
+`systemctl show -p Environment qf-tick.service` at startup. The delta between
+what systemd configured and what the tick actually holds *is* the profile
+injection, with no dot-file parsing at all. It logs, it never dies, and when the
+loop pauses the delta is carried into the issue body — if the loop is about to
+pause with `MAX_DISAGREE` effectively 5 while the unit says 3, that belongs
+where a human is already looking.
+
+Two kinds of expected noise, so you do not chase them:
+
+- **A hand-run tick reports every declared knob as `MISSING`.** `install.sh
+  once` and the tests do not have the unit's environment. That is correct, not
+  a fault — and it is another reason to trip things with `systemctl start
+  qf-tick.service` instead.
+- **`UNVERIFIED` means "could not ask", not "clean".** No `systemctl`, a
+  non-zero `systemctl`, a unit that is not `loaded`, or no `Environment`
+  property all report it, and every escalation from that tick carries the line.
+  A pass over a question nobody asked is the failure being fixed here.
+
+## What a retry tick looks like, so you do not read it as a stall
+
+When the previous tick's rejection has a live target, the next tick is a
+**retry**, and it deliberately looks narrower than a normal tick. In
+`journalctl -u qf-tick.service` it announces itself:
+
+```text
+[tick HH:MM:SS] this tick is a RETRY of evaluate-… (still unrecorded)
+```
+
+Three things are different, and none of them is the loop being stuck:
+
+- **The action is closed to one named target.** The leader is told this tick is
+  action 1 on that exact row and the other five actions are unavailable: no new
+  experiment, no different row. So a retry tick submits nothing and spends no
+  probe budget — it does still cost a leader turn and one of the twelve daily
+  ticks, which is what retirement exists to bound.
+- **The entry template is reduced**, not rewritten: `retry-prompt.md` replaces
+  the six-action template with one fixed shape and four bans — no
+  rounding-equivalence, no superlatives or firsts, a title that names only the
+  action and the config, and no comparator other than the pre-registered `vs`.
+  Each ban is traceable to a rejection that actually happened. The premise is
+  that **rewriting resamples the defect surface**: on 2026-09-04 round 2 fixed
+  the defect it was told about and introduced a new one, so a retry must shrink.
+- **The target's frontier row is pasted into the context at full precision**,
+  with its comparator, because the leader receives `frontier.md` and not
+  `frontier.json` — the markdown carries none of `config_digest`, `vs`, `tol`
+  or the row's own measured value. Without the paste the template would mandate
+  fields whose only sources are a blank or a remembered number, which is the
+  rejection it exists to prevent.
+
+A retry that cannot be assembled whole degrades to an **ordinary** tick and says
+so loudly (`WARNING could not paste the row for retry target …`). Half a retry
+block — the closed action without the bans, or the template without the row — is
+worse than none. And if you see the same run retried repeatedly, that is bounded:
+two counted rejections retire it.
+
+## Releasing the pause the box is in now
+
+The live `PAUSE` dates from 2026-09-04 and predates all of this. Two routes.
+
+**Preferred, once the loop is deployed and the token is installed:** do
+nothing. "Deployed" is load-bearing, and it is three separate things:
+
+1. **The new `research-loop/` is in the trusted checkout.** `tick.sh` warns and
+   stops if `pause-issue.sh` is not there and executable, which is the state of
+   any box whose `/srv` predates this change.
+2. **`install.sh on` has been re-run since.** The units are what pin
+   `QF_PAUSE_ISSUE_REPO` and `QF_PAUSE_TOKEN_FILE` and what wire
+   `OnFailure=qf-tick-failure.service`; until they are reinstalled,
+   `pause-issue.sh` exits 1 with the repo unset and files **nothing**.
+3. **The timer is armed.**
+
+```bash
+# 1 — is the new code there at all:
+ls -l /srv/queue-forecasting/tools/queue-forecasting/host/research-loop/pause-issue.sh
+git -C /srv/queue-forecasting log --oneline -1
+
+# 2 — are the INSTALLED units the checkout's, and is the environment drifted:
+sudo /srv/queue-forecasting/tools/queue-forecasting/host/phase2-setup.sh \
+  mirror-refresh --check
+# then, idempotently, and read its output rather than its exit status:
+sudo /srv/queue-forecasting/tools/queue-forecasting/host/research-loop/install.sh on
+
+# 3 — armed, and paused or not:
+sudo /srv/.../host/research-loop/install.sh status
+```
+
+`install.sh on` is where the preflights live — the token's existence and its
+`0600`, the pinned `QF_PAUSE_ISSUE_REPO`, and the allowlist — checked against
+**both** units, because `qf-tick-failure.service` restates those directives
+rather than inheriting them and can therefore diverge from them. So **its
+output is the verification**, and it is safe to re-run on a live box: it
+reinstalls the units, reloads, and re-enables an already-enabled timer, and it
+does not touch a running tick.
+
+**`install.sh status` reports; `install.sh on` refuses.** `status` is read-only
+and never dies: it reads the timer and `PAUSE`, compares both installed units
+against the checkout, and runs the repo, token and allowlist preflights against
+the **installed** units — so it does answer "can this box file and release a
+pause". What it cannot answer is whether the checkout itself is current, which
+is `mirror-refresh --check`'s question, and it will not fix anything it finds.
+`on` is the authoritative verification because it reinstalls *before* it
+checks.
+
+Given all three, that `PAUSE`
+carries no `issue:`/`stamp:` binding, so the next tick's `check` recovers its
+stamp (from its own `auto-paused <stamp>:` line, else the file's mtime — never
+from `date`, which would file a fresh duplicate hourly), **files the issue for
+it**, and stays paused. Close that issue as an allowlisted login and the resume
+path zeroes the counters for you, in the verified order. This is worth
+preferring for a reason beyond convenience: it exercises the release path you
+will actually depend on, on a pause where being wrong costs nothing.
+
+**By hand**, if the token is not in place yet or you do not want to wait an
+hour. Removing `PAUSE` alone is **not enough** — the drift counter is still at
+its threshold, so the loop would re-pause on the first rejection:
+
+```bash
+sudo -H -u research bash -lc '
+  set -e
+  # THE SAME EXPRESSION tick.sh AND pause-issue.sh USE. Neither unit pins
+  # QF_TICK_STATE or XDG_STATE_HOME, so an XDG_STATE_HOME set in
+  # ~research/.profile moves the real directory and a hardcoded
+  # ~/.local/state path would write three decoys beside a live streak.
+  S="${QF_TICK_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/qf-tick}"
+  echo "state: $S"
+  mkdir -p "$S"
+  printf "%s\n" 0    > "$S/consecutive-disagreements"
+  printf "%s\n" 0    > "$S/consecutive-verifier-failures"
+  printf "%s\n" none > "$S/last-reject-target"
+  # THE READ-BACK GATES THE REMOVAL. Not printed for eyeballing: `set -e` plus
+  # `test` means PAUSE is removed only if all three really hold those values.
+  test "$(cat "$S/consecutive-disagreements")"     = 0
+  test "$(cat "$S/consecutive-verifier-failures")" = 0
+  test "$(cat "$S/last-reject-target")"            = none
+  rm -f ~/qf-research/PAUSE
+  echo "released"'
+```
+
+**Every line before the `rm` is a gate, and that is the whole point of the
+order.** Without `set -e` and those three `test`s, a state directory that does
+not exist yet — or one moved by an `XDG_STATE_HOME` in `~research/.profile` —
+lets all three writes fail while `rm -f` runs anyway: `PAUSE` gone,
+`consecutive-disagreements` still at 3, one tick, and a re-pause on its first
+rejection. That is precisely the failure this ordering exists to prevent, and
+an eyeballed `cat` does not prevent it. If it prints `released`, it worked; if
+it prints nothing after `state:`, nothing was removed.
+
+The three basenames are defined once in `state-names.sh` and shared by
+`tick.sh` and `pause-issue.sh`; if you are typing them from memory, read that
+file — a rename done by halves makes the resume path's own read-back
+self-confirming.
+
+## Verifying this on the host
+
+Everything below was written against a container with no network, no `gh` and no
+running systemd, so none of it is proven. It is all cheap to check on the box,
+and each item names the failure it is checking for.
+
+**Use the unit, not `install.sh once`.** The unit is sandboxed
+(`ProtectSystem=strict`, `PrivateTmp=no`) and a hand-run tick is not, so a hand
+run cannot prove a sandbox fix — that is exactly how the 2026-09-02 `EROFS` on
+`/tmp/claude-<uid>/…` hid for a day: the hand run created the directory and the
+sandboxed ticks quietly reused it until `/tmp` was cleaned.
+
+```bash
+sudo systemctl start qf-tick.service
+journalctl -u qf-tick.service -n 100 --no-pager   # no EROFS, and a stated reason
+```
+
+**1. The host's `gh` accepts the flags these scripts use.** A rejected flag is
+an alarm that never files and a pause that cannot be released. Run as the
+research user, with only the pause token in scope, exactly as `gh_()` does:
+
+```bash
+sudo -H -u research bash -lc '
+  export GH_TOKEN="$(cat ~/.config/qf/pause-issue-token)" GH_PROMPT_DISABLED=1
+  gh label list --repo lotas/qf-research --search qf-pause --limit 50 \
+    --json name --jq ".[].name"
+  gh issue list --repo lotas/qf-research --state all --search 20260904T101126Z \
+    --limit 50 --json number,body --jq ".[] | .number"'
+```
+
+**2. `gh issue create` prints only the URL on stdout.** The issue number is
+parsed as `${url##*/}`, so a banner *before* the URL survives (the last `/` is
+still the URL's) but anything printed *after* it does not — and a non-numeric
+answer binds nothing, leaving a pause with no release handle until the next tick
+re-files. Create one scratch issue and look at raw stdout:
+
+```bash
+sudo -H -u research bash -lc '
+  export GH_TOKEN="$(cat ~/.config/qf/pause-issue-token)"
+  gh issue create --repo lotas/qf-research --title "scratch: stdout shape" \
+    --body "delete me" | cat -A | tail -3'
+```
+
+**3. `gh api --paginate --jq` emits one line per match, not per page.** The
+closing actor is `awk 'NF { last = $0 }'` over that stream because `gh` applies
+`--jq` per page; a page-spanning filter would emit one answer per page and
+authorise nobody. Against an issue that has been closed, reopened and closed:
+
+```bash
+# Against an issue that has been closed, reopened and closed again:
+sudo -H -u research bash -lc '
+  export GH_TOKEN="$(cat ~/.config/qf/pause-issue-token)"
+  gh api repos/lotas/qf-research/issues/<n>/events --paginate \
+    --jq ".[] | select(.event == \"closed\") | (.actor.login // \"\")"' \
+  | tee /dev/stderr | wc -l
+```
+
+Expected: **one line per `closed` event** — two for the issue described, and
+the last line is the login that authorised anything. The failure shape is a
+count that tracks the number of *pages* instead, or a single line containing
+several logins; either means `--jq` is being applied per page and
+`awk 'NF { last = $0 }'` would authorise the wrong login or nobody.
+
+**4. GitHub's search index finds a just-created issue by a body substring.** The
+idempotency key is the stamp in the body, searched across `--state all`. If the
+index lags, a create that succeeded but did not get bound files a **duplicate**
+next tick. Create the scratch issue from item 2 with a unique stamp in the body,
+then immediately `gh issue list --state all --search <that stamp>` and see
+whether it comes back. If it does not, expect duplicates and say so in the
+issue body rather than trusting the key.
+
+**5. `gh api` exits non-zero on HTTP 4xx/5xx.** Every "stay paused" branch in
+`check` is a `|| return 1` on a `gh api` exit status; if a 403 exits zero with
+an error body, an API failure reads as an answer. Check with a path that must
+fail:
+
+```bash
+sudo -H -u research bash -lc '
+  export GH_TOKEN="$(cat ~/.config/qf/pause-issue-token)"
+  gh api repos/lotas/qf-research/issues/999999999; echo "exit=$?"'
+```
+
+**6. `gh label create` really exits non-zero on an existing label.** The
+preflight determines existence with a *read* precisely so this does not matter,
+but `cmd_open`'s comment asserts it, and an assertion nobody checked is how
+that bug arrived in the first place:
+
+```bash
+sudo -H -u research bash -lc '
+  export GH_TOKEN="$(cat ~/.config/qf/pause-issue-token)"
+  gh label create qf-pause --repo lotas/qf-research \
+    --description "auto-paused research loop" --color B60205; echo "first=$?"
+  gh label create qf-pause --repo lotas/qf-research \
+    --description "auto-paused research loop" --color B60205; echo "second=$?"'
+```
+
+Expected: `second=` **non-zero** (the label already exists after the first, or
+after any pause the loop has ever filed). If it is `0`, the comment is wrong
+and should be corrected — the code is right either way.
+
+**7. `MONITOR_SERVICE_RESULT` is delivered.** It is set for `OnFailure=` units
+since systemd **250**; older systemd gives `unknown`, which is honest but tells
+you less. `systemctl --version | head -1`, and then read the title of the issue
+item 8 files.
+
+**8. `OnFailure=` actually fires, end to end.** The cheapest reversible way to
+trip a `die` **above** the PAUSE check is a malformed knob, which
+`tick.sh` validates before it touches any state. Do this with `PAUSE` absent:
+
+`systemctl edit` is interactive, so write the drop-in directly — the whole
+block pastes:
+
+```bash
+sudo mkdir -p /etc/systemd/system/qf-tick.service.d
+sudo tee /etc/systemd/system/qf-tick.service.d/zz-trip.conf >/dev/null <<'EOF'
+[Service]
+Environment=QF_TICK_MAX_TICKS=bogus
+EOF
+sudo systemctl daemon-reload
+sudo systemctl start qf-tick.service                   # expected: FAILS
+journalctl -u qf-tick.service -n 20 --no-pager         # "MAX_TICKS must be a
+                                                       #  non-negative integer"
+journalctl -u qf-tick-failure.service -n 40 --no-pager
+sudo rm -f /etc/systemd/system/qf-tick.service.d/zz-trip.conf
+sudo systemctl daemon-reload
+```
+
+(`sudo systemctl revert qf-tick.service` also removes it — and everything else
+in that directory, which is the point of item 10 but not of this one.)
+
+Then check all four consequences: the journal shows **no** `Failed to enqueue
+OnFailure job` (an `OnFailure=` naming a unit nothing installed is a hole that
+looks closed); `qf-tick-failure.service` ran to completion under
+`ProtectSystem=strict` with `gh` reaching the proxy rather than dying on
+nftables — the failure to watch for is `Failed to connect to github.com port 443
+after 5 ms`, which reads as a credential problem and is a missing
+`~/.profile`; a `PAUSE` exists carrying `tick-unit-failure`; and an issue was
+filed titled `PAUSED <stamp>: tick-unit-failure at exit-code`.
+
+Reverting the drop-in does **not** unpause the box — that `PAUSE` is real and
+its issue is the release handle, which is exactly what item 9 then exercises.
+
+**9. The full release path, on that same issue.** Comment on it, close it as an
+allowlisted login, and start a tick:
+
+```bash
+sudo systemctl start qf-tick.service
+journalctl -u qf-tick.service -n 40 --no-pager
+```
+
+Expect `RESUMED: lotas/qf-research#<n> closed by <login> (stamp …); counters
+zeroed`, then `resumed by an allowlisted close; continuing this tick`, then the
+tick proceeding with your comment in the leader's context and not the copilot's.
+Worth also closing one as a **non**-allowlisted login once and seeing the loop
+stay paused with the actor logged — that is the half of the gate that is easy to
+believe without evidence.
+
+Two housekeeping notes. The resumed tick is a **real** tick: it may pick action
+4 or 5 and submit a probe, so do this when the daily budget can afford one, or
+`sudo -H -u research touch ~research/qf-research/PAUSE` again once you have read the resume line.
+And close (or delete) the scratch issues from items 2 and 4 — they carry no
+stamp any `PAUSE` names, so they cannot release anything, but an open
+`qf-pause`-shaped issue in that repo is a thing somebody will read at 3am.
+
+**10. The threshold drop-in is reported, and revert clears it.** A `systemctl
+edit` drop-in raising `QF_TICK_MAX_DISAGREE` to 5 ran live for weeks, unreviewed
+and invisible to a check that compares unit *files*. The comparison is now over
+the **effective** environment and runs on every deploy:
+
+```bash
+sudo /srv/queue-forecasting/tools/queue-forecasting/host/phase2-setup.sh \
+  mirror-refresh --check
+```
+
+Expect `qf-tick.service effective-environment drift: DRIFT QF_TICK_MAX_DISAGREE
+repo=3 live=5`. It is **reported, not refused** — a drop-in is a deliberate
+human act, and dying here would let one forgotten drop-in block the deploy that
+ships its fix. The committed value stays **3**; that drop-in is drift to remove,
+not tuning to bless:
+
+```bash
+sudo systemctl revert qf-tick.service && sudo systemctl daemon-reload
+sudo /srv/.../host/phase2-setup.sh mirror-refresh --check   # drift line gone
+```
+
+A key present only in the drop-in is reported **by name with no value** (its
+value is unreviewed by definition and this output goes to a deploy log); a
+declared key is reported with both sides, because reading "repo=3 live=5" is the
+entire point.
+
 ## Running it
 
 ```bash
@@ -620,11 +1326,46 @@ sudo /srv/.../host/research-loop/install.sh once
 sudo /srv/.../host/research-loop/install.sh on
 sudo /srv/.../host/research-loop/install.sh off
 
-# Stop the next tick without touching the timer:
-touch ~research/qf-research/PAUSE
+# Stop the next tick without touching the timer. AS `research`, like every
+# other write into that tree: a root-owned file in a directory the loop owns is
+# the shape that already cost this project a `chown -R` inside `.git`.
+sudo -H -u research touch ~research/qf-research/PAUSE
+
+# What is installed, when it next fires, whether it is paused:
+sudo /srv/.../host/research-loop/install.sh status
+
+# Read a pause without waiting for a tick (does not resume unless it may):
+sudo -H -u research bash -lc \
+  'QF_PAUSE_ISSUE_REPO=lotas/qf-research \
+   /srv/.../host/research-loop/pause-issue.sh check ~/qf-research/PAUSE'
 ```
 
-Tests: `host/tests/test_prereg.py`, `test_frontier.py`, `test_tick.sh`. The tick
+**A hand-written `PAUSE` now files an issue too**, and it will look odd: the
+next tick finds a file with no `issue:`/`stamp:` binding, dates it from the
+file's mtime and files the alarm, so the title comes out as
+`PAUSED <stamp>:  at ` — the brake and the count are parsed out of an
+`auto-paused` line a `touch` never wrote. Harmless, and it is the right
+trade (a pause nobody was told about is the failure this whole mechanism
+exists for). There is no way to make it quiet — a `PAUSE` carrying
+`auto-paused` and `stamp:` but no `issue:` still hits the unbound branch and
+still files an issue. Either remove the file again rather than closing the
+issue, or make the issue it files readable:
+
+```bash
+sudo -H -u research bash -lc '
+  S="$(date -u +%Y%m%dT%H%M%SZ)"
+  printf "auto-paused %s: operator-hold at 1\nsee (held by hand)\nstamp: %s\n" \
+    "$S" "$S" > ~/qf-research/PAUSE'
+```
+
+As `research`, like every other write into that workspace. A root-written
+`PAUSE` happens to work — `pause-issue.sh` replaces the file rather than
+editing it in place, and the directory is research-owned — but it leaves a
+root-owned file in a tree the loop owns, and that is the shape that has already
+cost this project a `chown -R` in `.git`.
+
+Tests: `host/tests/test_prereg.py`, `test_frontier.py`, `test_tick.sh`,
+`test_pause_issue.sh`, `test_tick_failure_alarm.sh`, `test_unit_drift.sh`. The tick
 test stubs both CLIs and asserts the guards — including that a rejected claim is
 not recorded, which is the failure that would otherwise be silent until a wrong
 finding was in the journal being cited by the next tick.

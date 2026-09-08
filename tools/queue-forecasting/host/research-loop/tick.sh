@@ -52,6 +52,15 @@ MAX_QUEUE_BYTES="${QF_TICK_MAX_QUEUE_BYTES:-24576}"
 # agents disagreeing once is the mechanism working. Repeatedly is a leader whose
 # reasoning has drifted, and it must not keep pushing.
 MAX_DISAGREE="${QF_TICK_MAX_DISAGREE:-3}"
+# TWO BRAKES, BECAUSE THERE ARE TWO FAILURES (design §2). This one counts
+# invocations that produced no USABLE VERDICT -- exit 0 AND a valid anchored
+# final `VERDICT:` line, both halves required. It used to share the counter
+# above, deliberately; that became unsafe the moment a repeated rejection of one
+# bounded target stopped advancing drift, because a `codex` outage on such a
+# target would then advance NOTHING and the loop would burn a leader turn an hour
+# forever. Separating them also lets the PAUSE file say which of the two
+# happened, which is the first thing a human needs to know.
+MAX_VERIFIER_FAILS="${QF_TICK_MAX_VERIFIER_FAILS:-3}"
 # How much of the previous tick's rejection is quoted back to the leader. Small
 # on purpose: it is one verdict's reason, not a transcript, and it competes for
 # the leader's attention with the numbers it is supposed to be reading.
@@ -117,8 +126,8 @@ cd "$QF_RESEARCH" || die "no workspace at $QF_RESEARCH (cwd would be inherited,
 # leader ran with NO queue excerpt and a notice claiming it had been given the
 # "first bogus bytes". And on GNU `head`, `-c -1` means "all but the last byte",
 # so a negative value silently REMOVED the cap it was setting.
-for _knob in MAX_RUNS MAX_TICKS MAX_EXTRACTS MAX_DISAGREE MAX_QUEUE_BYTES \
-              MAX_FEEDBACK_BYTES COPILOT_TRIES COPILOT_BACKOFF; do
+for _knob in MAX_RUNS MAX_TICKS MAX_EXTRACTS MAX_DISAGREE MAX_VERIFIER_FAILS \
+              MAX_QUEUE_BYTES MAX_FEEDBACK_BYTES COPILOT_TRIES COPILOT_BACKOFF; do
   _value="${!_knob}"
   case "$_value" in
     ''|*[!0-9]*)
@@ -135,6 +144,179 @@ unset _knob _value
 [ "$COPILOT_TRIES" -gt 0 ] \
   || die "COPILOT_TRIES must be at least 1: zero would skip verification
   entirely and publish whatever the leader wrote."
+
+# --------------------------------------------------------------------------
+# THE KNOBS THIS TICK IS ACTUALLY USING, AGAINST WHAT THE UNIT DECLARES.
+#
+# THE BLIND SPOT THIS CLOSES, AND IT IS AN ORDERING FACT. `ExecStart=/bin/bash
+# -lc` is load-bearing (the proxy variables live in `~/.profile` and nftables
+# refuses without them), so the login profile is read AFTER systemd has already
+# set the unit's environment -- and a stale `export QF_TICK_MAX_DISAGREE=5`
+# there therefore WINS at execution time. Every check that compares systemd's
+# CONFIGURATION -- `unit_matches` on the unit file, `env_matches` on the
+# effective unit environment -- reports clean while the loop runs on 5. A
+# drop-in doing the same thing ran unreviewed for weeks and was found only while
+# investigating the 2026-09-04 pause.
+#
+# THE TICK IS THE ONLY PLACE THE ACTUAL VALUES EXIST, and it needs no privilege
+# to ask what they were supposed to be. The delta between systemd's configured
+# value and this process's own environment IS the injected override, with no
+# dot-file parsing at all -- so it also sees an override this box's login
+# profile makes invisible to a textual scan (`eval`, a command substitution,
+# `$BASH_ENV`, a file reachable only through a path a running shell resolves).
+# The sibling scan in `phase2-setup.sh` runs at DEPLOY time and says so; this
+# runs hourly, which is the interval `~research` is writable over.
+#
+# A REPORT, NOT A REFUSAL, exactly as `env_matches`: a forgotten override must
+# not block the deploy that ships its fix, and a tick that refuses to run is a
+# worse outcome than one that runs loudly with a knob it has told you about.
+#
+# VALUES FOR DECLARED KEYS, NAMES ONLY FOR THE REST -- the same policy, for the
+# same reason. A key the unit declares is a reviewed threshold and printing both
+# sides is the entire point ("3 vs 5"); an undeclared key's value is by
+# definition unreviewed, could be anything including a credential, and this
+# lands in a journal, a systemd log and a GitHub issue.
+#
+# QF_* ONLY, in and out. Nothing else is read, compared or printed -- notably
+# not the dispatcher's QFD_* family, whose values include a database URL.
+#
+# UNKNOWN IS NOT CLEAN. No `systemctl`, a call that fails, a unit that is not
+# loaded on this host: each is a question nobody answered, and reporting those
+# as a match is the exact failure mode being fixed. `LoadState` is asked for in
+# the SAME call because `Environment=` alone cannot tell "declares nothing" from
+# "no such unit", and the second reads as "every knob is unexpected".
+#
+# ONE `systemctl` CALL PER TICK, parsed once. This is on the hourly path.
+env_selfcheck() {  # env_selfcheck -- prints report lines; 1 = not clean/unknown
+  # THE UNIT NAME IS A CONSTANT, not a knob: a `QF_*` variable naming the unit
+  # would itself land in the comparison below, and an override of the thing
+  # being compared against is not a check.
+  local unit=qf-tick.service
+  local out rc=0 line loadstate="" envline="" seen_env=0 tok key val drift=0
+  local -a toks=()
+  local -A want=() live=()
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf 'UNVERIFIED (no `systemctl` on PATH, so what %s declares is UNKNOWN, not clean)\n' \
+      "$unit"
+    return 1
+  fi
+  out="$(systemctl show -p LoadState -p Environment "$unit" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'UNVERIFIED (`systemctl show` exited %s: %s -- what %s declares is UNKNOWN, not clean)\n' \
+      "$rc" "$(printf '%s' "$out" | tr '\n' ' ' | head -c 160)" "$unit"
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      LoadState=*)   loadstate="${line#LoadState=}" ;;
+      Environment=*) envline="${line#Environment=}"; seen_env=1 ;;
+    esac
+  done <<<"$out"
+  if [ "$loadstate" != loaded ]; then
+    printf 'UNVERIFIED (%s is LoadState=%s on this host, so what it declares is UNKNOWN, not empty)\n' \
+      "$unit" "${loadstate:-unreadable}"
+    return 1
+  fi
+  if [ "$seen_env" = 0 ]; then
+    printf 'UNVERIFIED (`systemctl show` returned no Environment property for %s, so its declaration is UNKNOWN, not empty)\n' \
+      "$unit"
+    return 1
+  fi
+  # `read -r -a`, NEVER `for tok in $envline`: an unquoted expansion also
+  # PATHNAME-expands, so a value containing `*` would be replaced by whatever
+  # files sit in the cwd -- a comparison whose answer depends on the directory,
+  # printing filenames into a report that is supposed to print no unreviewed
+  # values at all. (`env_matches` records the same trap.)
+  read -r -a toks <<<"$envline"
+  for tok in "${toks[@]}"; do
+    # A DECLARED VALUE THAT IS QUOTED CONTINUES PAST THE SPLIT, so neither half
+    # is comparable. Named as unparseable rather than compared: a report that
+    # says `unit="3` for a value of `3 and a half` sends an operator looking for
+    # a difference where there is none -- a true alarm with a false description.
+    # No unit declares such a value today; `QF_LEADER_FLAGS`/`QF_COPILOT_FLAGS`
+    # are the family that would.
+    case "$tok" in
+      '"'*|*'"'*)
+        printf 'UNPARSEABLE %s (the unit declares a quoted, whitespace-bearing value; read it with `systemctl cat %s`)\n' \
+          "${tok%%=*}" "$unit"
+        drift=1
+        continue ;;
+    esac
+    case "$tok" in QF_*'='*) ;; *) continue ;; esac
+    want["${tok%%=*}"]="${tok#*=}"
+  done
+  # `compgen -e` GIVES NAMES, NOT LINES. Reading `printenv` would split a value
+  # containing a newline across two lines and compare half of it -- the false
+  # description again. Names come from the builtin and each value is read by
+  # indirection, so no value is ever parsed.
+  while IFS= read -r key; do
+    case "$key" in QF_*) live["$key"]="${!key}" ;; esac
+  done < <(compgen -e)
+  for key in "${!want[@]}"; do
+    if [ -z "${live[$key]+x}" ]; then
+      # THE UNIT'S VALUE IS PRINTABLE (declared, therefore reviewed) and the
+      # ABSENCE is the finding: a profile `unset`, or a tick that is not running
+      # under the unit at all -- `install.sh once` and a hand-run reach here too,
+      # and "your environment is not the unit's" is true and worth saying in
+      # both cases.
+      printf 'MISSING %s (the unit declares it as %s; this tick has no such variable)\n' \
+        "$key" "${want[$key]}"
+      drift=1
+      continue
+    fi
+    if [ "${live[$key]}" != "${want[$key]}" ]; then
+      printf 'DRIFT %s unit=%s effective=%s\n' \
+        "$key" "${want[$key]}" "$(printf '%s' "${live[$key]}" | tr '\n' ' ')"
+      drift=1
+    fi
+  done
+  for key in "${!live[@]}"; do
+    [ -z "${want[$key]+x}" ] || continue
+    # THE NAME ONLY. See the header: unreviewed value, and this text reaches a
+    # GitHub issue.
+    printf 'UNEXPECTED %s (set in the environment this tick is running with, absent from %s)\n' \
+      "$key" "$unit"
+    drift=1
+  done
+  return "$drift"
+}
+
+# CAPTURED, NOT JUST LOGGED. `ENV_NOTE` is empty when the check is clean and is
+# quoted into the escalation -- and therefore into the pause issue -- when it is
+# not; see the escalation writer for why that fence is the only seam that
+# reaches a human who is not reading the journal.
+ENV_NOTE=""
+if ! ENV_NOTE="$(env_selfcheck)"; then
+  say "WARNING the knobs this tick is using were not confirmed against"
+  say "  qf-tick.service. systemd sets the unit's environment and then"
+  say "  \`ExecStart=/bin/bash -lc\` reads ~/.profile ON TOP of it, so a stale"
+  say "  \`export QF_TICK_MAX_DISAGREE=5\` there wins here while every check of"
+  say "  systemd's CONFIGURATION reports clean. What differs, or could not be"
+  say "  asked:"
+  while IFS= read -r _env_line; do
+    [ -z "$_env_line" ] || say "    $_env_line"
+  done <<<"$ENV_NOTE"
+  unset _env_line
+  say "  Reported, not enforced: a forgotten override must not block the deploy"
+  say "  that ships its fix, and a tick that refuses to run is worse."
+fi
+
+# THE THREE STATE FILENAMES, SHARED WITH `pause-issue.sh`. Not restated in both
+# files: `pause-issue.sh check` zeroes these three and reads them back before it
+# removes PAUSE, so a rename on either side would make that read-back
+# SELF-CONFIRMING -- it verifies the value it just wrote to a path nothing else
+# reads, PAUSE goes away, and the real counter is still at its threshold. See
+# state-names.sh. A missing file is a STOP: guessing these names is the failure
+# the shared file exists to remove.
+# shellcheck source=state-names.sh
+[ -r "$HERE/state-names.sh" ] \
+  || die "$HERE/state-names.sh is missing or unreadable. Refusing to run: it
+  names the counter files that are this loop's brakes, and \`pause-issue.sh\`
+  zeroes those same names on a release. Reinstall the research-loop directory."
+. "$HERE/state-names.sh"
+DISAGREE_FILE="$STATE/$QF_STATE_DISAGREE"
+VERIFIER_FILE="$STATE/$QF_STATE_VERIFIER"
+TARGET_FILE="$STATE/$QF_STATE_TARGET"
 
 # THE AGENT CLIs AND THE PROXY, before anything looks for them. Sourced here --
 # the single entry point -- so the timer, `install.sh once` and a hand-run tick
@@ -157,11 +339,110 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# CTX IS CREATED HERE, ABOVE THE PAUSE CHECK, because a pause that a human just
+# released hands the loop a directive and the directive needs somewhere to live
+# (design §4.3). The `trap` already covers every early-exit path below, so
+# moving it up costs nothing and leaks nothing.
+CTX="$(mktemp -d "$STATE/ctx.XXXXXX")" || die "cannot make a context directory"
+trap 'rm -rf "$CTX"' EXIT
+
+# THE PAUSE CHECK IS NOW A QUESTION, NOT A FULL STOP -- because on 2026-09-04
+# the loop paused itself correctly and nobody found out for two and a half days,
+# and the only release was to shell into the box. `pause-issue.sh check` resumes
+# ONLY when an allowlisted human closed the issue this PAUSE names, and leaves
+# the brake in place for every other answer -- an open issue, a stranger's
+# close, a repo mismatch, every API error, every answer that does not parse.
+#
+# ITS OUTPUT IS NOT SWALLOWED: whether it resumed or why it refused is the only
+# diagnostic an operator gets, and the tick log is where they look.
 if [ -e "$QF_RESEARCH/PAUSE" ]; then
-  say "PAUSE exists; stopping"
-  say "  reason: $(head -c 200 "$QF_RESEARCH/PAUSE" 2>/dev/null)"
-  exit 0
+  # A MISSING HELPER IS ITS OWN DIAGNOSIS, NOT JUST ANOTHER REASON TO STAY
+  # PAUSED. Folding "the script is not there" into the else-branch reproduced
+  # the 2026-09-04 failure in a new place: brake on, the documented release path
+  # dead, and the log saying only "PAUSE exists; stopping". A forgotten
+  # `chmod +x` or a half-finished deploy is exactly how that happens, and it is
+  # indistinguishable from a pause nobody has got round to releasing.
+  RESUMED=0
+  if [ ! -x "$HERE/pause-issue.sh" ]; then
+    say "WARNING $HERE/pause-issue.sh is missing or not executable, so this"
+    say "  PAUSE cannot be released by closing its GitHub issue -- the only"
+    say "  remaining release is 'rm $QF_RESEARCH/PAUSE' on the box."
+    say "  Fix with: chmod +x $HERE/pause-issue.sh (or redeploy research-loop/)."
+  elif "$HERE/pause-issue.sh" check "$QF_RESEARCH/PAUSE"; then
+    RESUMED=1
+    say "resumed by an allowlisted close; continuing this tick"
+    # LEADER-ONLY AND CONSUMED ONCE. Copied into CTX now and deleted from the
+    # state directory when it is injected, so a directive from a pause three
+    # weeks ago is never read as an instruction about this tick.
+    #
+    # AND THE COPY IS CHECKED, because this is the one step of the resume that
+    # runs with the brake ALREADY GONE. `pause-issue.sh` persists the directive,
+    # zeroes and reads back all three state files and removes PAUSE last -- in
+    # that order, verified. An unchecked `cp` on the far side of it had two
+    # silent failures on a nearly full filesystem: a PARTIAL copy was injected
+    # into the leader's prompt and the state copy was then deleted, or no copy
+    # arrived at all and the state copy survived unread, because nothing looks
+    # at it once PAUSE is gone. The resume stays safe either way; what is lost
+    # is the release instruction a human deliberately left behind.
+    #
+    # `cmp`, NOT JUST THE EXIT STATUS: half a directive is worse than none --
+    # a truncated sentence is still read as an instruction -- so the
+    # destination has to be IDENTICAL, not merely written. `cmp` missing (it is
+    # `diffutils`, essential on Debian) fails the same way a bad copy does: the
+    # directive is dropped loudly, never injected half-read.
+    #
+    # THE PARTIAL DESTINATION IS REMOVED, which is what keeps the invariant the
+    # injection site relies on: `$CTX/human-directive.md` exists only if it is a
+    # verified-intact copy, so the `rm` of the state copy there still means
+    # "this was consumed" and never "this was lost".
+    if [ -s "$STATE/human-directive.md" ]; then
+      if ! cp "$STATE/human-directive.md" "$CTX/human-directive.md" \
+         || ! cmp -s "$STATE/human-directive.md" "$CTX/human-directive.md"; then
+        rm -f "$CTX/human-directive.md"
+        say "CRITICAL the human directive could not be copied intact into $CTX."
+        say "  The leader is about to run WITHOUT an instruction a human left"
+        say "  on the pause issue. It is kept at $STATE/human-directive.md,"
+        say "  but nothing reads that once PAUSE is gone -- read it by hand and"
+        say "  check the state directory's filesystem for space."
+      fi
+    fi
+  fi
+  # THE STOP IS ONE BRANCH, REACHED BY BOTH REFUSALS. A missing helper diagnoses
+  # itself above and then stops here like any other unhappy answer -- warning
+  # and continuing would be the one outcome worse than either.
+  if [ "$RESUMED" = 0 ]; then
+    say "PAUSE exists; stopping"
+    say "  reason: $(head -c 200 "$QF_RESEARCH/PAUSE" 2>/dev/null)"
+    exit 0
+  fi
 fi
+
+# THE PROMPT FILES ARE THE MECHANISM, so an unreadable one is a STOP rather than
+# a quieter tick. Every one of them fails OPEN when `cat`ed: the surrounding
+# group succeeds, the tick reports nothing unusual, and an agent runs with its
+# instructions missing. The three failures are not equally bad but they are all
+# silent:
+#
+#   tick-prompt.md   -- the leader gets context with no task, no six actions and
+#                       no output template.
+#   verify-prompt.md -- the copilot is handed an entry and the evidence with no
+#                       instruction to check one against the other, and its
+#                       verdict line is what publishes a finding.
+#   retry-prompt.md  -- the worst of the three, because the retry block's OTHER
+#                       half still emits: the leader would be steered onto
+#                       action 1 on one named row with the shrink instruction,
+#                       the closed action list and all four bans absent. That is
+#                       the 2026-09-04 rewrite-and-resample with the brake off,
+#                       which is strictly worse than not retrying at all.
+#
+# Checked here, once, before any budget is spent or any agent is paid.
+for _prompt in tick-prompt.md verify-prompt.md retry-prompt.md; do
+  [ -r "$HERE/$_prompt" ] && [ -s "$HERE/$_prompt" ] \
+    || die "$HERE/$_prompt is missing, empty or unreadable. Refusing to run:
+  every prompt file fails OPEN when it is cat'ed, so this would have run an
+  agent with its instructions silently absent."
+done
+unset _prompt
 
 # STATE THAT CANNOT BE READ OR WRITTEN IS A STOP, NOT A ZERO. Both counters used
 # `cat ... || echo 0`, so an unreadable or unwritable state directory silently
@@ -183,6 +464,412 @@ set_counter() {  # set_counter <path> <value> -- fails if it did not persist
   [ "$(cat "$1" 2>/dev/null)" = "$2" ] || return 1
 }
 
+# THE REJECTED TARGET CANNOT USE `counter`. That helper refuses any value
+# containing a non-digit -- correctly, a counter it cannot trust is a stop -- so
+# it fails on every run id. Two shapes are legal here and nothing else: the
+# literal `none`, or ONE canonical EVALUATION id. A probe id is refused because
+# `frontier.py`'s index maps an id to a LIST of rows (one probe can be scored
+# under two contracts), so a probe id does not identify a row, and suppressing a
+# streak on an id retirement cannot bound is unbounded by construction.
+#
+# ANYTHING ELSE IS A *CHANGED* TARGET, not an error that stops the tick: empty,
+# multi-line, malformed and unreadable all fail here, the caller then treats the
+# rejection as a new episode, and the streak advances. Failing towards the pause
+# is the safe direction; failing towards suppression is the 2026-09-04 livelock.
+target() {  # target <path> -- prints `none` or one canonical evaluation id
+  local path="$1" value
+  # NEVER-WRITTEN IS `none`, not a failure: a fresh state directory has no
+  # stored target and that is the normal first tick, not a fault.
+  [ -e "$path" ] || { echo none; return 0; }
+  value="$(cat "$path" 2>/dev/null)" || return 1
+  case "$value" in
+    none) echo none; return 0 ;;
+    evaluate-*) ;;
+    *) return 1 ;;
+  esac
+  # `grep -qx` ON THE WHOLE LINE, and via a pipe so a multi-line file cannot
+  # pass by having one good line: `-x` anchors each line, but the surrounding
+  # `case` has already rejected anything whose FIRST line is not `evaluate-*`,
+  # and a second line makes this a two-line stream that `$(...)` would have
+  # collapsed on output. So the count is checked too.
+  printf '%s' "$value" | grep -qxE 'evaluate-[0-9A-Za-z]+-[0-9a-f]+-[0-9]+' \
+    || return 1
+  [ "$(printf '%s' "$value" | wc -l)" = 0 ] || return 1
+  echo "$value"
+}
+
+set_target() {  # set_target <path> <value> -- persists, or fails
+  # WRITTEN THEN VERIFIED, the same contract as `set_counter`: a target that
+  # silently did not persist would make the next rejection of the same run look
+  # like a new episode, which merely advances the streak -- but the reverse (a
+  # stale value surviving a failed write) would suppress one it must not.
+  # BRACED, because `>"$1.tmp" 2>/dev/null` does NOT silence a failure to OPEN
+  # `$1.tmp`: redirections are applied left to right, so the shell has already
+  # printed `Permission denied` by the time stderr is pointed away.
+  { printf '%s\n' "$2" >"$1.tmp"; } 2>/dev/null || return 1
+  mv "$1.tmp" "$1" 2>/dev/null || { rm -f "$1.tmp" 2>/dev/null; return 1; }
+  [ "$(cat "$1" 2>/dev/null)" = "$2" ] || return 1
+}
+
+# THE ENTRY'S DECLARED TARGET, resolved by `frontier.py` ITSELF.
+#
+# NOT A LOCAL `sed`, and this is a correctness requirement rather than reuse for
+# its own sake. `frontier.py:target_of` collects EVERY `**Target run:**` match
+# and returns nothing when they disagree, because an escalation quoting a
+# previous entry's target line inside an `Evidence:` fence has two matches and
+# resolving by position is exactly the failure the declared field exists to
+# prevent. A local first-match `sed` would disagree with it in that case: the
+# frontier would count the rejection against NO run (so retirement never fires)
+# while this script suppressed the drift streak for it -- suppression with
+# nothing bounding it, which is the 2026-09-04 livelock with the brake off. The
+# two must never disagree, so there is one implementation.
+#
+# LINE ENDINGS ARE NORMALIZED first, as `frontier.py:_committed_blobs` does for
+# committed files: a `\r\n`-bodied entry otherwise captures `<id>\r` and matches
+# nothing, silently reading as `none`.
+#
+# ANY FAILURE IS `none`, which increments. A leader whose entry cannot be parsed
+# gets no suppression.
+entry_target() {  # entry_target <entry file> -- `none` or one evaluation id
+  local out
+  out="$(python3 - "$HERE" "$1" <<'PYTGT'
+import sys
+try:
+    sys.path.insert(0, sys.argv[1])
+    import frontier
+    with open(sys.argv[2], encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    print(frontier.target_of(text.replace("\r\n", "\n").replace("\r", "\n"))
+          or "none")
+except Exception as exc:
+    # `none` IS THE SAFE ANSWER BUT A SILENT ONE. If `frontier.py`'s import
+    # chain breaks -- it reaches `prereg` and `experiment` under `host/` -- every
+    # rejection would read as `none`, suppression would be off, and three ticks
+    # later the loop would pause reporting `consecutive-disagreements at 3`:
+    # the 2026-09-04 misdiagnosis reproduced exactly. Stderr is not captured at
+    # the call site, so this lands in the tick log.
+    print(f"WARNING entry_target could not resolve a target: {exc!r}",
+          file=sys.stderr)
+    print("none")
+PYTGT
+)" || out=none
+  case "$out" in
+    evaluate-*) printf '%s\n' "$out" ;;
+    *) echo none ;;
+  esac
+}
+
+# WHAT THE FRONTIER SAYS ABOUT ONE ID: recorded | unrecorded | retired |
+# ambiguous | absent. The last two exist as their own answers rather than being
+# folded into `unrecorded`, because a target that does not resolve to EXACTLY
+# ONE row is one retirement cannot reach -- see `suppressible`.
+handling_of() {  # handling_of <frontier.json> <run id>
+  python3 - "$1" "$2" <<'PYHDL'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        report = json.load(fh)
+except Exception as exc:
+    # UNREADABLE RESOLVES NOTHING. `absent` is not suppressible, so a reporting
+    # glitch advances the streak instead of silently suppressing it -- but it is
+    # NOT the same fact as "that id is off the scoreboard", and the log line the
+    # caller prints cannot tell them apart. So the difference is said here.
+    # The predicate answer stays `absent`: failing towards the pause is right.
+    print(f"WARNING handling_of could not read {sys.argv[1]}: {exc!r}",
+          file=sys.stderr)
+    print("absent")
+    raise SystemExit(0)
+rid = sys.argv[2]
+hits = [r for s in (report.get("series") or []) for r in (s.get("rows") or [])
+        if r.get("evaluation") == rid]
+print("absent" if not hits else
+      "ambiguous" if len(hits) > 1 else
+      hits[0].get("handling", "unrecorded"))
+PYHDL
+}
+
+# THE LOAD-BEARING PREDICATE (design §2.1). Suppressing the drift streak for a
+# repeated target is safe ONLY because RETIREMENT bounds it, and retirement only
+# counts escalation episodes against a resolved, UNRECORDED row. Suppressing on
+# anything else -- ambiguous, absent (stale), already recorded, already retired
+# -- is unbounded, and rebuilds the exact 2026-09-04 livelock with the drift
+# brake switched off. So the whole predicate is one comparison, and every other
+# state behaves exactly like `none`: it increments and stores nothing.
+#
+# IT TAKES THE HANDLING, NOT THE FRONTIER. An earlier signature accepted the
+# JSON path and never read it, which made every call site read as though it
+# resolved the id here -- it does not, `handling_of` does, exactly once.
+suppressible() {  # suppressible <handling>
+  [ "$1" = unrecorded ]
+}
+
+# THE RETRY DECISION, and it is made HERE -- from the stored target and the
+# frontier THIS tick built -- rather than from the entry, which does not exist
+# yet. Design §3.1: the shrink instruction is worthless unless the leader reads
+# it before it plans the entry, so the retry cannot be derived from PENDING.md.
+#
+# THE SAME PREDICATE THE STREAK USED (design §2.1), deliberately. If the two
+# ever disagreed the tick could suppress a drift streak for a target it then
+# refuses to instruct the leader to retry: the brake would be off and the leader
+# would get no steer either, which is 2026-09-04 with nothing left to stop it.
+#
+# A STORED TARGET THAT IS NO LONGER SUPPRESSIBLE IS CLEARED HERE -- recorded by
+# another route, retired, gone ambiguous, or off the scoreboard entirely -- so
+# the next rejection is counted as a NEW episode rather than suppressed against
+# a target nobody was ever told to retry.
+# THE NAME SAYS `take`, because this function MUTATES: on two of its three
+# paths it writes `none` into the target file. An earlier name (`retry_target`)
+# read as a pure query at a call site that is a command substitution inside the
+# context assembly, which is the last place a reader expects state to change.
+take_retry_target() {  # take_retry_target <frontier.json> <target file> -- prints id, or fails
+  local json="$1" file="$2" stored state
+  # A MALFORMED STORED VALUE IS CLEARED TOO, not just refused: leaving it there
+  # would make every later tick re-derive the same failure, and `target` already
+  # treats unreadable/empty/multi-line as "not a target".
+  #
+  # AND IT SAYS SO. This was the one silent branch: an operator whose target
+  # file had been corrupted saw the retry simply not happen, while the sibling
+  # path below named the state that disqualified it.
+  if ! stored="$(target "$file")"; then
+    # `|| true` HERE FOR THE SAME REASON AS BELOW, and with the same owner: the
+    # verdict path rewrites this file on every branch except a verifier outage
+    # and warns when it cannot. THE MESSAGE SAYS `cleared` UNCONDITIONALLY --
+    # both here and below -- so a `set_target` that failed prints a claim that
+    # is false for the length of one tick; the verdict path's own
+    # "could not clear the last rejected target" warning is the correction, and
+    # it is the line an operator should believe.
+    set_target "$file" none || true
+    say "the stored retry target is unreadable or malformed; cleared" >&2
+    return 1
+  fi
+  [ "$stored" != none ] || return 1
+  state="$(handling_of "$json" "$stored")"
+  # AN EMPTY ANSWER IS `absent`, which is not suppressible. `handling_of` shells
+  # out to `python3`; if that vanished, `$state` would be empty, the refusal
+  # line would render "is ; cleared", and the log would name no state at all.
+  [ -n "$state" ] || state=absent
+  # `suppressible <handling>` TAKES THE RESOLVED STATE, not the path.
+  # `handling_of` is the one thing that resolves an id, and it did so above --
+  # exactly once, so the two answers cannot drift apart.
+  if suppressible "$state"; then
+    # STDERR, NOT STDOUT, FOR EVERY DIAGNOSTIC IN THIS FUNCTION. The call site
+    # is a command substitution -- it reads the id off stdout -- and it sits
+    # inside the group redirected into `context.md`. A `say` on stdout would
+    # therefore be appended to the id on success, injected into the leader's
+    # context, and absent from the tick log. All three at once.
+    say "this tick is a RETRY of $stored (still unrecorded)" >&2
+    printf '%s\n' "$stored"
+    return 0
+  fi
+  # `|| true`, AND THE OWNER OF A FAILED CLEAR IS THE VERDICT PATH. A clear that
+  # did not persist leaves a stale target that the streak block then compares
+  # against this tick's entry -- and that block rewrites the file on every
+  # branch except a verifier outage, warning when it cannot ("could not clear
+  # the last rejected target"). So a failure here costs at most one tick's retry
+  # instruction, is re-attempted within the same tick, and is warned about
+  # there; dying here would instead lose a leader turn to a state-directory
+  # glitch that the tick can still recover from.
+  set_target "$file" none || true
+  say "the stored retry target $stored is $state; cleared" >&2
+  return 1
+}
+
+# THE TARGET ROW AND ITS COMPARATOR, PASTED -- because the leader NEVER
+# RECEIVES `frontier.json`.
+#
+# Its prompt is `tick-prompt.md` + `context.md`, and `context.md` embeds the
+# MARKDOWN render; the JSON goes to the copilot alone as its evidence. So a
+# template telling the leader to take `claim`, `bar`, `direction`, `tol`, `vs`
+# and `config_digest` "from the frontier JSON" mandated fields it could not
+# fill: the markdown's row table carries none of those, and its only figure is
+# a `%.4g` cell for the WINNING config. Both ways out were rejectable -- a blank
+# mandated field, or a number recited from the previous entry, which is the
+# "number you remember is a number you invented" rejection the retry exists to
+# stop.
+#
+# TWO ROWS, BECAUSE A SIGNED DELTA HAS TWO OPERANDS. Ban 1 demands both operands
+# and the delta between them, and the second operand is the PRE-REGISTERED `vs`
+# ROW'S metric -- which the target row carries only as an id, not as a figure.
+# Pasting the target alone reproduced the same defect one layer down: the header
+# says every field is sourced from the paste, and ban 1 then asked for a number
+# that was not in it.
+#
+# SAME SERIES ONLY, which is `judge_claim`'s rule and not a convenience: a
+# reference from another extract, baseline or contract is a different
+# population, and a delta across that boundary is the cross-series comparison
+# `frontier.py` exists to refuse.
+#
+# A MISSING COMPARATOR IS A LEGITIMATE STATE, not a failure of the retry: a
+# reference run has no `vs` by declaration, and a `vs` may name a run this
+# series has not scored. So the block says WHICH, and stops there -- in that
+# case `retry-prompt.md` requires NO DELTA AT ALL rather than a second operand
+# fetched from somewhere, so the note must not send the leader looking for one.
+# See the note itself for why an instruction inside data is the wrong place for
+# one.
+#
+# ONE ROW EACH, NOT THE REPORT, and at FULL PRECISION: ban 1 asks for a signed
+# delta at four significant figures (0.0817 vs 0.0818 was not "unchanged"),
+# which no `%.4g` cell can support.
+#
+# WITH THE SERIES' `holdout` AT THE TOP LEVEL. `holdout` is a SERIES field, not
+# a row field, so pasting rows alone would have left the mandated `Confidence`
+# field unsatisfiable in exactly the same way -- and a row carries no `extract`,
+# so the leader could not even find its own series heading in the markdown to
+# read the window off. It sits above both rows because it is the one window both
+# were scored on.
+#
+# ONE FIELD HERE IS NOT IMMUTABLE: `claim`. It is derived from the comparator's
+# metrics, so a comparator scored during the leader's turn can flip it
+# (`kept` -> `broken`) between this pre-leader snapshot and the refreshed JSON
+# the copilot is judged against. Low probability -- the comparator is by
+# definition an earlier run -- and not worth engineering around, but the
+# template says to cite `claim` verbatim, so the skew is recorded here.
+#
+# PASTING RATHER THAN WIDENING THE MARKDOWN: every ordinary tick would pay for a
+# retry-only need. And rather than naming a command: that adds a tool call the
+# leader can get wrong for data the tick already holds. Pasting is also the only
+# option where the copilot can check every figure, because the same values reach
+# it in the JSON it receives.
+retry_row() {  # retry_row <frontier.json> <run id> -- pretty JSON, or fails
+  python3 - "$1" "$2" <<'PYROW'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        report = json.load(fh)
+except Exception as exc:
+    print(f"WARNING retry_row could not read {sys.argv[1]}: {exc!r}",
+          file=sys.stderr)
+    raise SystemExit(1)
+# A NON-DICT TOP LEVEL WARNS INSTEAD OF TRACEBACKING. Unreachable while
+# `frontier.py --json` is the only writer, and the same shape `handling_of`
+# assumes -- but a traceback here is indistinguishable in the log from the
+# read failure above, and it costs one line to say which happened.
+if not isinstance(report, dict):
+    print(f"WARNING retry_row got {type(report).__name__}, not an object",
+          file=sys.stderr)
+    raise SystemExit(1)
+rid = sys.argv[2]
+hits = []
+for series in report.get("series") or []:
+    rows = series.get("rows") or []
+    for row in rows:
+        if row.get("evaluation") == rid:
+            hits.append((series, row, rows))
+# EXACTLY ONE, checked again here even though `suppressible` already rejected
+# `ambiguous`: this function is what produces the numbers a claim rests on, and
+# silently pasting the first of two rows would put a figure from the wrong
+# contract into a mandated field.
+if len(hits) != 1:
+    print(f"WARNING retry_row resolved {len(hits)} rows for {rid}",
+          file=sys.stderr)
+    raise SystemExit(1)
+series, row, rows = hits[0]
+# THE COMPARATOR IS MATCHED ON EITHER ID, because `vs` is a RUN id and
+# `judge_claim` resolves it through an index keyed by BOTH the evaluation and
+# the probe -- a `vs` naming the probe must resolve to the same row here as it
+# does there, or the pasted delta would disagree with the pasted `claim`.
+vs = row.get("vs") or ""
+peers = [r for r in rows if r is not row
+         and vs in (r.get("evaluation"), r.get("probe"))]
+out = {"holdout": series.get("holdout"), "target": row, "comparator": None}
+# THE NOTE STATES A FACT AND PRESCRIBES NOTHING. Both notes used to end
+# "obtain <it> with a command and paste it under `Evidence:`", which is the
+# exact opposite of what `retry-prompt.md` requires: a null comparator means NO
+# DELTA, because a reference row has no `vs` by construction and a `vs` that
+# resolves to zero rows in THIS series may well be scored in another one -- so
+# fetching its figure builds the cross-series comparison `verify-prompt.md`
+# calls the single most consequential error possible here. The leader was
+# handed both instructions in one prompt, and the template only won because it
+# names the note's clause and overrides it verbatim -- which breaks the moment
+# either side is reworded. This is DATA about the paste; the prompt owns what
+# the leader should do about it.
+#
+# EACH REASON IS LOAD-BEARING AND UNCHANGED. `retry-prompt.md` quotes all three
+# (no `vs`; `vs` resolves to 0 rows; a count above 1) to explain why no delta
+# was ever pre-registered, so the reason text is not the part to shorten.
+if not vs:
+    out["comparator_note"] = (
+        "this row pre-registered no `vs`, so there is no comparator row and no"
+        " delta is possible")
+elif len(peers) != 1:
+    out["comparator_note"] = (
+        f"`vs` is {vs}, which resolves to {len(peers)} rows in this series, so"
+        " no comparator row is pasted")
+else:
+    out["comparator"] = peers[0]
+# `sort_keys=True` ORDERS THE KEYS OF EACH OBJECT, which makes the paste stable
+# across ticks; the REPORT is not reordered and neither row is mutated -- the
+# rows are the ones the copilot holds, wrapped, not rewritten.
+print(json.dumps(out, indent=2, sort_keys=True))
+PYROW
+}
+
+# A BRAKE THAT COULD NOT BE WRITTEN MAKES THE TICK A FAILURE. Set by either
+# `pause_now` caller, read by `finish` far below. Both callers used to IGNORE
+# `pause_now`'s status and carry on through publish to a ZERO exit, so
+# `OnFailure=qf-tick-failure.service` -- the one thing that can tell a human
+# about a `die` or a brake that did not take (design §4b) -- never fired. The
+# tick logged CRITICAL, published normally, exited 0, and repeated hourly with
+# no brake and no issue: the 2026-09-04 silence exactly, by the route the alarm
+# was built to cover.
+PAUSE_UNWRITABLE=0
+
+# THE ONLY ORDINARY WAY OUT BELOW THE ESCALATION, so the flag above cannot be
+# lost on one exit path and honoured on another.
+#
+# THE PUBLISH RUNS FIRST AND THIS IS NOT A `die`. By the time a brake fails the
+# escalation file is already written, and `publish` is what commits and pushes
+# it; aborting before that would lose the record AS WELL as the brake, which is
+# two harms where there was one. So the tick finishes its work and only then
+# reports the failure through its exit status.
+finish() {  # finish -- exit 0, or non-zero if a brake could not be written
+  [ "$PAUSE_UNWRITABLE" = 1 ] || exit 0
+  say "EXITING NON-ZERO: the brake could not be written, so this tick is a"
+  say "  FAILURE and not a normal stop. Nothing local is holding the loop back"
+  say "  and the next timer tick will run as though nothing happened, so"
+  say "  OnFailure=qf-tick-failure.service is the only thing left that can"
+  say "  tell a human. The escalation above was published first, deliberately."
+  exit 1
+}
+
+# WRITING THE BRAKE, AND RAISING THE ALARM. Two callers, one behaviour, and the
+# brake name reaches the PAUSE file so a human can tell an outage from drift
+# without opening anything. The `stamp:` line is machine-read: §4 binds a pause
+# to the issue that authorizes releasing it.
+pause_now() {  # pause_now <brake> <n> <escalation path> <stamp>
+  local brake="$1" n="$2" recorded="$3" stamp="$4"
+  # THE BRAKE NAME IS VERBATIM AND THE COUNT IS BESIDE IT. Both matter: a human
+  # greps for `consecutive-verifier-failures` to tell an outage from drift, and
+  # §4.1 gives the issue title the same `<brake> at <n>` shape so the two agree.
+  # Not "<n> consecutive <brake>", which read "3 consecutive
+  # consecutive-disagreements".
+  if ! printf 'auto-paused %s: %s at %s\nsee %s\nstamp: %s\n' \
+       "$stamp" "$brake" "$n" "$recorded" "$stamp" >"$QF_RESEARCH/PAUSE"; then
+    # The PAUSE file IS the brake. If it cannot be written, say so as loudly as
+    # possible rather than reporting a pause that did not happen.
+    #
+    # AND THE `return 1` IS LOAD-BEARING, not decoration: both callers set
+    # `PAUSE_UNWRITABLE` from it and `finish` turns that into a non-zero exit.
+    # A log line is not an alarm -- for two and a half days in 2026-09-04
+    # nothing read the log.
+    say "CRITICAL cannot write $QF_RESEARCH/PAUSE. The loop is NOT paused."
+    say "  Disable the timer by hand: sudo systemctl disable --now qf-tick.timer"
+    return 1
+  fi
+  say "PAUSED: $brake at $n"
+  # THE ALARM IS NOT THE BRAKE, and a failure here must never undo the line
+  # above. It depends on a token, a network and GitHub -- three things that fail
+  # independently of the reason this loop is pausing, and one of which
+  # (`QF_PAUSE_ISSUE_REPO` unset) is the normal state of a box that has not been
+  # configured for it. Losing the pause because the notification failed would be
+  # strictly worse than a silent pause.
+  # ITS STDERR IS NOT SWALLOWED: whatever it says about why the alarm failed is
+  # the only diagnostic there will be, and the tick's own log is where an
+  # operator looks.
+  "$HERE/pause-issue.sh" open "$QF_RESEARCH/PAUSE" "$brake" "$n" "$recorded" \
+    || say "WARNING could not file the pause issue; the loop is still paused"
+}
+
 TODAY="$(date -u +%Y-%m-%d)"
 TICKS_FILE="$STATE/ticks-$TODAY"
 TICKS="$(counter "$TICKS_FILE")" \
@@ -199,11 +886,10 @@ set_counter "$TICKS_FILE" "$((TICKS + 1))" \
 
 # --------------------------------------------------------------------------
 # Context. Bounded on purpose: a leader handed the whole history re-derives
-# conclusions instead of acting on them.
+# conclusions instead of acting on them. (CTX itself is created much earlier --
+# see the PAUSE check, which needs somewhere to put a released pause's
+# directive.)
 # --------------------------------------------------------------------------
-CTX="$(mktemp -d "$STATE/ctx.XXXXXX")" || die "cannot make a context directory"
-trap 'rm -rf "$CTX"' EXIT
-
 say "reading scored history"
 if ! "$TRUSTED/results.sh" --json >"$CTX/results.json" 2>"$CTX/results.err"; then
   die "results.sh failed: $(head -c 300 "$CTX/results.err")"
@@ -492,6 +1178,73 @@ fi
     cat "$CTX/prev-escalation.md"
     echo
   fi
+  # THE HUMAN'S RELEASE COMMENTS (design §4.3), leader-only and labelled
+  # non-evidence on exactly the same contract as the escalation feedback above:
+  # a figure typed into a GitHub comment is still not a source, and the copilot
+  # never sees this block, so it cannot be cited past the gate.
+  #
+  # CONSUMED ONCE. Deleted from the state directory as it is injected -- a
+  # directive from a pause three weeks ago is not an instruction about this
+  # tick, and a `check` that resumed nothing must not re-serve the last one.
+  #
+  # NOT RE-CAPPED HERE. `pause-issue.sh` already caps the COMMENT TEXT at
+  # QF_TICK_MAX_FEEDBACK_BYTES, and it is the only layer that knows which bytes
+  # are the untrusted prose and which are the rules about it. A second blind
+  # `head -c` at this size cut the tail off the whole file instead -- removing
+  # the citation ban precisely when the most human prose had arrived. One cap,
+  # in the layer that can aim it.
+  if [ -s "$CTX/human-directive.md" ]; then
+    cat "$CTX/human-directive.md"
+    echo
+    rm -f "$STATE/human-directive.md"
+  fi
+  # RETRY MODE, AND THE ACTION IS NOT OPEN IN IT (design §3). A retry must
+  # SHRINK the entry, not rewrite it: on 2026-09-04 round 2 fixed the defect it
+  # was told about and introduced a new one, because rewriting resamples the
+  # defect surface and every added hedge is another sentence that can be wrong.
+  #
+  # PLACED AFTER THE REJECTION FEEDBACK, which is the objection this shrink
+  # answers, and BEFORE the briefing, so both are read before the entry is
+  # planned. And the tick NAMES the target: deriving the retry from whatever
+  # the leader happens to pick cannot work when the instruction has to be read
+  # before the choice is made.
+  #
+  # AND IT MUTATES STATE: `take_retry_target` clears a stored target that is no
+  # longer suppressible, here, during context assembly. That is the point -- the
+  # decision cannot be derived from an entry that does not exist yet -- but it
+  # is why the name says `take`.
+  #
+  # FAIL CLOSED, ALL OR NOTHING. Half a retry block is worse than none: the
+  # target line alone steers the leader onto action 1 on one named row with the
+  # shrink instruction and the four bans absent, and the template without the
+  # pasted row mandates fields whose figures the leader cannot see. Either way
+  # it rewrites rather than shrinks, which is the 2026-09-04 failure. So the row
+  # is extracted BEFORE anything is emitted, and a failure degrades to an
+  # ORDINARY tick -- the stored target stays, so the streak stays suppressed and
+  # retirement still bounds it; one tick's instruction is lost, not the brake.
+  if RETRY_ID="$(take_retry_target "$CTX/frontier.json" "$TARGET_FILE")" \
+     && retry_row "$CTX/frontier.json" "$RETRY_ID" >"$CTX/retry-row.json"; then
+    cat "$HERE/retry-prompt.md"
+    echo
+    echo "The target of this retry is \`$RETRY_ID\`."
+    echo
+    echo "Its row from the frontier JSON at full precision, under \`target\`,"
+    echo "with the pre-registered comparator row under \`comparator\` and the"
+    echo "series' \`holdout\` window above both. This is the source for every"
+    echo "field of the template above; you have not been given the JSON it came"
+    echo "from. A null \`comparator\` carries a \`comparator_note\` saying why."
+    echo
+    echo '```json'
+    cat "$CTX/retry-row.json"
+    echo '```'
+    echo
+  elif [ -n "${RETRY_ID:-}" ]; then
+    # SAID LOUDLY, because the tick has just decided a retry was due and then
+    # not asked for one: an operator seeing repeated rejections of one run needs
+    # to know the steer never reached the leader.
+    say "WARNING could not paste the row for retry target $RETRY_ID; this tick" >&2
+    say "  runs as an ORDINARY tick rather than emitting half a retry block" >&2
+  fi
   # ABSOLUTE PATHS, SUPPLIED. The leader runs as `research`, whose PATH does not
   # carry the trusted host directory, and a leader that guesses `./experiment.py`
   # spends its one action discovering that. The workspace is named for the same
@@ -656,6 +1409,13 @@ if ! command -v codex >/dev/null 2>&1; then
   say "  what this step exists to prevent. Escalating instead."
   say "  (If \`bash -ic 'command -v codex'\` finds it, see agent-env.sh.)"
   VERDICT="DISAGREE"
+  # AN OUTAGE, NOT A REJECTION, and the distinction is not cosmetic in two
+  # places. A copilot that is not installed judged nothing, so counting it as
+  # drift accuses the leader of a claim nobody read -- and the escalation's
+  # `Escalation kind:` line is machine-read by `frontier.py`'s retirement
+  # counting, so labelling this a rejection would retire the run after two
+  # `codex` outages, which is precisely the harm retirement exists to prevent.
+  VERIFIER_FAILED=1
   REASON="codex is not installed, so the claim could not be verified"
 else
   say "copilot verifying"
@@ -742,31 +1502,104 @@ $(cat "$CODEX_ERR")"
     # to it and re-parsing was wrong twice over: the tail-wins rule then picked a
     # trailing `VERDICT: AGREE` out of the partial output, so a copilot that
     # printed AGREE and then crashed published the entry as verified.
+    #
+    # AND THIS IS THE OTHER HALF OF THE USABLE-VERDICT DEFINITION: verdict text
+    # from a process that exited non-zero is not a verdict. So this advances the
+    # verifier-failure counter and -- the direction that matters -- must not
+    # RESET it, or a copilot crashing after printing a verdict would clear the
+    # infrastructure brake every tick and the outage would never reach the
+    # threshold.
     VERDICT="DISAGREE"
-    # The streak is not advanced for this; see the block after the escalation
+    # The DRIFT streak is not advanced for this (the verifier-failure counter
+    # is, see six lines above); see the block after the escalation
     # is written for why a verifier that never ran is not a leader that drifted.
     VERIFIER_FAILED=1
     REASON="codex exited non-zero; its output is NOT trusted as a verdict:
 $REASON"
   else
-    # ANCHORED to its own line, and the LAST such line wins: a model that reasons
-    # out loud may name both words before committing to one, so the first match
-    # would read the wrong one -- but an unanchored match would also accept
-    # `VERDICT: AGREE` quoted inside a sentence arguing against it.
+    # ANCHORED to its own line, and it must be the LAST NONBLANK LINE of the
+    # reply -- not merely the last line that happens to match.
+    #
+    # THE ANCHORING WAS ALREADY HERE; THE FINALITY WAS NOT. `tail -1` over the
+    # MATCHES read
+    #
+    #     VERDICT: AGREE
+    #     Correction: the central figure is absent; this must not be recorded.
+    #
+    # as a usable AGREE: the entry was PUBLISHED and both counters were reset by
+    # a copilot that retracted itself in the very next sentence. The contract in
+    # design §2.2 is "exit 0 AND a valid anchored FINAL `VERDICT:` line", and
+    # only two of those three words were implemented.
+    #
+    # THE OLD PROTECTION IS PRESERVED, deliberately: a model that reasons out
+    # loud may name BOTH words before committing to one, so the first match
+    # would read the wrong one. The last NONBLANK line still gives that reply
+    # the right answer, while refusing the retracted one above -- and an
+    # unanchored match would in either case accept `VERDICT: AGREE` quoted
+    # inside a sentence arguing against it.
+    #
+    # NONBLANK, NOT LAST: `codex` output routinely ends in blank lines, and
+    # "the last line" would fail every real reply -- three ticks of that pauses
+    # the loop on the verifier brake over a formatting artefact.
+    #
+    # AND THIS IS A REAL BEHAVIOUR CHANGE, in the conservative direction: a
+    # copilot that appends a trailing log line after its verdict now escalates
+    # (as no usable verdict, so the verifier counter -- not the drift streak)
+    # instead of recording. `verify-prompt.md` already instructs it to end with
+    # exactly one line, and publishing an entry whose verifier kept talking is
+    # the failure that is not recoverable.
     VERDICT="$(printf '%s\n' "$CHECK" \
+               | grep -v '^[[:space:]]*$' | tail -1 \
                | grep -oE '^[[:space:]]*VERDICT:[[:space:]]*(AGREE|DISAGREE)[[:space:]]*$' \
-               | tail -1 | grep -oE '(AGREE|DISAGREE)')"
+               | grep -oE '(AGREE|DISAGREE)')"
   fi
-  # NO VERDICT IS A DISAGREEMENT. A copilot that returned prose without a verdict
-  # verified nothing, and defaulting the other way would make the whole step
-  # decorative the first time its output format drifted.
-  [ -n "$VERDICT" ] || { VERDICT="DISAGREE"; REASON="no VERDICT line in the copilot's reply
-$REASON"; }
+  # NO VERDICT IS A DISAGREEMENT -- it still escalates, because nothing may be
+  # recorded unverified and defaulting the other way would make the whole step
+  # decorative the first time the output format drifted.
+  #
+  # BUT IT IS AN INFRASTRUCTURE FAILURE, NOT DRIFT, and this line used to leave
+  # `VERIFIER_FAILED` at 0. A usable verdict is `exit 0 AND a valid anchored
+  # final VERDICT line`; a copilot that returned prose without one verified
+  # nothing, exactly like one that could not start, so it advances the verifier
+  # counter rather than accusing the leader of drifting -- and its escalation is
+  # labelled an outage, so it retires nothing.
+  if [ -z "$VERDICT" ]; then
+    VERDICT="DISAGREE"
+    VERIFIER_FAILED=1
+    REASON="no VERDICT line in the copilot's reply
+$REASON"
+  fi
 fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-DISAGREE_FILE="$STATE/consecutive-disagreements"
+# DISAGREE_FILE / VERIFIER_FILE / TARGET_FILE are set once near the top, from
+# state-names.sh, which `pause-issue.sh` sources too.
 VERIFIER_FAILED="${VERIFIER_FAILED:-0}"
+
+# THE ENTRY'S DECLARED TARGET, and its state in the frontier THIS tick built.
+#
+# THE SAME SNAPSHOT THE COPILOT WAS JUDGED AGAINST, and for the same reason it
+# was refreshed: `frontier2.json` is built AFTER the leader acted, so a run this
+# tick submitted and scored appears there and not in the pre-leader snapshot.
+# Judging the target against the stale one would read every fresh submission as
+# `absent` -- not suppressible -- so the loop would advance the drift brake on
+# exactly the ticks that did the most work.
+#
+# `$EVIDENCE`, NOT A SECOND DERIVATION FROM `[ -s frontier2.json ]`. That test
+# is weaker than the one that produced `$EVIDENCE`: `frontier()` requires BOTH
+# renders to succeed AND the JSON to be non-empty, so a `--json` pass that wrote
+# complete output and then exited non-zero leaves a non-empty file the tick has
+# already declared unusable. Re-deriving would then judge suppression against a
+# snapshot the copilot was deliberately not shown -- two answers to one question.
+FRONTIER_NOW="$EVIDENCE"
+ENTRY_TARGET="$(entry_target "$PENDING")"
+case "$ENTRY_TARGET" in
+  evaluate-*) ENTRY_HANDLING="$(handling_of "$FRONTIER_NOW" "$ENTRY_TARGET")" ;;
+  # `none` AND `absent` ARE THE SAME THING TO EVERY CONSUMER BELOW: neither is
+  # suppressible, both increment, and both store `none`.
+  *) ENTRY_TARGET=none; ENTRY_HANDLING=absent ;;
+esac
+
 if [ "$VERDICT" = "AGREE" ]; then
   mv "$PENDING" "$JOURNAL/$STAMP.md"
   RECORDED="$JOURNAL/$STAMP.md"
@@ -774,6 +1607,14 @@ if [ "$VERDICT" = "AGREE" ]; then
   # conservative (it pauses sooner), while an un-incremented one is not.
   set_counter "$DISAGREE_FILE" 0 \
     || say "note: could not reset the disagreement counter"
+  # A USABLE VERDICT MEANS THE VERIFIER IS UP, whichever way it went.
+  set_counter "$VERIFIER_FILE" 0 \
+    || say "note: could not reset the verifier-failure counter"
+  # CLEARED ON AGREE, which is the part that was missing: resetting only the
+  # NUMBER left a stored target behind, so the next rejection of a DIFFERENT run
+  # could read as a retry of this one and be suppressed.
+  set_target "$TARGET_FILE" none \
+    || say "note: could not clear the last rejected target"
   say "verified; recording $STAMP.md"
 else
   RECORDED="$JOURNAL/escalations/$STAMP.md"
@@ -784,47 +1625,154 @@ else
     echo
     echo "## NOT RECORDED — the copilot did not agree"
     echo
+    # MACHINE-READ BY `frontier.py:escalation_targets`, which counts `rejection`
+    # only. `verifier-failure` must never count toward retirement: two `codex`
+    # outages would otherwise retire a write-up nobody ever judged, which is the
+    # precise harm retirement exists to prevent.
+    if [ "$VERIFIER_FAILED" = 1 ]; then
+      echo "Escalation kind: verifier-failure"
+    else
+      echo "Escalation kind: rejection"
+    fi
+    echo
     echo "This entry is an escalation, not a finding. The claim above was not"
     echo "accepted and must not be cited as a result."
     echo
     echo '```'
     printf '%s\n' "$REASON"
+    # THE KNOB DELTA GOES INSIDE THIS FENCE, and that is not stylistic: this
+    # fence -- the first one after `## NOT RECORDED` -- is exactly what
+    # `pause-issue.sh:issue_body` lifts for its "last three rejections,
+    # verbatim" section, so a line placed OUTSIDE it reaches the journal and
+    # nothing else. "Only in a journal nobody was reading" is the 2026-09-04
+    # failure this whole change exists to end: if the loop is about to pause
+    # with MAX_DISAGREE effectively 5 while the unit says 3, that belongs in
+    # the issue a human opens.
+    #
+    # ATTRIBUTED IN-BAND, because the same block is quoted back to the NEXT
+    # leader as the copilot's reason (see the feedback assembly above). The tick
+    # already authors `REASON` itself on every outage path -- "codex is not
+    # installed", "no VERDICT line in the copilot's reply" -- so tick-authored
+    # text in here is the existing contract, and the marker is what keeps the
+    # provenance honest.
+    #
+    # ONLY WHEN THERE IS SOMETHING TO SAY. Empty on a clean check, which is
+    # every production tick that is not overridden, so this adds nothing to the
+    # ordinary escalation.
+    [ -z "$ENV_NOTE" ] || printf '%s\n' "" \
+      "-- the lines below are tick.sh, not the copilot: this tick's QF_* knobs" \
+      "   were not confirmed against qf-tick.service --" "$ENV_NOTE"
     echo '```'
   } >"$RECORDED"
   rm -f "$PENDING"
-  # IF THE STREAK CANNOT BE COUNTED, PAUSE NOW. An unreadable or unwritable
-  # counter meant every disagreement recorded "1" and the threshold was never
-  # reached, so the one automatic brake on a drifting leader silently did not
-  # exist. Not being able to count to three is a reason to stop, not to continue.
-  #
-  # A CRASHED VERIFIER COUNTS, and that is deliberate even though it means an
-  # infrastructure fault can pause the loop. The retry above absorbs the
-  # transient case, which is the one that kept costing entries; what is left
-  # after three failed attempts is a copilot that is DOWN, and a loop that
-  # cannot verify anything must not keep spending a leader turn an hour --
-  # twelve a day, recording nothing -- because the reason it cannot verify is
-  # the network rather than the research. PAUSE is exactly the right response to
-  # "this cannot work right now"; the escalation says which kind it was.
-  if PREV="$(counter "$DISAGREE_FILE")" && set_counter "$DISAGREE_FILE" \
-       "$((PREV + 1))"; then
-    N=$((PREV + 1))
-  else
-    N="$MAX_DISAGREE"
-    say "WARNING the disagreement counter at $DISAGREE_FILE cannot be"
-    say "  persisted, so the streak cannot be tracked. Pausing now."
-  fi
-  say "NOT verified ($N consecutive); escalated to escalations/$STAMP.md"
-  [ "$VERIFIER_FAILED" = 0 ] \
-    || say "  the copilot did not run: this streak is infrastructure, not drift"
-  if [ "$N" -ge "$MAX_DISAGREE" ]; then
-    if ! printf 'auto-paused %s: %s consecutive unverified claims\nsee %s\n' \
-         "$STAMP" "$N" "$RECORDED" >"$QF_RESEARCH/PAUSE"; then
-      # The PAUSE file IS the brake. If it cannot be written, say so as loudly
-      # as possible rather than reporting a pause that did not happen.
-      say "CRITICAL cannot write $QF_RESEARCH/PAUSE. The loop is NOT paused."
-      say "  Disable the timer by hand: sudo systemctl disable --now qf-tick.timer"
+
+  # IF A STREAK CANNOT BE COUNTED, PAUSE NOW. Both counters used `cat || echo 0`
+  # once, so an unreadable or unwritable state directory silently reset them:
+  # every failure recorded "1" and no threshold was ever reached, so the one
+  # automatic brake on a loop that cannot make progress did not exist. Not being
+  # able to count to three is a reason to stop, not to continue.
+  if [ "$VERIFIER_FAILED" = 1 ]; then
+    # INFRASTRUCTURE. The retry loop above absorbs the transient case, which is
+    # the one that kept costing recordable entries; what is left after
+    # COPILOT_TRIES attempts is a copilot that is DOWN, and a loop that cannot
+    # verify anything must not keep spending a leader turn an hour -- twelve a
+    # day, recording nothing -- because the reason it cannot verify is the
+    # network rather than the research.
+    #
+    # NOTHING IS STORED AS A TARGET, and the stored one is left exactly as it
+    # was. The entry was never judged, so this tick is no evidence at all about
+    # which run the leader is stuck on: storing one would suppress a future
+    # rejection nobody has made yet, and clearing one would forget a genuine
+    # repeat that an outage merely interrupted.
+    if PREV="$(counter "$VERIFIER_FILE")" \
+       && set_counter "$VERIFIER_FILE" "$((PREV + 1))"; then
+      VN=$((PREV + 1))
     else
-      say "PAUSED: $N consecutive unverified claims"
+      VN="$MAX_VERIFIER_FAILS"
+      say "WARNING the verifier-failure counter at $VERIFIER_FILE cannot be"
+      say "  persisted, so the streak cannot be tracked. Pausing now."
+    fi
+    say "no usable verdict ($VN consecutive); escalated to escalations/$STAMP.md"
+    say "  the copilot did not answer: this streak is infrastructure, not drift"
+    if [ "$VN" -ge "$MAX_VERIFIER_FAILS" ]; then
+      # THE STATUS IS ACTED ON, NOT LOGGED. See `finish`: a brake that did not
+      # take must reach `OnFailure=`, or the CRITICAL line is the only trace and
+      # nothing reads it.
+      pause_now "consecutive-verifier-failures" "$VN" "$RECORDED" "$STAMP" \
+        || PAUSE_UNWRITABLE=1
+    fi
+  else
+    # RESEARCH DRIFT, counted once per rejected target EPISODE. Three ticks on
+    # 2026-09-04 each rewrote the SAME finished run and were each rejected on
+    # incidental prose; the third hit the threshold and paused the loop for 2.5
+    # days. That is one episode, not three, and what must bound it is retirement
+    # (the run stops being offered after two rejections), not the brake.
+    #
+    # SUPPRESSION IS THEREFORE CONDITIONAL ON THE TARGET BEING ONE RETIREMENT
+    # CAN REACH -- see `suppressible`. Everything else advances.
+    STORED="$(target "$TARGET_FILE")" || STORED=""
+    # THE ORDER OF THESE TWO IS LOAD-BEARING. `none` equals `none`, so the
+    # string comparison ALONE would suppress a rejection of "no target at all"
+    # against the last tick's "no target at all" -- an unbounded episode, since
+    # `none` retires nothing. `suppressible`'s veto is what stops that, and
+    # `driftnone` is the case that catches its removal.
+    if suppressible "$ENTRY_HANDLING" && [ "$STORED" = "$ENTRY_TARGET" ]; then
+      # FAIL CLOSED HERE TOO, *AND SAY SO*. An unreadable counter in this branch
+      # used to become `MAX_DISAGREE` silently, so the PAUSE file reported a
+      # drift streak at its threshold when the real cause was a counter that
+      # could not be read -- the same misdiagnosis the other two branches warn
+      # about. The direction is right; only the diagnostic was missing.
+      if ! N="$(counter "$DISAGREE_FILE")"; then
+        N="$MAX_DISAGREE"
+        say "WARNING the disagreement counter at $DISAGREE_FILE cannot be"
+        say "  read, so the streak cannot be tracked. Pausing now."
+      fi
+      # `last-reject-target` IS DELIBERATELY NOT WRITTEN HERE. It already holds
+      # this exact id -- that is what `STORED = ENTRY_TARGET` just established --
+      # so a write would be a no-op whose only effect could be to FAIL, and turn
+      # a bounded repeat into a fresh episode on the next tick.
+      say "NOT verified; same target as last tick ($ENTRY_TARGET)"
+      say "  the drift streak stays at $N -- retirement bounds this, not the brake"
+      say "  escalated to escalations/$STAMP.md"
+    else
+      if PREV="$(counter "$DISAGREE_FILE")" \
+         && set_counter "$DISAGREE_FILE" "$((PREV + 1))"; then
+        N=$((PREV + 1))
+      else
+        N="$MAX_DISAGREE"
+        say "WARNING the disagreement counter at $DISAGREE_FILE cannot be"
+        say "  persisted, so the streak cannot be tracked. Pausing now."
+      fi
+      # A TARGET IS STORED ONLY IF SUPPRESSION COULD LEGITIMATELY APPLY TO IT
+      # NEXT TIME. Storing an ambiguous, absent, recorded or retired id would
+      # suppress a streak retirement cannot bound -- the 2026-09-04 livelock
+      # with the drift brake switched off.
+      if suppressible "$ENTRY_HANDLING"; then
+        set_target "$TARGET_FILE" "$ENTRY_TARGET" \
+          || { say "WARNING cannot persist the rejected target at $TARGET_FILE;"
+               say "  the next rejection of $ENTRY_TARGET will count as a new one"; }
+      else
+        # SET, NOT LEFT ALONE. A stale stored target must not survive a
+        # rejection of something else, or the tick after it could read as a
+        # repeat of a run this leader has stopped working on.
+        set_target "$TARGET_FILE" none \
+          || say "note: could not clear the last rejected target"
+        say "  target $ENTRY_TARGET is $ENTRY_HANDLING: not suppressible"
+      fi
+      say "NOT verified ($N consecutive); escalated to escalations/$STAMP.md"
+    fi
+    # A VERIFIER THAT ANSWERED IS UP, and whether it agreed is not an
+    # infrastructure fact. Without this a copilot that failed twice and then
+    # returned a real DISAGREE would keep accumulating towards an outage pause
+    # across ticks it actually verified.
+    set_counter "$VERIFIER_FILE" 0 \
+      || say "note: could not reset the verifier-failure counter"
+    if [ "$N" -ge "$MAX_DISAGREE" ]; then
+      # SAME CONTRACT AS THE VERIFIER BRAKE ABOVE, and it must stay the same:
+      # the two brakes differ in what they mean, never in whether a failed write
+      # is a failed tick.
+      pause_now "consecutive-disagreements" "$N" "$RECORDED" "$STAMP" \
+        || PAUSE_UNWRITABLE=1
     fi
   fi
 fi
@@ -887,7 +1835,9 @@ if [ "$STAGED" != 1 ]; then
 fi
 if git diff --cached --quiet; then
   say "nothing to publish"
-  exit 0
+  # `finish`, NOT `exit 0`: a tick that reaches here with a brake it could not
+  # write is still a failed tick, and this is one of exactly two ways out.
+  finish
 fi
 git -c "user.name=${QF_GIT_NAME:-qf-research agent}" \
     -c "user.email=${QF_GIT_EMAIL:-research@queue-forecasting.invalid}" \
@@ -901,3 +1851,6 @@ if ! git push -q 2>/dev/null; then
   git push -q || die "cannot push the journal"
 fi
 say "published $(basename "$RECORDED")"
+# THE LAST LINE OF THE SCRIPT IS NOT AN EXIT STATUS. Without this the tick's
+# status would be `say`'s, which is 0 whatever happened to the brake.
+finish

@@ -1,0 +1,50 @@
+[Unit]
+Description=File the pause issue for a tick that failed before it could pause itself
+Documentation=file:///srv/queue-forecasting/tools/queue-forecasting/host/research-loop/tick-failure-alarm.sh
+# NOT ENABLED, AND THERE IS NO [Install] SECTION ON PURPOSE. This unit is
+# reached only by `qf-tick.service`'s `OnFailure=`; a `WantedBy=multi-user` here
+# would file a pause issue on every boot.
+
+[Service]
+Type=oneshot
+User=research
+Group=research
+
+# A LOGIN SHELL, for the same load-bearing reason as qf-tick.service: the
+# research user's egress is nftables uid-scoped through tinyproxy and the proxy
+# variables live in `~/.profile`. Without them `gh` bypasses the proxy, nftables
+# refuses, and the alarm fails with what reads as a credential problem -- at the
+# one moment the alarm is the only thing that will tell anybody anything.
+ExecStart=/bin/bash -lc '/srv/queue-forecasting/tools/queue-forecasting/host/research-loop/tick-failure-alarm.sh'
+
+# SHORT, because this is three GitHub calls and a file write. A hang here is a
+# network problem, and hanging for hours would hold nothing useful open.
+TimeoutStartSec=5m
+
+# THE SAME TWO KNOBS AS qf-tick.service, and pinned for the same reasons: the
+# repository is never derived from the research-writable checkout's `git
+# remote`, and the token path is pinned because the default is invisible. They
+# are restated rather than shared because an alarm that inherits its
+# configuration from the unit that just failed is an alarm with the same
+# failure modes.
+Environment=QF_PAUSE_ISSUE_REPO=lotas/qf-research
+Environment=QF_PAUSE_TOKEN_FILE=/home/research/.config/qf/pause-issue-token
+# AND IF ANYONE EVER PINS `QF_RESEARCH`, PIN IT IN BOTH UNITS OR NEITHER. Both
+# this alarm and `tick.sh` default it to `$HOME/qf-research`, so today they
+# agree. Pinned in qf-tick.service alone, they would not: the alarm would write
+# `PAUSE` where `tick.sh` never looks -- a brake nobody applies and an issue
+# whose close releases nothing. `env_matches` will NOT catch that, because a
+# unit declaring nothing is not drift; only this comment will.
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateDevices=yes
+# `ProtectHome` MUST NOT be set: the PAUSE file, the token and `~/.profile` all
+# live in the research user's home, which is all this unit touches.
+ReadWritePaths=/home/research
+# /tmp for the same reason qf-tick.service documents at length: with
+# `ProtectSystem=strict` and `PrivateTmp=no` it is the host's real, read-only
+# /tmp, and `gh` writes scratch there. A read-only /tmp is how the loop lost its
+# shell on 2026-09-02 -- an alarm is a bad place to rediscover it.
+ReadWritePaths=/tmp
+PrivateTmp=no

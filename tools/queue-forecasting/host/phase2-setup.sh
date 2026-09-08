@@ -759,7 +759,12 @@ cmd_mirror_refresh() {
 # the install doing its job. Everything else must match exactly.
 assert_units_current() {
   local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local drifted=0 unit src
+  local drifted=0 env_drifted=0 prof_drifted=0 prof_dup=0 unit src
+  # RESOLVED ONCE, and by asking rather than assuming: these checks also run
+  # from the test host and from a container, where `systemctl` is absent and an
+  # unguarded call would abort the whole refresh over a missing binary.
+  local SYSTEMCTL_OK=""
+  command -v systemctl >/dev/null 2>&1 && SYSTEMCTL_OK=1
   for spec in \
       "dispatcher/qf-dispatch.service:phase2-setup.sh install" \
       "dispatcher/qf-runs-prune.service:phase2-setup.sh install" \
@@ -769,6 +774,7 @@ assert_units_current() {
       "evaluator/qf-eval.service:phase2c-setup.sh install" \
       "evaluator/qf-eval.socket:phase2c-setup.sh install" \
       "research-loop/qf-tick.service:research-loop/install.sh on" \
+      "research-loop/qf-tick-failure.service:research-loop/install.sh on" \
       "research-loop/qf-tick.timer:research-loop/install.sh on" \
   ; do
     src="$here/${spec%%:*}"
@@ -782,13 +788,129 @@ assert_units_current() {
       warn "Remedy:  sudo ./$remedy"
       drifted=$((drifted + 1))
     fi
+    # AND THE EFFECTIVE ENVIRONMENT, which the comparison above cannot see: a
+    # `systemctl edit` drop-in is a second file. See `env_matches`.
+    #
+    # REPORTED, NOT REFUSED -- unlike a stale file, which dies below. Two
+    # reasons, and neither is squeamishness. A stale file has a remedy this
+    # script can name and the deploy can apply (`sudo ./<setup> install`); a
+    # drop-in is a deliberate human act whose disposition is a REVIEWED
+    # decision, and `systemctl revert` is not something a refresh gets to do to
+    # somebody's live tuning. And dying here would let one forgotten drop-in
+    # block every future deploy INCLUDING the deploy that ships its fix. The
+    # 2026-09-04 cost was silence, not permissiveness: this ends the silence.
+    if [ -n "${SYSTEMCTL_OK:-}" ]; then
+      local eff="" show_rc=0
+      eff="$(systemctl show -p Environment "$unit" 2>/dev/null \
+             | sed -n 's/^Environment=//p' | tr '\n' ' ')" || show_rc=$?
+      if [ "$show_rc" != 0 ]; then
+        # NOT READ AS "no environment". An empty answer would compare clean
+        # against a unit that declares nothing and report a pass over a question
+        # nobody managed to ask.
+        warn "cannot read the effective environment of $unit (systemctl show"
+        warn "exited $show_rc), so QF_* drift in it is UNKNOWN, not absent."
+      else
+        local envline
+        # THE LINES ARE THE TRUTH HERE, NOT THE EXIT STATUS. `env_matches`
+        # returns non-zero for the same condition it prints, so counting the
+        # lines and discarding the status keeps one source of truth rather than
+        # two that can disagree; the status exists for callers (the tests) that
+        # want a yes/no without parsing.
+        while IFS= read -r envline; do
+          [ -n "$envline" ] || continue
+          warn "$unit effective-environment drift: $envline"
+          env_drifted=$((env_drifted + 1))
+        done < <(env_matches "$src" "$eff" || true)
+      fi
+    fi
+    # AND THE PROFILE THE ExecStart READS, which neither check above can see.
+    # `systemctl show` reports systemd's CONFIGURATION; a `bash -lc` ExecStart
+    # then executes `~/.profile` INSIDE the process, AFTER that environment is
+    # set, so an `export QF_TICK_MAX_DISAGREE=5` there wins at execution time
+    # while both checks above report clean. See `profile_qf_matches`.
+    #
+    # NO `systemctl` INVOLVED, on purpose: this is a pure function over file
+    # contents, so it works on the test host and in a container, where the
+    # effective-environment branch above cannot run at all.
+    if _unit_reads_login_profile "$src"; then
+      local u_user u_home pline
+      u_user="$(sed -n 's/^[[:space:]]*User=//p' "$src" | tail -1)"
+      u_home=""
+      # ASKED, NOT ASSUMED. `/home/$u_user` is a guess, and a guess that is
+      # wrong finds no profile and therefore reports CLEAN -- a false all-clear
+      # manufactured by looking in the wrong place, which is exactly the shape
+      # every check in this section exists to end.
+      [ -n "$u_user" ] && u_home="$(getent passwd "$u_user" 2>/dev/null | cut -d: -f6)"
+      if [ -z "$u_home" ]; then
+        warn "$unit runs a LOGIN shell but the home of user '${u_user:-<unset>}' did"
+        warn "not resolve, so QF_* set in its login profile is UNKNOWN, not absent."
+        prof_drifted=$((prof_drifted + 1))
+      else
+        while IFS= read -r pline; do
+          [ -n "$pline" ] || continue
+          case "$pline" in
+            # LOWER VOLUME FOR AGREEMENT, and this is the whole difference: a
+            # duplicate is a second source of truth worth knowing about, not a
+            # live contradiction, and warning about it at the same pitch as an
+            # override is how a block stops being read.
+            PROFILE-DUPLICATE*) info "$unit login-profile: $pline"
+                                prof_dup=$((prof_dup + 1)) ;;
+            *)                  warn "$unit login-profile: $pline"
+                                prof_drifted=$((prof_drifted + 1)) ;;
+          esac
+        done < <(profile_qf_matches "$src" "$u_home" || true)
+      fi
+    fi
   done
+  if [ "$env_drifted" -gt 0 ]; then
+    warn "$env_drifted effective-environment difference(s) above. A value the"
+    warn "unit does not declare comes from a drop-in in"
+    warn "/etc/systemd/system/<unit>.d/ -- see it with 'systemctl cat <unit>'"
+    warn "and, once it is a decision and not an accident, either commit it to"
+    warn "the unit or 'sudo systemctl revert <unit> && systemctl restart <unit>'."
+  fi
+  if [ "$prof_drifted" -gt 0 ] || [ "$prof_dup" -gt 0 ]; then
+    warn "$prof_drifted login-profile override(s) and $prof_dup duplicate(s) above."
+    warn "systemd sets a unit's Environment= FIRST and a 'bash -lc' ExecStart then"
+    warn "runs ~/.profile INSIDE the process, so an assignment there WINS over the"
+    warn "reviewed value and 'systemctl show' cannot see it. Remedy: delete it from"
+    warn "the profile and leave the unit as the one place these are set."
+    warn "SCANNED: ~/.bash_profile, ~/.bash_login, ~/.profile in bash's own"
+    warn "precedence, plus -- from the one bash executes -- files they source by a"
+    warn "textually resolvable path, 3 levels deep. NOT SCANNED: /etc/profile and"
+    warn "/etc/profile.d (root-owned, the same trust domain as the unit, unlike"
+    warn "~research which the watched identity can write), \$BASH_ENV, and any path"
+    warn "only a running shell could resolve -- those are reported UNSCANNED, never"
+    warn "counted clean. It is a textual scan, not a shell: an assignment inside a"
+    warn "conditional or a heredoc is reported though it may never run, and one"
+    warn "made by eval or a command substitution is not seen at all."
+  fi
   if [ "$drifted" -gt 0 ]; then
     die "$drifted unit(s) are stale. Refusing to restart into them: an
   install that moves code without its configuration is the failure this check
   exists to make loud."
   fi
-  info "installed units match the checkout"
+  # THE LAST LINE AN OPERATOR READS MUST NOT CONTRADICT THE WARNINGS ABOVE IT.
+  # It used to print unconditionally, so a run that had just reported a live
+  # drop-in closed with "installed units match the checkout" -- after a wall of
+  # deploy output, an all-clear re-burying the very thing this check was added
+  # to surface. The stale-FILE case dies above, so reaching here means the files
+  # match and nothing more than that may be claimed.
+  #
+  # AND THE PROFILE FINDINGS COUNT TOWARDS THAT, for the same reason: an
+  # `export QF_TICK_MAX_DISAGREE=5` in ~research/.profile is not fixed by
+  # reinstalling anything either, and closing with "installed units match the
+  # checkout" underneath it re-buries exactly what was just surfaced. Duplicates
+  # do NOT suppress the all-clear: they are consistent with the units matching,
+  # they were printed at `info`, and a line that fires on agreement is a line
+  # that gets ignored.
+  if [ "$env_drifted" -gt 0 ] || [ "$prof_drifted" -gt 0 ]; then
+    warn "unit FILES match the checkout; the $env_drifted effective-environment
+  difference(s) and $prof_drifted login-profile finding(s) above are NOT fixed by
+  reinstalling, and are still live."
+  else
+    info "installed units match the checkout"
+  fi
 }
 
 unit_matches() {  # unit_matches <checkout> <installed>
@@ -834,6 +956,438 @@ _unit_key_filter() {  # _unit_key_filter <checkout-for-keys> <file-to-filter>
     }
     { if (!(key($0) in substituted)) print }
   ' "$1" "$2"
+}
+
+# --------------------------------------------------------------------------
+# UNIT FILES ARE NOT THE WHOLE STORY, and that is how the live loop came to run
+# `QF_TICK_MAX_DISAGREE=5` against a committed 3 for weeks. `unit_matches`
+# compares the FILE; a `systemctl edit` drop-in is a SECOND file, in
+# /etc/systemd/system/<unit>.d/, and it is invisible to a comparison of the
+# first. New code under hand-tuned configuration, found only while
+# investigating the 2026-09-04 pause -- the same class of failure as the stale
+# unit above, reached by the one route that check cannot see.
+#
+# THE EXACT KEY SET, NOT JUST THE DECLARED KEYS. The case a drop-in is most
+# likely to produce is an entirely new knob that exists ONLY live, and a
+# comparison scoped to what the repo declares cannot see one by construction.
+#
+# VALUES FOR DECLARED KEYS, NAMES ONLY FOR THE REST. A key the repo declares is
+# a reviewed threshold or budget and printing both sides is the entire point --
+# a human needs to read "3 vs 5". An unexpected key's value is by definition
+# unreviewed and could be anything, including a credential, and this output goes
+# to a deploy log.
+#
+# QF_* ONLY, in and out. Nothing else is read, compared or printed -- notably
+# not the QFD_* knobs of the dispatcher, which no drop-in has touched and whose
+# values include a database URL.
+env_matches() {  # env_matches <repo unit> <effective assignments>
+  local unit="$1" effective="$2" drift=0 key val line declared=""
+  local -A want=() live=()
+  # DECLARED AND EFFECTIVE ARE TOKENISED BY THE SAME FUNCTION. The first
+  # implementation of the FILE check derived its exclusions with a second `sed`
+  # over the first's output and quietly stopped comparing every `Environment=`
+  # line; two spellings of "what is an assignment" is the same trap one level
+  # up, so there is exactly one.
+  while IFS= read -r line; do
+    declared="$declared $line"
+  done < <(sed -n 's/^[[:space:]]*Environment=//p' "$unit" 2>/dev/null)
+  while IFS= read -r line; do
+    key="${line%%=*}"; val="${line#*=}"
+    want["$key"]="$val"
+  done < <(_env_qf_tokens "$declared")
+  while IFS= read -r line; do
+    key="${line%%=*}"; val="${line#*=}"
+    live["$key"]="$val"
+  done < <(_env_qf_tokens "$effective")
+
+  # THE ORDER OF THESE FIVE TESTS IS THE POLICY, so it is written down rather
+  # than left to be inferred from the nesting:
+  #
+  #   1. ABSENT LIVE wins over every value question, because the key NAME is
+  #      trustworthy even when the value parse is not, and a directive that
+  #      vanished is the 2b-1 `PYTHONPATH` failure this whole file exists for.
+  #   2. A SUBSTITUTED (`%%…%%`) declared value skips the rest. Deliberate, and
+  #      it is why the placeholder test sits ABOVE both quoting tests: if the
+  #      value is not compared at all, its quoting cannot matter, and reporting
+  #      a value nobody compares is the always-fires shape.
+  #   3/4. QUOTED, declared side then live side.
+  #   5. The comparison.
+  for key in "${!want[@]}"; do
+    if [ -z "${live[$key]+x}" ]; then
+      # THE DECLARED VALUE IS QUOTED ITSELF: printed as unreadable rather than
+      # TRUNCATED. `"--a` for a value of `--a --b` is a report that misdescribes
+      # what the unit says, and the point of printing a declared value is that a
+      # human can act on it.
+      case "${want[$key]}" in
+        '"'*) printf 'MISSING %s (the unit declares it with a quoted value this check cannot read whole; the running service has no such key at all)\n' "$key" ;;
+        *)    printf 'MISSING %s (the unit declares it as %s; the running service has no such key)\n' \
+                     "$key" "${want[$key]}" ;;
+      esac
+      drift=1
+      continue
+    fi
+    case "${want[$key]}" in *%%*) continue ;; esac
+    # A QUOTED VALUE IS DECLARED UNPARSEABLE RATHER THAN COMPARED.
+    #
+    # WHAT IS ACTUALLY WRONG WITH COMPARING IT, stated correctly -- an earlier
+    # version of this comment claimed the comparison "could only report equal by
+    # accident", which is unreachable: `_env_qf_tokens` leaves the opening quote
+    # on the value, so a truncated value can never equal a whole one. The real
+    # damage is the REPORT. It would say `live="3` for a value that is
+    # `3 and a half`, and send an operator looking for a difference in a place
+    # where there is none -- a true alarm carrying a false description, which is
+    # worse than either a clean pass or an honest refusal.
+    #
+    # THE TWO KNOBS THAT WOULD TRIP THIS, named because whoever adds them will
+    # not be reading this function: `QF_LEADER_FLAGS` and `QF_COPILOT_FLAGS`
+    # (tick.sh:77-78) are the one family whose value is a FLAG LIST -- `--a --b`
+    # -- and no unit declares either today. DECLARE ONE IN A UNIT AND THIS FIRES
+    # ON EVERY REFRESH, FOREVER: a check that always fires is a check that gets
+    # ignored, which is this file's own failure mode. (It does NOT "surface
+    # harmlessly as UNEXPECTED" -- an earlier comment here said so, and that
+    # was the bug `_env_qf_tokens` now fixes.) If either has to be pinned,
+    # teach this function `systemd-escape`'s rules first, or pin it in a file
+    # read by `EnvironmentFile=` instead.
+    case "${want[$key]}" in
+      '"'*) printf 'UNPARSEABLE %s (the UNIT declares it with a quoted, whitespace-bearing value, so the comparison would describe the wrong difference; read it with `systemctl cat` by hand)\n' "$key"
+            drift=1
+            continue ;;
+    esac
+    case "${live[$key]}" in
+      '"'*) printf 'UNPARSEABLE %s (the effective value is quoted, so it contains whitespace and cannot be compared word-wise; read it with `systemctl show -p Environment` by hand)\n' "$key"
+            drift=1
+            continue ;;
+    esac
+    if [ "${live[$key]}" != "${want[$key]}" ]; then
+      printf 'DRIFT %s repo=%s live=%s\n' "$key" "${want[$key]}" "${live[$key]}"
+      drift=1
+    fi
+  done
+  for key in "${!live[@]}"; do
+    [ -z "${want[$key]+x}" ] || continue
+    # THE NAME ONLY. See the header: unreviewed value, deploy log.
+    printf 'UNEXPECTED %s (present in the running service, absent from the unit in this checkout)\n' "$key"
+    drift=1
+  done
+  return "$drift"
+}
+
+_env_qf_tokens() {  # _env_qf_tokens <whitespace-separated assignments>
+  # `read -r -a`, AND NEVER `for t in $s`. An unquoted expansion also performs
+  # PATHNAME EXPANSION, so a value containing `*` would be replaced by whatever
+  # filenames sit in the caller's working directory: a comparison whose answer
+  # depends on the cwd, and one that can print a directory listing into a report
+  # that is supposed to print no unreviewed values at all.
+  local flat="${1//$'\n'/ }"
+  local -a toks=()
+  local t key val quoted
+  read -r -a toks <<<"$flat"
+  for t in "${toks[@]}"; do
+    # THE TWO SIDES QUOTE IN DIFFERENT PLACES, and this is what this loop was
+    # rewritten to fix. Both spellings are legal systemd:
+    #
+    #   declared:  Environment="QF_FLAGS=--a --b"   -> first token  "QF_FLAGS=--a
+    #   live:      QF_FLAGS="--a --b"               -> first token  QF_FLAGS="--a
+    #
+    # The declared form puts the quote BEFORE THE KEY, so `QF_*` did not match,
+    # so the key was dropped from `want` ENTIRELY -- and then the live copy was
+    # reported as `UNEXPECTED QF_FLAGS (absent from the unit in this checkout)`,
+    # a sentence that is FACTUALLY FALSE and would fire on every refresh
+    # forever, while the same key DISAPPEARING live returned CLEAN because
+    # nothing was left in `want` to miss it. Both sides are normalised here to
+    # key + value, with a leading `"` left on the value as the single
+    # downstream marker for "quoted, and it continues past the split".
+    quoted=0
+    case "$t" in '"'*) quoted=1; t="${t#\"}" ;; esac
+    case "$t" in QF_*) ;; *) continue ;; esac
+    case "$t" in
+      *=*) key="${t%%=*}"; val="${t#*=}" ;;
+      # A `QF_`-SHAPED TOKEN WITH NO `=` is not an assignment systemd can have
+      # produced; it is almost always the tail of a quoted value. Kept with an
+      # empty value so it is REPORTED (as an unexpected key, by name) rather
+      # than dropped -- a tokeniser that silently discards what it does not
+      # understand is how a check narrows itself to nothing.
+      *)   key="$t"; val="" ;;
+    esac
+    case "$val" in '"'*) quoted=1; val="${val#\"}" ;; esac
+    if [ "$quoted" = 1 ]; then
+      case "$val" in
+        # COMPLETE, AND THEREFORE NOT A PROBLEM: the closing quote is in this
+        # same token, so the value is one word and quoting it changed nothing.
+        # `Environment="QF_A=1"` has to compare equal to a live `1`; reporting
+        # that as unparseable would be a check firing over punctuation.
+        *'"') val="${val%\"}" ;;
+        # CONTINUES PAST THE SPLIT, so part of the value is in tokens this
+        # function cannot attribute. The retained quote is the marker.
+        *)    val="\"$val" ;;
+      esac
+    fi
+    printf '%s=%s\n' "$key" "$val"
+  done
+}
+
+# --------------------------------------------------------------------------
+# AND THE PROFILE, WHICH RUNS AFTER SYSTEMD HAS ALREADY SPOKEN. This is the
+# blind spot `env_matches` still had, and it is an ORDERING fact rather than a
+# hypothesis: `qf-tick.service` and `qf-tick-failure.service` start a LOGIN
+# shell (`/bin/bash -lc`), deliberately -- the research user's egress is
+# nftables uid-scoped through tinyproxy, the proxy variables and the agent CLIs'
+# PATH live in `~research/.profile`, and without them git fails as
+# "Failed to connect to github.com port 443 after 5 ms", a proxy fault wearing a
+# credential fault's face. systemd sets `Environment=` FIRST; the profile is
+# executed AFTERWARDS, inside the process. So
+#
+#     export QF_TICK_MAX_DISAGREE=5
+#
+# left in that profile BEATS the reviewed 3 at execution time, while
+# `env_matches` compares systemd's CONFIGURATION and reports a clean match --
+# the check whose entire purpose is making the loop's configuration visible,
+# blind in the one direction the loop actually reads its configuration from.
+# The same route can override every supposedly-pinned knob including
+# `QF_PAUSE_ISSUE_REPO` and `QF_PAUSE_TOKEN_FILE`, which would make a pause
+# file its issue into a repository nobody watches, or none at all: the
+# 2026-09-04 silence with the alarm installed.
+#
+# A REPORT, NOT A REFUSAL, exactly as `env_matches`: a forgotten override must
+# not block the deploy that ships its fix.
+#
+# WHAT IS SCANNED, AND ITS LIMITS -- stated because a check that claims more
+# coverage than it has is worse than one that says what it looked at:
+#   - `~/.bash_profile`, `~/.bash_login`, `~/.profile`, in bash's OWN
+#     precedence: the first that exists AND is readable is the one executed and
+#     the others are dead text. Both are reported, the dead ones marked
+#     `shadowed`, because a stale export in a shadowed file goes live the moment
+#     the file shadowing it is deleted.
+#   - from the one bash executes, files it `source`s by a path resolvable
+#     TEXTUALLY (absolute, `$HOME`/`${HOME}`/`~`-rooted, or relative to the
+#     home), transitively, three levels deep. `~/.profile` sourcing
+#     `~/.profile.d-proxy` -- which is what phase0-setup.sh writes -- is depth 2,
+#     and `~/.bashrc` and what IT sources is depth 3.
+#   - NOT `/etc/profile`, `/etc/profile.d/*` or `/etc/bash.bashrc`: root-owned,
+#     the same trust domain as the unit itself, whereas `~research` is writable
+#     by the identity being watched. NOT `$BASH_ENV`. NOT a path only a running
+#     shell could resolve (`$NVM_DIR/nvm.sh`) -- those are reported UNSCANNED
+#     rather than silently counted as clean.
+#   - A TEXTUAL SCAN, NOT A SHELL. An assignment inside a conditional, a
+#     function or a heredoc is reported although it may never execute
+#     (over-reporting, the safe direction); one produced by `eval` or a command
+#     substitution is not seen at all (under-reporting, and this is where it is
+#     written down). A bare `export QF_X` with no `=` is not an assignment and is
+#     not reported: it re-exports a value that must have come from an assignment
+#     this scan does see, or from systemd, where `env_matches` sees it.
+#
+# QF_* ONLY, in and out -- and here that rule is load-bearing rather than
+# tidy: this is the file that holds the proxy settings and the agent CLIs'
+# credentials, and this output goes to a deploy log.
+profile_qf_matches() {  # profile_qf_matches <repo unit> <home of the unit's User>
+  local unit="$1" home="$2" reported=0 maxdepth=3
+  local -A want=() seen=()
+  local line key val st f role depth parent login="" note tgt i unres declared=""
+  local -a q_file=() q_role=() q_depth=() q_parent=()
+  # THE UNIT SIDE IS TOKENISED BY THE FUNCTION THAT ALREADY DOES IT. Two
+  # spellings of "what does this unit declare" is the trap the FILE check fell
+  # into (two `sed`s, one firing on the other's output, every `Environment=`
+  # line silently excluded), so `want` is built here exactly as `env_matches`
+  # builds it and only the PROFILE side is new grammar.
+  while IFS= read -r line; do
+    declared="$declared $line"
+  done < <(sed -n 's/^[[:space:]]*Environment=//p' "$unit" 2>/dev/null)
+  while IFS= read -r line; do
+    key="${line%%=*}"; val="${line#*=}"
+    want["$key"]="$val"
+  done < <(_env_qf_tokens "$declared")
+
+  # BASH'S PRECEDENCE, NOT A GLOB. "The first one that exists and is readable"
+  # is bash's documented rule, and following it matters in both directions: a
+  # readable `.bash_profile` makes `.profile` dead text, while an UNREADABLE
+  # `.bash_profile` is SKIPPED by bash, so `.profile` is then the live one and
+  # calling it shadowed would be a false description of the running system.
+  for f in "$home/.bash_profile" "$home/.bash_login" "$home/.profile"; do
+    [ -e "$f" ] || continue
+    if [ -f "$f" ] && [ -r "$f" ]; then
+      if [ -z "$login" ]; then
+        login="$f"; q_file+=("$f"); q_role+=(login); q_depth+=(1); q_parent+=("")
+      else
+        q_file+=("$f"); q_role+=(shadowed); q_depth+=(1); q_parent+=("")
+      fi
+    else
+      # EXISTS AND WAS NOT READ, WHICH IS NOT "no QF_* in it". Reading nothing
+      # and reporting a pass is the shape this whole family of checks exists to
+      # end: the question was never asked, so the answer is not "no".
+      printf 'PROFILE-UNREADABLE %s (it exists and this check could not read it, so a QF_* assignment in it is UNKNOWN, not absent)\n' "$f"
+      reported=1
+    fi
+  done
+
+  i=0
+  while [ "$i" -lt "${#q_file[@]}" ]; do
+    f="${q_file[$i]}"; role="${q_role[$i]}"; depth="${q_depth[$i]}"; parent="${q_parent[$i]}"
+    i=$((i + 1))
+    # A CYCLE IS LEGAL SHELL. `.profile` sourcing a file that sources it back
+    # would walk forever; `seen` is also what keeps one file reached twice from
+    # being reported twice.
+    [ -z "${seen[$f]+x}" ] || continue
+    seen["$f"]=1
+    note=""
+    [ "$role" = shadowed ] && note=" [shadowed: a bash login shell reads $login instead]"
+    [ -n "$parent" ] && note="$note [sourced by $parent]"
+    while IFS=$'\t' read -r key st val; do
+      reported=1
+      if [ -z "${want[$key]+x}" ]; then
+        # THE NAME ONLY, same policy as `env_matches`'s UNEXPECTED: a key the
+        # unit does not declare has an unreviewed value which could be anything.
+        printf 'PROFILE-UNEXPECTED %s %s (name only: the unit does not declare it, so its value is unreviewed)%s\n' \
+               "$key" "$f" "$note"
+        continue
+      fi
+      # A DECLARED KEY IS A REVIEWED THRESHOLD and both values are printed: the
+      # entire point of this report is that a human reads "3 vs 5".
+      if [ "$st" = unreadable ]; then
+        printf 'PROFILE-OVERRIDE %s %s unit=%s profile=<quoted and whitespace-bearing; this scan cannot read it whole, read the file by hand>%s\n' \
+               "$key" "$f" "${want[$key]}" "$note"
+        continue
+      fi
+      case "${want[$key]}" in
+        # A SUBSTITUTED UNIT VALUE CANNOT BE COMPARED, so it is not claimed
+        # equal. `env_matches` skips these because the LIVE side is substituted
+        # too; here the other side is a literal in a dot-file, so the honest
+        # answer is "this sets it and equality cannot be shown".
+        *%%*) printf 'PROFILE-OVERRIDE %s %s unit=%s profile=%s (the unit value is substituted at install, so this cannot be shown equal to it)%s\n' \
+                     "$key" "$f" "${want[$key]}" "$val" "$note"
+              continue ;;
+      esac
+      if [ "$val" = "${want[$key]}" ]; then
+        # AGREEING TODAY IS STILL WORTH SAYING, at lower volume -- the caller
+        # prints DUPLICATE with `info` and everything else with `warn`. It is a
+        # second source of truth for a reviewed number, and it drifts silently
+        # the moment either side changes, which is how a live 5 survived a
+        # committed 3 for weeks.
+        printf 'PROFILE-DUPLICATE %s %s value=%s (matches the unit today; a second source of truth that drifts silently the moment either side changes)%s\n' \
+               "$key" "$f" "$val" "$note"
+      else
+        printf 'PROFILE-OVERRIDE %s %s unit=%s profile=%s%s\n' \
+               "$key" "$f" "${want[$key]}" "$val" "$note"
+      fi
+    done < <(_profile_qf_assignments "$f")
+
+    # A SHADOWED FILE IS NOT EXECUTED, so neither are its `source` lines. Its
+    # own assignments are still reported above, because deleting the file that
+    # shadows it makes them live.
+    [ "$role" = shadowed ] && continue
+    unres=0
+    while IFS= read -r tgt; do
+      if [ "$tgt" = '?' ]; then unres=$((unres + 1)); continue; fi
+      # A source of a file that is not there executes nothing.
+      [ -e "$tgt" ] || continue
+      if [ "$depth" -ge "$maxdepth" ]; then
+        printf 'PROFILE-UNSCANNED %s (sourced by %s, past this check depth limit of %s, so a QF_* assignment in it is UNKNOWN, not absent)\n' \
+               "$tgt" "$f" "$maxdepth"
+        reported=1
+        continue
+      fi
+      q_file+=("$tgt"); q_role+=(sourced); q_depth+=("$((depth + 1))"); q_parent+=("$f")
+    done < <(_profile_source_targets "$f" "$home")
+    if [ "$unres" -gt 0 ]; then
+      # ONE LINE PER FILE, COUNTED, and naming the file that has them rather
+      # than the paths themselves: `\. "$NVM_DIR/nvm.sh"` is in this box's real
+      # dot-files, so a line per unresolvable target would fire on every refresh
+      # forever -- and a check that always fires is a check that gets ignored,
+      # which is this file's own failure mode. The path is not printed because
+      # it is not a QF_ name.
+      printf 'PROFILE-UNSCANNED %s (%s source line(s) in it name a path this check cannot resolve literally, so QF_* in those files is UNKNOWN, not absent)\n' \
+             "$f" "$unres"
+      reported=1
+    fi
+  done
+  return "$reported"
+}
+
+# A SHELL FILE IS NOT `systemctl show` OUTPUT, and that is why this is not
+# `_env_qf_tokens`. That function tokenises ONE line of space-separated
+# assignments; here the grammar has `export`/`declare -x`/`readonly` prefixes,
+# comments, `;`-separated commands and single quotes. What IS shared is the
+# POLICY -- values for declared keys, names for the rest -- which lives in one
+# place, in `profile_qf_matches` above, and the quoted-value convention: a value
+# whose quoting continues past the split is declared unreadable rather than
+# TRUNCATED, because `profile=3` for a value of `3 and a half` is a true alarm
+# carrying a false description, which sends an operator looking for a difference
+# where there is none.
+_profile_qf_assignments() {  # _profile_qf_assignments <file> -> KEY<TAB>ok|unreadable<TAB>value
+  awk '
+    {
+      probe = $0
+      sub(/^[[:space:]]+/, "", probe)
+      # A COMMENTED-OUT EXPORT IS NOT AN ASSIGNMENT. The one an operator has
+      # already commented out must not keep firing forever.
+      if (probe ~ /^#/) next
+      rest = $0
+      # THE PRECEDING CHARACTER IS PART OF THE MATCH, so `$QF_A=` (a REFERENCE)
+      # and `MYQF_A=` are not read as assignments, while `;export QF_A=` and
+      # `&& QF_A=` are.
+      while (match(rest, /(^|[[:space:];&|(){}])(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+|typeset[[:space:]]+-x[[:space:]]+|readonly[[:space:]]+)?QF_[A-Za-z0-9_]*=/)) {
+        tok = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        key = tok
+        sub(/=$/, "", key)
+        sub(/^.*[^A-Za-z0-9_]/, "", key)
+        val = rest
+        if (match(val, /[[:space:];]/)) { val = substr(val, 1, RSTART - 1) }
+        st = "ok"
+        q = substr(val, 1, 1)
+        if (q == "\"" || q == "\047") {
+          if (length(val) > 1 && substr(val, length(val), 1) == q) {
+            val = substr(val, 2, length(val) - 2)
+          } else {
+            st = "unreadable"; val = ""
+          }
+        }
+        printf "%s\t%s\t%s\n", key, st, val
+      }
+    }
+  ' "$1" 2>/dev/null
+}
+
+# WHAT THE PROFILE SOURCES IS PART OF THE PROFILE. phase0-setup.sh puts the
+# proxy variables in `~/.profile.d-proxy` and appends `. /home/research/...` to
+# `~/.profile`, so a scan of one file only would miss the very file this box
+# keeps its exported environment in -- coverage claimed and not held.
+#
+# RESOLVED TEXTUALLY OR NOT AT ALL. `$HOME`, `${HOME}` and `~/` are substituted
+# because they are what the real dot-files use; anything still carrying `$`, a
+# backtick or a glob is returned as `?` and reported UNSCANNED by the caller.
+# Guessing at `$NVM_DIR` would be a check that reports on a file it never opened.
+_profile_source_targets() {  # _profile_source_targets <file> <home> -> a path per source line, or '?'
+  local home="$2" line tok
+  # `\.` IS IN THE LEADING CLASS because nvm's own snippet spells it
+  # `&& \. "$NVM_DIR/nvm.sh"`, and a class without the backslash misses it.
+  # ONE SOURCE PER LINE is a stated limit: two on one line, `;`-separated, and
+  # the second is not followed.
+  local re='(^|[[:space:];&|(){}\\])(source|\.)[[:space:]]+([^[:space:];]+)'
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "${line#"${line%%[![:space:]]*}"}" in '#'*) continue ;; esac
+    [[ $line =~ $re ]] || continue
+    tok="${BASH_REMATCH[3]}"
+    tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}"
+    tok="${tok//\$\{HOME\}/$home}"
+    tok="${tok//\$HOME/$home}"
+    case "$tok" in '~/'*) tok="$home/${tok#\~/}" ;; esac
+    case "$tok" in
+      *'$'*|*'`'*|*'*'*|*'?'*|*'['*) printf '?\n'; continue ;;
+    esac
+    case "$tok" in
+      /*) printf '%s\n' "$tok" ;;
+      *)  printf '%s/%s\n' "$home" "$tok" ;;
+    esac
+  done < "$1"
+}
+
+# ONLY THE UNITS THAT ACTUALLY READ A PROFILE. `qf-dispatch.service` execs
+# python directly, so scanning qfd's dot-files would report on a file nothing
+# reads -- noise in the one block that has to stay worth reading. Textual, and
+# deliberately so: the login flag is a property of the unit FILE, which is what
+# this whole section compares.
+_unit_reads_login_profile() {  # _unit_reads_login_profile <unit file>
+  grep -Eq '^[[:space:]]*Exec[A-Za-z]*=.*sh[[:space:]]+(--login|-[A-Za-z]*l)' "$1" 2>/dev/null
 }
 
 # --------------------------------------------------------------------------
