@@ -58,7 +58,15 @@ TimeoutStopSec=90
 
 Environment=QF_REQUIRE_PREREG=1
 Environment=QF_TICK_MAX_RUNS=4
-Environment=QF_TICK_MAX_TICKS=12
+# NOT A WORK CAP, A WALL-CLOCK CUTOFF, and that is why it is 20 and not 12. The
+# counter advances on EVERY tick, including the ones that stop for free -- the
+# idle gate in the small hours, and `N probe(s) submitted today` once MAX_RUNS
+# is spent (1s of CPU, ~$0). At an hourly timer, 12 therefore ended the day
+# around noon: on 2026-09-09 the last ablation rung finished at ~09:45 with no
+# tick left to submit its evaluation, so its write-up slipped a day. The cost of
+# raising this is close to zero for the same reason the cap was reached -- the
+# ticks it adds are mostly free stops. MAX_RUNS is what bounds spend.
+Environment=QF_TICK_MAX_TICKS=20
 # BOTH BRAKES, and neither is raised. 2026-09-04 auto-paused correctly on the
 # first and mis-attributed nothing to the second because the second did not yet
 # exist: a verifier outage counted as drift.
