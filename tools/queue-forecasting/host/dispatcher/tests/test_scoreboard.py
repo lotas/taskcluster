@@ -219,5 +219,114 @@ class ScoreboardPin(unittest.TestCase):
         self.assertEqual(got["consistency"], {"days_required": 3})
 
 
+# A metric may be a GATE (it decides) or a REPORT (it is computed and shown and
+# never decides). The evaluator writes `role` only for the non-default `report`,
+# and a report metric may have nothing to report -- mean miss severity over zero
+# misses -- which arrives as `passed: null`. Before this, one null `passed`
+# anywhere made the pin None and the run recorded NO numbers at all: the shape
+# check for a gate was silently also the shape check for a thing that has no
+# verdict to be wrong about.
+class TestReportMetrics(unittest.TestCase):
+    def test_a_report_metric_may_carry_a_null_passed(self):
+        spec = dict(MAE, role="report", passed=None, value=None, measured=None)
+        got = json.loads(qfd._scoreboard_pin(board(mae=dict(MAE), sev=spec)))
+        self.assertEqual(got["metrics"]["sev"]["role"], "report")
+        self.assertIsNone(got["metrics"]["sev"]["passed"])
+        self.assertIs(got["metrics"]["mae"]["passed"], False)
+
+    def test_a_report_metric_with_a_bool_passed_keeps_it(self):
+        spec = dict(MAE, role="report", passed=False)
+        got = json.loads(qfd._scoreboard_pin(board(mae=dict(MAE), tail=spec)))
+        self.assertIs(got["metrics"]["tail"]["passed"], False)
+        self.assertEqual(got["metrics"]["tail"]["role"], "report")
+
+    def test_an_inconclusive_report_metric_is_recorded(self):
+        """Too few eligible rows to judge. `passed` is null and the flag says
+        WHY it is null -- otherwise a reader cannot tell "no rows landed here"
+        from "the number was lost"."""
+        spec = dict(MAE, role="report", passed=None, value=None,
+                    measured=None, inconclusive=True)
+        got = json.loads(qfd._scoreboard_pin(board(mae=dict(MAE), tail=spec)))
+        self.assertIs(got["metrics"]["tail"]["inconclusive"], True)
+        self.assertIsNone(got["metrics"]["tail"]["passed"])
+        # NOT recorded when false or absent: one spelling of the default, the
+        # same rule `role` follows.
+        self.assertNotIn("inconclusive", got["metrics"]["mae"])
+        quiet = dict(MAE, role="report", passed=None, inconclusive=False)
+        got = json.loads(qfd._scoreboard_pin(board(mae=dict(MAE), tail=quiet)))
+        self.assertNotIn("inconclusive", got["metrics"]["tail"])
+
+    def test_a_metric_cannot_be_both_judged_and_inconclusive(self):
+        """`passed` is the field a reader turns into a word, and every reader
+        written before this flag existed would read `passed: false` as a
+        failure. A contradiction is refused, not stored."""
+        for passed in (True, False):
+            spec = dict(MAE, role="report", passed=passed, inconclusive=True)
+            self.assertIsNone(qfd._scoreboard_pin(board(mae=dict(MAE),
+                                                        tail=spec)),
+                              f"passed={passed} with inconclusive=True")
+        # And it must be a real bool: `1` is not this field.
+        loose = dict(MAE, role="report", passed=None, inconclusive=1)
+        self.assertIsNone(qfd._scoreboard_pin(board(mae=dict(MAE),
+                                                    tail=loose)))
+
+    def test_the_eligible_row_count_is_recorded(self):
+        """THE NUMBER THAT MAKES `INCONCLUSIVE` ACTIONABLE. Unknown
+        metric-level fields are dropped here, so before this the count the
+        evaluator wrote never reached `qf` or `results.py` and the readout said
+        only "INCONCLUSIVE" -- a state with no reason attached. Kept on every
+        metric, not just the inconclusive ones: a gate that passed on 40,000
+        rows and one that passed on 12 are not the same claim."""
+        thin = dict(MAE, role="report", passed=None, measured=None,
+                    eligible_n=7, inconclusive=True)
+        got = json.loads(qfd._scoreboard_pin(
+            board(mae=dict(MAE, eligible_n=41200), tail=thin)))
+        self.assertEqual(got["metrics"]["mae"]["eligible_n"], 41200)
+        self.assertEqual(got["metrics"]["tail"]["eligible_n"], 7)
+        self.assertIs(got["metrics"]["tail"]["inconclusive"], True)
+        # Zero is a real answer -- an empty bucket -- and absence is how "not
+        # reported" is spelled.
+        got = json.loads(qfd._scoreboard_pin(board(mae=dict(MAE,
+                                                            eligible_n=0))))
+        self.assertEqual(got["metrics"]["mae"]["eligible_n"], 0)
+        self.assertNotIn("eligible_n",
+                         json.loads(qfd._scoreboard_pin(board(mae=dict(MAE))))
+                         ["metrics"]["mae"])
+
+    def test_an_eligible_row_count_that_is_not_a_count_refuses_the_board(self):
+        """A count is compared against a contract floor by whoever reads it, so
+        a float, a string or a negative would be compared and believed. `True`
+        is refused explicitly: it is an `int` in python and would record 1."""
+        for bad in (True, False, -1, 7.0, "7", None, [7]):
+            self.assertIsNone(
+                qfd._scoreboard_pin(board(mae=dict(MAE, eligible_n=bad))),
+                f"eligible_n={bad!r}")
+
+    def test_a_gate_still_refuses_a_null_passed(self):
+        """The exception is the ROLE's, not the field's. A gate with no verdict
+        is a gate whose verdict was lost."""
+        self.assertIsNone(qfd._scoreboard_pin(board(mae=dict(MAE, passed=None))))
+
+    def test_an_explicit_gate_role_is_not_recorded(self):
+        """`gate` is the default and the evaluator omits it, so recording it
+        would make two spellings of one thing that pins are compared across."""
+        got = json.loads(qfd._scoreboard_pin(board(mae=dict(MAE, role="gate"))))
+        self.assertNotIn("role", got["metrics"]["mae"])
+
+    def test_an_unknown_role_is_refused(self):
+        self.assertIsNone(qfd._scoreboard_pin(board(mae=dict(MAE, role="advisory"))))
+
+    def test_a_v2_sized_board_fits_the_byte_cap(self):
+        """8 metrics, each with a bucket and a role, is the v2 contract's order
+        of magnitude. The cap is a backstop; this records how far under it a
+        real board sits, so a later field does not silently approach it."""
+        metrics = {f"m{i}": dict(MAE, bucket="30m+", role="report")
+                   for i in range(8)}
+        size = len(qfd._scoreboard_pin({
+            "metrics": metrics,
+            "consistency": {"days_required": 3, "days_passed": 4}}).encode())
+        self.assertLess(size, qfd.SCOREBOARD_MAX_BYTES // 4, size)
+
+
 if __name__ == "__main__":
     unittest.main()

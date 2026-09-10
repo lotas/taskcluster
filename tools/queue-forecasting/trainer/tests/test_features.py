@@ -213,3 +213,34 @@ def test_stats_record_unseen_rate():
     h = b.transform(hold)
     assert h.stats["unseen_rate"]["task_queue_id"] == 1.0
     assert h.stats["unseen_rate"]["tags.kind"] == 0.0
+
+
+def test_meta_carries_baseline_guardrail_columns_and_x_does_not():
+    # `bl_*_level` is a string and `bl_*_sample_size` is not a declared
+    # feature: both must reach evaluate() via meta, never LightGBM via X.
+    c = _cfg()
+    df = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 01:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 5.0,
+         "task_queue_id": "q1", "tags": {"kind": "build"}, "queue_pending": 10,
+         "bl_wait_level": "queue+priority+bucket", "bl_wait_sample_size": 42},
+    ])
+    tr = FeatureBuilder(c).fit_transform(df)
+    assert "bl_wait_level" in tr.meta.columns
+    assert "bl_wait_sample_size" in tr.meta.columns
+    assert tr.meta["bl_wait_level"].iloc[0] == "queue+priority+bucket"
+    assert tr.meta["bl_wait_sample_size"].iloc[0] == 42
+    assert "bl_wait_level" not in tr.X.columns
+    assert "bl_wait_sample_size" not in tr.X.columns
+
+
+def test_meta_columns_unchanged_when_baseline_guardrail_columns_absent():
+    c = _cfg()
+    df = _frame([
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 01:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 5.0,
+         "task_queue_id": "q1", "tags": {"kind": "build"}, "queue_pending": 10},
+    ])
+    tr = FeatureBuilder(c).fit_transform(df)
+    assert list(tr.meta.columns) == ["pending_at", "resolved_at", "reason_resolved",
+                                     "task_id", "run_id"]

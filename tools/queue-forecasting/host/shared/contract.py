@@ -35,8 +35,15 @@ WHAT A CONTRACT MUST NAME, and why each one is not optional:
                       (`evaluate.py:327`). Changing the population at the same
                       time as the model makes "did it improve?" unanswerable, so
                       the population is part of the rule.
-  `metrics`        -- each with its bar and direction. A metric with no declared
-                      direction is a number nobody can fail.
+  `metrics`        -- each with its bar and direction, an optional `role`
+                      ("gate", the default, or "report": computed and shown but
+                      never deciding the verdict) and an optional
+                      `min_eligible_n`: the fewest eligible rows the metric may
+                      be judged on, below which the result is INCONCLUSIVE
+                      rather than a pass (for a gate, also per day in the
+                      consistency count). A metric with no declared direction is
+                      a number nobody can fail, and a bucket metric with no
+                      floor is a bar a one-row bucket can clear.
   `consistency`    -- >=3 of 5 holdout days, so a single outlier day cannot carry
                       a verdict.
   `p90_coverage`   -- the [85%, 95%] band, which is a two-sided check: a model
@@ -70,6 +77,13 @@ DIRECTIONS = ("lower_is_better", "higher_is_better", "band")
 # `absolute_improvement` the >=5pp form, `absolute` a bare threshold (the tail
 # gate: "30m+ p90 miss below 30%"), `band` a two-sided interval.
 BAR_KINDS = ("relative_improvement", "absolute_improvement", "absolute", "band")
+
+# What a metric is FOR. `gate` decides the verdict. `report` is computed and
+# shown beside the gates -- an operational alert and a rollback criterion --
+# and never decides anything: an outcome-conditioned metric such as "p90 miss
+# among actual 30m+ waits" is exactly what a candidate can game by inflating,
+# so it must be visible and must not choose models.
+ROLES = ("gate", "report")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 _HASH64_RE = re.compile(r"^[0-9a-f]{64}\Z")
@@ -159,7 +173,8 @@ def _check_bar(name, bar):
 def _check_metric(name, spec):
     _need_name(name, "metric name")
     _need_dict(spec, f"metrics.{name}")
-    unknown = set(spec) - {"direction", "bar", "bucket"}
+    unknown = set(spec) - {"direction", "bar", "bucket", "role",
+                           "min_eligible_n"}
     if unknown:
         _err(f"unknown key(s) in metrics.{name}: {sorted(unknown)}")
     direction = spec.get("direction")
@@ -174,6 +189,17 @@ def _check_metric(name, spec):
         _err(f"metrics.{name}: direction {direction!r} and bar kind"
              f" {bar['kind']!r} disagree; a band bar needs a band direction")
     out = {"direction": direction, "bar": bar}
+    # `null` reads as absent, the same rule `bucket` and `note` follow: an
+    # explicit JSON null for an optional key is not a value to refuse.
+    role = spec.get("role")
+    if role is None:
+        role = "gate"
+    if role not in ROLES:
+        _err(f"metrics.{name}.role must be one of {list(ROLES)}, got {role!r}")
+    if role != "gate":
+        # Only a NON-default role enters the canonical form, so every contract
+        # written before roles existed keeps its hash.
+        out["role"] = role
     bucket = spec.get("bucket")
     if bucket is not None:
         # The tail gate is a bucket metric: "30m+ p90 miss". The bucket NAME is
@@ -184,6 +210,23 @@ def _check_metric(name, spec):
         if not isinstance(bucket, str) or not bucket:
             _err(f"metrics.{name}.bucket must be a non-empty string")
         out["bucket"] = bucket
+    minimum = spec.get("min_eligible_n")
+    if minimum is not None:
+        # bool BEFORE int, and int rather than number, for the two reasons
+        # `_need_number` and `consistency.days_required` give: `True` would
+        # compare as a floor of 1 and judge every run, and a fractional row
+        # count is a number of rows that does not exist. A floor of 0 is refused
+        # rather than accepted as "no floor" -- an explicit zero reads as a
+        # deliberate minimum, and honouring it as absent is the kind of silent
+        # reinterpretation this file exists to avoid; omit the key instead.
+        if isinstance(minimum, bool) or not isinstance(minimum, int) \
+                or minimum < 1:
+            _err(f"metrics.{name}.min_eligible_n must be a positive integer,"
+                 f" got {minimum!r}")
+        # Only a PRESENT floor enters the canonical form, the same rule a
+        # non-default `role` follows, so every contract written before minimums
+        # existed keeps its hash.
+        out["min_eligible_n"] = minimum
     return out
 
 
@@ -280,6 +323,9 @@ def validate(raw):
         "consistency": consistency,
         "holdout_days": days,
     }
+    if not any(m.get("role", "gate") == "gate" for m in out["metrics"].values()):
+        _err("metrics has no gate: a contract of report-only metrics judges"
+             " nothing and would pass every run")
     if raw.get("note") is not None:
         # IN the identity, unlike a baseline's `promoted_at`. A note is what a
         # reader is told the rule means, so two contracts differing only in

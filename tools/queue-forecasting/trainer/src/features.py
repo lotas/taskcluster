@@ -13,6 +13,14 @@ from src.config import Config
 
 META_COLUMNS = ["pending_at", "resolved_at", "reason_resolved", "task_id", "run_id"]
 
+# The baseline guardrail inputs. They are NOT features (`bl_*_level` is a
+# string, and neither belongs in the model), but evaluate.py needs them to
+# reproduce the live serving guardrail, so carry them on `meta` whenever the
+# baseline export supplied them. Older exports omit them; then the evaluator
+# falls back to the legacy floor (see evaluate.compute_guarded_p90).
+OPTIONAL_META_COLUMNS = ["bl_wait_level", "bl_wait_sample_size",
+                         "bl_duration_level", "bl_duration_sample_size"]
+
 
 @dataclass
 class Split:
@@ -83,7 +91,8 @@ class FeatureBuilder:
         feature_cols = self.config.categorical_features + self.config.numeric_features
         X = df[feature_cols].copy()
         y = df["y"].astype(float) if "y" in df.columns else df[self.config.target_column].astype(float)
-        meta = df[META_COLUMNS].copy()
+        meta_cols = META_COLUMNS + [c for c in OPTIONAL_META_COLUMNS if c in df.columns]
+        meta = df[meta_cols].copy()
         return X, y, meta
 
     def _extract_tags(self, df: pd.DataFrame) -> pd.DataFrame:

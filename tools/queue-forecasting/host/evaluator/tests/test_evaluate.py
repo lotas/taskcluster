@@ -27,6 +27,7 @@ import unittest
 
 import numpy as np
 import pyarrow
+import pyarrow.compute as pc
 import pyarrow.parquet
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +45,7 @@ import extract_spec as extract_spec_mod                        # noqa: E402
 import inventory as inventory_mod                              # noqa: E402
 import parquet_writer as parquet_writer_mod                    # noqa: E402
 import srcscan                                                 # noqa: E402
+import verdict as verdict_mod                                  # noqa: E402
 
 RUN_ID = "evaluate-20260829T101112Z-abcdef1-7"
 
@@ -111,8 +113,18 @@ class Fixture:
     """A whole evaluable world on disk: extract, baseline, contract, staged
     predictions, and a `cfg` shaped like `service.Config`."""
 
+    # The level/sample-size fields the 2026-09 exporter adds. `baseline_levels`
+    # is OFF by default, so the fixture's baseline is the old 4-column export and
+    # the refusal a guarded contract must produce against one is the case that
+    # needs no setup.
+    BASELINE_LEVELS = {"bl_wait_level": "queue+priority+bucket",
+                       "bl_wait_sample_size": 50,
+                       "bl_duration_level": "metadata_name",
+                       "bl_duration_sample_size": 50}
+
     def __init__(self, *, target="wait_time", holdout_days=len(HOLDOUT),
-                 days_required=2, slice_values=("completed",)):
+                 days_required=2, slice_values=("completed",),
+                 contract_metrics=None, baseline_levels=False):
         self.tmp = tempfile.mkdtemp()
         self.extracts = os.path.join(self.tmp, "extracts")
         self.baselines = os.path.join(self.tmp, "baselines")
@@ -125,6 +137,8 @@ class Fixture:
         self.holdout_days = holdout_days
         self.days_required = days_required
         self.slice_values = list(slice_values)
+        self.contract_metrics = contract_metrics
+        self.baseline_levels = baseline_levels
         self.extract_rows, self.prediction_rows = make_rows()
         self.baseline_rows = None      # defaults to 3x the truth: a bad baseline
         self.run_id = RUN_ID
@@ -186,13 +200,14 @@ class Fixture:
     def write_baseline(self):
         directory = os.path.join(self.baselines, "staging")
         os.makedirs(directory, exist_ok=True)
-        p50_column, p90_column = ev.BASELINE_COLUMNS[self.target]
+        p50_column, p90_column = ev.BASELINE_COLUMNS[self.target][:2]
         rows = self.baseline_rows
         if rows is None:
             rows = [{"task_id": r["task_id"], "run_id": r["run_id"],
                      "pending_at": r["pending_at"].isoformat(),
                      p50_column: _times(r["y_true"], 3.0),
-                     p90_column: _times(r["y_true"], 4.0)}
+                     p90_column: _times(r["y_true"], 4.0),
+                     **(self.BASELINE_LEVELS if self.baseline_levels else {})}
                     for r in self.extract_rows]
         with open(os.path.join(directory, baseline_mod.NDJSON_NAME), "w") as fh:
             for row in rows:
@@ -233,6 +248,8 @@ class Fixture:
             "consistency": {"days_required": self.days_required},
             "holdout_days": self.holdout_days,
         }
+        if self.contract_metrics is not None:
+            body["metrics"] = self.contract_metrics
         body.update(over)
         return body
 
@@ -320,6 +337,13 @@ class EvaluateCase(unittest.TestCase):
     def setUp(self):
         self.fx = Fixture().build()
         self.addCleanup(self.fx.close)
+
+    def fixture(self, **over):
+        """A second built world beside `self.fx`, for the cases that need a
+        different contract or a different baseline shape."""
+        fx = Fixture(**over).build()
+        self.addCleanup(fx.close)
+        return fx
 
     def refusal(self, **over):
         with self.assertRaises(ev.EvaluateError) as cm:
@@ -795,7 +819,7 @@ class TestThePopulationAccounting(EvaluateCase):
         fx.extract_rows = extract
         fx.prediction_rows = predictions
         fx.write_extract()
-        p50_column, p90_column = ev.BASELINE_COLUMNS[fx.target]
+        p50_column, p90_column = ev.BASELINE_COLUMNS[fx.target][:2]
         fx.baseline_rows = [
             {"task_id": r["task_id"], "run_id": r["run_id"],
              "pending_at": r["pending_at"].isoformat(),
@@ -826,7 +850,7 @@ class TestThePopulationAccounting(EvaluateCase):
         fx.extract_rows = extract
         fx.prediction_rows = predictions
         fx.write_extract()
-        p50_column, p90_column = ev.BASELINE_COLUMNS[fx.target]
+        p50_column, p90_column = ev.BASELINE_COLUMNS[fx.target][:2]
         fx.baseline_rows = [
             {"task_id": r["task_id"], "run_id": r["run_id"],
              "pending_at": r["pending_at"].isoformat(),
@@ -1184,6 +1208,170 @@ class TestTheNcSuiteAgreesWithThisModule(EvaluateCase):
                 # A class `qfd` would reject becomes an opaque default, so the
                 # refusal this module wrote to be read would not reach the record.
                 self.assertRegex(klass, pattern.group(1))
+
+
+V2_METRICS = {
+    "mae": {"direction": "lower_is_better",
+            "bar": {"kind": "relative_improvement", "value": 0.15}},
+    "within_2x": {"direction": "higher_is_better",
+                  "bar": {"kind": "absolute_improvement", "value": 0.05}},
+    "pinball_p90_guarded": {"direction": "lower_is_better",
+                            "bar": {"kind": "relative_improvement",
+                                    "value": 0.0}},
+    "p90_coverage_guarded": {"direction": "band",
+                             "bar": {"kind": "band", "low": 0.88,
+                                     "high": 0.93}},
+    "p90_miss_tail_guarded": {"direction": "lower_is_better", "bucket": "30m+",
+                              "role": "report",
+                              "bar": {"kind": "absolute", "value": 0.30}},
+    "p90_miss_severity_tail": {"direction": "lower_is_better", "bucket": "30m+",
+                               "role": "report",
+                               "bar": {"kind": "relative_improvement",
+                                       "value": 0.0}},
+    "interval_width_guarded": {"direction": "lower_is_better", "role": "report",
+                               "bar": {"kind": "relative_improvement",
+                                       "value": -0.10}},
+}
+
+
+class TestGuardedScoring(EvaluateCase):
+    """A contract that claims to judge the SERVED p90 has to be scored against
+    the number a user is served, and that number is a function of the BASELINE's
+    level and sample size -- not of the model's output alone. So the shape of the
+    promoted baseline decides whether such a contract is evaluable at all."""
+
+    def test_a_guarded_contract_refuses_a_baseline_without_levels(self):
+        # Fixture baseline is the old 4-column export by default. Scoring it
+        # anyway would apply no floor and publish a plausible number for a
+        # quantity nobody serves, which is worse than a refusal.
+        f = self.fixture(contract_metrics=V2_METRICS)
+        with self.assertRaises(ev.EvaluateError) as cm:
+            f.run()
+        self.assertIn("bl_wait_level", str(cm.exception))
+        self.assertEqual(cm.exception.error_class, "baseline_lacks_levels")
+
+    def test_a_guarded_contract_scores_the_served_p90(self):
+        f = self.fixture(contract_metrics=V2_METRICS, baseline_levels=True)
+        f.run()
+        doc = f.verdict_document()
+        self.assertIn("pinball_p90_guarded", doc["metrics"])
+        self.assertEqual(doc["metrics"]["p90_miss_tail_guarded"]["role"],
+                         "report")
+        self.assertEqual(len(doc["baseline_columns"]), 4)
+        table = f.eval_table()
+        for col in ("p90_guarded", "guard_applied", "bl_level",
+                    "bl_sample_size"):
+            self.assertIn(col, table.column_names)
+        applied = table.filter(pc.field("guard_applied") == True)  # noqa: E712
+        # The fixture's rows are all strong-level with n=50, so the floor fires.
+        self.assertGreater(applied.num_rows, 0)
+        g = np.array(applied["p90_guarded"])
+        r = np.array(applied["p90_raw"])
+        b = np.array(applied["bl_p90"])
+        p = np.array(applied["p50"])
+        self.assertTrue(np.all(g >= r), "the floor lowered the raw p90")
+        self.assertTrue(np.all(g >= b), "the baseline p90 was not a floor")
+        self.assertTrue(np.all(g >= p), "the served p90 fell below p50")
+
+    def test_a_v1_contract_still_scores_against_a_4_column_baseline(self):
+        f = self.fixture()          # v1 metrics, old baseline
+        f.run()
+        doc = f.verdict_document()
+        self.assertIn(doc["verdict"], ("go", "no-go"))
+        self.assertNotIn("pinball_p90_guarded", doc["metrics"])
+        # The COLUMN is unconditional -- the per-row schema does not depend on
+        # which contract judged the run -- but it carries nothing, because
+        # nothing computed a served p90.
+        table = f.eval_table()
+        self.assertIn("p90_guarded", table.column_names)
+        guarded = table.column("p90_guarded").to_pylist()
+        self.assertTrue(all(v is None or np.isnan(v) for v in guarded))
+        self.assertEqual(table.column("guard_applied").to_pylist(),
+                         [None] * len(guarded))
+
+    def test_every_guarded_count_recomputes_from_the_per_row_file(self):
+        # The same property the v1 recompute test proves for the raw counts: a
+        # verdict nobody can recompute is a number to be believed.
+        f = self.fixture(contract_metrics=V2_METRICS, baseline_levels=True)
+        f.run()
+        doc = f.verdict_document()
+        table = f.eval_table().to_pydict()
+        y = np.array(table["y_true"], dtype=float)
+        g = np.array(table["p90_guarded"], dtype=float)
+        self.assertEqual(
+            doc["model"]["aggregate"]["p90_coverage_guarded"]["covered_n"],
+            int((y <= g).sum()))
+        miss = y > g
+        self.assertAlmostEqual(
+            doc["model"]["aggregate"]["p90_excess_guarded"]["sum_excess"],
+            float((y[miss] - g[miss]).sum()), places=6)
+
+    def test_a_row_with_a_null_level_does_not_refuse_a_modern_export(self):
+        """A modern export writes all eight `bl_*` keys for every row and puts
+        `null` in them for a row it had no baseline for (`baselineExportRecord`:
+        "a missing key is a schema change per row"). So the format test is about
+        the KEYS: a value-based one refused a current export because one holdout
+        row lacked a wait baseline, which is a row-level absence the guard
+        already handles -- no strong level, no floor -- rather than a missing
+        rule.
+        """
+        fx = Fixture(contract_metrics=V2_METRICS)
+        fx.write_extract()
+        p50_column, p90_column = ev.BASELINE_COLUMNS[fx.target][:2]
+        victim = fx.extract_rows[-1]["task_id"]
+        fx.baseline_rows = [
+            {"task_id": r["task_id"], "run_id": r["run_id"],
+             "pending_at": r["pending_at"].isoformat(),
+             p50_column: r["y_true"] * 3.0, p90_column: r["y_true"] * 4.0,
+             **dict(Fixture.BASELINE_LEVELS,
+                    **({"bl_wait_level": None, "bl_wait_sample_size": None}
+                       if r["task_id"] == victim else {}))}
+            for r in fx.extract_rows]
+        fx.write_baseline()
+        fx.write_contract()
+        fx.write_predictions()
+        self.addCleanup(fx.close)
+        fx.run()
+        doc = fx.verdict_document()
+        self.assertIn("pinball_p90_guarded", doc["metrics"])
+        table = fx.eval_table()
+        levels = table.column("bl_level").to_pylist()
+        self.assertIn(None, levels)
+        # And exactly the level-less row got no floor.
+        applied = table.column("guard_applied").to_pylist()
+        for level, fired in zip(levels, applied):
+            self.assertEqual(fired, level is not None)
+
+    def test_a_baseline_covering_no_predicted_row_says_so(self):
+        """"No level columns" and "no matching rows" are different findings, and
+        the first version answered the second with the first: "re-export with a
+        newer predictor" is the wrong remedy for a baseline that simply does not
+        cover this cohort. So `has_levels` is vacuously true over zero matched
+        rows and the accurate refusal downstream is the one that fires."""
+        fx = Fixture(contract_metrics=V2_METRICS, baseline_levels=True)
+        fx.write_extract()
+        p50_column, p90_column = ev.BASELINE_COLUMNS[fx.target][:2]
+        fx.baseline_rows = [
+            {"task_id": "unrelated" + r["task_id"], "run_id": r["run_id"],
+             "pending_at": r["pending_at"].isoformat(),
+             p50_column: r["y_true"] * 3.0, p90_column: r["y_true"] * 4.0,
+             **Fixture.BASELINE_LEVELS}
+            for r in fx.extract_rows]
+        fx.write_baseline()
+        fx.write_contract()
+        fx.write_predictions()
+        self.addCleanup(fx.close)
+        with self.assertRaises(ev.EvaluateError) as cm:
+            fx.run()
+        self.assertIn("covered by the baseline", str(cm.exception))
+        self.assertNotIn("bl_wait_level", str(cm.exception))
+
+    def test_every_guarded_metric_name_is_one_the_verdict_can_compute(self):
+        # `GUARDED_METRICS` is a SUBSET of `VALUE_OF`, defined beside it. A name
+        # in one and not the other would either refuse a baseline for a metric
+        # nothing scores, or score a served metric with no format requirement.
+        for name in ev.GUARDED_METRICS:
+            self.assertIn(name, verdict_mod.VALUE_OF, name)
 
 
 if __name__ == "__main__":

@@ -46,8 +46,8 @@ BH="$(make_baseline one | tail -1)"
   || { bad "fixture produced no baseline hash: '$BH'"; echo "pass=$pass fail=$fail"; exit 1; }
 
 # --- the shipped templates ------------------------------------------------
-for t in wait_time run_duration; do
-  tpl="$HOST/contracts/$t.v1.json.in"
+for t in wait_time.v1 run_duration.v1 wait_time.v2; do
+  tpl="$HOST/contracts/$t.json.in"
   [ -f "$tpl" ] && ok "$t template exists" || bad "$t template missing"
   grep -q '@BASELINE_HASH@' "$tpl" && ok "$t carries the placeholder" \
     || bad "$t has no placeholder: it may have been instantiated in place"
@@ -92,6 +92,27 @@ else
   bad "the output does not load: $(tr '\n' ' ' < "$TMP/e" | cut -c1-200)"
 fi
 
+# --- the v2 contract ------------------------------------------------------
+# Pinned in the WORK COPY, like v1 above, and never in `$HOST/contracts`: once
+# the operator commits the real `wait_time.v2.json` this test would otherwise
+# refuse ("already exists") and then delete the tracked contract on its way out.
+H2="$(make_baseline v2 | tail -1)"
+cp "$HOST/contracts/wait_time.v2.json.in" "$work/"
+OUT2="$("$SCRIPT" "$work/wait_time.v2.json.in" "$H2" 2>&1)" \
+  && ok "v2 template pins to a promoted baseline" \
+  || bad "v2 template refused: $OUT2"
+PYTHONPATH="$HOST/shared" python3 - "$work/wait_time.v2.json" <<'PY' \
+  && ok "v2 validates: four gates, four report metrics, no raw tail gate" \
+  || bad "v2 did not validate as expected"
+import json, sys, contract
+body, _ = contract.load(sys.argv[1])
+roles = {k: v.get("role", "gate") for k, v in body["metrics"].items()}
+assert sum(r == "gate" for r in roles.values()) == 4, roles
+assert sum(r == "report" for r in roles.values()) == 4, roles
+assert roles["p90_miss_tail_guarded"] == "report", roles
+assert "p90_miss_tail" not in body["metrics"], "raw tail miss must not be in v2"
+PY
+
 # --- refusals -------------------------------------------------------------
 "$SCRIPT" "$work/wait_time.v1.json.in" "$BH" >"$TMP/log" 2>&1 \
   && bad "a second instantiation overwrote an existing contract" \
@@ -122,8 +143,8 @@ m["ndjson_rows"] = (m.get("ndjson_rows") or 0) + 5   # leaves baseline_hash
 with open(p, "w") as fh:
     json.dump(m, fh)
 PY
-cp "$HOST/contracts/wait_time.v1.json.in" "$work/wait_time.v2.json.in"
-"$SCRIPT" "$work/wait_time.v2.json.in" "$BH" >"$TMP/log" 2>&1 \
+cp "$HOST/contracts/wait_time.v1.json.in" "$work/wait_time.edited.json.in"
+"$SCRIPT" "$work/wait_time.edited.json.in" "$BH" >"$TMP/log" 2>&1 \
   && bad "pinned a contract to a baseline edited since promotion" \
   || { grep -qi 'does not hash\|does not verify' "$TMP/log" \
        && ok "a baseline edited since promotion cannot be pinned" \
@@ -134,6 +155,84 @@ printf '{}' > "$work/notatemplate.json"
 "$SCRIPT" "$work/notatemplate.json" "$BH" >/dev/null 2>&1 \
   && bad "accepted a file that is not a .json.in template" \
   || ok "a non-template path is refused"
+
+# --- --activate -----------------------------------------------------------
+# The cutover. Appended here, in a directory of its own, so nothing above is
+# disturbed: `--activate` writes an ACTIVE file NEXT TO the contract it wrote,
+# and a shared work directory would let one case's setting decide another's.
+act="$TMP/act"; mkdir -p "$act"
+H3="$(make_baseline three | tail -1)"
+cp "$HOST/contracts/wait_time.v1.json.in" "$act/"
+cp "$HOST/contracts/run_duration.v1.json.in" "$act/"
+"$SCRIPT" "$act/wait_time.v1.json.in" "$H3" --activate >"$TMP/log" 2>&1 \
+  && ok "--activate is accepted" \
+  || bad "--activate refused: $(tr '\n' ' ' < "$TMP/log" | cut -c1-200)"
+CH3="$(PYTHONPATH="$HOST/shared" python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["contract_hash"])' "$act/wait_time.v1.json")"
+grep -qx "wait_time $CH3" "$act/ACTIVE" \
+  && ok "--activate wrote the target line into ACTIVE" \
+  || bad "ACTIVE does not name the contract: $(tr '\n' ' ' < "$act/ACTIVE" 2>&1)"
+
+# THE POINT OF THE FILE: the contract stays published. The whole reason this is
+# a setting and not a deletion is that the frontier reads old bodies.
+[ -f "$act/wait_time.v1.json" ] && ok "activating does not remove the contract" \
+  || bad "the contract file disappeared"
+
+# A SECOND TARGET does not displace the first: the file is keyed by target.
+"$SCRIPT" "$act/run_duration.v1.json.in" "$H3" --activate >"$TMP/log" 2>&1 \
+  && ok "a second target activates too" \
+  || bad "second activation refused: $(tr '\n' ' ' < "$TMP/log" | cut -c1-200)"
+grep -qx "wait_time $CH3" "$act/ACTIVE" \
+  && ok "activating another target leaves the first line alone" \
+  || bad "the wait_time line was lost when run_duration was activated"
+
+# IDEMPOTENT, and this is the case that matters: a target must never end up
+# with two lines, because `qfd.read_active_contracts` keeps the FIRST -- so an
+# appended second line would leave the OLD contract active while the command
+# reported success.
+cp "$HOST/contracts/wait_time.v2.json.in" "$act/"
+"$SCRIPT" "$act/wait_time.v2.json.in" "$H3" --activate >"$TMP/log" 2>&1 \
+  && ok "activating a v2 over a v1 is accepted" \
+  || bad "v2 activation refused: $(tr '\n' ' ' < "$TMP/log" | cut -c1-200)"
+CH4="$(PYTHONPATH="$HOST/shared" python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["contract_hash"])' "$act/wait_time.v2.json")"
+[ "$(grep -c '^wait_time ' "$act/ACTIVE")" -eq 1 ] \
+  && ok "one line per target after a re-activation" \
+  || bad "ACTIVE has $(grep -c '^wait_time ' "$act/ACTIVE") wait_time lines"
+grep -qx "wait_time $CH4" "$act/ACTIVE" \
+  && ok "the line was REPLACED with v2, not appended beside v1" \
+  || bad "ACTIVE still names v1 after activating v2"
+
+# MODE 0644 ON THE PUBLISHED CONTRACT. `mktemp` makes 0600 and this runs as
+# root, so a missing chmod leaves a contract that is committed and unreadable by
+# qfd: omitted from `available_contracts`, and therefore an ACTIVE entry the
+# dispatcher cannot resolve right after the script said "activated".
+mode="$(stat -c '%a' "$act/wait_time.v1.json" 2>/dev/null \
+        || stat -f '%Lp' "$act/wait_time.v1.json")"
+[ "$mode" = "644" ] && ok "the published contract is mode 0644" \
+  || bad "the published contract is mode $mode, not 644: qfd cannot read it"
+
+# AND THE DEFAULT IS UNCHANGED: no flag, no ACTIVE file. Publishing a rule and
+# cutting over to it are two decisions.
+noact="$TMP/noact"; mkdir -p "$noact"
+cp "$HOST/contracts/wait_time.v1.json.in" "$noact/"
+# BOTH templates copied. The unknown-option case below names the run_duration
+# one, and against a path that does not exist the script refuses for "not a
+# file" -- which would pass the assertion while proving nothing about option
+# parsing.
+cp "$HOST/contracts/run_duration.v1.json.in" "$noact/"
+"$SCRIPT" "$noact/wait_time.v1.json.in" "$H3" >"$TMP/log" 2>&1 \
+  && [ ! -e "$noact/ACTIVE" ] \
+  && ok "without --activate nothing is activated" \
+  || bad "an ACTIVE file appeared without --activate"
+
+"$SCRIPT" "$noact/run_duration.v1.json.in" "$H3" --bogus >"$TMP/log" 2>&1 \
+  && bad "an unknown option was accepted" \
+  || { grep -q 'unknown option' "$TMP/log" \
+       && ok "an unknown option is refused, naming it" \
+       || bad "wrong refusal for an unknown option"; }
 
 echo
 echo "instantiate-contract: pass=$pass fail=$fail"

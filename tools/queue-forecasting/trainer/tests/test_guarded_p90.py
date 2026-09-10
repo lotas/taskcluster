@@ -134,3 +134,132 @@ def test_evaluate_omits_guarded_metrics_when_no_baseline_p90(tmp_path):
     assert "p90_coverage" in report.primary_agg
     assert "p90_coverage_guarded" not in report.primary_agg
     assert "pinball_p90_guarded"  not in report.primary_agg
+
+
+def test_level_aware_guard_floors_only_strong_levels_with_enough_samples():
+    p50 = np.array([10.0, 10.0, 10.0, 10.0])
+    p90 = np.array([12.0, 12.0, 12.0, 12.0])
+    bl = np.array([50.0, 50.0, 50.0, 50.0])
+    level = np.array(["queue+priority+bucket", "queue+bucket",
+                      "queue+priority+bucket", None], dtype=object)
+    n = np.array([20.0, 500.0, 19.0, np.nan])
+    out = compute_guarded_p90(p50=p50, model_p90=p90, baseline_p90=bl,
+                              baseline_level=level, baseline_sample_size=n,
+                              strong_levels=("queue+priority+bucket",))
+    # strong + n>=20 -> floored; weak level -> raw; strong but n<20 -> raw; no level -> raw
+    assert out.tolist() == [50.0, 12.0, 12.0, 12.0]
+
+
+def test_level_aware_guard_still_floors_by_p50():
+    out = compute_guarded_p90(p50=np.array([30.0]), model_p90=np.array([12.0]),
+                              baseline_p90=np.array([np.nan]),
+                              baseline_level=np.array(["queue"], dtype=object),
+                              baseline_sample_size=np.array([100.0]),
+                              strong_levels=("queue+priority+bucket",))
+    assert out.tolist() == [30.0]
+
+
+def test_without_level_arrays_the_legacy_any_finite_floor_is_kept():
+    # Old-format baselines (no level column) can only support the old rule.
+    out = compute_guarded_p90(p50=np.array([1.0]), model_p90=np.array([2.0]),
+                              baseline_p90=np.array([9.0]))
+    assert out.tolist() == [9.0]
+
+
+def test_half_present_level_pair_raises_instead_of_falling_back():
+    # Only one of the pair: applying the served rule is impossible and silently
+    # reporting the legacy floor under `*_guarded` would be a lie.
+    import pytest
+    for kwargs in ({"baseline_level": np.array(["queue+priority+bucket"], dtype=object)},
+                   {"baseline_sample_size": np.array([100.0])}):
+        with pytest.raises(ValueError, match="must be given together"):
+            compute_guarded_p90(p50=np.array([1.0]), model_p90=np.array([2.0]),
+                                baseline_p90=np.array([9.0]), **kwargs)
+
+
+def test_level_arrays_without_strong_levels_raises():
+    import pytest
+    with pytest.raises(ValueError, match="strong_levels is required"):
+        compute_guarded_p90(p50=np.array([1.0]), model_p90=np.array([2.0]),
+                            baseline_p90=np.array([9.0]),
+                            baseline_level=np.array(["queue+priority+bucket"], dtype=object),
+                            baseline_sample_size=np.array([100.0]))
+
+
+def test_strong_level_with_nonfinite_baseline_p90_keeps_raw_model_p90():
+    out = compute_guarded_p90(p50=np.array([1.0, 1.0]),
+                              model_p90=np.array([2.0, 2.0]),
+                              baseline_p90=np.array([np.nan, np.inf]),
+                              baseline_level=np.array(["queue+priority+bucket"] * 2,
+                                                      dtype=object),
+                              baseline_sample_size=np.array([100.0, 100.0]),
+                              strong_levels=("queue+priority+bucket",))
+    assert out.tolist() == [2.0, 2.0]
+
+
+def test_nullable_dtype_level_and_sample_size_columns_are_handled():
+    # A pandas `string`/`Int64` baseline column carries pd.NA, which np.isin
+    # would choke on; the guard must treat those rows as ungated.
+    level = pd.array(["queue+priority+bucket", pd.NA, "queue+bucket"], dtype="string")
+    n = pd.array([100, 100, 100], dtype="Int64")
+    out = compute_guarded_p90(p50=np.array([1.0, 1.0, 1.0]),
+                              model_p90=np.array([2.0, 2.0, 2.0]),
+                              baseline_p90=np.array([50.0, 50.0, 50.0]),
+                              baseline_level=level, baseline_sample_size=n,
+                              strong_levels=("queue+priority+bucket",))
+    assert out.tolist() == [50.0, 2.0, 2.0]
+
+
+def _guard_eval_frame():
+    meta = pd.DataFrame({
+        "pending_at": pd.to_datetime(["2026-04-19T05:00Z", "2026-04-19T10:00Z"]),
+        "reason_resolved": ["completed", "completed"],
+        "task_id": ["a", "b"], "run_id": [0, 0],
+    })
+    return meta
+
+
+def test_evaluate_level_aware_guard_differs_from_legacy_guard(tmp_path):
+    # Row 0: strong level, n>=20 -> baseline floor applies under both rules.
+    # Row 1: weak level -> the served rule keeps the raw p90 and misses the
+    # actual, while the legacy priority-blind floor would have covered it.
+    meta = _guard_eval_frame()
+    y_true    = np.array([10.0, 400.0])
+    preds_p50 = np.array([9.0, 20.0])
+    preds_p90 = np.array([12.0, 25.0])
+    bl_p90    = np.array([500.0, 500.0])
+    level = np.array(["queue+priority+bucket", "queue+bucket"], dtype=object)
+    n = np.array([50.0, 50.0])
+
+    common = dict(preds_p50=preds_p50, preds_p90=preds_p90, hold_meta=meta,
+                  y_true=y_true, holdout_day_keys=["2026-04-19"],
+                  baseline_dir=tmp_path, target="wait", baseline_p90=bl_p90)
+    served = evaluate(**common, baseline_level=level, baseline_sample_size=n)
+    legacy = evaluate(**common)
+
+    assert served.primary_agg["p90_coverage_guarded"]["covered_n"] == 1
+    assert legacy.primary_agg["p90_coverage_guarded"]["covered_n"] == 2
+    # The raw-model view is untouched by which guard rule was used: row 0's
+    # actual is under the raw p90, row 1's is far above it.
+    assert (served.primary_agg["p90_coverage"]["covered_n"]
+            == legacy.primary_agg["p90_coverage"]["covered_n"] == 1)
+
+
+def test_evaluate_records_which_guard_rule_ran(tmp_path):
+    # Both rules write the same `*_guarded` keys, so the report has to say
+    # which one produced them.
+    meta = _guard_eval_frame()
+    common = dict(preds_p50=np.array([9.0, 20.0]), preds_p90=np.array([12.0, 25.0]),
+                  hold_meta=meta, y_true=np.array([10.0, 400.0]),
+                  holdout_day_keys=["2026-04-19"], baseline_dir=tmp_path,
+                  target="wait", baseline_p90=np.array([500.0, 500.0]))
+    served = evaluate(**common,
+                      baseline_level=np.array(["queue+priority+bucket",
+                                               "queue+bucket"], dtype=object),
+                      baseline_sample_size=np.array([50.0, 50.0]))
+    legacy = evaluate(**common)
+    assert served.guard_rule == "served"
+    assert legacy.guard_rule == "legacy_any_finite_floor"
+    # No baseline p90 at all -> no guarded view, so no rule.
+    no_guard = evaluate(**{k: v for k, v in common.items() if k != "baseline_p90"})
+    assert no_guard.guard_rule is None

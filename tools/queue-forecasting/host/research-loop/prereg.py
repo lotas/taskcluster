@@ -33,11 +33,16 @@ from __future__ import annotations
 
 import math
 
-# The contract's metric names, from `contracts/wait_time.v1.json`. A closed set
-# on purpose: `bar=tail` or `bar=p90` would each read fine and neither would
-# ever match a scoreboard key, so the pre-registration would be unfalsifiable
-# in precisely the way this file exists to prevent.
-BARS = ("mae", "within_2x", "p90_coverage", "p90_miss_tail")
+# The contract's metric names -- the UNION of `contracts/wait_time.v1.json` and
+# `contracts/wait_time.v2.json`, because a pre-registration written under v1
+# must still parse after the cutover. A closed set on purpose: `bar=tail` or
+# `bar=p90` would each read fine and neither would ever match a scoreboard key,
+# so the pre-registration would be unfalsifiable in precisely the way this file
+# exists to prevent.
+BARS = ("mae", "within_2x", "p90_coverage", "p90_miss_tail",
+        "pinball_p90_guarded", "p90_coverage_guarded",
+        "p90_miss_tail_guarded", "p90_miss_severity_tail",
+        "interval_width_guarded")
 
 # `improve` claims the bar moves in the contract's good direction. `hold` claims
 # it does NOT move -- which is a real hypothesis here and not a hedge: the qctx

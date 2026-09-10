@@ -70,6 +70,44 @@ def test_load_baseline_predictions(tmp_path):
     assert df.iloc[1]["bl_wait_p50"] == 45.5
 
 
+def test_load_baseline_predictions_keeps_level_and_sample_size_when_present(tmp_path):
+    import json
+    from src.data_loader import load_baseline_predictions
+    p = tmp_path / "baseline_predictions.ndjson"
+    p.write_text(json.dumps({
+        "task_id": "T", "run_id": 0, "pending_at": "2026-08-01T00:00:00Z",
+        "bl_duration_p50": 1.0, "bl_duration_p90": 2.0,
+        "bl_duration_level": "metadata_name", "bl_duration_sample_size": 30,
+        "bl_wait_p50": 3.0, "bl_wait_p90": 4.0,
+        "bl_wait_level": "queue+priority+bucket", "bl_wait_sample_size": 25,
+    }) + "\n")
+    df = load_baseline_predictions(p)
+    assert list(df.columns) == [
+        "task_id", "run_id", "bl_duration_p50", "bl_duration_p90",
+        "bl_wait_p50", "bl_wait_p90",
+        "bl_duration_level", "bl_duration_sample_size",
+        "bl_wait_level", "bl_wait_sample_size",
+    ]
+    assert df.loc[0, "bl_wait_level"] == "queue+priority+bucket"
+    assert df.loc[0, "bl_wait_sample_size"] == 25
+
+
+def test_load_baseline_predictions_tolerates_the_old_six_column_format(tmp_path):
+    import json
+    from src.data_loader import load_baseline_predictions
+    p = tmp_path / "baseline_predictions.ndjson"
+    p.write_text(json.dumps({
+        "task_id": "T", "run_id": 0, "pending_at": "2026-08-01T00:00:00Z",
+        "bl_duration_p50": 1.0, "bl_duration_p90": 2.0,
+        "bl_wait_p50": 3.0, "bl_wait_p90": 4.0,
+    }) + "\n")
+    df = load_baseline_predictions(p)
+    assert list(df.columns) == [
+        "task_id", "run_id", "bl_duration_p50", "bl_duration_p90",
+        "bl_wait_p50", "bl_wait_p90",
+    ]
+
+
 def test_repo_family_derivation_version_matches_js():
     """The Python constant must stay in lockstep with src/repo-family.js.
 

@@ -96,7 +96,11 @@ def metric_ranks(contract):
 
 
 def load_contract(contracts, contract_hash):
-    """The contract body, for `holdout_days` and its metric directions.
+    """The contract body: `holdout_days`, metric directions, and metric ROLES.
+
+    The roles matter as much as the directions -- a `role: report` metric is
+    measured and shown but does not decide, so a report reading this contract
+    wrong would either gate on an alert or hide a real gate.
 
     Read off disk rather than over `qf`: `_op_contracts` returns only the hash,
     the filename and the directory, because the file is root-owned in the trusted
@@ -131,6 +135,14 @@ def _band_bounds(contract):
         if isinstance(low, (int, float)) or isinstance(high, (int, float)):
             out[name] = (low, high)
     return out
+
+
+def gate_metrics(contract):
+    """The metric names that DECIDE under this contract. A `role: report`
+    metric is shown beside the gates and must not make or break PROMISING:
+    that is the whole reason the role exists."""
+    return {name for name, spec in ((contract.get("metrics") or {}).items())
+            if (spec or {}).get("role", "gate") == "gate"}
 
 
 def holdout_window(extract, contract):
@@ -1014,6 +1026,9 @@ def build(rows, extracts, contracts, journaled=(), escalations=None,
         bands = _band_bounds(contract)
         entry["ordered"] = bool(ranks)
         entry["ranks"] = ranks
+        # STASHED, so the `cleared` loop below and `render` both read the same
+        # gate set this contract was loaded once for.
+        entry["gates"] = gate_metrics(contract)
         for row in entry["rows"]:
             row["claim"] = judge_claim(row, index,
                                        rank=ranks.get(row["prereg"]["bar"]),
@@ -1039,8 +1054,15 @@ def build(rows, extracts, contracts, journaled=(), escalations=None,
     cleared = {}
     for key, entry in series.items():
         _extract, baseline, contract = key
+        # THE GATES ONLY. A `role: report` metric is measured and shown but does
+        # not decide, so counting its flag here would let a reported alert veto a
+        # config that cleared every gate -- v2 demotes the 30m+ miss rate for
+        # exactly that reason. An unreadable contract yields no gate names, in
+        # which case every reported flag still counts, as it did before roles.
+        gates = entry["gates"]
         for row in entry["rows"]:
-            flags = row.get("passed") or {}
+            flags = {k: v for k, v in (row.get("passed") or {}).items()
+                     if not gates or k in gates}
             if flags and all(v is True for v in flags.values()):
                 group = (row["config_id"], baseline, contract)
                 cleared.setdefault(group, []).append(key)
@@ -1167,6 +1189,8 @@ def _series_out(key, entry):
         "as_of": entry["as_of"],
         "ordered": entry["ordered"],
         "ranks": entry["ranks"],
+        # A LIST, because the report is serialised as JSON and a set is not.
+        "gates": sorted(entry.get("gates") or ()),
         "holdout": [d.date().isoformat() for d in entry["holdout"]]
         if entry["holdout"] else None,
         "runs": len(entry["rows"]),
@@ -1393,6 +1417,11 @@ def render(report):
             note = {"band": " (band: first seen)",
                     None: " (unordered: first seen)"}.get(
                         entry["ranks"].get(name), "")
+            # REPORTED, NOT GATED. Without this a `NO` on a report row reads as
+            # a failed gate, which is the reading the role exists to prevent.
+            gates = set(entry.get("gates") or ())
+            if gates and name not in gates:
+                note += " (report)"
             out.append(f"| {name} | {best['value']:.4g}{note} |"
                        f" {best['config']} | {mark} |")
         out.append("")

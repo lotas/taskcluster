@@ -374,15 +374,44 @@ def cmd_contracts(args):
     if not resp.get("ok"):
         die(resp.get("error", "contracts failed"))
     rows = resp.get("contracts") or []
+    # WHICH ONE IS ACTIVE, shown here because this is the listing two refusal
+    # messages send an operator to. Without it "ACTIVE names X, which is not
+    # published" points at a page that cannot show whether X is set at all.
+    active = resp.get("active")
+    active = active if isinstance(active, dict) else {}
+    stuck = resp.get("active_unresolved")
+    stuck = stuck if isinstance(stuck, dict) else {}
+    by_hash = {}
+    for target, digest in active.items():
+        by_hash.setdefault(digest, []).append(target)
     if not rows:
         print(f"no contracts in {resp.get('dir') or '<unset>'}")
         print("  (a .json.in template is not a contract: it carries no pinned")
         print("   baseline, so it judges against nothing. See")
         print("   instantiate-contract.sh)")
-        return
-    for row in rows:
-        print(f"{(row.get('contract_hash') or '?')[:12]}  {row.get('file')}")
-        print(f"    --contract {row.get('contract_hash')}")
+    else:
+        for row in rows:
+            digest = row.get("contract_hash") or "?"
+            marks = "".join(f"  ACTIVE for {t}"
+                            for t in sorted(by_hash.get(digest, ())))
+            print(f"{digest[:12]}  {row.get('file')}{marks}")
+            # THE FULL HASH, on its own line and paste-ready: `--contract`
+            # refuses a prefix, so printing only the truncated identity makes
+            # the natural copy-paste the value the validator rejects.
+            print(f"    --contract {row.get('contract_hash')}")
+    for target, digest in sorted(stuck.items()):
+        # UNRESOLVED, and said out loud. `experiment.py` refuses on this, so an
+        # operator seeing a refusal must be able to see the cause here: the
+        # .json is not deployed, or qfd cannot read it (mode 0644).
+        print(f"ACTIVE for {target} UNRESOLVED: {digest[:12]} is named in"
+              f" ACTIVE and is not published above")
+    # The vocabulary comes from the reply (`contract_mod.TARGETS`), not from a
+    # copy here: a second list would drift and then report a target as unset
+    # that cannot be set.
+    targets = resp.get("targets")
+    for target in sorted(set(targets if isinstance(targets, list) else [])
+                         - set(active) - set(stuck)):
+        print(f"no ACTIVE entry for {target}: chosen by scored-run usage")
 
 
 def cmd_evaluate(args):
@@ -458,7 +487,20 @@ def print_scoreboard(text):
         # written by an older build, and "??" is the honest answer to a field
         # that does not say.
         passed = spec.get("passed")
-        mark = "PASS" if passed is True else "FAIL" if passed is False else "??"
+        if spec.get("role") == "report":
+            # Shown, never decides: an alert, not a verdict. Same strictness
+            # as the gate branch: `passed: 1` must not render as ok.
+            #
+            # INCONCLUSIVE before `n/a`: both carry `passed: None`, and the
+            # difference is the whole point of the field. `n/a` says the bar was
+            # not reached; INCONCLUSIVE says it was not reached BECAUSE the
+            # slice was too thin to judge, which a reader must not read as an
+            # all-clear. `is True`, not truthiness, like every other branch.
+            mark = ("INCONCLUSIVE" if spec.get("inconclusive") is True
+                    else "ok" if passed is True else "ALERT" if passed is False
+                    else "n/a" if passed is None else "??") + " (report)"
+        else:
+            mark = "PASS" if passed is True else "FAIL" if passed is False else "??"
         bits = [f"  {mark}  {name}"]
         if spec.get("bucket"):
             bits.append(f"[{spec['bucket']}]")
@@ -478,6 +520,15 @@ def print_scoreboard(text):
             label = bar.get("kind") or "bar"
             bits.append(f"bar={label}"
                         + (f":{'..'.join(numbers)}" if numbers else ""))
+        # THE ROW COUNT THE RATIO DIVIDED BY. Printed for EVERY metric, not only
+        # the inconclusive ones: "INCONCLUSIVE n=7" is a reason, and `n=41200`
+        # beside a metric that passed is how a reader notices when the next run's
+        # bucket has collapsed to a handful of rows without tripping the floor.
+        # `int` and not bool, like everywhere else here -- this renders pins that
+        # may have been written by an older build.
+        eligible = spec.get("eligible_n")
+        if isinstance(eligible, int) and not isinstance(eligible, bool):
+            bits.append(f"n={eligible}")
         print(" ".join(bits), file=sys.stderr)
     days = board.get("consistency") or {}
     if days.get("days_required") is not None:

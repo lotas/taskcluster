@@ -80,6 +80,41 @@ CFG_QCTX = "configs/wait_time_residual_throughput_filtered_baseline_qctx.yaml"
 CFG_QCTX_D = "configs/wait_qctx_d_priority_flow.yaml"
 
 
+CONTRACT_V2 = "2" * 64
+
+# The SHIPPED v2 template, pinned to a hash and written where `load_contract`
+# will read it. Instantiated from the real template rather than hand-typed so
+# that a change to the gate/report split shows up here as a failure.
+V2_M = {"mae": 0.26856, "within_2x": 0.09506,
+        "pinball_p90_guarded": 0.08, "p90_coverage_guarded": 0.901,
+        "p90_coverage": 0.8821, "p90_miss_tail_guarded": 0.31078,
+        "p90_miss_severity_tail": -0.04, "interval_width_guarded": -0.02}
+# Every GATE passes; the reported tail miss does not.
+V2_P = {"mae": True, "within_2x": True,
+        "pinball_p90_guarded": True, "p90_coverage_guarded": True,
+        "p90_coverage": True, "p90_miss_tail_guarded": False,
+        "p90_miss_severity_tail": False, "interval_width_guarded": None}
+
+
+def v2_contracts():
+    """`{contracts, dir}` naming a pinned copy of the shipped v2 template."""
+    import json
+    import tempfile
+    d = tempfile.mkdtemp()
+    with open(os.path.join(HOST, "contracts", "wait_time.v2.json.in")) as fh:
+        body = json.loads(fh.read().replace("@BASELINE_HASH@", BASELINE))
+    with open(os.path.join(d, "wait_time.v2.json"), "w") as fh:
+        json.dump(body, fh)
+    return {"contracts": [{"contract_hash": CONTRACT_V2,
+                           "file": "wait_time.v2.json"}], "dir": d}
+
+
+def v2_row(evaluation, probe, config, metrics, passed, **kw):
+    out = row(evaluation, probe, config, metrics, passed, **kw)
+    out["contract"] = CONTRACT_V2
+    return out
+
+
 def _only(report):
     """The single config group in a report, by whatever name it was keyed under.
 
@@ -141,6 +176,33 @@ class Series(unittest.TestCase):
         self.assertEqual(F.metric_ranks(contract),
                          {"mae": "higher", "within_2x": "higher",
                           "p90_coverage": "band", "p90_miss_tail": "lower"})
+
+    def test_gate_metrics_ignores_the_reported_metrics(self):
+        contract = {"metrics": {
+            "mae": {"bar": {"kind": "relative_improvement", "value": 0.15}},
+            "within_2x": {"bar": {"kind": "absolute_improvement", "value": 0.05}},
+            "pinball_p90_guarded": {"bar": {"kind": "relative_improvement",
+                                            "value": 0.0}},
+            "p90_coverage_guarded": {"bar": {"kind": "band", "low": 0.88,
+                                             "high": 0.93}},
+            "p90_coverage": {"role": "report",
+                             "bar": {"kind": "band", "low": 0.85, "high": 0.95}},
+            "p90_miss_tail_guarded": {"role": "report",
+                                      "bar": {"kind": "absolute", "value": 0.30}},
+            "p90_miss_severity_tail": {"role": "report",
+                                       "bar": {"kind": "relative_improvement",
+                                               "value": 0.0}},
+            "interval_width_guarded": {"role": "report",
+                                       "bar": {"kind": "relative_improvement",
+                                               "value": -0.10}},
+        }}
+        self.assertEqual(F.gate_metrics(contract),
+                         {"mae", "within_2x", "pinball_p90_guarded",
+                          "p90_coverage_guarded"})
+
+    def test_gate_metrics_of_an_unreadable_contract_is_empty(self):
+        # Which is what keeps the pre-roles behaviour when the file is missing.
+        self.assertEqual(F.gate_metrics({}), set())
 
     def test_an_unreadable_contract_leaves_the_series_unordered(self):
         rows = [row("e1", REF_PROBE, CFG_REF, REFERENCE_M, REFERENCE_P),
@@ -211,6 +273,32 @@ class ConfirmGate(unittest.TestCase):
     def test_a_config_that_misses_a_bar_never_appears(self):
         rows = [row("e2", "p-qctx", CFG_QCTX, QCTX_M, QCTX_P)]   # tail fails
         report = F.build(rows, EXTRACTS, CONTRACTS)
+        self.assertEqual(report["configs"], {})
+
+    def test_a_failing_report_metric_does_not_stop_a_config_clearing(self):
+        # Under v2 the 30m+ miss rate is `role: report`: it is measured, shown,
+        # and must not veto a config that passed every gate. Counting it here is
+        # the bug this role exists to prevent.
+        rows = [v2_row("e2", "p-qctx", CFG_QCTX, V2_M, V2_P)]
+        report = F.build(rows, EXTRACTS, v2_contracts())
+        info = report["configs"][_only(report)]
+        self.assertEqual(info["status"], "PROMISING")
+        self.assertEqual(info["independent_cohorts"], 1)
+
+    def test_the_report_table_marks_a_reported_metric(self):
+        rows = [v2_row("e2", "p-qctx", CFG_QCTX, V2_M, V2_P)]
+        text = F.render(F.build(rows, EXTRACTS, v2_contracts()))
+        # A `NO` on a reported row must not read as a failed gate.
+        line = [l for l in text.splitlines()
+                if l.startswith("| p90_miss_tail_guarded |")]
+        self.assertTrue(line and "(report)" in line[0], line)
+        gated = [l for l in text.splitlines() if l.startswith("| mae |")]
+        self.assertTrue(gated and "(report)" not in gated[0], gated)
+
+    def test_a_failing_gate_still_stops_it(self):
+        rows = [v2_row("e2", "p-qctx", CFG_QCTX, V2_M,
+                       dict(V2_P, p90_coverage_guarded=False))]
+        report = F.build(rows, EXTRACTS, v2_contracts())
         self.assertEqual(report["configs"], {})
 
     def test_a_row_with_no_metrics_is_not_a_clean_sweep(self):

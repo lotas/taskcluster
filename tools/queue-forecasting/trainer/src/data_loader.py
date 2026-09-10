@@ -268,7 +268,10 @@ def load_baseline_predictions(path: Path) -> pd.DataFrame:
     """Load per-row baseline-prediction NDJSON (produced by predictor.js
     --export-baseline-predictions) into a DataFrame keyed by (task_id, run_id).
 
-    Null p50/p90 values in the NDJSON stay as NaN in the DataFrame.
+    Null p50/p90 values in the NDJSON stay as NaN in the DataFrame. Keeps the
+    join keys, the baseline quantiles, and the optional guardrail columns
+    (`bl_duration_level`, `bl_duration_sample_size`, `bl_wait_level`,
+    `bl_wait_sample_size`) when the export carried them.
     """
     import json as _json
     records: list[dict] = []
@@ -279,10 +282,15 @@ def load_baseline_predictions(path: Path) -> pd.DataFrame:
                 continue
             records.append(_json.loads(line))
     df = pd.DataFrame.from_records(records)
-    # Keep only the join keys + baseline columns; drop pending_at (already
-    # on the main frame). Column types are float64; NaN for nulls.
+    # Join keys + the baseline quantiles, always; the guardrail inputs
+    # (`*_level`, `*_sample_size`) when the export carried them. Exports before
+    # 2026-09 did not, and a missing optional column is the trainer's cue to
+    # fall back to the legacy priority-blind floor (see compute_guarded_p90).
     keep = ["task_id", "run_id", "bl_duration_p50", "bl_duration_p90",
             "bl_wait_p50", "bl_wait_p90"]
+    optional = ["bl_duration_level", "bl_duration_sample_size",
+                "bl_wait_level", "bl_wait_sample_size"]
+    keep += [col for col in optional if col in df.columns]
     return df[keep]
 
 

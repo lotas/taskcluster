@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "name": "wait_time_v2",
+  "target": "wait_time",
+  "baseline_hash": "@BASELINE_HASH@",
+  "note": "v2, 2026-09-10. Judges the SERVED p90 (level-aware guardrail from src/live-predictor/p90-guardrail.js applied) with a proper scoring rule. The 30m+ miss rate conditions on the outcome and rewards inflation, so it is reported as an operational alert and never decides. MAE and within-2x bars unchanged from v1. Primary slice only, as before. The two 30m+ reports carry min_eligible_n 200: the scored holdouts hold tens of thousands of 30m+ rows, so 200 is a floor against a near-empty bucket on a quiet day rendering as an alert or an all-clear, not a power calculation.",
+  "primary_slice": {
+    "reason_resolved": ["completed"],
+    "anchor": "pending_at"
+  },
+  "holdout_days": 5,
+  "consistency": {
+    "days_required": 3
+  },
+  "metrics": {
+    "mae": {
+      "direction": "lower_is_better",
+      "bar": {"kind": "relative_improvement", "value": 0.15}
+    },
+    "within_2x": {
+      "direction": "higher_is_better",
+      "bar": {"kind": "absolute_improvement", "value": 0.05}
+    },
+    "pinball_p90_guarded": {
+      "direction": "lower_is_better",
+      "bar": {"kind": "relative_improvement", "value": 0.0}
+    },
+    "p90_coverage_guarded": {
+      "direction": "band",
+      "bar": {"kind": "band", "low": 0.88, "high": 0.93}
+    },
+    "p90_coverage": {
+      "direction": "band",
+      "role": "report",
+      "bar": {"kind": "band", "low": 0.85, "high": 0.95}
+    },
+    "p90_miss_tail_guarded": {
+      "direction": "lower_is_better",
+      "bucket": "30m+",
+      "role": "report",
+      "min_eligible_n": 200,
+      "bar": {"kind": "absolute", "value": 0.30}
+    },
+    "p90_miss_severity_tail": {
+      "direction": "lower_is_better",
+      "bucket": "30m+",
+      "role": "report",
+      "min_eligible_n": 200,
+      "bar": {"kind": "relative_improvement", "value": 0.0}
+    },
+    "interval_width_guarded": {
+      "direction": "lower_is_better",
+      "role": "report",
+      "bar": {"kind": "relative_improvement", "value": -0.10}
+    }
+  }
+}

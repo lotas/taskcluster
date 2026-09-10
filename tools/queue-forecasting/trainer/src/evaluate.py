@@ -51,18 +51,62 @@ def per_row_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     return out
 
 
-def compute_guarded_p90(*, p50: np.ndarray, model_p90: np.ndarray,
-                        baseline_p90: np.ndarray) -> np.ndarray:
-    """Floor the model's p90 with the historical baseline p90 (where finite),
-    then floor by p50 so p90 >= p50 always holds.
+# Mirrors src/live-predictor/predict.js WAIT_P90_GUARDRAIL_MIN_SAMPLE and
+# DURATION_P90_GUARDRAIL_MIN_SAMPLE (both 20) and the per-target strong levels
+# in wait-p90-guardrail.js / duration-p90-guardrail.js. host/evaluator/metrics.py
+# transcribes the same constants; a parity test there pins the two together.
+GUARDRAIL_MIN_SAMPLE = 20
+STRONG_BASELINE_LEVELS = {
+    "wait": ("queue+priority+bucket",),
+    "duration": ("metadata_name",),
+}
 
-    NaN baseline rows fall back to model_p90 (no guard applied to that row).
+
+def compute_guarded_p90(*, p50: np.ndarray, model_p90: np.ndarray,
+                        baseline_p90: np.ndarray,
+                        baseline_level: np.ndarray | None = None,
+                        baseline_sample_size: np.ndarray | None = None,
+                        strong_levels: tuple[str, ...] | None = None,
+                        min_sample_size: int = GUARDRAIL_MIN_SAMPLE) -> np.ndarray:
+    """The p90 a user would be served, given the model's raw p90.
+
+    With `baseline_level`/`baseline_sample_size`: an exact transcription of
+    `applyP90Guardrail` in src/live-predictor/p90-guardrail.js -- floor the
+    model p90 with the baseline p90 ONLY when the baseline level is one of
+    `strong_levels` and its sample size is >= `min_sample_size`, then floor by
+    p50 so p90 >= p50 always holds.
+
+    Without BOTH of them (old-format baseline exports carry no level): the
+    legacy rule, floor on ANY finite baseline p90. That is the priority-blind
+    floor serving removed in June 2026, so numbers computed this way are an
+    UPPER BOUND on served coverage, not the served number. Exactly one of the
+    two is a caller bug and raises rather than quietly reporting the legacy
+    number under the served metric's name.
     """
     p50 = np.asarray(p50, dtype=float)
     model_p90 = np.asarray(model_p90, dtype=float)
     baseline_p90 = np.asarray(baseline_p90, dtype=float)
-    bl_floor = np.where(np.isfinite(baseline_p90), baseline_p90, -np.inf)
-    return np.maximum(p50, np.maximum(model_p90, bl_floor))
+    if (baseline_level is None) != (baseline_sample_size is None):
+        raise ValueError(
+            "baseline_level and baseline_sample_size must be given together: "
+            "with only one, the served rule cannot be applied and the legacy "
+            "floor would be reported under the same metric name")
+    if baseline_level is None or baseline_sample_size is None:
+        bl_floor = np.where(np.isfinite(baseline_p90), baseline_p90, -np.inf)
+        return np.maximum(p50, np.maximum(model_p90, bl_floor))
+    if strong_levels is None:
+        raise ValueError("strong_levels is required when baseline_level is given")
+    # Via pandas, not np.asarray: a nullable/`string`-dtype level column holds
+    # pd.NA, which np.isin propagates into a TypeError, and a nullable Int64
+    # sample size will not cast to float directly.
+    level = pd.Series(baseline_level, dtype=object)
+    level = level.where(level.notna(), None).to_numpy()
+    n = pd.to_numeric(pd.Series(baseline_sample_size), errors="coerce").to_numpy(dtype=float)
+    eligible = (np.isin(level, list(strong_levels))
+                & np.isfinite(baseline_p90)
+                & np.isfinite(n) & (n >= min_sample_size))
+    guarded = np.where(eligible, np.maximum(model_p90, baseline_p90), model_p90)
+    return np.maximum(p50, guarded)
 
 
 def pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> dict:
@@ -292,6 +336,10 @@ class MetricsReport:
     primary_buckets_agg: dict[str, dict] = field(default_factory=dict)
     baseline_buckets_per_day: dict[str, dict[str, dict]] = field(default_factory=dict)
     baseline_buckets_agg: dict[str, dict] = field(default_factory=dict)
+    # Which rule produced the `*_guarded` metrics, so a reader can tell a
+    # served number from the legacy upper bound -- the keys are identical
+    # either way. "served" | "legacy_any_finite_floor" | None (no guarded view).
+    guard_rule: str | None = None
 
 
 def load_prior_manifest(run_dir: Path, target: str) -> dict | None:
@@ -312,23 +360,40 @@ def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
              hold_meta: pd.DataFrame, y_true: np.ndarray,
              holdout_day_keys: list[str], baseline_dir: Path,
              target: str,
-             baseline_p90: np.ndarray | None = None) -> MetricsReport:
+             baseline_p90: np.ndarray | None = None,
+             baseline_level: np.ndarray | None = None,
+             baseline_sample_size: np.ndarray | None = None) -> MetricsReport:
     """Compute per-day + aggregate metrics on primary/supplemental slices
     and load the matching baseline JSONs.
 
     `target` is "duration" or "wait" — selects which field of the baseline
     JSONs to read.
 
-    When ``baseline_p90`` is provided (run-duration runs), the report also
-    carries a guarded p90 view: max(preds_p90, baseline_p90) floored by p50.
-    Coverage and pinball loss for the guarded view are emitted alongside the
-    raw-model p90 metrics so we can compare calibration globally.
+    When ``baseline_p90`` is provided, the report also carries a guarded p90
+    view. With ``baseline_level`` and ``baseline_sample_size`` that view is the
+    live serving rule (floor only on a strong baseline level with a large
+    enough sample, then floor by p50); without them it falls back to the legacy
+    priority-blind floor, which is an upper bound on served coverage rather
+    than the served number. See ``compute_guarded_p90``. Coverage and pinball
+    loss for the guarded view are emitted alongside the raw-model p90 metrics
+    so we can compare calibration globally. Because both rules write the same
+    metric keys, the report's ``guard_rule`` field records which one ran.
     """
     primary_mask      = hold_meta["reason_resolved"].isin(["completed"]).to_numpy()
     supplemental_mask = hold_meta["reason_resolved"].isin(["completed", "failed"]).to_numpy()
 
+    if baseline_p90 is None:
+        guard_rule = None
+    elif baseline_level is not None and baseline_sample_size is not None:
+        guard_rule = "served"
+    else:
+        guard_rule = "legacy_any_finite_floor"
+
     preds_p90_guarded = (
-        compute_guarded_p90(p50=preds_p50, model_p90=preds_p90, baseline_p90=baseline_p90)
+        compute_guarded_p90(p50=preds_p50, model_p90=preds_p90, baseline_p90=baseline_p90,
+                            baseline_level=baseline_level,
+                            baseline_sample_size=baseline_sample_size,
+                            strong_levels=STRONG_BASELINE_LEVELS[target])
         if baseline_p90 is not None else None
     )
 
@@ -389,4 +454,5 @@ def evaluate(*, preds_p50: np.ndarray, preds_p90: np.ndarray,
         primary_buckets_agg=primary_buckets_agg,
         baseline_buckets_per_day=baseline_buckets_per_day,
         baseline_buckets_agg=baseline_buckets_agg,
+        guard_rule=guard_rule,
     )

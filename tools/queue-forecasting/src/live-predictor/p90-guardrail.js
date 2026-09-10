@@ -4,7 +4,7 @@
  * fallback levels are poorly calibrated and would inject noisy quantiles.
  *
  * Run-duration and wait-time share this logic but differ in which baseline
- * level counts as strong (`metadata_name` vs `queue+bucket`), so the strong
+ * level counts as strong (`metadata_name` vs `queue+priority+bucket`), so the strong
  * levels are passed in by the per-target wrappers.
  */
 

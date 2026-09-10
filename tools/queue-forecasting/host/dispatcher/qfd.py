@@ -861,7 +861,9 @@ SCOREBOARD_MAX_BYTES = 8 * 1024
 # as checked.
 #
 # `passed` is the field that must be exactly `True` or `False`: it is the only one
-# a reader turns into a word.
+# a reader turns into a word. The one exception is a `role: report` metric, which
+# is shown and never decides, so a `null` there means "nothing to report" (mean
+# miss severity over zero misses) rather than a lost verdict.
 _SCOREBOARD_NUMERIC = ("value", "baseline", "measured")   # finite number or null
 _SCOREBOARD_REQUIRED = ("passed", "bar", "value", "measured")
 # `direction` is checked against the CONTRACT's vocabulary rather than "is a
@@ -945,12 +947,65 @@ def _scoreboard_pin(board):
             return None
         if any(field not in spec for field in _SCOREBOARD_REQUIRED):
             return None
-        if not isinstance(spec["passed"], bool):
+        role = spec.get("role")
+        if role is not None:
+            # The evaluator writes `role` only for a non-default role, and the
+            # only non-default role is `report`. Anything else is not the
+            # evaluator's vocabulary (contract_mod.ROLES).
+            if role not in contract_mod.ROLES:
+                return None
+            if role == "gate":
+                role = None          # the default, never recorded
+        # `passed` is exactly True or False for a gate -- it is the field a reader
+        # turns into a word. A REPORT metric may also have nothing to report
+        # (`None`): it is shown and never decides, so a null here is a value,
+        # not a shape error.
+        if not isinstance(spec["passed"], bool) and not (
+                role == "report" and spec["passed"] is None):
             return None
         bar = _scoreboard_bar(spec["bar"])
         if bar is None:
             return None
+        # `inconclusive` marks a REPORT metric the evaluator could not judge
+        # because too few eligible rows landed in it -- fewer than the contract's
+        # minimum. Optional (an older evaluator never sends it) and STRICTLY
+        # BOOL: `1` and `"true"` are not this field, and coercing them would
+        # record a judgement nobody made.
+        inconclusive = spec.get("inconclusive")
+        if inconclusive is not None and not isinstance(inconclusive, bool):
+            return None
+        if inconclusive and spec["passed"] is not None:
+            # A METRIC CANNOT BE BOTH JUDGED AND INCONCLUSIVE. `passed` is the
+            # field a reader turns into a word, so the pair "passed: false,
+            # inconclusive: true" would read as a failure on any reader that
+            # does not know the newer field -- which is every reader written
+            # before it. Refuse the board rather than store a contradiction.
+            return None
+        # `eligible_n` is the row count the metric's ratio divided by, and it is
+        # what makes `INCONCLUSIVE` actionable: "7 rows, floor 200" is a reason,
+        # "INCONCLUSIVE" alone is a shrug. Recorded because unknown metric fields
+        # are DROPPED here, so a field the evaluator writes and this does not
+        # name never reaches `qf` or `results.py` at all.
+        #
+        # A STRICT NON-NEGATIVE INT, and a null is refused rather than stored:
+        # this field exists to carry a number, and "the count is unknown" is
+        # already spelled by omitting it. `bool` is excluded explicitly because
+        # `True` is an `int` in python and would record a count of 1.
+        eligible = spec.get("eligible_n")
+        if "eligible_n" in spec:
+            if (not isinstance(eligible, int) or isinstance(eligible, bool)
+                    or eligible < 0):
+                return None
         kept = {"passed": spec["passed"], "bar": bar}
+        if "eligible_n" in spec:
+            kept["eligible_n"] = eligible
+        if inconclusive:
+            # RECORDED ONLY WHEN TRUE, like `role`: a false-valued flag on every
+            # metric is a second spelling of the default that pins get compared
+            # across.
+            kept["inconclusive"] = True
+        if role is not None:
+            kept["role"] = role
         for field in _SCOREBOARD_NUMERIC:
             if field not in spec:
                 continue
@@ -1493,6 +1548,102 @@ def cgroup_current_bytes(container_id, docker):
         return None
 
 
+ACTIVE_CONTRACTS_FILE = "ACTIVE"
+_CONTRACT_HASH_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+
+def read_active_contracts(directory, published):
+    """`(active, unresolved)` from `<contracts_dir>/ACTIVE`, both `{target: hash}`.
+
+    THE SETTING THAT LETS A NEW RULE WIN UNATTENDED. `experiment.choose_contract`
+    ranks published contracts by how many scored runs used them, so a contract
+    published this morning has zero and the incumbent wins forever: publishing v2
+    could never cut the loop over to it. `--contract` names one for ONE run, and
+    deleting v1 is not the alternative -- `research-loop/frontier.py:load_contract`
+    reads v1's BODY to interpret the historical v1 cohorts, so a deleted contract
+    makes old results unreadable, and the file is tracked so a deploy restores it.
+
+    So the cutover is a SETTING, not a deletion: every contract stays published
+    and one line says which one is active for a target. Root-owned in the trusted
+    checkout and tracked in git, so the cutover is a commit that survives a deploy
+    -- the same provenance argument as the contracts themselves.
+
+    READ FRESH ON EVERY CALL, like the directory listing beside it, and for the
+    same reason: an operator edits this between requests and a cached answer would
+    serve the previous decision.
+
+    A MALFORMED LINE IS OMITTED AND LOGGED, NEVER GUESSED: an unknown target or
+    something that is not a contract hash names nothing, and guessing which
+    contract was meant is how a run gets judged by a rule nobody named.
+
+    A WELL-FORMED LINE NAMING AN UNPUBLISHED CONTRACT IS NOT OMITTED -- it comes
+    back in `unresolved`, and that split is the whole point of this returning two
+    dicts. Dropping it was the first version of this function and it rebuilt the
+    exact failure the setting exists to prevent: `active` came back empty, the
+    resolver saw "no setting", ranked by usage, and the loop kept running v1
+    while ACTIVE said v2 and the tool that wrote it said "activated". Both of the
+    realistic triggers produce precisely that state -- an operator committing
+    ACTIVE but not the new `.json`, and a `.json` written mode 0600 so
+    `contract.load` cannot read it and `available_contracts` omits it. Neither is
+    "no setting". `experiment.py` REFUSES on an unresolved entry.
+    """
+    out, unresolved = {}, {}
+    if not directory:
+        return out, unresolved
+    path = os.path.join(directory, ACTIVE_CONTRACTS_FILE)
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except FileNotFoundError:
+        # NOT AN ERROR. No ACTIVE file is the default state: every target is
+        # chosen by usage, which is what happened before this setting existed.
+        return out, unresolved
+    except OSError as e:
+        log.error("cannot read %s: %s", path, e)
+        return out, unresolved
+    for number, raw in enumerate(lines, 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            log.error("%s line %d: expected `<target> <contract_hash>`,"
+                      " got %r", path, number, raw)
+            continue
+        target, digest = fields
+        if target not in contract_mod.TARGETS:
+            log.error("%s line %d: unknown target %r, not one of %s",
+                      path, number, target, list(contract_mod.TARGETS))
+            continue
+        if not _CONTRACT_HASH_RE.match(digest):
+            log.error("%s line %d: %r is not a 64-hex lowercase contract"
+                      " hash", path, number, digest)
+            continue
+        if target in out or target in unresolved:
+            # FIRST WINS, and the second is named. Two lines for one target is
+            # an operator mid-edit; picking the last would make the meaning of
+            # the file depend on line order nobody documented. Checked across
+            # BOTH dicts, so a duplicate cannot resolve past an unresolved
+            # first line and quietly become the answer.
+            log.error("%s line %d: target %r is already set by an earlier"
+                      " line; ignoring this duplicate", path, number, target)
+            continue
+        if digest not in published:
+            # REPORTED, NOT DROPPED: see the docstring. The line is well formed,
+            # so this is a deployment fault and not a typo -- and a deployment
+            # fault that reads as "no setting" is the one outcome this whole
+            # file exists to make impossible.
+            log.error("%s line %d: contract %s is named active for %s but is"
+                      " not published in %s -- the .json may not be deployed,"
+                      " or may not be readable by this service (mode 0644);"
+                      " `qf contracts` lists what is published", path, number,
+                      digest[:12], target, directory)
+            unresolved[target] = digest
+            continue
+        out[target] = digest
+    return out, unresolved
+
+
 class Refused(Exception):
     """A request that gets a reason, not a crash. A refusal is never a crash:
     the caller gets the reason and the record keeps it."""
@@ -1790,9 +1941,24 @@ class Dispatcher:
         directory is root-owned and qfd cannot write it, so reading it is not a
         second writer."""
         contracts = self.available_contracts()
+        active, unresolved = read_active_contracts(self.cfg.contracts_dir,
+                                                   contracts)
         return {"contracts": [{"contract_hash": h, "file": n}
                               for h, n in sorted(contracts.items(),
                                                  key=lambda kv: kv[1])],
+                # WHICH ONE IS ACTIVE, beside what is published: see
+                # `read_active_contracts`. `active_unresolved` carries the
+                # well-formed entries that name nothing published -- separately,
+                # because a resolver must be able to tell "no setting" (rank by
+                # usage) from "a setting that could not be resolved" (refuse).
+                "active": active,
+                "active_unresolved": unresolved,
+                # THE TARGET VOCABULARY, so the client can say "no ACTIVE entry
+                # for run_duration" without carrying a second copy of the list
+                # `contract_mod` owns. A client-side copy that drifted would
+                # report a target as unset that cannot be set, or stay silent
+                # about one that can.
+                "targets": list(contract_mod.TARGETS),
                 "dir": self.cfg.contracts_dir}
 
     def _op_baselines(self, payload, uid):

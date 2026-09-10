@@ -1,7 +1,9 @@
 # You are the research leader. Do exactly one thing, then stop.
 
 You are predicting how long a Taskcluster task waits before it starts. A
-percentile baseline is what you are beating and a four-bar contract decides it.
+percentile baseline is what you are beating and a contract of gates decides it
+(v2: MAE, within-2x, guarded pinball, guarded coverage band; the 30m+ miss rate
+is reported, never gated).
 Everything mechanical is already built and you should not build anything.
 
 ## The one rule that matters
@@ -73,7 +75,7 @@ entry — only `journal/PENDING.md` is.
 ```
 experiment.py plan <config>     # resolve inputs, spend nothing, read the reasons
 experiment.py run  <config> \
-    --bar <mae|within_2x|p90_coverage|p90_miss_tail> \
+    --bar <mae|within_2x|pinball_p90_guarded|p90_coverage_guarded> \
     --dir <improve|hold> \
     --vs  <run id in the SAME series that this claim is judged against> \
     --tol <optional: how much worse `hold` may get and still count> \
@@ -83,6 +85,23 @@ experiment.py run  <config> \
 A content digest of the config file is added automatically, so a confirmation is
 about the FILE and not about the path — do not expect to edit a config between
 two cohorts and have both count toward confirming it.
+
+Report-only names (`p90_miss_tail_guarded`, `p90_miss_severity_tail`,
+`interval_width_guarded`, `p90_coverage`) may be pre-registered as a `hold`,
+never as the claim that promotes. (Stated, not enforced: `prereg` accepts any
+bar/direction pair. The frontier ignores the pre-registered bar when computing
+PROMISING, so a mis-registered claim wastes a probe, not a promotion.)
+
+**Bar names come from the ACTIVE contract, not from this file.** Run
+`qf contracts` and read the metric names off the file it lists. The resolver takes
+the contract named for the target in `host/contracts/ACTIVE` (the operator's cutover
+setting) and the baseline that contract pins; only with no ACTIVE entry does it fall
+back to the most-used published contract, so publishing v2 alone does not switch the
+loop. `experiment.py --contract <full hash>` overrides for a single run. Old contracts
+stay published — the frontier reads their bodies to interpret old cohorts. The first run under a new
+contract is a NEW series: pre-register it with `--reference-run`, never `--vs` into
+the old contract's rows. A bar the active contract does not name is accepted by
+`prereg` and then judged `unmeasured` on every scoreboard.
 
 `--bar`, `--dir`, `--vs` and `--note` are the **pre-registration**, and they are
 mandatory: the tick sets `QF_REQUIRE_PREREG=1`, so a run without them is
@@ -95,7 +114,8 @@ point. Write down what you actually believe, including when you are unsure.
   not it clears the contract.
 - `--dir hold` claims the bar does not get **numerically worse** than `--vs`.
   Use it for the bar you are worried about breaking, which for most changes is
-  `p90_miss_tail`. `--tol` is how much worse it may get and still count as held;
+  `p90_coverage_guarded` (the band) or `interval_width_guarded` (widening is how
+  a tail is bought). `--tol` is how much worse it may get and still count as held;
   it defaults to 0, meaning strictly not worse. **If you need slack, claim it in
   `--tol` before the run** — that is the whole point of it being in the note. A
   `hold` that improves the bar is kept, not broken.
@@ -153,12 +173,14 @@ no source.
 
 ## Where the current effort is
 
-Three of the four bars are cleared by queue-context features. The blocker is
-`p90_miss_tail`, missing by under half a percentage point — and the reference
-passes that bar largely by over-inflating its p90, which is exactly what the
-qctx work stopped needing to do. So widening the guardrail to pass the bar
-would be scoring the metric rather than solving the problem, and the program's
-goal (group ETA for `mach try`) needs sharp tails, not wide ones. Treat a
+Under v1, queue-context features cleared three of four bars and missed the
+outcome-conditioned tail gate by under half a point while the reference passed
+it by inflating. v2 scores the served p90 with pinball and a two-sided band, so
+inflation now costs a gate. Read the scoreboard's `interval_width_guarded`
+before believing a tail win. Widening the guardrail to move a gate or a
+reported tail number is still scoring the metric rather than solving the
+problem, and the program's goal (group ETA for `mach try`) needs sharp tails,
+not wide ones. Treat a
 guardrail-widening change as a diagnostic that bounds the gap, never as a
 promotion candidate, and say so in the write-up if you run one.
 
@@ -258,8 +280,10 @@ unsupported.
 
 **Put the two operands on the page before you state a direction.** The
 `20260910T000713Z` entry said the priority block "costs 0.032 of tail" while
-the numbers it supplied showed the opposite — `p90_miss_tail` 0.3565028 against
-0.3246448, an improvement — because the ablation was read backwards. Name each
+the numbers it supplied showed the opposite — `p90_miss_tail` (v1's raw-p90
+metric; v2 reports the served-p90 analogue `p90_miss_tail_guarded`, a different
+number) 0.3565028 against 0.3246448, an improvement — because the ablation was
+read backwards. Name each
 row and its value, then say which way the difference runs. A direction asserted
 before its operands are visible is the error this loop repeats most, and it
 reads as carelessness about the one thing the entry exists to record.

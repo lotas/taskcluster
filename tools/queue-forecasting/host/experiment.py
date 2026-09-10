@@ -373,32 +373,186 @@ def named_extract(config, extracts, request_hash):
     return chosen, rejected, runners_up
 
 
-def choose_baseline(baselines, counts):
-    """The most-used baseline that is not broken; newest as a tiebreak."""
-    usable = [b for b in (baselines or []) if not b.get("broken")]
-    if not usable:
-        raise Refused(
-            "no usable promoted baseline: every published one is flagged"
-            " broken, or none is published. `promote-baseline.sh` publishes"
-            " one, and that is an operator action.")
-    usable.sort(key=lambda b: (-counts.get(b.get("baseline_hash"), 0),
-                               _reverse(str(b.get("promoted_at") or "")),
-                               b.get("baseline_hash") or ""))
-    return usable[0]
+def choose_contract(target, contracts, counts, active=None,
+                    active_unresolved=None):
+    """The ACTIVE contract for this target, else the most-used one.
 
+    Ranked by usage for the same reason as everything else here -- a verdict
+    under a rule nothing else was judged by belongs to no series. But usage only
+    grows, so on usage ALONE a contract published today (zero scored runs) loses
+    to the incumbent forever and publishing v2 could never cut the loop over to
+    it. `--contract` fixes that for ONE run; `host/contracts/ACTIVE` fixes it
+    PERSISTENTLY, which is what an unattended loop needs.
 
-def choose_contract(target, contracts, counts):
-    """The most-used contract for this target."""
+    THE ALTERNATIVE THAT LOOKS EASIER AND IS WRONG: deleting the old contract
+    file. `research-loop/frontier.py:load_contract` reads a contract's BODY to
+    interpret the cohorts that were judged under it -- holdout overlap, metric
+    ranks, gate sets -- so deleting v1 makes every historical v1 result
+    unreadable, and the file is tracked in git so a deploy would restore it
+    anyway. Every contract stays published; ACTIVE says which one is current.
+
+    A NAME IS NOT A RANKING, so an ACTIVE entry that does not resolve to a
+    published contract for this target REFUSES instead of falling back. The
+    fallback would be SILENT in the worst possible way: the operator wrote a
+    setting, the tool that wrote it said "activated", the loop ignored it, and
+    every result afterwards was judged by the rule they thought they had
+    replaced. That is not a hypothetical -- an operator who commits ACTIVE
+    without the new `.json`, or a `.json` written mode 0600 that qfd cannot
+    read, both land here, which is why `qfd.read_active_contracts` reports them
+    in `active_unresolved` rather than dropping them.
+    """
     usable = [c for c in (contracts or []) if c.get("target") in (None, target)]
+    stuck = (active_unresolved or {}).get(target)
+    if stuck:
+        # BEFORE the "nothing published" refusal below, because when the
+        # contracts directory is empty BOTH apply and only this one names the
+        # setting the operator actually wrote.
+        raise Refused(
+            f"host/contracts/ACTIVE names contract {str(stuck)[:12]}... as"
+            f" active for target {target!r}, and the dispatcher cannot resolve"
+            f" it to a published contract. Two things do this: the contract's"
+            f" .json was never deployed (ACTIVE was committed and the contract"
+            f" file was not), or it is on the host but qfd cannot read it"
+            f" (check that the .json is mode 0644 -- `instantiate-contract.sh`"
+            f" writes it readable, an older one did not). `qf contracts` lists"
+            f" what is published. Refused rather than ranking by usage, which"
+            f" would run every experiment under the rule you meant to replace"
+            f" while ACTIVE said otherwise.")
     if not usable:
         raise Refused(
             f"no published contract for target {target!r}."
             " `instantiate-contract.sh` pins a template to a promoted"
             " baseline_hash, and that is an operator action.")
+    wanted = (active or {}).get(target)
+    if wanted:
+        for contract in usable:
+            if contract.get("contract_hash") == wanted:
+                return contract
+        published = ", ".join(sorted(
+            (c.get("contract_hash") or "?")[:12] for c in usable)) or "none"
+        raise Refused(
+            f"host/contracts/ACTIVE names contract {str(wanted)[:12]}... as"
+            f" active for target {target!r}, and no published contract for that"
+            f" target has that hash. Published for {target}: {published}."
+            f" `qf contracts` lists every published contract and the active"
+            f" setting it reports. Fix the ACTIVE line -- refused rather than"
+            f" falling back to usage ranking, which would judge every run after"
+            f" this by the rule you meant to replace, silently.")
     usable.sort(key=lambda c: (-counts.get(c.get("contract_hash"), 0),
                                _reverse(str(c.get("created_at") or "")),
                                c.get("contract_hash") or ""))
     return usable[0]
+
+
+def named_contract(target, contracts, contract_hash):
+    """The contract an operator NAMED, checked by the same target rule.
+
+    AN OVERRIDE, NOT A PREFERENCE, and the reason it has to exist is the same
+    shape as `named_extract`'s: `choose_contract`'s first key is scored-run
+    usage count, and a newly published contract starts at zero. v1 has every
+    scored run behind it, so v1 keeps being chosen no matter how many times an
+    operator publishes v2 -- publishing a new rule could not cut the loop over
+    to it at all.
+
+    THE FULL HASH, NOT A PREFIX, for the reason spelled out in `named_extract`:
+    this is a declaration, the whole point is a rule no usage count endorses,
+    and a prefix landing on a near-miss would judge the run by a rule nobody
+    named. Run `plan` to get the hash to paste.
+
+    THE TARGET CHECK IS STILL ENFORCED. Naming a contract overrides which one
+    is CHOSEN, not what the config is. A `run_duration` contract cannot judge a
+    `wait_time` run, and the evaluator would refuse it later anyway -- after a
+    probe has been spent.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", contract_hash or ""):
+        raise Refused(
+            f"--contract wants a full 64-hex contract hash, not"
+            f" {contract_hash!r}. This flag exists to name a rule that usage"
+            f" count will never choose, so a prefix that resolves to a"
+            f" near-miss would judge the run by a rule nobody named. Run"
+            f" `plan` on this config and paste the hash it prints.")
+    for contract in contracts or []:
+        if contract.get("contract_hash") != contract_hash:
+            continue
+        if contract.get("target") not in (None, target):
+            raise Refused(
+                f"--contract named {contract_hash[:12]}..., whose target is"
+                f" {contract.get('target')!r}, but this config's target is"
+                f" {target!r}. Naming a contract overrides which one is"
+                f" chosen, not what the config measures.")
+        return contract
+    known = ", ".join(sorted(
+        (c.get("contract_hash") or "?")[:12]
+        for c in contracts or [])) or "none"
+    raise Refused(
+        f"no published contract has hash {contract_hash[:12]}...."
+        f" Published: {known}. `qf contracts` lists them;"
+        f" `instantiate-contract.sh` publishes one, and that is an operator"
+        f" action.")
+
+
+def baseline_for_contract(contract, baselines):
+    """The baseline THIS contract is stated against. Not a separate choice.
+
+    THE DEFECT THIS CLOSES. `plan` used to rank baselines and contracts
+    independently, each by usage count, and they are not independent: a
+    contract PINS `baseline_hash` (`shared/contract.py:_REQUIRED`) and
+    `evaluator/evaluate.py` refuses to judge a run whose recorded baseline is
+    not the one its contract names -- "a bar relative to one baseline, measured
+    against another, is not the bar that was agreed". So a contract published
+    against a newly promoted baseline would have been paired with the OLD
+    most-used baseline, and every evaluation of every run would be refused.
+    The contract and its baseline are one pair; resolving the contract resolves
+    the baseline.
+
+    There is NO ranking fallback here on purpose: see the refusal below.
+    """
+    pinned = contract.get("baseline_hash")
+    if not pinned:
+        # REFUSED, NOT RANKED. `baseline_hash` is required by
+        # `shared/contract.py`, and `qfd.available_contracts` only lists files
+        # that pass that validator -- so a LISTED row with no pin cannot mean
+        # "a contract without a baseline". It can only mean this process could
+        # not read the body: wrong directory, a file readable by root and not
+        # by this identity, a name that moved. Ranking the baseline separately
+        # here would silently rebuild the exact defect this function exists to
+        # close, and `render_plan` would then say "pinned by that contract"
+        # about a baseline no contract named.
+        raise Refused(
+            f"contract {(contract.get('contract_hash') or '?')[:12]}... is"
+            f" published but its body could not be read from this identity"
+            f" ({contract.get('body_unreadable') or 'no path attempted'}), so"
+            f" the baseline it pins is unknown. Every listed contract has a"
+            f" baseline_hash -- `qf contracts` only lists files that validate"
+            f" -- so this is a read problem, not a contract problem: check"
+            f" that the contracts directory `qf contracts` reports is readable"
+            f" by the identity running this. Refused rather than falling back"
+            f" to the most-used baseline, which is the pairing the evaluator"
+            f" exists to reject.")
+    for baseline in baselines or []:
+        if baseline.get("baseline_hash") != pinned:
+            continue
+        if baseline.get("broken"):
+            raise Refused(
+                f"contract {(contract.get('contract_hash') or '?')[:12]}... is"
+                f" stated against baseline {pinned[:12]}..., which IS"
+                f" published but is flagged broken -- its manifest is missing,"
+                f" unreadable, or does not hash to its own name. Re-run"
+                f" `promote-baseline.sh` for that baseline, or pick a contract"
+                f" stated against a good one. Judging against a broken"
+                f" baseline is not judging against the bar that was agreed.")
+        return baseline
+    published = ", ".join(sorted(
+        (b.get("baseline_hash") or "?")[:12]
+        for b in baselines or [])) or "none"
+    raise Refused(
+        f"contract {(contract.get('contract_hash') or '?')[:12]}... is stated"
+        f" against baseline {pinned[:12]}..., which is not published."
+        f" Published: {published}. The contract PINS its baseline and the"
+        f" evaluator refuses any run whose baseline differs, so this pairing"
+        f" cannot be judged at all. Either `promote-baseline.sh` publishes"
+        f" {pinned[:12]}..., or pick a contract stated against a published"
+        f" baseline -- both are operator actions.")
 
 
 class _reverse:
@@ -419,11 +573,21 @@ class _reverse:
 
 
 def plan(config, extracts, baselines, contracts, history,
-         named=None):
+         active=None, active_unresolved=None, named=None, contract_hash=None):
     """Everything a run needs, plus why each input was chosen.
 
-    `named` is a full extract request hash from `--extract`. It replaces the
-    RANKING only: see `named_extract`.
+    `named` is a full extract request hash from `--extract` and
+    `contract_hash` a full contract hash from `--contract`. Both replace the
+    RANKING only: see `named_extract` and `named_contract`.
+
+    `active` is `{target: contract_hash}` from `host/contracts/ACTIVE` (see
+    `choose_contract`). PRECEDENCE, strongest first: `--contract` (this run),
+    ACTIVE (this deployment, until the next commit), usage ranking (the
+    default). `--contract` wins over ACTIVE because a per-run override that a
+    persistent setting could veto would be an override in name only.
+
+    THE CONTRACT IS RESOLVED BEFORE THE BASELINE, and the baseline is then read
+    OFF it. They are one pair: see `baseline_for_contract`.
     """
     counts = usage_counts(history)
     if named:
@@ -431,13 +595,18 @@ def plan(config, extracts, baselines, contracts, history,
     else:
         extract, rejected, runners_up = choose_extract(config, extracts,
                                                        counts["extract"])
+    if contract_hash:
+        contract = named_contract(config["target"], contracts, contract_hash)
+    else:
+        contract = choose_contract(config["target"], contracts,
+                                   counts["contract"], active=active,
+                                   active_unresolved=active_unresolved)
     train_start = cohort_train_start(config, extract.get("as_of_date"))
     return {
         "config": config,
         "extract": extract,
-        "baseline": choose_baseline(baselines, counts["baseline"]),
-        "contract": choose_contract(config["target"], contracts,
-                                    counts["contract"]),
+        "contract": contract,
+        "baseline": baseline_for_contract(contract, baselines),
         "as_of": extract.get("as_of_date"),
         "cohort_train_start": train_start.date().isoformat() if train_start
                               else None,
@@ -449,6 +618,22 @@ def plan(config, extracts, baselines, contracts, history,
         # kind of claim as a run on the chosen one, and the difference has to
         # reach the entry that cites it.
         "extract_named": bool(named),
+        # AND THE SAME FOR THE CONTRACT. A run judged by a rule an operator
+        # named, rather than by the rule the series has been using, is a
+        # different kind of claim -- and the difference has to reach the entry
+        # that cites it.
+        "contract_named": bool(contract_hash),
+        # AND WHETHER A SETTING CHOSE IT rather than a usage count. Separate
+        # from `contract_named` because they are different claims: one is "an
+        # operator typed this hash for this run", the other is "this deployment
+        # has cut over". False when `--contract` won, because then the flag is
+        # what decided, whatever ACTIVE says.
+        "contract_active": bool(not contract_hash
+                                and (active or {}).get(config["target"])),
+        # THE SETTING ITSELF, kept even when `--contract` outranked it, so the
+        # rendering can say the flag overrode a live cutover rather than
+        # silently looking like the ordinary case.
+        "contract_active_hash": (active or {}).get(config["target"]) or None,
     }
 
 
@@ -494,6 +679,23 @@ def inventory(limit=200):
         if not ok:
             raise Refused(f"cannot read `qf {op}`: {body}")
         out[name] = body.get(name) or []
+        if op == "contracts":
+            # Named explicitly rather than reusing the loop's last `body`: the
+            # directory only comes back on this one op, and a reader should not
+            # have to know the iteration order to see that.
+            out[name] = read_contract_bodies(out[name], body.get("dir"))
+            # AND THE ACTIVE SETTING, which rides the same reply because it is
+            # read from the same root-owned directory
+            # (`qfd.read_active_contracts`). Kept as `{target: contract_hash}`
+            # and consulted BEFORE usage ranking: see `choose_contract`.
+            active = body.get("active")
+            out["active"] = active if isinstance(active, dict) else {}
+            # AND THE ENTRIES THAT NAME NOTHING PUBLISHED, kept separate on
+            # purpose: "no setting" ranks by usage, "a setting I could not
+            # resolve" REFUSES. Collapsing the two is how a half-deployed
+            # cutover reads as no cutover at all -- see `choose_contract`.
+            stuck = body.get("active_unresolved")
+            out["active_unresolved"] = stuck if isinstance(stuck, dict) else {}
 
     ok, body = qf("list", "--limit", str(limit), "--json", timeout=120)
     if not ok:
@@ -506,6 +708,78 @@ def inventory(limit=200):
         if ok:
             history.append(status.get("job") or status)
     out["history"] = history
+    return out
+
+
+def read_contract_bodies(rows, directory):
+    """Put `target`, `name` and `baseline_hash` on each contract row.
+
+    `qf contracts` DOES NOT CARRY THEM. `qfd._op_contracts` returns only
+    `{"contract_hash", "file"}` plus the directory, because the contracts live
+    root-owned in the trusted checkout and qfd is not their reader -- so every
+    field the resolver actually decides on has to be read off the file, the
+    same way `research-loop/frontier.py:load_contract` reads it.
+
+    That mattered more than it looked: `choose_contract` filters on
+    `c.get("target") in (None, target)`, and with `target` never present the
+    filter passed EVERYTHING, so a `run_duration` contract was a candidate for
+    a `wait_time` config. `baseline_hash` is the field the fix depends on
+    outright -- without it every contract falls into the no-pin fallback.
+
+    Read with stdlib `json` rather than `shared/contract.py`: nothing else in
+    this file imports from `shared`, and this is a lookup, not a validation --
+    the dispatcher and the evaluator both validate what they are handed.
+
+    A ROW THAT COULD NOT BE ENRICHED IS MARKED, NOT DROPPED AND NOT GUESSED.
+    `body_unreadable` carries why, and `baseline_for_contract` turns it into a
+    refusal that names it. Dropping the row would make a contract invisible to
+    the one command an operator would use to find out why a run was refused;
+    guessing the baseline would rebuild the mispairing this all exists to stop.
+    """
+    out = []
+    for row in rows or []:
+        row = dict(row)
+        if not directory or not row.get("file"):
+            # BEFORE THE OPEN. `os.path.join("", "wait_time.v1.json")` is a
+            # RELATIVE path, so a listing that came back without `dir` would
+            # resolve every contract against the current working directory and
+            # enrich the row from whatever happens to be sitting there. A
+            # decoy file in a CWD deciding which baseline a run trains against
+            # is not a failure mode worth having.
+            row["body_unreadable"] = (
+                f"`qf contracts` returned no directory"
+                if not directory else "the row names no file")
+            out.append(row)
+            continue
+        path = os.path.join(directory, row["file"])
+        try:
+            with open(path) as fh:
+                body = json.load(fh)
+        except (OSError, ValueError) as e:
+            row["body_unreadable"] = f"{path}: {e}"
+            out.append(row)
+            continue
+        if not isinstance(body, dict):
+            row["body_unreadable"] = f"{path}: not a JSON object"
+            out.append(row)
+            continue
+        declared = body.get("contract_hash")
+        if declared is not None and declared != row.get("contract_hash"):
+            # The file carries its own hash and it is not this row's, so the
+            # file moved or was rewritten between qfd resolving the listing and
+            # this read. Enriching from it would attach one contract's baseline
+            # to another contract's hash -- which is the mispairing in a form
+            # nothing downstream could detect.
+            row["body_unreadable"] = (
+                f"{path} declares contract_hash {str(declared)[:12]}, not the"
+                f" {(row.get('contract_hash') or '?')[:12]} this row names:"
+                f" the file changed after it was listed")
+            out.append(row)
+            continue
+        for field in ("name", "target", "baseline_hash"):
+            if row.get(field) is None and body.get(field) is not None:
+                row[field] = body[field]
+        out.append(row)
     return out
 
 
@@ -806,7 +1080,8 @@ def cmd_doctor(args):
         inv = inventory(limit=args.limit)
     except Refused as e:
         check("inventory readable", False, str(e)[:200])
-        inv = {"extracts": [], "baselines": [], "contracts": [], "history": []}
+        inv = {"extracts": [], "baselines": [], "contracts": [],
+               "active": {}, "active_unresolved": {}, "history": []}
     check("extracts", bool(inv["extracts"]), f"{len(inv['extracts'])} published",
           "qf extract --target wait_time ... (operator)")
     usable_baselines = [b for b in inv["baselines"] if not b.get("broken")]
@@ -888,9 +1163,37 @@ def render_plan(resolved):
            f"  lookback={extract.get('lookback_days')}",
            f"          cohort needs train_start"
            f" <= {resolved['cohort_train_start']}",
+           f"contract  {resolved['contract'].get('contract_hash')}"
+           + ("  (NAMED with --contract)"
+              if resolved.get("contract_named")
+              else "  ACTIVE (host/contracts/ACTIVE)"
+              if resolved.get("contract_active") else ""),
            f"baseline  {resolved['baseline'].get('baseline_hash')}",
-           f"contract  {resolved['contract'].get('contract_hash')}"]
+           "          pinned by that contract, not chosen separately"]
 
+    if not resolved.get("contract_active_hash"):
+        # THE MODE, STATED. Without this line an operator cannot tell from the
+        # plan whether the contract came from a setting they control or from a
+        # usage count that will keep choosing the incumbent forever.
+        #
+        # AND NOT WHEN `--contract` DECIDED. Usage did not choose it either, so
+        # printing "chosen by usage" beside "(NAMED with --contract)" on the
+        # line above states two different origins for one contract.
+        if not resolved.get("contract_named"):
+            out.append(f"no ACTIVE contract for {config['target']}: chosen by"
+                       f" usage")
+    elif resolved.get("contract_named"):
+        out.append(
+            f"--contract OVERRODE the ACTIVE setting"
+            f" ({resolved['contract_active_hash'][:12]}... is active for"
+            f" {config['target']}). The flag wins for this run only; ACTIVE is"
+            f" unchanged.")
+    if resolved.get("contract_named"):
+        out.append("\nNAMED with --contract: usage count did not choose this"
+                   " rule, you did -- and the baseline above is the one THIS"
+                   " contract pins, so it moved with it. Earlier runs in this"
+                   " series were judged by a different contract, so their"
+                   " verdicts are not directly comparable to this one.")
     if resolved.get("extract_named"):
         out.append("\nNAMED with --extract: usage count did not choose this"
                    " extract, you did. Comparability is now YOUR claim --"
@@ -924,7 +1227,8 @@ def render_plan(resolved):
 def cmd_plan(args):
     config = read_config(config_path(workspace_path(args.workspace),
                                      args.config))
-    resolved = plan(config, named=args.extract, **inventory(limit=args.limit))
+    resolved = plan(config, named=args.extract, contract_hash=args.contract,
+                    **inventory(limit=args.limit))
     print(render_plan(resolved))
     return 0
 
@@ -1066,7 +1370,8 @@ def cmd_run(args):
     # different one.
     args.workspace_resolved = workspace
     config = read_config(config_path(workspace, args.config))
-    resolved = plan(config, named=args.extract, **inventory(limit=args.limit))
+    resolved = plan(config, named=args.extract, contract_hash=args.contract,
+                    **inventory(limit=args.limit))
     print(render_plan(resolved))
     # BUILT BEFORE THE PUSH, and that ordering is the point. A note the
     # dispatcher rejects fails the SUBMIT, which happens after the commit and
@@ -1170,6 +1475,18 @@ def main(argv=None):
                               " never choose; then judge with --vs inside that"
                               " cohort, or --reference-run if it is the first"
                               " run there.")
+        # THE SAME EXIT, FOR THE RULE. A contract published today has zero
+        # scored runs, so on usage alone the incumbent wins forever and
+        # publishing v2 could never cut the loop over to it.
+        one.add_argument("--contract", metavar="CONTRACT_HASH",
+                         help="judge against a NAMED published contract"
+                              " instead of the most-used one for this"
+                              " config's target. The full 64-hex hash, not a"
+                              " prefix -- `plan` prints it. The baseline"
+                              " follows the contract: a contract pins its"
+                              " baseline_hash and the evaluator refuses any"
+                              " other, so naming a contract also names the"
+                              " baseline.")
         if name == "run":
             one.add_argument("--dry-run", action="store_true",
                              help="stop after planning")

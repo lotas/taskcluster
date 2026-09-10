@@ -322,7 +322,9 @@ async function queryRecentResolved(pool) {
       r.wait_duration_s AS actual_wait_s,
       p.run_p50_s,  p.run_p90_s,
       r.run_duration_s  AS actual_run_s,
-      r.reason_resolved
+      r.reason_resolved,
+      (p.input_features->'baselines'->'wait'->>'level')     AS wait_level,
+      (p.input_features->'baselines'->'duration'->>'level') AS duration_level
     FROM queue_forecast_run_predictions p
     JOIN queue_forecast_task_runs r USING (task_id, run_id)
     JOIN queue_forecast_tasks      t USING (task_id)
@@ -345,7 +347,9 @@ async function queryRecentUnresolved(pool) {
       p.run_p50_s,  p.run_p90_s,
       CASE WHEN r.started_at IS NULL THEN 'pending' ELSE 'running' END AS state,
       r.pending_at,
-      EXTRACT(EPOCH FROM (now() - r.pending_at)) AS age_pending_s
+      EXTRACT(EPOCH FROM (now() - r.pending_at)) AS age_pending_s,
+      (p.input_features->'baselines'->'wait'->>'level')     AS wait_level,
+      (p.input_features->'baselines'->'duration'->>'level') AS duration_level
     FROM queue_forecast_run_predictions p
     JOIN queue_forecast_task_runs r USING (task_id, run_id)
     JOIN queue_forecast_tasks      t USING (task_id)
@@ -951,6 +955,36 @@ function bandCells(n, good, warn, bad) {
          `<td class="r cell-bad">${pct(bad)}</td>`;
 }
 
+// Levels flagged low-confidence by MEASURED miss rate, not by guardrail
+// eligibility: on the 30-day live aggregation (2026-09-10) `queue` fallback
+// waits exceeded p90 65% of the time and `priority+bucket` 51%. (The
+// guardrail also skips every non-strong level, including `queue+bucket`
+// and `normalized_name`, which are NOT flagged here because their measured
+// miss rates are acceptable.) A flagged row's interval should be shown as
+// uncertain or hidden.
+const LOW_CONFIDENCE_LEVELS = {
+  wait: new Set(['queue', 'priority+bucket', 'global', '(null)']),
+  duration: new Set(['kind+test-type', 'task_queue_id', 'scheduler_id', 'global', '(null)']),
+};
+function isLowConfidence(kind, level) {
+  const weak = LOW_CONFIDENCE_LEVELS[kind];
+  return !!weak && weak.has(level == null ? '(null)' : level);
+}
+
+// Renders a p50/p90 pair, badging both cells when the baseline `level`
+// backing them is flagged low-confidence (see LOW_CONFIDENCE_LEVELS above).
+// The numbers are never suppressed — only badged — since this dashboard is
+// a diagnostic surface, not the product UI.
+function confidenceCells(kind, level, p50, p90) {
+  const low = isLowConfidence(kind, level);
+  const cls = low ? 'r cell-warn' : 'r';
+  const shown = level == null ? '(null)' : level;
+  const title = low ? ` title="low confidence: baseline level ${esc(shown)}"` : '';
+  const badge = low ? ' <span class="badge badge-warn">low conf</span>' : '';
+  return `<td class="${cls}"${title}>${fmtDuration(p50)}</td>` +
+         `<td class="${cls}"${title}>${fmtDuration(p90)}${badge}</td>`;
+}
+
 // ─── Section Renderers ───────────────────────────────────────────────────────
 
 function renderTableHealth(rows) {
@@ -1102,9 +1136,10 @@ function renderPredictorHealth(h) {
 
   function renderCoverageList(coverage, kind) {
     if (!coverage || !coverage.length) return `<p class="muted">No ${kind} coverage data.</p>`;
-    const rows = coverage.map(c =>
-      `<tr><td>${esc(c.level)}</td><td class="r">${fmtNum(c.n)}</td></tr>`
-    ).join('');
+    const rows = coverage.map(c => {
+      const badge = isLowConfidence(kind, c.level) ? ` <span class="badge badge-warn">low confidence</span>` : '';
+      return `<tr><td>${esc(c.level)}${badge}</td><td class="r">${fmtNum(c.n)}</td></tr>`;
+    }).join('');
     return `<table><thead><tr><th>${kind} baseline level</th><th class="r">Count (1h)</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
@@ -1121,11 +1156,13 @@ function renderPredictorHealth(h) {
         <h3>Active model versions</h3>
         ${renderVersionList(h.wait_versions, 'wait')}
         ${renderVersionList(h.duration_versions, 'duration')}
+        <p class="muted">Served versions change only on live-predictor restart; a newer training report does not imply it is being served.</p>
       </div>
       <div class="section">
         <h3>Baseline coverage</h3>
         ${renderCoverageList(h.wait_coverage, 'wait')}
         ${renderCoverageList(h.duration_coverage, 'duration')}
+        <p class="muted">Rows at a low-confidence level get no p90 guardrail; the task tables below badge them.</p>
       </div>
     </div>
     <div class="section">
@@ -1159,11 +1196,9 @@ function renderResolvedSample(rows) {
       <td class="ts">${tsCol(r.resolved_at)}</td>
       <td class="mono">${taskLink(r.task_id, r.run_id)}</td>
       <td>${esc(r.task_queue_id)}</td>
-      <td class="r">${fmtDuration(r.wait_p50_s)}</td>
-      <td class="r">${fmtDuration(r.wait_p90_s)}</td>
+      ${confidenceCells('wait', r.wait_level, r.wait_p50_s, r.wait_p90_s)}
       <td class="r ${waitClass}">${fmtDuration(r.actual_wait_s)}</td>
-      <td class="r">${fmtDuration(r.run_p50_s)}</td>
-      <td class="r">${fmtDuration(r.run_p90_s)}</td>
+      ${confidenceCells('duration', r.duration_level, r.run_p50_s, r.run_p90_s)}
       <td class="r ${runClass}">${fmtDuration(r.actual_run_s)}</td>
     </tr>`;
   }
@@ -1185,10 +1220,8 @@ function renderUnresolvedSample(rows) {
       <td class="ts">${tsCol(r.predicted_at)}</td>
       <td class="mono">${taskLink(r.task_id, r.run_id)}</td>
       <td>${esc(r.task_queue_id)}</td>
-      <td class="r">${fmtDuration(r.wait_p50_s)}</td>
-      <td class="r">${fmtDuration(r.wait_p90_s)}</td>
-      <td class="r">${fmtDuration(r.run_p50_s)}</td>
-      <td class="r">${fmtDuration(r.run_p90_s)}</td>
+      ${confidenceCells('wait', r.wait_level, r.wait_p50_s, r.wait_p90_s)}
+      ${confidenceCells('duration', r.duration_level, r.run_p50_s, r.run_p90_s)}
       <td>${esc(r.state)}</td>
       <td class="r">${fmtDuration(r.age_pending_s)}</td>
     </tr>`;
@@ -2048,7 +2081,7 @@ function buildAggregationsPage(data) {
   const generatedAt = new Date(data.generatedAt).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const bodyHtml = `
 <div class="meta">Window: last ${AGGREGATIONS_WINDOW_DAYS} days · ${data.overallMeta}</div>
-<div class="meta">Bands: good (actual &le; p50) · warn (p50 &lt; actual &le; p90) · bad (actual &gt; p90). Each section shows two flavors: <b>all resolved</b> matches the existing aggregation page; <b>completed only</b> restricts to <code>reason_resolved = 'completed'</code>, matching the trainer's headline slice.</div>
+<div class="meta">Bands: good (actual &le; p50) · warn (p50 &lt; actual &le; p90) · bad (actual &gt; p90). For a calibrated model expect about 50% / 40% / 10%; p50–p90 is <b>not</b> a 90% interval, it covers about 40% of outcomes. Each section shows two flavors: <b>all resolved</b> matches the existing aggregation page; <b>completed only</b> restricts to <code>reason_resolved = 'completed'</code>, matching the trainer's headline slice.</div>
 
 <h2>Overall</h2>
 ${data.overall}

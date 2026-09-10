@@ -1,5 +1,5 @@
 import { createPool } from './db.js';
-import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL, writeLineWithBackpressure } from './utils.js';
+import { normalizeMetadataName, pendingBucket, PENDING_BUCKET_SQL, writeLineWithBackpressure, baselineExportRecord } from './utils.js';
 
 const pool = createPool(process.env.DATABASE_URL);
 
@@ -618,15 +618,7 @@ async function runExportBaselinePredictions({ fromDate, toDate, outputPath, excl
     for (const row of rowsRes.rows) {
       const blD = predictDurationFromStats(row, stats);
       const blW = predictWaitFromStats(row, waitStats);
-      await writeLineWithBackpressure(out, JSON.stringify({
-        task_id: row.task_id,
-        run_id:  row.run_id,
-        pending_at: row.pending_at instanceof Date ? row.pending_at.toISOString() : row.pending_at,
-        bl_duration_p50: blD ? parseFloat(blD.p50) : null,
-        bl_duration_p90: blD ? parseFloat(blD.p90) : null,
-        bl_wait_p50:     blW ? parseFloat(blW.p50) : null,
-        bl_wait_p90:     blW ? parseFloat(blW.p90) : null,
-      }) + '\n');
+      await writeLineWithBackpressure(out, JSON.stringify(baselineExportRecord(row, blD, blW)) + '\n');
       dayCount++;
     }
     cumulative += dayCount;

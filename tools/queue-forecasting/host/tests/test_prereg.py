@@ -63,6 +63,27 @@ class Roundtrip(unittest.TestCase):
         self.assertEqual(got["hypothesis"],
                          "dropping capacity should not cost the tail")
 
+    def test_the_v2_gate_names_round_trip(self):
+        # The cutover names. A pre-registration on a v2 gate has to survive
+        # encode/decode intact or the claim silently becomes unregistered.
+        note = P.encode("configs/wait_qctx_d_priority_flow.yaml",
+                        "pinball_p90_guarded", "improve",
+                        "served p90 should score better, not just miss less",
+                        vs="probe-20260831T130111Z-51b862ebf4de-5568")
+        got = P.decode(note)
+        self.assertTrue(got["registered"])
+        self.assertEqual(got["bar"], "pinball_p90_guarded")
+        self.assertEqual(got["direction"], "improve")
+
+        note = P.encode("configs/wait_qctx_d_priority_flow.yaml",
+                        "p90_coverage_guarded", "hold",
+                        "the guarded coverage band should not be left",
+                        vs="probe-20260831T130111Z-51b862ebf4de-5568")
+        got = P.decode(note)
+        self.assertTrue(got["registered"])
+        self.assertEqual(got["bar"], "p90_coverage_guarded")
+        self.assertEqual(got["direction"], "hold")
+
     def test_cfg_stays_first_so_results_py_still_labels_the_column(self):
         # `results.py:_split_note` needs `cfg=<path> | ...` verbatim.
         note = P.encode("configs/a.yaml", "mae", "improve", "why", vs="e0")

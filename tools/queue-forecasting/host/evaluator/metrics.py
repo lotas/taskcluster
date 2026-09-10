@@ -25,6 +25,32 @@ details and are not:
     that is supposed to be bounded, or divide by zero.
   * `p90_coverage` counts `y_true <= p90`, so it is a COVERAGE, and the contract
     checks it as a band. A one-sided reading of it rewards inflation.
+  * The GUARDED p90 is the SERVED p90: `guarded_p90` transcribes
+    `applyP90Guardrail` from serving -- floor the model p90 with the baseline
+    p90 only when the baseline level is strong for the target and its sample
+    size is at least `GUARDRAIL_MIN_SAMPLE`, then floor by p50. Scoring only the
+    raw p90 judges a number no user is ever shown.
+  * `pinball_p90` is the quantile (pinball) loss at alpha=0.9 -- the one score
+    that punishes both a missed tail and a needlessly wide one, so a config
+    cannot buy coverage with inflation alone.
+  * `p90_excess_guarded` is the seconds beyond the served p90, SUMMED over
+    misses, and its ratio is that sum over the WHOLE eligible POPULATION --
+    every row with a finite actual and a finite served p90, counting zero for
+    the rows that were covered -- not a mean among the misses. The denominator
+    is the reason: two models miss DIFFERENT rows, so a per-miss mean divides
+    each one by a denominator its own errors chose, and a model that eliminates
+    a hundred small misses and leaves one large one scores WORSE than the model
+    it beat. Over one fixed population it is a one-sided expected excess, so
+    model and baseline are comparable. `miss_n` is still emitted, as a
+    description of how many rows contributed. A MEAN rather than a median
+    because a median is not a sum of per-day parts, and this file emits only
+    counts that add up. EVALUATOR-ONLY: the trainer has no counterpart, so the
+    two-route comparison does not cover it; it is a report, not a gate.
+  * `interval_width_guarded` is `p90_guarded - p50`, summed: how much of the
+    calibration was bought with width. Read next to coverage, it is what
+    separates a calibrated tail from an inflated one. EVALUATOR-ONLY, like
+    `p90_excess_guarded`: the trainer has no counterpart, so the two-route
+    comparison does not cover it; it is a report, not a gate.
   * Counts, never ratios. Nothing here divides: the ratio is computed once, by
     the verdict, from summed counts -- which is what lets a trusted process
     recompute every number from the parts rather than trusting a quotient.
@@ -44,7 +70,52 @@ WAIT_BUCKETS = (
 )
 
 
-def _counts(y_true, y_pred, p90=None):
+# THE SERVING RULE, transcribed from src/live-predictor/p90-guardrail.js and
+# predict.js (WAIT_P90_GUARDRAIL_MIN_SAMPLE / DURATION_P90_GUARDRAIL_MIN_SAMPLE
+# are both 20; the strong levels are in wait-p90-guardrail.js and
+# duration-p90-guardrail.js). The trainer transcribes the same rule in
+# `compute_guarded_p90`; `test_metrics.py` pins the two together. This is what
+# a user is served, so it is what a contract that claims to judge the served
+# number must score.
+GUARDRAIL_MIN_SAMPLE = 20
+STRONG_BASELINE_LEVELS = {
+    "wait_time": ("queue+priority+bucket",),
+    "run_duration": ("metadata_name",),
+}
+
+
+def guarded_p90(*, p50, p90_raw, bl_p90, bl_level, bl_sample_size, target):
+    """`(guarded, applied)`: the served p90 and whether the floor fired.
+
+    Floor the raw p90 with the baseline p90 only when the baseline level is
+    strong for this target AND its sample size is at least the minimum; then
+    floor by p50 so p90 >= p50 always holds. Exactly `applyP90Guardrail`.
+    """
+    p50 = np.asarray(p50, dtype=float)
+    raw = np.asarray(p90_raw, dtype=float)
+    blp = np.asarray(bl_p90, dtype=float)
+    level = np.asarray(bl_level, dtype=object)
+    n = np.asarray(bl_sample_size, dtype=float)
+    strong = STRONG_BASELINE_LEVELS[target]
+    applied = (np.isin(level, list(strong)) & np.isfinite(blp)
+               & np.isfinite(n) & (n >= GUARDRAIL_MIN_SAMPLE))
+    guarded = np.where(applied, np.maximum(raw, blp), raw)
+    return np.maximum(p50, guarded), applied
+
+
+def _pinball(yt, q, alpha):
+    """Counts for the pinball (quantile) loss at `alpha`. Transcribed from
+    the trainer's `evaluate.pinball_loss`: the SUM and the eligible count, never
+    the mean."""
+    yt = np.asarray(yt, dtype=float)
+    q = np.asarray(q, dtype=float)
+    mask = np.isfinite(yt) & np.isfinite(q)
+    diff = yt[mask] - q[mask]
+    loss = np.maximum(alpha * diff, (alpha - 1.0) * diff)
+    return {"eligible_n": int(mask.sum()), "sum": float(loss.sum())}
+
+
+def _counts(y_true, y_pred, p90=None, p90_guarded=None):
     """Every count for one set of rows. No division anywhere."""
     yt = np.asarray(y_true, dtype=float)
     yp = np.asarray(y_pred, dtype=float)
@@ -68,31 +139,68 @@ def _counts(y_true, y_pred, p90=None):
         mask = np.isfinite(yt) & np.isfinite(p90)
         out["p90_coverage"] = {"eligible_n": int(mask.sum()),
                               "covered_n": int((yt[mask] <= p90[mask]).sum())}
+        out["pinball_p90"] = _pinball(yt, p90, 0.9)
+    if p90_guarded is not None:
+        g = np.asarray(p90_guarded, dtype=float)
+        mask = np.isfinite(yt) & np.isfinite(g)
+        out["p90_coverage_guarded"] = {
+            "eligible_n": int(mask.sum()),
+            "covered_n": int((yt[mask] <= g[mask]).sum())}
+        out["pinball_p90_guarded"] = _pinball(yt, g, 0.9)
+        # Miss severity: seconds beyond the served p90, summed over misses,
+        # over the SAME eligible population coverage is scored on -- `mask`, so
+        # `eligible_n` here is `p90_coverage_guarded`'s. The ratio is that sum
+        # per eligible row (zero for a covered row), never per miss: a per-miss
+        # denominator is chosen by the model's own errors and is not comparable
+        # between two models that miss different rows. `miss_n` stays as a
+        # description of the population, not as the divisor.
+        miss = mask & (yt > g)
+        out["p90_excess_guarded"] = {
+            "eligible_n": int(mask.sum()),
+            "miss_n": int(miss.sum()),
+            "sum_excess": float((yt[miss] - g[miss]).sum())}
+        # Interval width: how much of the calibration was bought with width.
+        # `mask` already requires a finite y_true, so the width is read over the
+        # same rows coverage is scored on -- a width averaged over a wider row
+        # set than its coverage is not comparable with it.
+        wmask = mask & np.isfinite(yp)
+        out["interval_width_guarded"] = {
+            "eligible_n": int(wmask.sum()),
+            "sum_width": float((g[wmask] - yp[wmask]).sum())}
     return out
 
 
-def _empty_counts(with_p90):
+def _empty_counts(with_p90, with_guarded=False):
     out = {"mae": {"eligible_n": 0, "sum_abs_error": 0.0},
            "within_2x": {"eligible_n": 0, "hit_n": 0}}
     if with_p90:
         out["p90_coverage"] = {"eligible_n": 0, "covered_n": 0}
+        out["pinball_p90"] = {"eligible_n": 0, "sum": 0.0}
+    if with_guarded:
+        out["p90_coverage_guarded"] = {"eligible_n": 0, "covered_n": 0}
+        out["pinball_p90_guarded"] = {"eligible_n": 0, "sum": 0.0}
+        out["p90_excess_guarded"] = {"eligible_n": 0, "miss_n": 0,
+                                     "sum_excess": 0.0}
+        out["interval_width_guarded"] = {"eligible_n": 0, "sum_width": 0.0}
     return out
 
 
-def compute(*, y_true, p50, p90=None, days, buckets=False):
+def compute(*, y_true, p50, p90=None, p90_guarded=None, days, buckets=False):
     """`{"aggregate": counts, "per_day": {day: counts}, "buckets": {...}}`.
 
     ONE PASS over the row set, with the per-day split derived from `days` rather
     than from a re-read. `days` is a per-row array of `YYYY-MM-DD` strings.
     """
     yt = np.asarray(y_true, dtype=float)
-    result = {"aggregate": _counts(yt, p50, p90), "per_day": {}}
+    result = {"aggregate": _counts(yt, p50, p90, p90_guarded), "per_day": {}}
     days = np.asarray(days)
     for day in sorted(set(days.tolist())):
         sel = days == day
         result["per_day"][str(day)] = _counts(
             yt[sel], np.asarray(p50, dtype=float)[sel],
-            None if p90 is None else np.asarray(p90, dtype=float)[sel])
+            None if p90 is None else np.asarray(p90, dtype=float)[sel],
+            None if p90_guarded is None
+            else np.asarray(p90_guarded, dtype=float)[sel])
     if buckets:
         result["buckets"] = {}
         for name, lo, hi in WAIT_BUCKETS:
@@ -101,11 +209,14 @@ def compute(*, y_true, p50, p90=None, days, buckets=False):
             # model move rows out of the bucket it is bad at.
             sel = np.isfinite(yt) & (yt >= lo) & (yt < hi)
             if not sel.any():
-                result["buckets"][name] = _empty_counts(p90 is not None)
+                result["buckets"][name] = _empty_counts(
+                    p90 is not None, p90_guarded is not None)
                 continue
             result["buckets"][name] = _counts(
                 yt[sel], np.asarray(p50, dtype=float)[sel],
-                None if p90 is None else np.asarray(p90, dtype=float)[sel])
+                None if p90 is None else np.asarray(p90, dtype=float)[sel],
+                None if p90_guarded is None
+                else np.asarray(p90_guarded, dtype=float)[sel])
     return result
 
 
@@ -117,7 +228,6 @@ def aggregate(per_day):
     days = list(per_day)
     if not days:
         return _empty_counts(False)
-    has_p90 = "p90_coverage" in per_day[days[0]]
     out = {
         "mae": {"eligible_n": sum(per_day[d]["mae"]["eligible_n"]
                                   for d in days),
@@ -128,12 +238,18 @@ def aggregate(per_day):
                       "hit_n": sum(per_day[d]["within_2x"]["hit_n"]
                                    for d in days)},
     }
-    if has_p90:
-        out["p90_coverage"] = {
-            "eligible_n": sum(per_day[d]["p90_coverage"]["eligible_n"]
-                              for d in days),
-            "covered_n": sum(per_day[d]["p90_coverage"]["covered_n"]
-                             for d in days)}
+    # Every remaining count is a flat dict of summable fields keyed the same
+    # way in every slice, so they are summed one way rather than once each: a
+    # hand-written copy per key is a place for one of them to be summed wrong.
+    for key, fields in (("p90_coverage", ("eligible_n", "covered_n")),
+                        ("pinball_p90", ("eligible_n", "sum")),
+                        ("p90_coverage_guarded", ("eligible_n", "covered_n")),
+                        ("pinball_p90_guarded", ("eligible_n", "sum")),
+                        ("p90_excess_guarded", ("eligible_n", "miss_n",
+                                                 "sum_excess")),
+                        ("interval_width_guarded", ("eligible_n", "sum_width"))):
+        if key in per_day[days[0]]:
+            out[key] = {f: sum(per_day[d][key][f] for d in days) for f in fields}
     return out
 
 
@@ -163,3 +279,92 @@ def p90_miss(counts):
     against the source."""
     cov = coverage(counts)
     return None if cov is None else 1.0 - cov
+
+
+def pinball_p90_guarded(counts):
+    entry = counts.get("pinball_p90_guarded")
+    if not entry or not entry["eligible_n"]:
+        return None
+    return entry["sum"] / entry["eligible_n"]
+
+
+def coverage_guarded(counts):
+    entry = counts.get("p90_coverage_guarded")
+    if not entry or not entry["eligible_n"]:
+        return None
+    return entry["covered_n"] / entry["eligible_n"]
+
+
+def p90_miss_guarded(counts):
+    """See `p90_miss`: same unit conversion, over the served p90."""
+    cov = coverage_guarded(counts)
+    return None if cov is None else 1.0 - cov
+
+
+def miss_severity_guarded(counts):
+    """Mean seconds beyond the served p90 PER ELIGIBLE ROW -- the one-sided
+    expected excess, counting zero for every row the served p90 covered.
+
+    NOT a mean among the misses. That version divided each model by a
+    denominator its own errors selected, so two models that miss different rows
+    were not comparable on it and a model that removed many small misses while
+    leaving one large one looked worse than the one it beat. Over the fixed
+    population (the same rows `coverage_guarded` scores) the comparison is
+    between two numbers measured on the same thing.
+
+    None only when nothing is eligible -- which for a REPORT metric is a null,
+    not a refusal. Zero misses is a VALUE of 0.0, not an absence.
+    """
+    entry = counts.get("p90_excess_guarded")
+    if not entry or not entry["eligible_n"]:
+        return None
+    return entry["sum_excess"] / entry["eligible_n"]
+
+
+def interval_width_guarded(counts):
+    entry = counts.get("interval_width_guarded")
+    if not entry or not entry["eligible_n"]:
+        return None
+    return entry["sum_width"] / entry["eligible_n"]
+
+
+# --- eligible counts, beside the ratios they are the denominator of ------
+#
+# WHY A SECOND TABLE RATHER THAN A SECOND RETURN VALUE. A ratio's value and the
+# number of rows it was computed over are read by different callers: the verdict
+# compares the value against a bar, and it separately has to know whether there
+# were enough rows for that comparison to mean anything (`min_eligible_n`).
+# Returning a pair from every ratio would put the count in the hands of every
+# existing caller of `mae()`; a table keyed the same way `verdict.VALUE_OF` is
+# keeps the two lookups symmetrical, and a test pins the two key sets together
+# so a metric cannot gain a bar without gaining a row count.
+#
+# Each function returns THE DENOMINATOR ITS RATIO DIVIDES BY -- not "the rows in
+# this slice". `p90_miss_severity_tail` divides by `p90_excess_guarded`'s
+# eligible count and not by `miss_n`, so that is what is reported for it; a
+# floor checked against the wrong count is a floor that does not hold.
+def _eligible(key):
+    def fn(counts):
+        entry = (counts or {}).get(key)
+        # 0 when the entry is missing, which is the honest answer: a slice that
+        # carries no `p90_coverage_guarded` at all was scored over no eligible
+        # rows for it. A `None` here would have to be special-cased by every
+        # comparison against a minimum.
+        if not isinstance(entry, dict):
+            return 0
+        n = entry.get("eligible_n")
+        return int(n) if isinstance(n, int) and not isinstance(n, bool) else 0
+    return fn
+
+
+ELIGIBLE_OF = {
+    "mae": _eligible("mae"),
+    "within_2x": _eligible("within_2x"),
+    "p90_coverage": _eligible("p90_coverage"),
+    "p90_miss_tail": _eligible("p90_coverage"),
+    "pinball_p90_guarded": _eligible("pinball_p90_guarded"),
+    "p90_coverage_guarded": _eligible("p90_coverage_guarded"),
+    "p90_miss_tail_guarded": _eligible("p90_coverage_guarded"),
+    "p90_miss_severity_tail": _eligible("p90_excess_guarded"),
+    "interval_width_guarded": _eligible("interval_width_guarded"),
+}

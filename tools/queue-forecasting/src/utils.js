@@ -57,6 +57,36 @@ export const PENDING_BUCKET_SQL = `CASE
   ELSE 'saturated'
 END`;
 
+/**
+ * One baseline-prediction NDJSON row, as `predictor.js --export-baseline-predictions`
+ * writes it and as `trainer/src/data_loader.load_baseline_predictions` and
+ * `host/evaluator/evaluate.read_baseline` read it.
+ *
+ * `level` and `sample_size` are what the live guardrail keys on
+ * (`src/live-predictor/p90-guardrail.js`: only a strong level with
+ * sample_size >= 20 floors the served p90). Without them an offline scorer can
+ * only reproduce the priority-blind floor that serving removed in June 2026.
+ * Nulls, never undefined: JSON.stringify drops undefined keys and a row with a
+ * missing key is a schema change per row.
+ */
+export function baselineExportRecord(row, blD, blW) {
+  const num = (v) => (v == null ? null : parseFloat(v));
+  const int = (v) => (v == null ? null : parseInt(v, 10));
+  return {
+    task_id: row.task_id,
+    run_id: row.run_id,
+    pending_at: row.pending_at instanceof Date ? row.pending_at.toISOString() : row.pending_at,
+    bl_duration_p50: blD ? num(blD.p50) : null,
+    bl_duration_p90: blD ? num(blD.p90) : null,
+    bl_duration_level: blD ? (blD.level ?? null) : null,
+    bl_duration_sample_size: blD ? int(blD.sample_size) : null,
+    bl_wait_p50: blW ? num(blW.p50) : null,
+    bl_wait_p90: blW ? num(blW.p90) : null,
+    bl_wait_level: blW ? (blW.level ?? null) : null,
+    bl_wait_sample_size: blW ? int(blW.sample_size) : null,
+  };
+}
+
 export function extractImageName(taskDef) {
   const image = taskDef?.payload?.image;
   if (!image) return null;

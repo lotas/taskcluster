@@ -61,6 +61,17 @@ def build(jobs_raw, statuses_raw):
                         if isinstance(m, dict)},
             "passed": {n: m.get("passed") for n, m in board.items()
                        if isinstance(m, dict)},
+            # Only the non-default role, because that is all the evaluator
+            # writes: a name in here is a metric that does not decide anything.
+            "role": {n: m.get("role") for n, m in board.items()
+                     if isinstance(m, dict) and m.get("role") == "report"},
+            # Same shape and same rule as `role`: recorded only where it is
+            # True, so a name in here is a metric that was measured over too
+            # few rows to judge. `is True`, not truthiness -- this reads pins
+            # written by other builds, and `"false"` is truthy.
+            "inconclusive": {n: True for n, m in board.items()
+                             if isinstance(m, dict)
+                             and m.get("inconclusive") is True},
         })
     return rows
 
@@ -120,13 +131,33 @@ def render(rows):
         cells = []
         for name in names:
             value = r["metrics"].get(name)
+            # `i` TAKES PRECEDENCE, and it is read before the value, because an
+            # inconclusive metric was not judged and so has no `measured` --
+            # its cell is a dash, and an unmarked dash reads as "this contract
+            # did not name that metric" rather than "too few rows to judge".
+            # Without the mark on the dash branch too the flag would be
+            # invisible in the table, which is the one thing it exists to fix.
+            inconclusive = name in r.get("inconclusive", {})
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 # A trailing `!` on a metric that missed its bar. The bars are
                 # in the contract and identical for every row in a series, so
                 # printing them would be the same numbers on every line.
-                mark = "" if r["passed"].get(name) is True else "!"
+                # A report metric never decides the verdict, but its bar IS
+                # applied, so it gets its own pair of marks rather than `!`:
+                # `R` when it missed (an alert -- a tail regression is the
+                # reason report metrics exist and must be hard to miss), `r`
+                # when it met its bar or had no value to judge. `--json`
+                # carries `passed` for the exact state.
+                if inconclusive:
+                    mark = "i"
+                elif name in r.get("role", {}):
+                    mark = "R" if r["passed"].get(name) is False else "r"
+                else:
+                    mark = "" if r["passed"].get(name) is True else "!"
                 cells.append("{:>{}.4g}{:<1}".format(
                     value, widths[name] - 1, mark))
+            elif inconclusive:
+                cells.append("{:>{}}i".format("-", widths[name] - 1))
             else:
                 cells.append("{:>{}}".format("-", widths[name]))
         config, free = split[r["evaluation"]]
@@ -134,7 +165,10 @@ def render(rows):
                         _elide(config, cfg_w), cells, free[:40]))
 
     out.append("")
-    out.append("`!` = missed its bar.  Full numbers: ./results.sh --json")
+    out.append("`!` = missed its bar.  `r` = report metric ok/no value,"
+               " `R` = report metric alert (never decides the verdict),"
+               " `i` = report metric inconclusive (too few rows to judge)."
+               "  Full numbers: ./results.sh --json")
 
     series = {(r["extract"][:8], r["baseline"][:8], r["contract"][:8])
               for r in rows}

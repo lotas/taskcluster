@@ -83,6 +83,12 @@ import contract as contract_mod                                # noqa: E402
 import extract_manifest as extract_manifest_mod                # noqa: E402
 import extract_spec as extract_spec_mod                        # noqa: E402
 
+# The verdict document's version. NOT bumped for an ADDITIVE change: the v2
+# guarded columns and metric entries appear beside the v1 ones and nothing reads
+# this document by branching on the number (no consumer in the tree compares it
+# to a literal), so a bump would invalidate every recorded verdict to describe a
+# file every reader still parses. It bumps when a field is REMOVED, RENAMED, or
+# changes meaning.
 SCHEMA = 1
 
 PREDICTIONS_NAME = "predictions.parquet"
@@ -101,10 +107,27 @@ PREDICTION_COLUMNS = ("task_id", "run_id", "row_id", "p50", "p90_raw")
 # `data_loader.load_baseline_predictions` reads them. Keyed by the contract's
 # target, because a wait contract judged against duration baselines would
 # produce numbers rather than an error.
+#
+# FOUR COLUMNS, NOT TWO, since 2026-09: the exporter also writes the baseline's
+# own LEVEL and SAMPLE SIZE, and the p90 a user is actually SERVED depends on
+# both -- `applyP90Guardrail` floors the model's p90 with the baseline's only
+# when the level is strong for the target and the sample is large enough
+# (`metrics.STRONG_BASELINE_LEVELS`, `metrics.GUARDRAIL_MIN_SAMPLE`). An older
+# export carries neither, so the served number cannot be reproduced from it at
+# all. A contract naming any `GUARDED_METRICS` name is therefore REFUSED against
+# such an export rather than scored with a floor serving does not apply: the
+# second choice would publish a plausible number for a quantity nobody serves.
 BASELINE_COLUMNS = {
-    "wait_time": ("bl_wait_p50", "bl_wait_p90"),
-    "run_duration": ("bl_duration_p50", "bl_duration_p90"),
+    "wait_time": ("bl_wait_p50", "bl_wait_p90", "bl_wait_level",
+                  "bl_wait_sample_size"),
+    "run_duration": ("bl_duration_p50", "bl_duration_p90",
+                     "bl_duration_level", "bl_duration_sample_size"),
 }
+
+# The contract metrics that score the SERVED p90, RE-EXPORTED rather than
+# restated: `verdict` owns the metric vocabulary, and a second hand-maintained
+# copy of a subset of `VALUE_OF` is a list that goes stale silently.
+GUARDED_METRICS = verdict_mod.GUARDED_METRICS
 
 # Ceilings, checked from Parquet METADATA before any read, so a hostile or
 # mistaken file is refused rather than allocated.
@@ -535,6 +558,17 @@ def read_baseline(cfg, req, contract, *, wanted_keys):
     STREAMED, for the same reason `runs.parquet` is: the NDJSON is the whole
     window's rows and the prediction set is one holdout's worth, so only the
     rows being judged are ever held.
+
+    `rows` maps `task_id:run_id` to `(p50, p90, level, sample_size)`, with the
+    level a `str` or `None` and the two numbers NaN when absent.
+
+    `has_levels` is a verdict about the FORMAT: whether every matched row
+    DECLARED the level and sample-size keys, not whether it had values for them.
+    A modern export writes those keys with `null` for a row it had no baseline
+    for, and that is a row-level absence the guard already handles -- so a
+    value-based test would refuse a current export over one such row. It is
+    vacuously true over zero matched rows, because "the baseline covers none of
+    these predictions" is a different finding with its own refusal.
     """
     baseline_hash = req["baseline_hash"]
     directory = os.path.join(cfg.baselines_dir, baseline_hash)
@@ -577,9 +611,18 @@ def read_baseline(cfg, req, contract, *, wanted_keys):
              f" manifest says {str(entry.get('sha256'))[:12]}: the promoted"
              f" baseline is not the one that was published")
 
-    p50_column, p90_column = BASELINE_COLUMNS[contract["target"]]
+    p50_column, p90_column, level_column, n_column = \
+        BASELINE_COLUMNS[contract["target"]]
     wanted = set(wanted_keys.tolist())
     found = {}
+    # WHETHER EVERY MATCHED ROW DECLARES THE LEVEL COLUMNS, which is a question
+    # about the KEYS and not about the values. `baselineExportRecord` always
+    # emits all eight `bl_*` fields -- "a missing key is a schema change per
+    # row" -- and writes `null` for a row it had no baseline for. So a
+    # value-based test would refuse a modern export because one matched row
+    # happened to have no baseline, which is a row-level absence the guard
+    # already handles (no strong level, no floor) rather than a missing rule.
+    declares_levels = True
     seen_rows = 0
     with open(path) as fh:
         for number, line in enumerate(fh, start=1):
@@ -599,15 +642,26 @@ def read_baseline(cfg, req, contract, *, wanted_keys):
                 _err(f"{baseline_mod.NDJSON_NAME} has {key} more than once."
                      f" A duplicate baseline row would take whichever came last,"
                      f" and the bar is stated against one number per row.")
+            if level_column not in record or n_column not in record:
+                declares_levels = False
+            level = record.get(level_column)
             found[key] = (_number_or_nan(record.get(p50_column)),
-                          _number_or_nan(record.get(p90_column)))
+                          _number_or_nan(record.get(p90_column)),
+                          level if isinstance(level, str) else None,
+                          _number_or_nan(record.get(n_column)))
     if seen_rows != rows_declared:
         _err(f"{baseline_mod.NDJSON_NAME} has {seen_rows} rows but its manifest"
              f" says {rows_declared}. The digest matched, so this is the"
              f" manifest describing the file wrongly rather than the file"
              f" changing -- either way the identity is not what it claims.")
-    return {"columns": (p50_column, p90_column), "rows": found,
-            "manifest": manifest}
+    # PURELY A FORMAT FACT, and vacuously true over zero matched rows. It must
+    # not double as "the baseline covers these predictions": a baseline that
+    # matches nothing has its own accurate refusal below ("no predicted row is
+    # ... covered by the baseline"), and answering that with "re-export with a
+    # newer predictor" would be the wrong diagnosis AND the wrong remedy.
+    has_levels = declares_levels
+    return {"columns": (p50_column, p90_column, level_column, n_column),
+            "rows": found, "has_levels": has_levels, "manifest": manifest}
 
 
 def _number_or_nan(value):
@@ -691,6 +745,23 @@ def _eval_table(scored, contract):
         "bl_p90": pyarrow.array(scored["bl_p90"], pyarrow.float64()),
         "bl_abs_error": pyarrow.array(np.abs(bl_p50 - y_true),
                                       pyarrow.float64()),
+        # THE THREE THINGS THE SERVED p90 IS MADE OF, so that number is
+        # recomputable by hand too: the level and sample size the guard reads,
+        # and what it decided. Always written -- a v1 contract leaves
+        # `p90_guarded`/`guard_applied` null rather than absent, so the schema
+        # does not depend on the contract.
+        # `read_baseline` already yields `str | None` here, so no NaN branch.
+        "bl_level": pyarrow.array(scored["bl_level"].tolist(),
+                                  pyarrow.string()),
+        "bl_sample_size": pyarrow.array(scored["bl_sample_size"],
+                                        pyarrow.float64()),
+        "p90_guarded": pyarrow.array(
+            scored["p90_guarded"] if scored["p90_guarded"] is not None
+            else np.full(len(y_true), np.nan), pyarrow.float64()),
+        "guard_applied": pyarrow.array(
+            scored["guard_applied"].tolist()
+            if scored["guard_applied"] is not None
+            else [None] * len(y_true), pyarrow.bool_()),
     })
 
 
@@ -829,10 +900,26 @@ def evaluate(cfg, req, contract_name):
 
     baseline = read_baseline(cfg, req, contract,
                              wanted_keys=predictions["row_id"])
-    bl_p50 = np.array([baseline["rows"].get(k, (np.nan, np.nan))[0]
-                       for k in predictions["row_id"].tolist()], dtype=float)
-    bl_p90 = np.array([baseline["rows"].get(k, (np.nan, np.nan))[1]
-                       for k in predictions["row_id"].tolist()], dtype=float)
+    # ONE lookup per predicted row, then four views of it. A row the baseline
+    # has no entry for reads as all-absent, which `keep` below excludes and
+    # `baseline_missing_n` counts.
+    missing = (np.nan, np.nan, None, np.nan)
+    picked = [baseline["rows"].get(k, missing)
+              for k in predictions["row_id"].tolist()]
+    bl_p50 = np.array([r[0] for r in picked], dtype=float)
+    bl_p90 = np.array([r[1] for r in picked], dtype=float)
+    bl_level = np.array([r[2] for r in picked], dtype=object)
+    bl_n = np.array([r[3] for r in picked], dtype=float)
+    wants_guarded = any(name in GUARDED_METRICS for name in contract["metrics"])
+    if wants_guarded and not baseline["has_levels"]:
+        cols = BASELINE_COLUMNS[contract["target"]]
+        _err(f"the contract names a guarded metric, but baseline"
+             f" {req['baseline_hash'][:12]} carries no {cols[2]} / {cols[3]}"
+             f" column. The served p90 depends on the baseline level, so it"
+             f" cannot be reproduced from this export; re-export with"
+             f" predictor.js --export-baseline-predictions (2026-09 or later)"
+             f" and promote.",
+             error_class="baseline_lacks_levels")
 
     y_true = extract["y_true"][index]
     # THE ONE SCORED POPULATION. Both sides are computed over exactly these rows,
@@ -872,15 +959,32 @@ def evaluate(cfg, req, contract_name):
         "p90_raw": predictions["p90_raw"][keep],
         "bl_p50": bl_p50[keep],
         "bl_p90": bl_p90[keep],
+        "bl_level": bl_level[keep],
+        "bl_sample_size": bl_n[keep],
     }
+    if wants_guarded:
+        scored["p90_guarded"], scored["guard_applied"] = \
+            metrics_mod.guarded_p90(
+                p50=scored["p50"], p90_raw=scored["p90_raw"],
+                bl_p90=scored["bl_p90"], bl_level=scored["bl_level"],
+                bl_sample_size=scored["bl_sample_size"],
+                target=contract["target"])
+        # The baseline's own served p90 is its p90 floored by its p50: the
+        # guard is the identity for the thing it floors with.
+        bl_guarded = np.maximum(scored["bl_p50"], scored["bl_p90"])
+    else:
+        scored["p90_guarded"] = None
+        scored["guard_applied"] = None
+        bl_guarded = None
     buckets = any(spec.get("bucket") is not None
                   for spec in contract["metrics"].values())
     model = metrics_mod.compute(y_true=scored["y_true"], p50=scored["p50"],
-                               p90=scored["p90_raw"], days=scored["day"],
-                               buckets=buckets)
+                               p90=scored["p90_raw"],
+                               p90_guarded=scored["p90_guarded"],
+                               days=scored["day"], buckets=buckets)
     baseline_result = metrics_mod.compute(
         y_true=scored["y_true"], p50=scored["bl_p50"], p90=scored["bl_p90"],
-        days=scored["day"], buckets=buckets)
+        p90_guarded=bl_guarded, days=scored["day"], buckets=buckets)
 
     try:
         decision = verdict_mod.decide(contract, model=model,

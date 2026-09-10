@@ -64,8 +64,11 @@ the numbers, not the numbers.
    get numerically worse than `vs`, within the pre-registered `tol`" — not
    "the bar passed", and not "the pass/fail status is unchanged".
 6. **A guardrail-widening change is presented as a promotion candidate.**
-   Inflating the p90 to pass `p90_miss_tail` scores the metric instead of
-   solving the problem; it is a legitimate diagnostic and never a promotion.
+   Inflating the p90 to move `p90_miss_tail_guarded` or `p90_coverage_guarded`
+   scores the metric instead of solving the problem; it is a legitimate
+   diagnostic and never a promotion. Check `interval_width_guarded` on the
+   scoreboard: a tail gain with a width increase is inflation until shown
+   otherwise.
 
 ## What is not yours to reject
 

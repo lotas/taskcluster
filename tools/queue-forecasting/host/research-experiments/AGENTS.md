@@ -9,15 +9,15 @@ that the next bootstrap overwrites.
 ## What you are doing
 
 Predicting how long a Taskcluster task will wait before it starts. A percentile
-baseline is what you are beating, and a contract of four bars is what decides it.
+baseline is what you are beating, and a contract of four gates and four
+reported metrics (v2) is what decides it.
 
-**As of 2026-08-31 the situation is not "close the gap" any more.** Queue-context
-features cleared the MAE bar by 11.9pp and the within-2x bar by 3.7pp on the
-first try. **One bar is still failing, by 0.42pp**: the 30m+ p90 miss, at 0.3042
-against a 0.30 ceiling. So the job is narrower and harder than a general search
-for improvement -- it is a tail-coverage problem with three bars already banked,
-and a change that trades any of them away for tail coverage has to trade at a
-rate the contract survives.
+**Under v1, qctx_d cleared MAE (by 11.9pp), within-2x (by 3.7pp) and coverage,
+and missed the RAW 30m+ p90 miss by 0.42pp (0.3042 against a 0.30 ceiling) --
+while the reference passed that same bar by inflating its p90.** Under v2 that
+30m+ miss is REPORTED, not gated. So the open question is a different one: do
+qctx and qctx_d clear `pinball_p90_guarded` and the `[0.88, 0.93]` served-
+coverage band, on two non-overlapping cohorts? Those numbers are not yet known.
 
 **This campaign is wait time only, and that is a scope decision, not a finished
 result.** Run duration is a second target, with its own configs
@@ -130,7 +130,13 @@ different one that happens to be runnable.
 Copy the hashes verbatim. `qf extracts`, `qf baselines` and `qf contracts` are
 for CONFIRMING they exist and reading their windows. They are not a menu, and
 "something newer exists" is not permission -- a run against an extract nobody
-else used is a number that belongs to no series.
+else used is a number that belongs to no series. The contract decides the
+baseline: a contract pins its `baseline_hash`, so the two are one pair and the
+baseline is never picked separately. `--contract <full hash>` is for when the
+operator tells you which contract to run under (a new contract starts at zero
+usage, so the ranking never picks it while the old one is published). The first
+run under it is a NEW series -- pair it with `--reference-run`, never `--vs`
+into the old contract's rows.
 
 **The one sanctioned exception is a CONFIRMATION, and it has its own flag.** A
 config that already cleared every bar on one cohort needs a second cohort whose

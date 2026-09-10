@@ -216,6 +216,291 @@ class TestItEmitsAVerdictNeverAnAction(unittest.TestCase):
             self.assertIn(key, entry)
 
 
+def result_guarded(p50_factor, *, p90_factor, guard_factor, ndays=3,
+                   n_per_day=20, seed=0, tail=True):
+    """Like `result`, plus a guarded p90 = max(raw, actual * guard_factor).
+
+    `tail=False` omits the three `30m+` actuals, leaving that bucket EMPTY --
+    the only honest way to give a bucketed metric no eligible rows now that a
+    model with zero misses has a severity of 0.0 rather than no value.
+    """
+    rng = np.random.default_rng(seed)
+    yt, p50, p90, g, days = [], [], [], [], []
+    for d in range(ndays):
+        fixed = np.array([2000.0, 4000.0, 9000.0, 30.0]) if tail \
+            else np.array([30.0])
+        actual = np.concatenate([rng.lognormal(4, 1, n_per_day - 4), fixed])
+        yt.extend(actual)
+        p50.extend(actual * p50_factor)
+        raw = actual * p90_factor
+        p90.extend(raw)
+        g.extend(np.maximum(raw, actual * guard_factor))
+        days.extend([f"2026-08-{d + 1:02d}"] * len(actual))
+    return metrics.compute(y_true=np.array(yt), p50=np.array(p50),
+                           p90=np.array(p90), p90_guarded=np.array(g),
+                           days=np.array(days), buckets=True)
+
+
+V2_LIKE_METRICS = {
+    "mae": {"direction": "lower_is_better",
+            "bar": {"kind": "relative_improvement", "value": 0.15}},
+    "pinball_p90_guarded": {
+        "direction": "lower_is_better",
+        "bar": {"kind": "relative_improvement", "value": 0.0}},
+    "p90_coverage_guarded": {"direction": "band",
+                             "bar": {"kind": "band", "low": 0.88, "high": 0.93}},
+    "p90_miss_tail_guarded": {"direction": "lower_is_better", "bucket": "30m+",
+                              "role": "report",
+                              "bar": {"kind": "absolute", "value": 0.30}},
+    "p90_miss_severity_tail": {
+        "direction": "lower_is_better", "bucket": "30m+", "role": "report",
+        "bar": {"kind": "relative_improvement", "value": 0.0}},
+    "interval_width_guarded": {
+        "direction": "lower_is_better", "role": "report",
+        "bar": {"kind": "relative_improvement", "value": -0.10}},
+}
+
+
+class TestReportMetricsAreShownAndNeverDecide(unittest.TestCase):
+    def test_a_failing_bucketed_report_metric_does_not_flip_a_go(self):
+        # A model whose served p90 sits BELOW every tail actual fails the 30m+
+        # report metric outright. BOTH factors must be < 1: the helper takes
+        # `max(raw, actual * guard_factor)`, so a low guard alone cannot pull
+        # the served p90 under the truth.
+        #
+        # NO COVERAGE BAND in this contract on purpose. `result_guarded` scales
+        # the p90 off the actual by one factor, so its coverage is exactly 0.0
+        # or exactly 1.0 and a band can NEVER pass -- with the band in, the
+        # verdict was no-go for that unrelated reason and the assertion below
+        # could not tell a correct judge from one that counted report metrics.
+        c = a_contract(metrics={
+            "mae": {"direction": "lower_is_better",
+                    "bar": {"kind": "relative_improvement", "value": 0.15}},
+            "pinball_p90_guarded": {
+                "direction": "lower_is_better",
+                "bar": {"kind": "relative_improvement", "value": 0.0}},
+            "p90_miss_tail_guarded": {
+                "direction": "lower_is_better", "bucket": "30m+",
+                "role": "report",
+                "bar": {"kind": "absolute", "value": 0.30}},
+        })
+        model = result_guarded(1.0, p90_factor=0.9, guard_factor=0.9)
+        base = result_guarded(2.0, p90_factor=3.0, guard_factor=3.0)
+        out = verdict.decide(c, model=model, baseline=base)
+        rep = out["metrics"]["p90_miss_tail_guarded"]
+        self.assertEqual(rep["role"], "report")
+        self.assertIs(rep["passed"], False)     # it IS evaluated and shown
+        self.assertEqual(out["verdict"], "go")
+        self.assertEqual(out["consistency"]["days_passed"], 3)
+        # THE DISCRIMINATING LINE. A judge that counted every metric rather
+        # than the gates would have said no-go here, so this assertion is what
+        # makes the `go` above evidence of anything.
+        self.assertFalse(all(m["passed"] for m in out["metrics"].values()))
+
+    def test_a_report_metric_with_no_eligible_rows_is_null_not_a_refusal(self):
+        # NO ROWS AT ALL in the `30m+` bucket -- `tail=False`. That is what "no
+        # eligible rows" has to mean for the severity metric: a model that never
+        # misses now scores 0.0, which is a value (it really did spill zero
+        # seconds per row), so a high guardrail no longer produces the absence
+        # this test is about.
+        # A gate would refuse; a report metric reports None and passes nothing.
+        # The BASELINE is deliberately worse than the model (2.0 vs 1.0): an
+        # identical pair makes the baseline's MAE exactly 0.0, and the `mae`
+        # GATE then refuses for an undefined relative improvement -- a refusal
+        # from the wrong metric entirely, which would have hidden whatever the
+        # report metric did.
+        model = result_guarded(1.0, p90_factor=1.0, guard_factor=100.0,
+                               tail=False)
+        base = result_guarded(2.0, p90_factor=1.0, guard_factor=100.0,
+                              tail=False)
+        # The fixture only works if the bucket really is empty.
+        self.assertEqual(
+            model["buckets"]["30m+"]["p90_coverage_guarded"]["eligible_n"], 0)
+        out = verdict.decide(a_contract(metrics=V2_LIKE_METRICS),
+                             model=model, baseline=base)
+        sev = out["metrics"]["p90_miss_severity_tail"]
+        self.assertIsNone(sev["value"])
+        self.assertIsNone(sev["passed"])
+        self.assertEqual(sev["role"], "report")
+
+    def test_report_metrics_do_not_count_toward_day_consistency(self):
+        c = a_contract(metrics={
+            "mae": {"direction": "lower_is_better",
+                    "bar": {"kind": "relative_improvement", "value": 0.15}},
+            # A report bar nothing can meet (width must shrink 500%).
+            "interval_width_guarded": {
+                "direction": "lower_is_better", "role": "report",
+                "bar": {"kind": "relative_improvement", "value": 5.0}},
+        })
+        out = verdict.decide(
+            c,
+            model=result_guarded(1.0, p90_factor=1.5, guard_factor=1.5),
+            baseline=result_guarded(2.0, p90_factor=3.0, guard_factor=3.0))
+        self.assertIs(out["metrics"]["interval_width_guarded"]["passed"], False)
+        self.assertEqual(out["verdict"], "go")
+        self.assertEqual(out["consistency"]["days_passed"], 3)
+
+    def test_the_new_metric_names_are_known(self):
+        for name in ("pinball_p90_guarded", "p90_coverage_guarded",
+                     "p90_miss_tail_guarded", "p90_miss_severity_tail",
+                     "interval_width_guarded"):
+            self.assertIn(name, verdict.VALUE_OF)
+
+    def test_a_report_metric_keeps_its_value_and_nulls_only_the_judgement(self):
+        # The two ways a judgement can fail to exist are DIFFERENT: here the
+        # report metric's own value exists and is worth showing, but the
+        # BASELINE has no misses, so its severity is exactly 0.0 and a RELATIVE
+        # improvement over zero is undefined. Nulling the value along with the
+        # verdict would throw away the number the report exists to show.
+        c = a_contract(metrics={
+            "mae": {"direction": "lower_is_better",
+                    "bar": {"kind": "relative_improvement", "value": 0.15}},
+            "p90_miss_severity_tail": {
+                "direction": "lower_is_better", "bucket": "30m+",
+                "role": "report",
+                "bar": {"kind": "relative_improvement", "value": 0.0}},
+        })
+        out = verdict.decide(
+            c,
+            model=result_guarded(1.0, p90_factor=0.5, guard_factor=0.5),
+            baseline=result_guarded(2.0, p90_factor=3.0, guard_factor=3.0))
+        sev = out["metrics"]["p90_miss_severity_tail"]
+        self.assertIsNotNone(sev["value"])      # the number IS reported
+        self.assertEqual(sev["baseline"], 0.0)  # nothing to be relative TO
+        self.assertIsNone(sev["passed"])        # so no judgement is claimed
+        self.assertIsNone(sev["measured"])
+
+    def test_a_gate_with_no_eligible_rows_is_still_a_refusal(self):
+        # The report-metric leniency must not leak into gates.
+        c = a_contract(metrics={
+            "p90_miss_severity_tail": {
+                "direction": "lower_is_better", "bucket": "30m+",
+                "bar": {"kind": "relative_improvement", "value": 0.0}},
+        })
+        no_misses = dict(p90_factor=1.0, guard_factor=100.0)
+        with self.assertRaises(verdict.VerdictError):
+            verdict.decide(c, model=result_guarded(1.0, **no_misses),
+                           baseline=result_guarded(1.0, **no_misses))
+
+
+class TestASliceTooThinToJudgeIsInconclusive(unittest.TestCase):
+    """`min_eligible_n`. The design promised "fewer than N eligible rows yields
+    INCONCLUSIVE, never PASS" and nothing implemented it: a one-row `30m+`
+    bucket rendered as `ok (report)`, which reads as evidence and is noise.
+
+    INCONCLUSIVE is not the same absence as "no value". The value IS computed
+    and reported; what is withheld is the judgement.
+    """
+
+    def a_tail_report(self, minimum):
+        return a_contract(metrics={
+            "mae": {"direction": "lower_is_better",
+                    "bar": {"kind": "relative_improvement", "value": 0.15}},
+            "p90_miss_tail": {
+                "direction": "lower_is_better", "bucket": "30m+",
+                "role": "report", "min_eligible_n": minimum,
+                "bar": {"kind": "absolute", "value": 0.30}},
+        })
+
+    def test_a_report_below_its_minimum_is_inconclusive_and_keeps_its_value(self):
+        model = result(1.0, p90_factor=1000.0)     # misses nothing: a 0.0 miss
+        # 3 tail rows per day over 3 days.
+        self.assertEqual(model["buckets"]["30m+"]["p90_coverage"]["eligible_n"], 9)
+        out = verdict.decide(self.a_tail_report(200), model=model,
+                             baseline=result(2.0))
+        tail = out["metrics"]["p90_miss_tail"]
+        self.assertIs(tail["inconclusive"], True)
+        self.assertIsNone(tail["passed"])
+        self.assertIsNone(tail["measured"])
+        # The NUMBER is still there -- the reader wants to see it, and to see
+        # how few rows it is over.
+        self.assertEqual(tail["value"], 0.0)
+        self.assertEqual(tail["eligible_n"], 9)
+
+    def test_above_its_minimum_the_same_metric_is_judged_normally(self):
+        # THE CANARY. Without it, "inconclusive" could be what this returns for
+        # every slice, and every assertion above would still pass.
+        model = result(1.0, p90_factor=1000.0)
+        out = verdict.decide(self.a_tail_report(9), model=model,
+                             baseline=result(2.0))
+        tail = out["metrics"]["p90_miss_tail"]
+        self.assertNotIn("inconclusive", tail)
+        self.assertIs(tail["passed"], True)
+        self.assertEqual(tail["measured"], 0.0)
+        self.assertEqual(tail["eligible_n"], 9)
+
+    def test_an_inconclusive_report_cannot_turn_a_go_into_a_no_go(self):
+        # A report never decides, minimum or not.
+        out = verdict.decide(self.a_tail_report(200), model=result(1.0),
+                             baseline=result(2.0))
+        self.assertEqual(out["verdict"], "go")
+
+    def test_a_gate_below_its_minimum_is_refused_by_name(self):
+        # The report leniency must not leak into gates: too few rows is not
+        # evidence a bar was met, so it must not be able to buy a `go`.
+        c = a_contract(metrics={"p90_miss_tail": {
+            "direction": "lower_is_better", "bucket": "30m+",
+            "min_eligible_n": 200,
+            "bar": {"kind": "absolute", "value": 0.30}}})
+        with self.assertRaises(verdict.VerdictError) as cm:
+            verdict.decide(c, model=result(1.0, p90_factor=1000.0),
+                           baseline=None)
+        message = str(cm.exception)
+        self.assertIn("INCONCLUSIVE", message)
+        self.assertIn("p90_miss_tail", message)
+        self.assertIn("200", message)
+
+    def test_every_metric_carries_its_row_count_minimum_or_not(self):
+        # "How many rows is this over?" is a question a reader has about all of
+        # them, so it is not conditional on a floor being declared.
+        model, base = result(1.0), result(2.0)
+        out = verdict.decide(a_contract(), model=model, baseline=base)
+        self.assertEqual(out["metrics"]["mae"]["eligible_n"],
+                         model["aggregate"]["mae"]["eligible_n"])
+
+    def test_the_row_count_comes_from_the_bucket_the_value_came_from(self):
+        # The value and its denominator must be read from ONE slice: an
+        # aggregate row count beside a bucket value would satisfy every floor.
+        model = result(1.0, p90_factor=1000.0)
+        out = verdict.decide(self.a_tail_report(9), model=model,
+                             baseline=result(2.0))
+        self.assertEqual(out["metrics"]["p90_miss_tail"]["eligible_n"], 9)
+        self.assertLess(out["metrics"]["p90_miss_tail"]["eligible_n"],
+                        out["metrics"]["mae"]["eligible_n"])
+
+    def test_a_day_below_the_minimum_does_not_count_as_a_passing_day(self):
+        # Conservative on purpose: a thin day can cost a `go`, never buy one.
+        # And it must not RAISE -- the bars are stated over the aggregate, so
+        # one thin day must not turn a whole result into an error.
+        # 3 days of 20 rows: the AGGREGATE (60) clears a floor of 25 and every
+        # DAY (20) is under it, which is the only arrangement that exercises
+        # the per-day branch -- a floor the aggregate also failed would have
+        # been refused by the gate before any day was looked at.
+        model = result(1.0)
+        self.assertEqual(model["aggregate"]["mae"]["eligible_n"], 60)
+        self.assertEqual(model["per_day"][sorted(model["per_day"])[0]]
+                         ["mae"]["eligible_n"], 20)
+        c = a_contract(metrics={"mae": {
+            "direction": "lower_is_better", "min_eligible_n": 25,
+            "bar": {"kind": "relative_improvement", "value": 0.15}}})
+        out = verdict.decide(c, model=model, baseline=result(2.0))
+        # The aggregate gate itself PASSED -- so the no-go below is the
+        # consistency count and nothing else.
+        self.assertIs(out["metrics"]["mae"]["passed"], True)
+        self.assertEqual(out["consistency"]["days_passed"], 0)
+        self.assertEqual(out["verdict"], "no-go")
+
+    def test_a_day_above_the_minimum_still_counts(self):
+        # The other half: without this the assertion above would hold for a
+        # per-day check that had simply stopped counting days.
+        c = a_contract(metrics={"mae": {
+            "direction": "lower_is_better", "min_eligible_n": 20,
+            "bar": {"kind": "relative_improvement", "value": 0.15}}})
+        out = verdict.decide(c, model=result(1.0), baseline=result(2.0))
+        self.assertEqual(out["consistency"]["days_passed"], 3)
+        self.assertEqual(out["verdict"], "go")
+
+
 if __name__ == "__main__":
     # Without this, `python tests/test_verdict.py` runs NOTHING and exits 0 --
     # a file that reports success for having done no work.

@@ -21,6 +21,10 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 # One board builder, so a fixture cannot disagree with itself about the shape
 # `qfd` writes. `bar` is an OBJECT here for the same reason it is one there.
+# `eligible_n` on `thin_tail` is now the shape too: `_scoreboard_pin` names the
+# field and records it, so a pin really does carry the count -- it used to be
+# dropped with every other unnamed metric field, which made this fixture wider
+# than anything a real run could produce.
 board() {  # board <measured-mae> <mae-passed> <tail>
   python3 -c '
 import json, sys
@@ -32,7 +36,20 @@ print(json.dumps({"metrics": {
     "p90_miss_tail": {"measured": tail, "passed": tail < 0.3, "value": tail,
                       "baseline": 0.34, "bucket": "30m+",
                       "direction": "lower_is_better",
-                      "bar": {"kind": "absolute", "value": 0.3}}},
+                      "bar": {"kind": "absolute", "value": 0.3}},
+    "miss_severity": {"measured": 0.42, "passed": None, "value": 0.42,
+                      "baseline": None, "role": "report",
+                      "direction": "lower_is_better",
+                      "bar": {"kind": "absolute", "value": 0.0}},
+    "tail_alert": {"measured": 0.78, "passed": False, "value": 0.78,
+                   "baseline": 0.5, "role": "report", "bucket": "30m+",
+                   "direction": "lower_is_better",
+                   "bar": {"kind": "absolute", "value": 0.5}},
+    "thin_tail": {"measured": None, "passed": None, "value": 0.05,
+                  "baseline": 0.04, "role": "report", "bucket": "30m+",
+                  "eligible_n": 7, "inconclusive": True,
+                  "direction": "lower_is_better",
+                  "bar": {"kind": "absolute", "value": 0.3}}},
     "consistency": {"days_required": 3, "days_passed": 4}},
     separators=(",", ":"), sort_keys=True))' "$1" "$2" "$3"
 }
@@ -99,6 +116,29 @@ grep -q "0.247 " <<< "$OUT" \
   && ok "a metric that met its bar is not marked" \
   || bad "a metric that met its bar is not marked"
 
+# A REPORT metric never decides the verdict, so it must not carry `!` -- which
+# every reader of this table reads as "the run missed its bar". Its bar IS
+# applied though, so a miss must still be visible: `R`, not a silent `r`.
+grep -q "0.42r" <<< "$OUT" \
+  && ok 'a report metric with no value to judge is marked r' \
+  || bad 'a report metric with no value to judge is marked r'
+
+grep -q "0.78R" <<< "$OUT" \
+  && ok 'a report metric that missed its bar is marked R' \
+  || bad 'a report metric that missed its bar is marked R'
+
+# INCONCLUSIVE. Too few eligible rows to judge, so no bar was applied -- and
+# `-r` would read as "ok or no value", which is what a one-row 30m+ bucket must
+# never look like beside a 40,000-row one. It has no `measured`, so the cell is
+# a dash and the mark is the only thing carrying the state.
+grep -qE '\-i( |$)' <<< "$OUT" \
+  && ok 'an inconclusive report metric is marked i' \
+  || bad 'an inconclusive report metric is marked i'
+
+grep -q 'inconclusive' <<< "$OUT" \
+  && ok 'the legend says what i means' \
+  || bad 'the legend says what i means'
+
 # THE ONE THAT MATTERS. The two configs differ in their last five characters, so
 # a table that truncates from the right prints both rows as the same experiment.
 grep -q "_baseline_qctx" <<< "$OUT" \
@@ -127,7 +167,7 @@ grep -q "WARNING: 2 different input sets" <<< "$CROSS_OUT" \
 # disagree about the shape depending on which ran first.
 KEYS="$(python3 "$RESULTS" --json < "$TMP/same" \
   | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)[0])))')"
-[ "$KEYS" = "baseline,contract,evaluation,extract,metrics,note,passed,probe,verdict,when" ] \
+[ "$KEYS" = "baseline,contract,evaluation,extract,inconclusive,metrics,note,passed,probe,role,verdict,when" ] \
   && ok "--json carries the joined fields and nothing display-only" \
   || bad "--json keys: $KEYS"
 

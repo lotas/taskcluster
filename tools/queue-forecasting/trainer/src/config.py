@@ -98,6 +98,9 @@ def load_config(
     )
 
 
+HAZARD_MODEL_TYPE = "discrete_hazard"
+
+
 def _validate_model_type_target(raw: dict[str, Any]) -> None:
     """discrete_hazard is wait-only, by design and by implementation.
 
@@ -109,7 +112,7 @@ def _validate_model_type_target(raw: dict[str, Any]) -> None:
     -- wrong numbers that look right. Reject it here, before any query runs,
     rather than at the far end of a training run.
     """
-    if raw.get("model_type") != "discrete_hazard":
+    if raw.get("model_type") != HAZARD_MODEL_TYPE:
         return
     target, target_column = raw.get("target"), raw.get("target_column")
     if target != "wait_time" or target_column != "wait_duration_s":

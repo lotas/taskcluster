@@ -523,6 +523,129 @@ class TestTheSourceScannerActuallyStrips(unittest.TestCase):
                                 source, _re.M):
             self.assertIn(name.split(".")[0], {"io", "tokenize", "__future__"})
 
+
+class TestMetricRoles(unittest.TestCase):
+    def test_the_default_role_is_gate_and_is_not_written_into_the_identity(self):
+        # v1 contracts carry no role; adding the concept must not change their hash.
+        before = contract.contract_hash(contract.validate(a_contract()))
+        with_explicit = a_contract()
+        with_explicit["metrics"]["mae"]["role"] = "gate"
+        after = contract.contract_hash(contract.validate(with_explicit))
+        self.assertEqual(before, after)
+        self.assertNotIn("role", contract.validate(a_contract())["metrics"]["mae"])
+
+    def test_a_report_role_is_kept_and_changes_the_identity(self):
+        body = a_contract()
+        body["metrics"]["mae"]["role"] = "report"
+        body["metrics"]["within_2x"] = {"direction": "higher_is_better",
+                                        "bar": {"kind": "absolute_improvement", "value": 0.05}}
+        out = contract.validate(body)
+        self.assertEqual(out["metrics"]["mae"]["role"], "report")
+        self.assertNotEqual(contract.contract_hash(out),
+                            contract.contract_hash(contract.validate(a_contract())))
+
+    def test_a_null_role_is_the_default_like_a_null_bucket(self):
+        body = a_contract()
+        body["metrics"]["mae"]["role"] = None
+        out = contract.validate(body)
+        self.assertNotIn("role", out["metrics"]["mae"])
+        self.assertEqual(contract.contract_hash(out),
+                         contract.contract_hash(contract.validate(a_contract())))
+
+    def test_an_unknown_role_is_refused(self):
+        body = a_contract()
+        body["metrics"]["mae"]["role"] = "advisory"
+        with self.assertRaisesRegex(contract.ContractError, "role"):
+            contract.validate(body)
+
+    def test_a_contract_of_only_report_metrics_is_refused(self):
+        body = a_contract()
+        body["metrics"]["mae"]["role"] = "report"
+        with self.assertRaisesRegex(contract.ContractError, "no gate"):
+            contract.validate(body)
+
+
+class TestAMetricsMinimumSampleSize(unittest.TestCase):
+    """`min_eligible_n`: a slice too thin to judge is INCONCLUSIVE, not a pass.
+
+    The design promised this and no field carried it, so `verdict._judge`
+    applied a bar to any slice with one eligible row -- a one-row `30m+` bucket
+    rendered as `ok (report)`.
+    """
+
+    def test_a_positive_integer_is_accepted_and_kept(self):
+        body = a_contract()
+        body["metrics"]["mae"]["min_eligible_n"] = 200
+        self.assertEqual(
+            contract.validate(body)["metrics"]["mae"]["min_eligible_n"], 200)
+
+    def test_absent_means_no_floor_and_does_not_change_the_identity(self):
+        # The same rule a default `role` follows: only a PRESENT minimum enters
+        # the canonical form, so every contract written before minimums existed
+        # keeps its hash.
+        out = contract.validate(a_contract())
+        self.assertNotIn("min_eligible_n", out["metrics"]["mae"])
+        self.assertNotIn("min_eligible_n", contract.canonical(out).decode())
+
+    def test_a_null_minimum_is_the_default_like_a_null_bucket(self):
+        body = a_contract()
+        body["metrics"]["mae"]["min_eligible_n"] = None
+        out = contract.validate(body)
+        self.assertNotIn("min_eligible_n", out["metrics"]["mae"])
+        self.assertEqual(contract.contract_hash(out),
+                         contract.contract_hash(contract.validate(a_contract())))
+
+    def test_setting_a_minimum_changes_the_identity(self):
+        # It is part of the RULE: "under 30% miss" and "under 30% miss on at
+        # least 200 rows" are two different bars.
+        body = a_contract()
+        body["metrics"]["mae"]["min_eligible_n"] = 200
+        self.assertNotEqual(contract.contract_hash(contract.validate(body)),
+                            contract.contract_hash(contract.validate(a_contract())))
+
+    def test_a_bool_is_refused(self):
+        # `isinstance(True, int)` is True, so a floor of `True` would compare as
+        # 1 and let a one-row slice through the very check it was added for.
+        body = a_contract()
+        body["metrics"]["mae"]["min_eligible_n"] = True
+        with self.assertRaisesRegex(contract.ContractError,
+                                    "min_eligible_n.*positive integer"):
+            contract.validate(body)
+
+    def test_a_float_is_refused(self):
+        body = a_contract()
+        body["metrics"]["mae"]["min_eligible_n"] = 200.5
+        with self.assertRaisesRegex(contract.ContractError, "min_eligible_n"):
+            contract.validate(body)
+
+    def test_zero_and_negative_are_refused(self):
+        for bad in (0, -1):
+            body = a_contract()
+            body["metrics"]["mae"]["min_eligible_n"] = bad
+            with self.assertRaisesRegex(contract.ContractError,
+                                        "min_eligible_n"):
+                contract.validate(body)
+
+
+class TestTheShippedV1ContractKeepsItsIdentity(unittest.TestCase):
+    """The one assertion that makes "optional keys do not change the hash" a
+    fact rather than a claim: the file that is already pinned by `qfd`, by the
+    NC evidence and by every recorded result must still hash to its own name."""
+
+    V1_HASH = "f740716d32b8ddef20bd2e42ede873fd0b59486f752c8d077293ebc440997173"
+
+    def test_the_shipped_v1_file_still_loads_with_its_recorded_hash(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "..", "contracts", "wait_time.v1.json")
+        if not os.path.exists(path):
+            self.skipTest(f"{path} is not in this checkout")
+        # `load` itself refuses a file whose body disagrees with its declared
+        # `contract_hash`, so this is two checks in one.
+        _contract, digest = contract.load(path)
+        self.assertEqual(digest, self.V1_HASH)
+
+
 if __name__ == "__main__":
     # AT THE END. This guard had drifted into the middle of the file as classes
     # were appended below it, so running the file directly executed only the

@@ -213,6 +213,42 @@ model, not just sit inert."** The config scored above carries every feature that
 ablation rejected. That finding is pre-freeze and therefore not in-series, which
 is what entry 2 is for.
 
+## Contract v2 (2026-09)
+
+Scored on the SERVED p90 (level-aware guardrail transcribed from serving:
+`src/live-predictor/p90-guardrail.js` — floor only at the `queue+priority+bucket`
+level with ≥ 20 samples, then floor by p50). Gates: MAE (−15% rel), within-2x (+5pp),
+`pinball_p90_guarded` (not worse than the percentile baseline), `p90_coverage_guarded`
+in [0.88, 0.93]. Reported, never gating: raw `p90_coverage`, `p90_miss_tail_guarded`
+(30m+), `p90_miss_severity_tail` (mean seconds beyond served p90 per 30m+ row, zero where covered — over the fixed population so models that miss different rows compare),
+`interval_width_guarded` (alert if > 10% wider than the baseline's). The 30m+ miss rate
+conditions on the outcome and rewards inflation; under v1 the reference passed it by
+inflating and qctx_d failed it by 0.42pp while cutting MAE 26%.
+
+Cutover rule — **v2 starts a NEW series; nothing is re-scored.** The evaluator refuses
+to judge a run against a contract whose pinned baseline differs from the baseline the
+run was probed with (`host/evaluator/evaluate.py:221-233`), and the existing promoted
+baseline `e51a3210` has no `bl_*_level` / `bl_*_sample_size` columns, which v2 requires.
+So every run scored so far stays a v1 result under `e51a3210` / `f740716d`, and v2 needs
+FRESH probes of the reference, `qctx` and `qctx_d` on each cohort, pinned to the new
+baseline. Confirmation groups by (config, baseline, contract)
+(`host/research-loop/frontier.py:1067`): re-pinning v1 to the new baseline would ALSO
+start a new series and could not confirm today's PROMISING rows — it would cost two
+fresh cohorts per config for a contract about to be retired. Recommended path: publish
+the new baseline (must cover 2026-07-25..2026-09-01 and must be exported before
+2026-09-23, when 60-day retention drops the 07-25 rows), instantiate v2 against it
+with `--activate` (writes `wait_time <v2 hash>` into `host/contracts/ACTIVE`, the
+persistent operator setting the resolver consults before usage ranking; commit it so a
+deploy cannot undo it). Keep `wait_time.v1.json` published: the frontier needs its body
+to read the v1 cohorts' overlap and gates. `experiment.py --contract <full hash>` is a
+per-run override only. then run
+reference + qctx + qctx_d on two non-overlapping cohorts under v2. Compare within v2
+only; the v1 numbers above are history.
+
+Also queued as a code change, one probe: `_split_by_pending_at` now drops train/val
+rows whose label was not yet known at the split's cutoff (quantile path aligned with
+`hazard_labels.determine_fates`). See entry 9.
+
 ## The queue
 
 Each entry is one variable. Run against the canonical trio in `AGENTS.md`.
@@ -318,8 +354,7 @@ from was escalated over unrelated defects and remains NOT RECORDED
 (`journal/escalations/20260901T113305Z.md`); nothing about that escalation is
 reversed by repeating a check that stands on its own.*
 
-**4. NOT RUNNABLE AS WRITTEN — the guardrail-width diagnostic cannot move the
-bar it was queued to explain.** Restated 2026-09-10 from the research loop's
+**4. CLOSED 2026-09-10 by contract v2.** Restated 2026-09-10 from the research loop's
 own reading of the code, verified here. Three facts, in increasing order of how
 much they matter:
 
@@ -347,6 +382,10 @@ read, because the answer is per-cohort.
 which was escalated over two unsupported asides elsewhere in the entry. These
 three readings stand on their own and were re-checked against the files named.*
 
+The question entry 4 asked — how much of the tail gap is information and how much is
+inflation — is now answered by the scoreboard itself: `pinball_p90_guarded` and
+`interval_width_guarded` are computed on the served p90 for every run. No probe needed.
+
 **5. `..._baseline_pool` — the pool class alone (config written).**
 `pool_kind` and `provider_type` on top of the promoted config, nothing removed.
 Per Finding 1 these two columns have never been tested on their own. The
@@ -373,6 +412,13 @@ tuning exercise. Same rebase note.
 **8. Re-run qctx_a / _b / _c in-series.** Only if entry 2 disagrees with the
 pre-freeze ablation. Three probes to re-derive a finding we already have on
 paper; worth it only if the paper turns out to be wrong.
+
+**9. Label alignment in the quantile split (code change, one probe).** `_split_by_pending_at`
+now drops train/val rows whose label was not yet known at the split's cutoff, matching
+`hazard_labels.determine_fates`. Re-run the promoted reference config once on the canonical
+trio and pre-register `--bar mae --dir hold --tol 0.01 --vs <reference run>`: the claim is
+that the fix moves the score by less than 1pp. If it moves more, the old reference was
+partly scoring leaked tail labels, and every earlier quantile result carries that bias.
 
 ## What would change this ordering
 

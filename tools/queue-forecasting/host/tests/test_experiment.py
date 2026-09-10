@@ -9,6 +9,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -77,7 +78,22 @@ ALL = [WIDE_GEN1, NARROW_GEN2, WIDE_GEN2, NARROW_GEN1]
 BASELINE = dict(baseline_hash="e51a3210" + "f" * 56, broken=False,
                 promoted_at="2026-08-28T00:00:00Z")
 CONTRACT = dict(contract_hash="f740716d" + "a" * 56, target="wait_time",
-                created_at="2026-08-28T00:00:00Z")
+                created_at="2026-08-28T00:00:00Z",
+                # PINNED, because every published contract is: `baseline_hash`
+                # is required by `shared/contract.py` and `qf contracts` only
+                # lists files that validate. A fixture without it would be a
+                # contract that cannot exist.
+                baseline_hash=BASELINE["baseline_hash"])
+
+# THE PAIR. `wait_time.v1.json` pins `baseline_hash`, and a v2 published
+# against a newly promoted baseline pins the NEW one -- which is the whole
+# reason the contract has to be resolved before the baseline.
+BASELINE_V2 = dict(baseline_hash="7c0ffee0" + "d" * 56, broken=False,
+                   promoted_at="2026-09-09T00:00:00Z")
+CONTRACT_V1 = dict(CONTRACT, name="wait_time_v1")
+CONTRACT_V2 = dict(contract_hash="3ab19c2e" + "b" * 56, target="wait_time",
+                   name="wait_time_v2", created_at="2026-09-09T00:00:00Z",
+                   baseline_hash=BASELINE_V2["baseline_hash"])
 
 # 20d: every quantile wait config. 26d: the hazard config's validation_days: 7.
 QUANTILE = dict(path="q.yaml", target="wait_time", model_type="lightgbm",
@@ -237,32 +253,14 @@ class TheRefusal(unittest.TestCase):
         self.assertIn("lookback_days is not published", str(caught.exception))
 
 
-class ChooseBaselineAndContract(unittest.TestCase):
-    def test_a_broken_baseline_is_never_chosen(self):
-        broken = dict(BASELINE, baseline_hash="1" * 64, broken=True,
-                      promoted_at="2026-08-31T00:00:00Z")
-        chosen = X.choose_baseline([broken, BASELINE], {})
-        self.assertEqual(chosen["baseline_hash"], BASELINE["baseline_hash"])
+class ChooseContract(unittest.TestCase):
+    """There is no baseline RANKING to test any more, and that is the fix.
 
-    def test_all_broken_is_a_refusal_naming_the_operator_step(self):
-        with self.assertRaises(X.Refused) as caught:
-            X.choose_baseline([dict(BASELINE, broken=True)], {})
-        self.assertIn("promote-baseline.sh", str(caught.exception))
-
-    def test_usage_beats_recency_for_a_baseline_too(self):
-        newer = dict(BASELINE, baseline_hash="2" * 64,
-                     promoted_at="2026-08-31T00:00:00Z")
-        counts = {BASELINE["baseline_hash"]: 9}
-        self.assertEqual(
-            X.choose_baseline([newer, BASELINE], counts)["baseline_hash"],
-            BASELINE["baseline_hash"])
-
-    def test_with_no_usage_the_newest_baseline_wins(self):
-        newer = dict(BASELINE, baseline_hash="2" * 64,
-                     promoted_at="2026-08-31T00:00:00Z")
-        self.assertEqual(
-            X.choose_baseline([BASELINE, newer], {})["baseline_hash"],
-            newer["baseline_hash"])
+    `choose_baseline` -- most-used, not-broken, newest as a tiebreak -- was
+    deleted with the defect. A baseline is not a thing this resolver picks: the
+    contract pins it, so what used to be four ranking tests is now
+    `ContractDecidesTheBaseline`.
+    """
 
     def test_a_contract_for_another_target_is_not_used(self):
         with self.assertRaises(X.Refused) as caught:
@@ -484,6 +482,481 @@ class NamedExtract(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertIn("--extract", done.stdout)
+
+
+class ContractDecidesTheBaseline(unittest.TestCase):
+    """A contract and its baseline are one pair, not two rankings.
+
+    THE ROLLOUT BLOCKER THIS PINS. `plan` used to rank baselines and contracts
+    independently, each by scored-run usage. A contract PINS `baseline_hash`
+    (`shared/contract.py:_REQUIRED`) and `evaluator/evaluate.py` refuses to
+    judge a run whose recorded baseline is not the one its contract names, so
+    the moment an operator published a contract pinned to a NEWLY promoted
+    baseline, the resolver paired it with the old most-used baseline and every
+    evaluation would have been refused -- after the probe was spent.
+
+    Both counts below are usage as it would really stand: v1 has ten scored
+    evaluations behind it, v2 has none, because it was published this morning.
+    """
+
+    # TEN scored evaluations under v1 and the OLD baseline, and TWELVE under
+    # another target's contract against the NEW baseline. Built so the two
+    # rankings DISAGREE: `choose_contract` says v1 for wait_time, while
+    # `choose_baseline` -- which never filtered by target -- says BASELINE_V2.
+    # A resolver that ranks them separately therefore pairs v1 with the
+    # baseline v1 does not name, and that pair is unjudgeable.
+    HISTORY = (
+        [{"pins": {"request_hash": NARROW_GEN2["request_hash"],
+                   "baseline_hash": BASELINE["baseline_hash"],
+                   "contract_hash": CONTRACT_V1["contract_hash"]}}] * 10
+        + [{"pins": {"request_hash": WIDE_GEN2["request_hash"],
+                     "baseline_hash": BASELINE_V2["baseline_hash"],
+                     "contract_hash": "d" * 64}}] * 12)
+
+    BASELINES = [BASELINE, BASELINE_V2]
+    CONTRACTS = [CONTRACT_V1, CONTRACT_V2]
+
+    def resolve(self, contract_hash=None, baselines=None, contracts=None):
+        return X.plan(QUANTILE, ALL,
+                      self.BASELINES if baselines is None else baselines,
+                      self.CONTRACTS if contracts is None else contracts,
+                      self.HISTORY, contract_hash=contract_hash)
+
+    def test_the_default_picks_the_used_contract_and_ITS_baseline(self):
+        """Usage still decides the contract. What must NOT happen is the
+        baseline being decided separately -- here the two disagree, because
+        BASELINE_V2 is newer and unused while BASELINE is older and used, so a
+        second ranking could land on either for reasons of its own."""
+        counts = X.usage_counts(self.HISTORY)
+        self.assertGreater(counts["baseline"][BASELINE_V2["baseline_hash"]],
+                           counts["baseline"][BASELINE["baseline_hash"]],
+                           "fixture must make usage point at the WRONG"
+                           " baseline for the contract usage chooses")
+        resolved = self.resolve()
+        self.assertEqual(resolved["contract"]["contract_hash"],
+                         CONTRACT_V1["contract_hash"])
+        self.assertEqual(resolved["baseline"]["baseline_hash"],
+                         CONTRACT_V1["baseline_hash"])
+        self.assertNotEqual(resolved["baseline"]["baseline_hash"],
+                            BASELINE_V2["baseline_hash"])
+        self.assertFalse(resolved["contract_named"])
+
+    def test_naming_v2_moves_the_baseline_with_it(self):
+        """The pairing is the point: naming the contract must not leave the run
+        training against the baseline v2 does not name, which is exactly the
+        arrangement `evaluate.py` refuses to judge."""
+        resolved = self.resolve(contract_hash=CONTRACT_V2["contract_hash"])
+        self.assertEqual(resolved["contract"]["contract_hash"],
+                         CONTRACT_V2["contract_hash"])
+        self.assertEqual(resolved["baseline"]["baseline_hash"],
+                         BASELINE_V2["baseline_hash"])
+        self.assertTrue(resolved["contract_named"])
+
+    def test_a_new_contract_is_otherwise_unreachable(self):
+        """Without the flag, publishing v2 could never cut the loop over:
+        usage only grows, so v1 wins forever. This is the same trap `--extract`
+        was added for on 2026-09-10."""
+        self.assertEqual(self.resolve()["contract"]["contract_hash"],
+                         CONTRACT_V1["contract_hash"])
+        self.assertEqual(
+            self.resolve(contract_hash=CONTRACT_V2["contract_hash"])
+            ["contract"]["contract_hash"],
+            CONTRACT_V2["contract_hash"])
+
+    def test_a_pinned_baseline_that_is_not_published_is_refused(self):
+        """Refused HERE, naming both hashes, rather than resolving to something
+        the evaluator will reject twenty minutes later."""
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(contract_hash=CONTRACT_V2["contract_hash"],
+                         baselines=[BASELINE])
+        message = str(caught.exception)
+        self.assertIn(CONTRACT_V2["contract_hash"][:12], message)
+        self.assertIn(BASELINE_V2["baseline_hash"][:12], message)
+        self.assertIn("promote-baseline.sh", message)
+
+    def test_a_pinned_baseline_flagged_broken_is_refused(self):
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(contract_hash=CONTRACT_V2["contract_hash"],
+                         baselines=[BASELINE,
+                                    dict(BASELINE_V2, broken=True)])
+        message = str(caught.exception)
+        self.assertIn("broken", message)
+        self.assertIn(BASELINE_V2["baseline_hash"][:12], message)
+
+    def test_a_prefix_is_refused_even_when_it_is_unambiguous(self):
+        """Same reasoning as `--extract`: naming a rule no usage count endorses
+        is exactly when a prefix landing on a near-miss would judge the run by
+        a rule nobody named."""
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(contract_hash=CONTRACT_V2["contract_hash"][:12])
+        self.assertIn("full 64-hex", str(caught.exception))
+
+    def test_an_unpublished_contract_hash_is_refused_and_the_real_ones_listed(self):
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(contract_hash="9" * 64)
+        message = str(caught.exception)
+        self.assertIn("no published contract", message)
+        self.assertIn(CONTRACT_V1["contract_hash"][:12], message)
+
+    def test_a_named_contract_for_another_target_is_refused(self):
+        """The override moves the RANKING, not the config. A run_duration
+        contract cannot judge a wait_time run, and the evaluator would refuse
+        it later anyway -- after the probe was spent."""
+        other = dict(CONTRACT_V2, target="run_duration")
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(contract_hash=other["contract_hash"],
+                         contracts=[CONTRACT_V1, other])
+        message = str(caught.exception)
+        self.assertIn("run_duration", message)
+        self.assertIn("wait_time", message)
+
+    def test_a_row_with_no_pinned_baseline_is_a_READ_failure_and_refuses(self):
+        """`baseline_hash` is required by `shared/contract.py`, and
+        `qfd.available_contracts` only lists files that validate -- so a listed
+        row without one cannot mean "a contract with no baseline". It can only
+        mean this process could not read the body, which is a permissions or
+        path problem and must say so. Falling back to the most-used baseline
+        would rebuild the defect and make `render_plan` claim "pinned by that
+        contract" about a baseline no contract named."""
+        unread = {"contract_hash": CONTRACT_V1["contract_hash"],
+                  "file": "wait_time.v1.json",
+                  "target": "wait_time",
+                  "body_unreadable": "/srv/qf/contracts/wait_time.v1.json:"
+                                     " Permission denied"}
+        with self.assertRaises(X.Refused) as caught:
+            X.plan(QUANTILE, ALL, self.BASELINES, [unread], self.HISTORY)
+        message = str(caught.exception)
+        self.assertIn(CONTRACT_V1["contract_hash"][:12], message)
+        self.assertIn("Permission denied", message)
+        self.assertIn("readable by the identity", message)
+
+    def test_the_plan_says_the_baseline_came_from_the_contract(self):
+        text = X.render_plan(
+            self.resolve(contract_hash=CONTRACT_V2["contract_hash"]))
+        self.assertIn("NAMED with --contract", text)
+        self.assertIn(CONTRACT_V2["contract_hash"], text)
+        self.assertIn(BASELINE_V2["baseline_hash"], text)
+        self.assertIn("pinned by that contract", text)
+
+    def test_both_plan_and_run_accept_the_flag(self):
+        """Through `--help`, which is how the agent discovers it -- and on
+        `plan` too, because reading what a named contract resolves to must not
+        cost a probe."""
+        import subprocess
+        for command in ("plan", "run"):
+            done = subprocess.run(
+                [sys.executable, X.__file__, command, "--help"],
+                capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("--contract", done.stdout)
+
+
+class ActiveContractBeatsUsage(unittest.TestCase):
+    """`host/contracts/ACTIVE` is how a cutover survives more than one run.
+
+    THE BLOCKER THIS CLOSES. `choose_contract` ranks by scored-run usage and
+    usage only grows, so v1 -- with ten evaluations behind it -- wins forever
+    and a v2 published this morning is unreachable unattended. `--contract`
+    was the answer for ONE invocation, which a loop that runs itself cannot
+    use. The documented alternative, deleting `wait_time.v1.json`, is wrong on
+    two counts: `research-loop/frontier.py:load_contract` reads v1's BODY to
+    interpret the cohorts judged under v1, and the file is tracked so a deploy
+    restores it. So every contract stays published and a setting says which is
+    current.
+
+    Precedence asserted here, strongest first: `--contract`, ACTIVE, usage.
+    """
+
+    HISTORY = ContractDecidesTheBaseline.HISTORY
+    BASELINES = [BASELINE, BASELINE_V2]
+    CONTRACTS = [CONTRACT_V1, CONTRACT_V2]
+    ACTIVE_V2 = {"wait_time": CONTRACT_V2["contract_hash"]}
+
+    def resolve(self, active=None, contract_hash=None, contracts=None,
+                active_unresolved=None):
+        return X.plan(QUANTILE, ALL, self.BASELINES,
+                      self.CONTRACTS if contracts is None else contracts,
+                      self.HISTORY, active=active,
+                      active_unresolved=active_unresolved,
+                      contract_hash=contract_hash)
+
+    def test_the_fixture_makes_usage_choose_v1(self):
+        """THE CANARY. Ten scored runs under v1 and none under v2, so every
+        assertion below is about ACTIVE overcoming a real incumbent rather
+        than about v2 winning a ranking it would have won anyway."""
+        counts = X.usage_counts(self.HISTORY)["contract"]
+        self.assertEqual(counts.get(CONTRACT_V2["contract_hash"], 0), 0)
+        self.assertEqual(counts[CONTRACT_V1["contract_hash"]], 10)
+        self.assertEqual(self.resolve()["contract"]["contract_hash"],
+                         CONTRACT_V1["contract_hash"])
+
+    def test_active_beats_usage_and_moves_the_baseline_with_it(self):
+        """The pairing still holds: a contract PINS its baseline, so activating
+        v2 has to move the run onto BASELINE_V2 -- pairing v2 with the
+        most-used baseline is the arrangement `evaluate.py` refuses to judge."""
+        resolved = self.resolve(active=self.ACTIVE_V2)
+        self.assertEqual(resolved["contract"]["contract_hash"],
+                         CONTRACT_V2["contract_hash"])
+        self.assertEqual(resolved["baseline"]["baseline_hash"],
+                         BASELINE_V2["baseline_hash"])
+        self.assertTrue(resolved["contract_active"])
+        self.assertFalse(resolved["contract_named"])
+
+    def test_a_named_contract_beats_the_active_setting(self):
+        """A per-run override a persistent setting could veto would be an
+        override in name only -- and `plan` says the flag overrode a live
+        cutover rather than letting it look like the ordinary case."""
+        resolved = self.resolve(active=self.ACTIVE_V2,
+                                contract_hash=CONTRACT_V1["contract_hash"])
+        self.assertEqual(resolved["contract"]["contract_hash"],
+                         CONTRACT_V1["contract_hash"])
+        self.assertTrue(resolved["contract_named"])
+        self.assertFalse(resolved["contract_active"])
+        text = X.render_plan(resolved)
+        self.assertIn("OVERRODE the ACTIVE setting", text)
+        self.assertIn(CONTRACT_V2["contract_hash"][:12], text)
+
+    def test_an_entry_for_another_target_does_not_apply(self):
+        """`{target: hash}`, keyed by target, so a run_duration cutover must
+        leave a wait_time config exactly where it was."""
+        resolved = self.resolve(
+            active={"run_duration": CONTRACT_V2["contract_hash"]})
+        self.assertEqual(resolved["contract"]["contract_hash"],
+                         CONTRACT_V1["contract_hash"])
+        self.assertFalse(resolved["contract_active"])
+
+    def test_active_naming_an_unpublished_contract_is_REFUSED(self):
+        """Not a fallback to ranking. A silent fallback means the operator
+        wrote a setting, the loop ignored it, and every result afterwards was
+        judged by the rule they meant to replace."""
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(active={"wait_time": "9" * 64})
+        message = str(caught.exception)
+        self.assertIn("ACTIVE", message)
+        self.assertIn("999999999999", message)
+        self.assertIn(CONTRACT_V1["contract_hash"][:12], message)
+        self.assertIn("qf contracts", message)
+
+    def test_active_naming_another_targets_contract_is_REFUSED(self):
+        """A published hash under the wrong target key. The dispatcher checks
+        that the hash is published; only here is the TARGET known, so this is
+        the only place the mismatch can be caught."""
+        other = dict(CONTRACT_V2, target="run_duration")
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(active={"wait_time": other["contract_hash"]},
+                         contracts=[CONTRACT_V1, other])
+        self.assertIn("ACTIVE", str(caught.exception))
+
+    def test_an_UNRESOLVED_active_entry_is_refused_not_ranked(self):
+        """THE BLOCKER. `qfd` reports a well-formed ACTIVE line naming nothing
+        published under `active_unresolved` instead of dropping it, and this is
+        the half that makes that reporting matter. Ranking by usage here means
+        the operator committed a cutover, the tool said "activated", and every
+        experiment afterwards ran under the rule they meant to replace."""
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(active_unresolved={"wait_time": "9" * 64})
+        message = str(caught.exception)
+        self.assertIn("ACTIVE", message)
+        self.assertIn("999999999999", message)
+        # BOTH CAUSES NAMED, because from here they are indistinguishable and
+        # an operator has to check both.
+        self.assertIn("deployed", message)
+        self.assertIn("0644", message)
+
+    def test_an_unresolved_entry_for_another_target_does_not_refuse(self):
+        """Keyed by target like `active`: a stuck run_duration cutover must not
+        stop wait_time work."""
+        resolved = self.resolve(
+            active_unresolved={"run_duration": "9" * 64})
+        self.assertEqual(resolved["contract"]["contract_hash"],
+                         CONTRACT_V1["contract_hash"])
+
+    def test_an_unresolved_entry_outranks_the_nothing_published_refusal(self):
+        """When the contracts directory resolves to nothing, BOTH refusals
+        apply and only this one names the setting the operator wrote -- "no
+        published contract for wait_time" would send them to publish a
+        contract they already published."""
+        with self.assertRaises(X.Refused) as caught:
+            self.resolve(contracts=[],
+                         active_unresolved={"wait_time": "9" * 64})
+        self.assertIn("ACTIVE", str(caught.exception))
+
+    def test_no_active_setting_leaves_the_ranking_untouched(self):
+        """Every spelling of "not set" is the pre-existing behaviour, because
+        that is the state the deployment is in until a commit changes it."""
+        for active in (None, {}, {"wait_time": None}, {"wait_time": ""}):
+            resolved = self.resolve(active=active)
+            self.assertEqual(resolved["contract"]["contract_hash"],
+                             CONTRACT_V1["contract_hash"], repr(active))
+            self.assertFalse(resolved["contract_active"], repr(active))
+
+    def test_the_plan_states_which_mode_chose_the_contract(self):
+        """An operator cannot tell a setting they control from a usage count
+        that will keep choosing the incumbent unless the plan says so."""
+        chosen = X.render_plan(self.resolve())
+        self.assertIn("no ACTIVE contract for wait_time: chosen by usage",
+                      chosen)
+        self.assertNotIn("ACTIVE (host/contracts/ACTIVE)", chosen)
+
+        active = X.render_plan(self.resolve(active=self.ACTIVE_V2))
+        self.assertIn("ACTIVE (host/contracts/ACTIVE)", active)
+        self.assertNotIn("chosen by usage", active)
+
+        # AND NOT BOTH. With `--contract` and no ACTIVE entry the contract line
+        # already says "(NAMED with --contract)", and "chosen by usage" beside
+        # it states two different origins for one contract.
+        named = X.render_plan(
+            self.resolve(contract_hash=CONTRACT_V2["contract_hash"]))
+        self.assertIn("NAMED with --contract", named)
+        self.assertNotIn("chosen by usage", named)
+
+    def test_inventory_keeps_the_setting_from_the_contracts_reply(self):
+        """`qf contracts --json` carries `active` beside `contracts`, and a
+        resolver that dropped it would rank by usage on a host that HAD cut
+        over -- the failure being fixed, reintroduced one layer up."""
+        replies = {
+            "extracts": {"extracts": []},
+            "baselines": {"baselines": []},
+            "contracts": {"contracts": [], "dir": None,
+                          "active": self.ACTIVE_V2,
+                          "active_unresolved": {"run_duration": "9" * 64}},
+            "list": {"jobs": []},
+        }
+
+        def fake_qf(*args, **kw):
+            return True, replies[args[0]]
+
+        with mock.patch.object(X, "qf", fake_qf):
+            inv = X.inventory(limit=5)
+        self.assertEqual(inv["active"], self.ACTIVE_V2)
+        self.assertEqual(inv["active_unresolved"], {"run_duration": "9" * 64})
+
+    def test_inventory_defaults_the_setting_when_the_reply_omits_it(self):
+        """An older dispatcher, or one whose contracts directory has no ACTIVE
+        file. `plan` must get a dict, not a None it would have to guard."""
+        replies = {
+            "extracts": {"extracts": []},
+            "baselines": {"baselines": []},
+            "contracts": {"contracts": [], "dir": None},
+            "list": {"jobs": []},
+        }
+        with mock.patch.object(X, "qf", lambda *a, **k: (True, replies[a[0]])):
+            inv = X.inventory(limit=5)
+        self.assertEqual(inv["active"], {})
+        self.assertEqual(inv["active_unresolved"], {})
+
+
+class ContractRowsAreEnriched(unittest.TestCase):
+    """`qf contracts` returns only `{contract_hash, file}` and the directory.
+
+    Every field the resolver decides on -- `target`, and now `baseline_hash` --
+    lives in the file, so `inventory` has to read it. `choose_contract` already
+    filtered on `target`, and with `target` never present that filter passed
+    everything: a `run_duration` contract was a candidate for a `wait_time`
+    config.
+    """
+
+    def build(self, bodies):
+        import json, shutil, tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name, body in bodies.items():
+            with open(os.path.join(root, name), "w") as fh:
+                fh.write(body if isinstance(body, str) else json.dumps(body))
+        return root
+
+    def test_target_name_and_baseline_hash_come_off_the_file(self):
+        root = self.build({"wait_time.v2.json": {
+            "name": "wait_time_v2", "target": "wait_time",
+            "baseline_hash": BASELINE_V2["baseline_hash"]}})
+        rows = X.read_contract_bodies(
+            [{"contract_hash": CONTRACT_V2["contract_hash"],
+              "file": "wait_time.v2.json"}], root)
+        self.assertEqual(rows[0]["target"], "wait_time")
+        self.assertEqual(rows[0]["name"], "wait_time_v2")
+        self.assertEqual(rows[0]["baseline_hash"],
+                         BASELINE_V2["baseline_hash"])
+        # The row it came in as is not mutated, and the hash is untouched.
+        self.assertEqual(rows[0]["contract_hash"],
+                         CONTRACT_V2["contract_hash"])
+
+    def test_an_enriched_run_duration_contract_is_no_longer_a_candidate(self):
+        root = self.build({"run_duration.v1.json": {
+            "name": "run_duration_v1", "target": "run_duration",
+            "baseline_hash": BASELINE["baseline_hash"]}})
+        rows = X.read_contract_bodies(
+            [{"contract_hash": CONTRACT_V2["contract_hash"],
+              "file": "run_duration.v1.json"}], root)
+        with self.assertRaises(X.Refused):
+            X.choose_contract("wait_time", rows, {})
+
+    def test_an_unreadable_or_unparseable_file_is_marked_not_dropped(self):
+        """Kept in the listing so `plan` can say WHY, and left unenriched so
+        `baseline_for_contract` refuses rather than guesses. A row that
+        vanishes is a refusal an operator cannot explain from what was
+        printed."""
+        root = self.build({"broken.json": "{not json"})
+        rows = X.read_contract_bodies(
+            [{"contract_hash": "a" * 64, "file": "broken.json"},
+             {"contract_hash": "b" * 64, "file": "absent.json"}], root)
+        self.assertEqual([r["contract_hash"] for r in rows],
+                         ["a" * 64, "b" * 64])
+        for row in rows:
+            self.assertIsNone(row.get("baseline_hash"))
+            self.assertIn("broken.json" if row["contract_hash"][0] == "a"
+                          else "absent.json", row["body_unreadable"])
+
+    def test_no_directory_does_not_resolve_the_file_against_the_CWD(self):
+        """`os.path.join("", "wait_time.v1.json")` is a RELATIVE path. Without
+        the guard, a listing that came back with no `dir` reads whatever file
+        of that name is sitting in the working directory -- so a decoy in a
+        checkout would decide which baseline a run trains against."""
+        import os as _os
+        root = self.build({"wait_time.v1.json": {
+            "name": "decoy", "target": "wait_time",
+            "baseline_hash": "e" * 64}})
+        here = _os.getcwd()
+        self.addCleanup(_os.chdir, here)
+        _os.chdir(root)
+        rows = X.read_contract_bodies(
+            [{"contract_hash": CONTRACT_V1["contract_hash"],
+              "file": "wait_time.v1.json"}], None)
+        self.assertIsNone(rows[0].get("baseline_hash"))
+        self.assertIsNone(rows[0].get("name"))
+        self.assertIn("no directory", rows[0]["body_unreadable"])
+
+    def test_a_row_naming_no_file_is_marked_before_any_open(self):
+        rows = X.read_contract_bodies(
+            [{"contract_hash": "a" * 64}], self.build({}))
+        self.assertIn("names no file", rows[0]["body_unreadable"])
+
+    def test_a_file_whose_own_hash_disagrees_is_not_used(self):
+        """The file carries its own `contract_hash`; if it is not this row's,
+        the file moved or was rewritten after qfd listed it. Enriching would
+        attach one contract's baseline to another contract's hash, which is the
+        mispairing in a form nothing downstream could detect."""
+        root = self.build({"wait_time.v1.json": {
+            "contract_hash": CONTRACT_V2["contract_hash"],
+            "name": "wait_time_v2", "target": "wait_time",
+            "baseline_hash": BASELINE_V2["baseline_hash"]}})
+        rows = X.read_contract_bodies(
+            [{"contract_hash": CONTRACT_V1["contract_hash"],
+              "file": "wait_time.v1.json"}], root)
+        self.assertIsNone(rows[0].get("baseline_hash"))
+        self.assertIn(CONTRACT_V2["contract_hash"][:12],
+                      rows[0]["body_unreadable"])
+
+    def test_a_file_carrying_its_own_matching_hash_still_enriches(self):
+        root = self.build({"wait_time.v2.json": {
+            "contract_hash": CONTRACT_V2["contract_hash"],
+            "name": "wait_time_v2", "target": "wait_time",
+            "baseline_hash": BASELINE_V2["baseline_hash"]}})
+        rows = X.read_contract_bodies(
+            [{"contract_hash": CONTRACT_V2["contract_hash"],
+              "file": "wait_time.v2.json"}], root)
+        self.assertEqual(rows[0]["baseline_hash"],
+                         BASELINE_V2["baseline_hash"])
+        self.assertNotIn("body_unreadable", rows[0])
 
 
 class TrainerDrift(unittest.TestCase):

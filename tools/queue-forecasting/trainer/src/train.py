@@ -59,11 +59,84 @@ def _peak_rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
+def _label_known_at(df: pd.DataFrame, c: cfg.Config, pending: "pd.Series | None" = None) -> pd.Series:
+    """When each row's label became observable.
+
+    wait_time:    the wait is known the moment the task starts,
+                  pending_at + wait_duration_s. A null wait_duration_s
+                  already yields NaT here (NaT arithmetic propagates), so it
+                  falls out of every split with no extra handling.
+    run_duration: the duration is known when the run resolves, resolved_at
+                  -- but ONLY where the label itself is non-null. resolved_at
+                  alone is not enough: a row that resolved WITHOUT ever
+                  running (no run_duration_s) has a resolved_at but no known
+                  run_duration, so counting it as known would be wrong --
+                  hence the explicit `.where(df[label_col].notna())` below,
+                  rather than returning resolved_at unconditionally.
+
+    `pending` may be passed in already computed (as `_split_by_pending_at`
+    does) to avoid a redundant `pd.to_datetime(df["pending_at"])`; the
+    default recomputes it, so this stays a valid 2-arg call.
+
+    Every real load path (`data_loader._fetch_main_dataset_from_db`'s
+    `AS y`, and `extract_source`'s `.rename(columns={target_column: "y"})`)
+    renames the target column to "y" before this function ever sees the
+    frame, so `c.target_column`'s own name is gone by the time `_split_
+    by_pending_at` runs in `main()`. Preferring "y" when present, and
+    falling back to `c.target_column` only when it isn't, mirrors the exact
+    idiom `FeatureBuilder._derive` already uses at `src/features.py:93`
+    (`df["y"] if "y" in df.columns else df[self.config.target_column]`) --
+    the same column-name ambiguity, resolved the same way. The fallback is
+    what keeps this testable against a frame built with the literal
+    `c.target_column` name (as the unit tests do), since such a frame has
+    no "y" column at all.
+    """
+    if pending is None:
+        pending = pd.to_datetime(df["pending_at"], utc=True)
+    label_col = "y" if "y" in df.columns else c.target_column
+    if c.target == "wait_time":
+        return pending + pd.to_timedelta(df[label_col].astype(float), unit="s")
+    return pd.to_datetime(df["resolved_at"], utc=True).where(df[label_col].notna())
+
+
 def _split_by_pending_at(df: pd.DataFrame, c: cfg.Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split on pending_at, and CENSOR each fit split at its own cutoff.
+
+    A row that pends inside the train window but whose label only becomes
+    known after train_end was not available to a model trained at train_end;
+    keeping it with its true label leaks the future into training, and does
+    so preferentially for the long tail (only long waits cross the boundary).
+    Rows are DROPPED rather than censored because a quantile regressor has no
+    censored-row concept -- which is also what a production retrain does (it
+    filters started_at IS NOT NULL). The holdout is never censored: it is
+    scored on actuals.
+
+    EXCLUDES model_type == cfg.HAZARD_MODEL_TYPE: that path's own per-split
+    leakage guard (hazard_labels.determine_fates) needs exactly the rows this
+    would drop -- a row with a null wait_duration_s (never started / resolved
+    without starting) or one whose start falls after the cutoff is not noise
+    to that model, it is a right-censored observation that belongs in the
+    risk set up to the cutoff. Hazard configs also deliberately skip the
+    `started_at IS NOT NULL` filter for the same reason (see
+    wait_hazard_qctx_d_priority_flow.yaml's filters comment); dropping these
+    rows here would reintroduce the exact survivorship bias Bet 2 exists to
+    fix. determine_fates is called downstream (once per split, at that
+    split's own w.train_end/w.val_end) on the UNCENSORED frame this function
+    still returns for that model_type.
+    """
     w = cfg.compute_windows(c)
     pending = pd.to_datetime(df["pending_at"], utc=True)
-    train = df[(pending >= w.train_start) & (pending < w.train_end)].reset_index(drop=True)
-    val   = df[(pending >= w.val_start)   & (pending < w.val_end)].reset_index(drop=True)
+    if c.model_type == cfg.HAZARD_MODEL_TYPE:
+        # The hazard path censors per split itself (hazard_labels.
+        # determine_fates), so it must see every row.
+        train = df[(pending >= w.train_start) & (pending < w.train_end)].reset_index(drop=True)
+        val   = df[(pending >= w.val_start)   & (pending < w.val_end)].reset_index(drop=True)
+    else:
+        known = _label_known_at(df, c, pending)
+        train = df[(pending >= w.train_start) & (pending < w.train_end)
+                   & (known <= w.train_end)].reset_index(drop=True)
+        val   = df[(pending >= w.val_start)   & (pending < w.val_end)
+                   & (known <= w.val_end)].reset_index(drop=True)
     hold  = df[(pending >= w.hold_start)  & (pending < w.hold_end)].reset_index(drop=True)
     return train, val, hold
 
@@ -179,6 +252,27 @@ def _write_predictions(path: Path, *, c: cfg.Config, builder: FeatureBuilder,
     print(f"  predictions written: {path} ({len(out):,} rows)")
 
 
+def _baseline_guard_inputs(
+    hold: Split, target_key: str,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """The three arrays evaluate.compute_guarded_p90 needs, or None each.
+
+    `bl_*_p90` is a declared numeric feature so it rides on `hold.X`; the
+    guardrail's level and sample size are NOT features (the level is a string)
+    and ride on `hold.meta` (see features.OPTIONAL_META_COLUMNS). Any of them
+    is absent for baseline exports predating the guardrail columns, which is
+    the evaluator's cue to fall back to the legacy floor.
+    """
+    p90_col = f"bl_{target_key}_p90"
+    lvl_col = f"bl_{target_key}_level"
+    n_col = f"bl_{target_key}_sample_size"
+    baseline_p90 = hold.X[p90_col].to_numpy() if p90_col in hold.X.columns else None
+    baseline_level = hold.meta[lvl_col].to_numpy() if lvl_col in hold.meta.columns else None
+    baseline_sample_size = (hold.meta[n_col].to_numpy()
+                            if n_col in hold.meta.columns else None)
+    return baseline_p90, baseline_level, baseline_sample_size
+
+
 def _require_baselines(holdout_day_keys: list[str], baseline_dir: Path) -> None:
     missing = [d for d in holdout_day_keys if not (baseline_dir / f"{d}.json").exists()]
     if missing:
@@ -272,8 +366,7 @@ def _run_discrete_hazard_training(
     if c.target != "wait_time":
         raise ValueError(f"discrete_hazard supports only target: wait_time, got {c.target!r}")
     target_key = "wait"
-    p90_col = f"bl_{target_key}_p90"
-    baseline_p90 = hold.X[p90_col].to_numpy() if p90_col in hold.X.columns else None
+    baseline_p90, baseline_level, baseline_sample_size = _baseline_guard_inputs(hold, target_key)
 
     report = do_eval(
         preds_p50=preds_p50,
@@ -284,6 +377,8 @@ def _run_discrete_hazard_training(
         baseline_dir=baseline_dir,
         target=target_key,
         baseline_p90=baseline_p90,
+        baseline_level=baseline_level,
+        baseline_sample_size=baseline_sample_size,
     )
 
     run_dir = MODELS_DIR / c.as_of_date.strftime("%Y-%m-%d")
@@ -322,6 +417,12 @@ def _run_discrete_hazard_training(
         "model_params": c.model_params,
         "resource_usage": {"peak_rss_mb": round(_peak_rss_mb(), 1)},
         "evaluation": {
+            # Which guardrail rule produced every `*_guarded` metric below.
+            # "legacy_any_finite_floor" means the baseline export carried no
+            # level/sample-size columns, so those numbers are the old
+            # priority-blind floor -- an UPPER BOUND on served coverage, not
+            # the served number. See evaluate.compute_guarded_p90.
+            "guard_rule": report.guard_rule,
             "primary": {
                 "slice": "reason_resolved = 'completed'",
                 "per_day": report.primary_per_day,
@@ -473,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
     n_train_rows, n_val_rows, n_hold_rows = len(train_df), len(val_df), len(hold_df)
     del train_df, val_df, hold_df
 
-    if c.model_type == "discrete_hazard":
+    if c.model_type == cfg.HAZARD_MODEL_TYPE:
         manifest, hazard_model = _run_discrete_hazard_training(
             c, w, holdout_day_keys, baseline_dir,
             train, val, hold, n_train_rows, n_val_rows, n_hold_rows,
@@ -485,7 +586,9 @@ def main(argv: list[str] | None = None) -> int:
             return f"{v * 100:.1f}%" if v is not None and v == v else "n/a"
         guarded = buckets30.get("p90_miss_rate_guarded")
         raw = buckets30.get("p90_miss_rate")
-        print(f"\n=== Discrete hazard model — 30m+ wait p90 miss: {_pct(guarded)} guarded (gate bar: 34.49%) / {_pct(raw)} raw ===")
+        guard_rule = manifest["evaluation"].get("guard_rule")
+        print(f"\n=== Discrete hazard model — 30m+ wait p90 miss: {_pct(guarded)} guarded"
+              f" [{guard_rule}] (gate bar: 34.49%) / {_pct(raw)} raw ===")
         print(f"Models + manifest in {run_dir}")
         if args.predictions_out:
             # Same ordering as the quantile path, for the same reason: the
@@ -694,12 +797,7 @@ def main(argv: list[str] | None = None) -> int:
     target_key = "duration" if c.target == "run_duration" else "wait"
     preds_p50 = models[0.5].predict(hold.X) if 0.5 in models else np.full(len(hold.y), np.nan)
     preds_p90 = models[0.9].predict(hold.X) if 0.9 in models else np.full(len(hold.y), np.nan)
-    p90_col = f"bl_{target_key}_p90"
-    baseline_p90 = (
-        hold.X[p90_col].to_numpy()
-        if p90_col in hold.X.columns
-        else None
-    )
+    baseline_p90, baseline_level, baseline_sample_size = _baseline_guard_inputs(hold, target_key)
     report = do_eval(
         preds_p50=preds_p50,
         preds_p90=preds_p90,
@@ -709,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
         baseline_dir=baseline_dir,
         target=target_key,
         baseline_p90=baseline_p90,
+        baseline_level=baseline_level,
+        baseline_sample_size=baseline_sample_size,
     )
 
     # Three-way compare only meaningful for residual runs.
@@ -753,6 +853,12 @@ def main(argv: list[str] | None = None) -> int:
         "quantiles": c.quantiles,
         "resource_usage": {"peak_rss_mb": round(_peak_rss_mb(), 1)},
         "evaluation": {
+            # Which guardrail rule produced every `*_guarded` metric below.
+            # "legacy_any_finite_floor" means the baseline export carried no
+            # level/sample-size columns, so those numbers are the old
+            # priority-blind floor -- an UPPER BOUND on served coverage, not
+            # the served number. See evaluate.compute_guarded_p90.
+            "guard_rule": report.guard_rule,
             "primary": {
                 "slice": "reason_resolved = 'completed'",
                 "per_day": report.primary_per_day,

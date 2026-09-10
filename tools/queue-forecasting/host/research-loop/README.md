@@ -297,7 +297,8 @@ judged on values rather than on pass/fail status, and that distinction is not
 cosmetic: status-equality would call a tail miss going 0.304 → 0.900 "kept"
 because both fail the 0.30 bar, and would call an improvement from fail to pass
 "broken". Judging on values keeps the claim answerable on a bar that is currently
-**failing** — which `p90_miss_tail` is — without accepting an arbitrary
+**failing** — which `p90_miss_tail` was under v1; under v2 the tail is a
+reported metric and the gate to watch is `p90_coverage_guarded` — without accepting an arbitrary
 regression.
 
 Band metrics (`p90_coverage`) have a "worse" too: **distance to the nearest band
