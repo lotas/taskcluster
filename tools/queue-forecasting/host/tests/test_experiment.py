@@ -388,6 +388,104 @@ class Plan(unittest.TestCase):
             self.assertIn(full, text)
 
 
+class NamedExtract(unittest.TestCase):
+    """`--extract`: the declared exit from the usage-count ordering.
+
+    The gap it closes is not hypothetical. `choose_extract` ranks by scored-run
+    usage count first, so the extract a config family has already used wins for
+    that family forever -- and the only thing a family blocked on "needs a
+    second non-overlapping cohort" needs is the extract usage count will never
+    pick. Three PROMISING configs sat on that from 2026-09-08 to 2026-09-10,
+    with the loop re-deriving the blocker every tick.
+    """
+
+    def named(self, config, request_hash, extracts=None):
+        return X.named_extract(config, extracts or ALL, request_hash)
+
+    def test_it_returns_the_named_extract_over_the_incumbent(self):
+        """The whole point: usage count says NARROW_GEN2 (3 scored runs), and
+        naming WIDE_GEN2 has to beat that, not lose to it."""
+        chosen, _, runners_up = self.named(QUANTILE, WIDE_GEN2["request_hash"])
+        self.assertEqual(chosen["request_hash"], WIDE_GEN2["request_hash"])
+        self.assertIn(NARROW_GEN2["request_hash"],
+                      [e["request_hash"] for e in runners_up])
+
+    def test_a_prefix_is_refused_even_when_it_is_unambiguous(self):
+        """`qf probe --extract` takes any unique 8+ hex prefix; this does not,
+        and the difference is deliberate. Naming a cohort no usage count
+        endorses is exactly when a prefix landing on a near-miss would produce
+        a number that belongs to no series and reads as if it did."""
+        with self.assertRaises(X.Refused) as caught:
+            self.named(QUANTILE, WIDE_GEN2["request_hash"][:12])
+        self.assertIn("full 64-hex", str(caught.exception))
+
+    def test_an_unpublished_hash_is_refused_and_the_real_ones_listed(self):
+        with self.assertRaises(X.Refused) as caught:
+            self.named(QUANTILE, "9" * 64)
+        message = str(caught.exception)
+        self.assertIn("no published extract", message)
+        self.assertIn(WIDE_GEN2["request_hash"][:12], message)
+
+    def test_naming_overrides_the_ranking_and_not_the_requirements(self):
+        """The hazard config's 26-day cohort needs train_start 2026-08-01 and
+        NARROW_GEN2 starts 08-07. An override that skipped `extract_can_serve`
+        would submit a probe that cannot train, which is the 2026-08-31
+        failure with a flag on it."""
+        with self.assertRaises(X.Refused) as caught:
+            self.named(HAZARD, NARROW_GEN2["request_hash"])
+        message = str(caught.exception)
+        self.assertIn("cannot serve", message)
+        self.assertIn("2026-08-01", message)
+
+    def test_a_gen1_extract_is_refused_for_a_qctx_config(self):
+        with self.assertRaises(X.Refused) as caught:
+            self.named(QUANTILE, WIDE_GEN1["request_hash"])
+        self.assertIn("task_created", str(caught.exception))
+
+    def test_plan_counts_scored_runs_on_the_NAMED_extract(self):
+        """The count must follow the extract that will actually be probed. If
+        it kept reporting the incumbent's 3, the plan would promise
+        comparability the run does not have -- the one thing an override must
+        never do quietly."""
+        resolved = X.plan(QUANTILE, ALL, [BASELINE], [CONTRACT], REAL_HISTORY,
+                          named=WIDE_GEN2["request_hash"])
+        self.assertEqual(resolved["extract"]["request_hash"],
+                         WIDE_GEN2["request_hash"])
+        self.assertEqual(resolved["scored_runs_here"], 0)
+        self.assertTrue(resolved["extract_named"])
+
+    def test_the_plan_says_it_was_named_and_still_warns(self):
+        text = X.render_plan(
+            X.plan(QUANTILE, ALL, [BASELINE], [CONTRACT], REAL_HISTORY,
+                   named=WIDE_GEN2["request_hash"]))
+        self.assertIn("NAMED with --extract", text)
+        self.assertIn("comparable to NOTHING", text)
+        self.assertIn(WIDE_GEN2["request_hash"], text)
+
+    def test_the_ordinary_path_is_unchanged_and_says_it_was_not_named(self):
+        resolved = X.plan(QUANTILE, ALL, [BASELINE], [CONTRACT], REAL_HISTORY)
+        self.assertEqual(resolved["extract"]["request_hash"],
+                         NARROW_GEN2["request_hash"])
+        self.assertFalse(resolved["extract_named"])
+        self.assertNotIn("NAMED with --extract", X.render_plan(resolved))
+
+    def test_both_plan_and_run_accept_the_flag(self):
+        """Asserted through `--help`, which is how the agent discovers it.
+
+        On `plan` as well as `run`, because reading what a named cohort
+        resolves to must not cost a probe -- and the 2026-09-10 escalation
+        established the blocker by pasting exactly this output, so the help
+        text IS the interface here.
+        """
+        import subprocess
+        for command in ("plan", "run"):
+            done = subprocess.run(
+                [sys.executable, X.__file__, command, "--help"],
+                capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("--extract", done.stdout)
+
+
 class TrainerDrift(unittest.TestCase):
     """Whether the agent's checkout trains the code that is deployed.
 

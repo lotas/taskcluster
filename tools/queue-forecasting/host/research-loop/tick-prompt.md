@@ -32,6 +32,26 @@ how three ticks were spent on one run on 2026-09-04.
 3. **A config is PROMISING and one cohort short of CONFIRMED.** Run it on a
    cohort whose holdout does not overlap. This is the highest-value action
    available whenever it applies. Stop.
+
+   **`plan` will not choose that cohort for you, so name it.**
+   `choose_extract` ranks by scored-run usage count first, which is right for
+   comparability and makes the one cohort a confirmation needs unreachable: the
+   extract the config is already PROMISING on wins for it forever. The one you
+   want is what `plan` lists under *"also able to serve this config, and not
+   chosen"*. Pass it as `--extract <full 64-hex request hash>` — the full hash,
+   because a prefix that lands on a near-miss produces a number belonging to no
+   series. Pre-register with `--reference-run`, not `--vs`: there is nothing in
+   the new cohort to be judged against, and a `--vs` pointing back into the old
+   one changes the cohort and the comparison at the same time.
+
+   **Check the second cohort's TRAIN window for baseline coverage first, and
+   say what you found.** A missing baseline row is filled with `0.0`, not
+   dropped (`_clean_baseline` in `trainer/src/model.py`), so an uncovered train
+   window silently trains on `log(y+1)` instead of `log((y+1)/(bl+1))` — the
+   target is redefined, the run differs from the PROMISING one in two things,
+   and it confirms nothing. The file that matters is the baseline's streamed
+   NDJSON, which is what the evaluator reads; the per-day JSONs beside it are
+   the trainer's report input and cover a different window.
 4. **The queue's top unblocked entry can run on a published extract.** Run it.
    Stop.
 5. **The queue's top entry needs a cohort that does not exist.** Submit one
@@ -224,6 +244,25 @@ meaning; it does not need to be readable prose, only the one id.
 
 Every number you cite must appear in the frontier JSON **or** in a pasted command
 output in your `Evidence:` block. A number you remember is a number you invented.
+
+**Delete a figure that is not load-bearing — do not soften it.** Every
+quantified aside is a rejection surface with no upside: the copilot checks each
+one, and a single unsupported number escalates the WHOLE entry, including the
+finding you were right about. On 2026-09-10 three entries in a row were
+rejected and two fell on ornament — `~22 GB` read off a `--mem` flag rather
+than an observed peak, and "the same defect at a quarter of the size" for 4
+days against 11. Neither carried any weight in its argument. If a number is
+not the claim, or a step in reaching the claim, cut it: "narrower" beats a
+ratio you did not compute, and a sentence with no digits in it cannot be
+unsupported.
+
+**Put the two operands on the page before you state a direction.** The
+`20260910T000713Z` entry said the priority block "costs 0.032 of tail" while
+the numbers it supplied showed the opposite — `p90_miss_tail` 0.3565028 against
+0.3246448, an improvement — because the ablation was read backwards. Name each
+row and its value, then say which way the difference runs. A direction asserted
+before its operands are visible is the error this loop repeats most, and it
+reads as carelessness about the one thing the entry exists to record.
 
 **The Evidence block is not optional book-keeping — it is the only way a
 command-derived figure can be verified.** The second agent that checks this entry

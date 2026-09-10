@@ -313,6 +313,66 @@ def no_extract_message(config, rejected):
     return "\n".join(lines)
 
 
+def named_extract(config, extracts, request_hash):
+    """The extract an operator NAMED, checked by the same can-serve rules.
+
+    AN OVERRIDE, NOT A PREFERENCE, and the reason it has to exist is that
+    `choose_extract`'s first key is scored-run usage count. That is right for
+    comparability and it makes ONE thing unreachable: a second, non-overlapping
+    cohort. The most-used extract wins for every config in a family, usage only
+    grows, so the extract a family needs to CONFIRM on can never be chosen --
+    `plan` prints it under "also able to serve this config, and not chosen" and
+    there was no way to say "that one". Three PROMISING configs sat blocked on
+    exactly this from 2026-09-08 to 2026-09-10.
+
+    THE FULL HASH, NOT A PREFIX, unlike `qf probe --extract` which accepts any
+    unique 8+ hex prefix. This is a declaration in the same sense as
+    `--reference-run`: the whole point is a cohort that no usage count endorses,
+    so a prefix landing on a near-miss would produce a number belonging to no
+    series and reading as if it did. Run `plan` to get the hash to paste.
+
+    CAN-SERVE IS STILL ENFORCED. Naming an extract overrides the RANKING, not
+    the config's requirements: a window too short for the cohort, or a qctx
+    config against an extract with no `task_created`, is refused here exactly as
+    `choose_extract` refuses it -- with the reasons, since an override is the
+    one case where the caller has a specific answer in mind and deserves to be
+    told why it was wrong.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", request_hash or ""):
+        raise Refused(
+            f"--extract wants a full 64-hex request hash, not"
+            f" {request_hash!r}. This flag exists to name a cohort that usage"
+            f" count will never choose, so a prefix that resolves to a"
+            f" near-miss would be a number belonging to no series. Run `plan`"
+            f" on this config and paste the hash it prints.")
+    chosen = None
+    others = []
+    for extract in extracts or []:
+        if extract.get("request_hash") == request_hash and chosen is None:
+            chosen = extract
+        else:
+            others.append(extract)
+    if chosen is None:
+        known = ", ".join(sorted(
+            (e.get("request_hash") or "?")[:12] for e in extracts or [])) or "none"
+        raise Refused(
+            f"no published extract has request hash {request_hash[:12]}...."
+            f" Published: {known}. `qf extracts` lists them; an extract that"
+            f" is not published cannot be probed.")
+    reasons = extract_can_serve(config, chosen)
+    if reasons:
+        raise Refused(
+            f"--extract named {request_hash[:12]}..., which cannot serve"
+            f" {config['path']}: {'; '.join(reasons)}. Naming an extract"
+            f" overrides which one is CHOSEN, not what the config needs.")
+    rejected, runners_up = [], []
+    for extract in others:
+        why = extract_can_serve(config, extract)
+        (rejected.append((extract, why)) if why
+         else runners_up.append(extract))
+    return chosen, rejected, runners_up
+
+
 def choose_baseline(baselines, counts):
     """The most-used baseline that is not broken; newest as a tiebreak."""
     usable = [b for b in (baselines or []) if not b.get("broken")]
@@ -358,11 +418,19 @@ class _reverse:
         return self.value == other.value
 
 
-def plan(config, extracts, baselines, contracts, history):
-    """Everything a run needs, plus why each input was chosen."""
+def plan(config, extracts, baselines, contracts, history,
+         named=None):
+    """Everything a run needs, plus why each input was chosen.
+
+    `named` is a full extract request hash from `--extract`. It replaces the
+    RANKING only: see `named_extract`.
+    """
     counts = usage_counts(history)
-    extract, rejected, runners_up = choose_extract(config, extracts,
-                                                   counts["extract"])
+    if named:
+        extract, rejected, runners_up = named_extract(config, extracts, named)
+    else:
+        extract, rejected, runners_up = choose_extract(config, extracts,
+                                                       counts["extract"])
     train_start = cohort_train_start(config, extract.get("as_of_date"))
     return {
         "config": config,
@@ -377,6 +445,10 @@ def plan(config, extracts, baselines, contracts, history):
                                                   0),
         "rejected": rejected,
         "runners_up": runners_up,
+        # SO THE RENDERING CAN SAY IT. A run on a named extract is not the same
+        # kind of claim as a run on the chosen one, and the difference has to
+        # reach the entry that cites it.
+        "extract_named": bool(named),
     }
 
 
@@ -819,6 +891,13 @@ def render_plan(resolved):
            f"baseline  {resolved['baseline'].get('baseline_hash')}",
            f"contract  {resolved['contract'].get('contract_hash')}"]
 
+    if resolved.get("extract_named"):
+        out.append("\nNAMED with --extract: usage count did not choose this"
+                   " extract, you did. Comparability is now YOUR claim --"
+                   " judge this run against another run on THIS extract with"
+                   " --vs, or declare it the first of a new series with"
+                   " --reference-run. A --vs pointing at a run on a different"
+                   " extract compares two cohorts and one config change.")
     scored = resolved["scored_runs_here"]
     if scored:
         out.append(f"\n{scored} scored run(s) already used this extract, so a"
@@ -845,7 +924,7 @@ def render_plan(resolved):
 def cmd_plan(args):
     config = read_config(config_path(workspace_path(args.workspace),
                                      args.config))
-    resolved = plan(config, **inventory(limit=args.limit))
+    resolved = plan(config, named=args.extract, **inventory(limit=args.limit))
     print(render_plan(resolved))
     return 0
 
@@ -987,7 +1066,7 @@ def cmd_run(args):
     # different one.
     args.workspace_resolved = workspace
     config = read_config(config_path(workspace, args.config))
-    resolved = plan(config, **inventory(limit=args.limit))
+    resolved = plan(config, named=args.extract, **inventory(limit=args.limit))
     print(render_plan(resolved))
     # BUILT BEFORE THE PUSH, and that ordering is the point. A note the
     # dispatcher rejects fails the SUBMIT, which happens after the commit and
@@ -1079,6 +1158,18 @@ def main(argv=None):
                          " configs/wait_qctx_d_priority_flow.yaml")
         one.add_argument("--note", help="what this experiment tests"
                          " (with --bar, this is the pre-registered hypothesis)")
+        # THE DECLARED EXIT FROM THE USAGE-COUNT ORDERING. On `plan` too, and
+        # not only on `run`: the point of naming a cohort is to read what it
+        # resolves to before spending a probe on it.
+        one.add_argument("--extract", metavar="REQUEST_HASH",
+                         help="run against a NAMED published extract instead"
+                              " of the most-used one that can serve this"
+                              " config. The full 64-hex hash, not a prefix --"
+                              " `plan` prints it. Use it for a second,"
+                              " non-overlapping cohort, which usage count can"
+                              " never choose; then judge with --vs inside that"
+                              " cohort, or --reference-run if it is the first"
+                              " run there.")
         if name == "run":
             one.add_argument("--dry-run", action="store_true",
                              help="stop after planning")

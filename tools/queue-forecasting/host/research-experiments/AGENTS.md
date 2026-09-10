@@ -132,6 +132,15 @@ for CONFIRMING they exist and reading their windows. They are not a menu, and
 "something newer exists" is not permission -- a run against an extract nobody
 else used is a number that belongs to no series.
 
+**The one sanctioned exception is a CONFIRMATION, and it has its own flag.** A
+config that already cleared every bar on one cohort needs a second cohort whose
+holdout does not overlap -- and that cohort is by definition the one no scored
+run has used, so "not a menu" would rule out the only run that can confirm
+anything. `experiment.py run --extract <full 64-hex request hash>` is how you
+say it, with `--reference-run` rather than `--vs`. It is not a licence to shop:
+outside a confirmation, an extract you chose yourself is still a number
+belonging to no series, and `plan` will still say so.
+
 ### The scored results so far
 
 Series A, all on the contract's unfiltered `completed` slice. Read the queue for

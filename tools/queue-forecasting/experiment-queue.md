@@ -198,7 +198,11 @@ That is worth stating plainly because it defines what a legitimate fix is. The
 tail — coverage has room from 0.8821 to 0.95, and within_2x has +4.5pp of slack
 above its bar to spend. But that means re-inflating exactly what qctx fixed, and
 the program's goal (group ETA for `mach try`) needs sharp tails, not wide ones.
-**Run it as a diagnostic to bound the gap; do not promote on it.**
+**Run it as a diagnostic to bound the gap; do not promote on it.** — **and see
+queue entry 4, restated 2026-09-10: this cannot be run as a probe at all.** The
+scored `p90_miss_tail` reads the raw head, so the guardrail's width is invisible
+to the bar it was meant to explain. The question survives; the experiment does
+not.
 
 ### The run above tested features a prior ablation had already rejected
 
@@ -314,9 +318,34 @@ from was escalated over unrelated defects and remains NOT RECORDED
 (`journal/escalations/20260901T113305Z.md`); nothing about that escalation is
 reversed by repeating a check that stands on its own.*
 
-**4. The guardrail-width diagnostic (see above).** Not a promotion candidate.
-Bounds how much of the 1.08pp is information versus inflation, which tells us
-whether entries 2 and 3 are solving a real problem or a calibration one.
+**4. NOT RUNNABLE AS WRITTEN — the guardrail-width diagnostic cannot move the
+bar it was queued to explain.** Restated 2026-09-10 from the research loop's
+own reading of the code, verified here. Three facts, in increasing order of how
+much they matter:
+
+- The p90 head's quantile is a constructor argument (`alpha: self.alpha`,
+  `trainer/src/model.py:50`), taken from the config's `quantiles` list and not
+  reachable through `model_params` — so "widen the guardrail" is not expressible
+  as a one-variable config change.
+- `train.py` refuses `--predictions-out` unless the config trained exactly 0.5
+  and 0.9, because the contract's columns are `p50` and `p90_raw`.
+- **Decisively: `p90_miss_tail` is computed from `scored["p90_raw"]`** — the raw
+  model head (`host/evaluator/evaluate.py:879`, `verdict.py:32`). The
+  baseline-floored guarded p90 (`compute_guarded_p90`) lives in the *trainer's*
+  own report and is never in the scored path. Widening it therefore cannot move
+  the metric that blocks entries 2 and 3, whatever it does to a served ETA.
+
+So the question above — how much of the 1.08pp is information versus inflation —
+is still a good question and this is not a way to ask it. What it becomes: a
+**report-side analysis of a run that already exists**, comparing `p90_raw`
+misses against guarded misses in one scored run's trainer report. That costs no
+probe, spends no extract, and is the only form in which the guardrail's width is
+observable at all. Whoever picks it up should state which run's report they
+read, because the answer is per-cohort.
+
+*Provenance: derived by the leader in `journal/escalations/20260910T021800Z.md`,
+which was escalated over two unsupported asides elsewhere in the entry. These
+three readings stand on their own and were re-checked against the files named.*
 
 **5. `..._baseline_pool` — the pool class alone (config written).**
 `pool_kind` and `provider_type` on top of the promoted config, nothing removed.
