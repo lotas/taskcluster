@@ -46,8 +46,11 @@ cd "$QF_DIR"
 # --- knobs (override by env) -----------------------------------------------
 FROM_DATE="${FROM_DATE:-2026-07-25}"       # inclusive
 TO_DATE="${TO_DATE:-2026-09-01}"           # EXCLUSIVE, as predictor.js --to is
-# Cohort A: the extract whose as_of_date (or request_hash) starts with this.
-COHORT_A="${COHORT_A:-2026-08-27}"
+# Cohort A: request_hash prefix of the loop's canonical Series A extract
+# (AGENTS.md "The canonical inputs"; as_of 2026-08-27). Three extracts share
+# that as_of, so a date does not name it. An as_of prefix is still accepted
+# when it is unambiguous.
+COHORT_A="${COHORT_A:-bd29b39ab625}"
 # Cohort B: request_hash prefix of the second, non-overlapping extract.
 COHORT_B="${COHORT_B:-975aea71d759}"
 REFERENCE_CONFIG="${REFERENCE_CONFIG:-configs/wait_time_residual_throughput_filtered_baseline.yaml}"
@@ -149,13 +152,22 @@ resp, a_prefix, b_prefix = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
 if not resp.get("ok"):
     sys.exit(f"qf extracts: {resp.get('error')}")
 rows = resp.get("extracts") or []
+def has_qctx(r):
+    return "task_created" in ((r.get("columns") or {}).get("qctx_runs") or ())
 def pick(prefix, label):
-    hits = [r for r in rows if r.get("target") == "wait_time"
-            and (str(r.get("as_of_date", "")).startswith(prefix)
-                 or str(r.get("request_hash", "")).startswith(prefix))]
+    named = [r for r in rows if r.get("target") == "wait_time"
+             and (str(r.get("as_of_date", "")).startswith(prefix)
+                  or str(r.get("request_hash", "")).startswith(prefix))]
+    # The qctx candidates need `task_created` in qctx_runs (experiment.py
+    # refuses otherwise), and the reference must run on the SAME extract, so
+    # an extract without it cannot be a cohort here at all.
+    hits = [r for r in named if has_qctx(r)]
     if len(hits) != 1:
-        sys.exit(f"{label} '{prefix}': expected exactly one wait_time extract, found {len(hits)}: "
-                 + ", ".join((h.get('request_hash') or '?')[:12] + '@' + str(h.get('as_of_date'))[:10] for h in hits))
+        sys.exit(f"{label} '{prefix}': expected exactly one wait_time extract with task_created, found {len(hits)}"
+                 f" (of {len(named)} named): " + ", ".join(
+                     f"{(h.get('request_hash') or '?')[:12]}@{str(h.get('as_of_date'))[:10]}"
+                     f" from {str(h.get('train_start'))[:10]} qctx={'yes' if has_qctx(h) else 'NO'}"
+                     for h in named) + ". Name one by hash prefix: COHORT_A=<12 hex> / COHORT_B=<12 hex>.")
     return hits[0]
 a, b = pick(a_prefix, "cohort A"), pick(b_prefix, "cohort B")
 if a["request_hash"] == b["request_hash"]:
