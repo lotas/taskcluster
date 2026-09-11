@@ -108,6 +108,36 @@ def test_load_baseline_predictions_tolerates_the_old_six_column_format(tmp_path)
     ]
 
 
+def test_load_baseline_predictions_keeps_only_rows_inside_the_pending_window(tmp_path):
+    """A promoted baseline may span several cohorts (the v2 set covers
+    2026-07-25..09-01, 8.8M rows); the trainer must hold only THIS cohort's rows
+    in memory, or the list-of-dicts alone pushes a 20g probe over its cap
+    (probe-20260911T094305Z: exit 137). The window is inclusive at both ends
+    and compared in UTC at second precision, which is what toISOString writes."""
+    import json
+    from datetime import datetime, timezone
+    from src.data_loader import load_baseline_predictions
+    p = tmp_path / "baseline_predictions.ndjson"
+    rows = [
+        {"task_id": "before", "run_id": 0, "pending_at": "2026-08-06T23:59:59.999Z"},
+        {"task_id": "lo",     "run_id": 0, "pending_at": "2026-08-07T00:00:00.000Z"},
+        {"task_id": "mid",    "run_id": 1, "pending_at": "2026-08-15T12:00:00.000Z"},
+        {"task_id": "hi",     "run_id": 0, "pending_at": "2026-08-26T23:59:59.000Z"},
+        {"task_id": "after",  "run_id": 0, "pending_at": "2026-08-27T00:00:00.000Z"},
+    ]
+    p.write_text("".join(json.dumps({**r, "bl_duration_p50": 1.0, "bl_duration_p90": 2.0,
+                                      "bl_wait_p50": 3.0, "bl_wait_p90": 4.0}) + "\n" for r in rows))
+    lo = datetime(2026, 8, 7, tzinfo=timezone.utc)
+    hi = datetime(2026, 8, 26, 23, 59, 59, tzinfo=timezone.utc)
+    df = load_baseline_predictions(p, pending_from=lo, pending_to=hi)
+    assert list(df["task_id"]) == ["lo", "mid", "hi"]
+    # No window = every row, as before.
+    assert len(load_baseline_predictions(p)) == 5
+    # A naive bound is read as UTC, not local time.
+    df2 = load_baseline_predictions(p, pending_from=datetime(2026, 8, 15), pending_to=datetime(2026, 8, 16))
+    assert list(df2["task_id"]) == ["mid"]
+
+
 def test_repo_family_derivation_version_matches_js():
     """The Python constant must stay in lockstep with src/repo-family.js.
 

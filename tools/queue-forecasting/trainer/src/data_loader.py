@@ -264,7 +264,20 @@ WHERE {where_sql};
 """
 
 
-def load_baseline_predictions(path: Path) -> pd.DataFrame:
+def _utc_second_prefix(value) -> str:
+    """`YYYY-MM-DDTHH:MM:SS` in UTC, the comparable prefix of what
+    `Date.prototype.toISOString` writes. A naive datetime is taken as UTC."""
+    ts = pd.Timestamp(value)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return ts.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def load_baseline_predictions(
+    path: Path,
+    *,
+    pending_from=None,
+    pending_to=None,
+) -> pd.DataFrame:
     """Load per-row baseline-prediction NDJSON (produced by predictor.js
     --export-baseline-predictions) into a DataFrame keyed by (task_id, run_id).
 
@@ -272,15 +285,33 @@ def load_baseline_predictions(path: Path) -> pd.DataFrame:
     join keys, the baseline quantiles, and the optional guardrail columns
     (`bl_duration_level`, `bl_duration_sample_size`, `bl_wait_level`,
     `bl_wait_sample_size`) when the export carried them.
+
+    `pending_from` / `pending_to` (inclusive, UTC, second precision) keep only
+    rows whose `pending_at` falls inside the window, WHILE streaming. A
+    promoted baseline may span several cohorts -- the contract-v2 set covers
+    2026-07-25..09-01, 8.8M rows -- and materialising every row as a dict
+    before filtering is what OOM-killed the first v2 reference probe (exit 137
+    under a 20g cap that the cohort's own rows had left ~2.6g of headroom in).
+    The caller passes the cohort frame's actual pending_at span, so the join
+    sees exactly the rows it can match.
     """
     import json as _json
+    lo = _utc_second_prefix(pending_from) if pending_from is not None else None
+    hi = _utc_second_prefix(pending_to) if pending_to is not None else None
     records: list[dict] = []
     with Path(path).open() as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            records.append(_json.loads(line))
+            rec = _json.loads(line)
+            if lo is not None or hi is not None:
+                # String compare on the fixed-width ISO prefix: no datetime
+                # parse per row, and correct because the exporter writes UTC.
+                at = str(rec.get("pending_at", ""))[:19]
+                if (lo is not None and at < lo) or (hi is not None and at > hi):
+                    continue
+            records.append(rec)
     df = pd.DataFrame.from_records(records)
     # Join keys + the baseline quantiles, always; the guardrail inputs
     # (`*_level`, `*_sample_size`) when the export carried them. Exports before
@@ -740,7 +771,14 @@ def load(
         if bl_dir.startswith("data/"):
             bl_dir = bl_dir[len("data/"):]
         bl_path = CACHE_DIR.parent / bl_dir / baseline_file
-        bl = load_baseline_predictions(bl_path)
+        # Only the rows this cohort can join: the promoted set may span many
+        # cohorts, and every row outside [min, max] pending_at is a dict that
+        # costs memory and matches nothing.
+        bl = load_baseline_predictions(
+            bl_path,
+            pending_from=df["pending_at"].min() if len(df) else None,
+            pending_to=df["pending_at"].max() if len(df) else None,
+        )
         before = len(df)
         df = df.merge(bl, on=["task_id", "run_id"], how="left")
         if len(df) != before:

@@ -618,15 +618,26 @@ stage_probe() {
     local note='v2 reference: percentile baseline + residual, first run of the v2 series on this cohort'
     if [ -z "$rid" ]; then
       info "reference on ${cohort:0:12} ... (blocks until probe AND evaluation finish)"
-      set +e
+      # `|| rc=$?`, not `set +e`: the ERR trap fires regardless of -e, and it
+      # fires INSIDE as_research before any recovery below could run. A
+      # command in an || list is exempt, and so is everything it calls.
+      local rc=0
       as_research "python3 $TRUSTED_HOST/experiment.py run $REFERENCE_CONFIG --extract $cohort --contract $V2_HASH \
-          --bar pinball_p90_guarded --dir improve --reference-run --note '$note'" | tee "$log"
-      local rc=${PIPESTATUS[0]}
-      set -e
+          --bar pinball_p90_guarded --dir improve --reference-run --note '$note'" | tee "$log" || rc=$?
       rid="$(grep -oE '\bprobe-[0-9A-Za-z-]+\b' "$log" | tail -1 || true)"
       if [ "$rc" -ne 0 ]; then
+        if [ -n "$rid" ] && grep -qE "^FAILED\b" "$log"; then
+          # The PROBE itself failed (qf prints `FAILED exit_code=... error_class=...`).
+          # Nothing to evaluate, nothing to record: a rerun must train again.
+          local why; why="$(grep -E "^FAILED\b" "$log" | tail -1)"
+          case "$why" in
+            *exit_code=137*) why="$why -- exit 137 is the container's memory cap (--mem 20g). Check the trainer's memory profile before retrying." ;;
+          esac
+          die "probe $rid FAILED on ${cohort:0:12}: $why (see $log)"
+        fi
         if [ -n "$rid" ]; then
-          # The probe exists; only what came after failed. Record it so the
+          # The probe exists and did not report failure; what came after it
+          # (the evaluation, or the client's wait) failed. Record it so the
           # rerun evaluates THIS run instead of training another.
           write_ref_state "$cohort" "$rid" false
           die "probe $rid was submitted but the run did not complete (see $log). Rerun this stage: it will finish with 'qf evaluate', not a new probe."
@@ -638,7 +649,9 @@ stage_probe() {
       ok "reference run: $rid"
     elif [ "$evaluated" != "True" ]; then
       info "finishing ${cohort:0:12}: evaluating recorded probe $rid under v2"
-      as_research "qf evaluate --run $rid --contract $V2_HASH --note '$note' --wait" | tee -a "$log"
+      local rc=0
+      as_research "qf evaluate --run $rid --contract $V2_HASH --note '$note' --wait" | tee -a "$log" || rc=$?
+      [ "$rc" -eq 0 ] || die "qf evaluate of $rid failed (see $log). If the probe itself failed, remove $state and rerun to train again."
       write_ref_state "$cohort" "$rid" true
       ok "reference run evaluated: $rid"
     else
