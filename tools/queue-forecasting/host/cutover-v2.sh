@@ -62,7 +62,7 @@ LOCK_FILE="${QFD_LOCK_FILE:-/var/lib/qf-locks/heavy-training.lock}"
 INTENT_DIR="${QFD_INTENT_DIR:-/var/lib/qf-locks/intent.d}"
 LOCK_WAIT_S="${LOCK_WAIT_S:-9000}"
 TRUSTED_REF="${TRUSTED_REF:-origin/feat/queue-forecasting}"
-GIT_REMOTE="${GIT_REMOTE:-lotas}"
+GIT_REMOTE="${GIT_REMOTE:-}"            # default: the remote whose URL is lotas/taskcluster (the fork the mirror clones)
 RESEARCH="${RESEARCH_USER:-research}"
 TRUSTED_HOST="${QF_TRUSTED_HOST:-/srv/queue-forecasting/tools/queue-forecasting/host}"
 
@@ -126,6 +126,13 @@ g rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$QF_DIR is not inside 
 BRANCH="$(g rev-parse --abbrev-ref HEAD)"
 PREFIX="$(g rev-parse --show-prefix)"      # e.g. tools/queue-forecasting/ -- porcelain paths are ROOT-relative
 [ "$BRANCH" = "${TRUSTED_REF#origin/}" ] || die "checkout is on '$BRANCH' but the mirror tracks $TRUSTED_REF; check out that branch or set TRUSTED_REF"
+if [ -z "$GIT_REMOTE" ]; then
+  # The mirror is a clone of github.com/lotas/taskcluster, so the push must
+  # land there whatever this checkout calls that remote.
+  GIT_REMOTE="$(g remote -v | awk '/lotas\/taskcluster.*\(push\)$/ {print $1; exit}')"
+  [ -n "$GIT_REMOTE" ] || die "no remote points at lotas/taskcluster (git remote -v); set GIT_REMOTE=<name>"
+fi
+g remote get-url "$GIT_REMOTE" >/dev/null 2>&1 || die "no remote named '$GIT_REMOTE' in this checkout (git remote -v)"
 grep -q "baselineExportRecord" src/predictor.js \
   || die "src/predictor.js does not carry baselineExportRecord: git pull 44b24cd888 first"
 [[ "$FROM_DATE" < "$TO_DATE" ]] || die "FROM_DATE $FROM_DATE must be before TO_DATE $TO_DATE"
