@@ -1,0 +1,86 @@
+{
+  "baseline_hash": "9c150d75a8ea3ba49f113f4d04c30f514f89a19ef5aa5168f6fc6d011b7bafca",
+  "consistency": {
+    "days_required": 3
+  },
+  "contract_hash": "da27748abb7c748981cce8fe1b68d5762622b784025f61216af96f8c787ba8ef",
+  "holdout_days": 5,
+  "metrics": {
+    "interval_width_guarded": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": -0.1
+      },
+      "direction": "lower_is_better",
+      "role": "report"
+    },
+    "mae": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.15
+      },
+      "direction": "lower_is_better"
+    },
+    "p90_coverage": {
+      "bar": {
+        "high": 0.95,
+        "kind": "band",
+        "low": 0.85
+      },
+      "direction": "band",
+      "role": "report"
+    },
+    "p90_coverage_guarded": {
+      "bar": {
+        "high": 0.93,
+        "kind": "band",
+        "low": 0.88
+      },
+      "direction": "band"
+    },
+    "p90_miss_severity_tail": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.0
+      },
+      "bucket": "30m+",
+      "direction": "lower_is_better",
+      "min_eligible_n": 200,
+      "role": "report"
+    },
+    "p90_miss_tail_guarded": {
+      "bar": {
+        "kind": "absolute",
+        "value": 0.3
+      },
+      "bucket": "30m+",
+      "direction": "lower_is_better",
+      "min_eligible_n": 200,
+      "role": "report"
+    },
+    "pinball_p90_guarded": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.0
+      },
+      "direction": "lower_is_better"
+    },
+    "within_2x": {
+      "bar": {
+        "kind": "absolute_improvement",
+        "value": 0.05
+      },
+      "direction": "higher_is_better"
+    }
+  },
+  "name": "wait_time_v2",
+  "note": "v2, 2026-09-10. Judges the SERVED p90 (level-aware guardrail from src/live-predictor/p90-guardrail.js applied) with a proper scoring rule. The 30m+ miss rate conditions on the outcome and rewards inflation, so it is reported as an operational alert and never decides. MAE and within-2x bars unchanged from v1. Primary slice only, as before. The two 30m+ reports carry min_eligible_n 200: the scored holdouts hold tens of thousands of 30m+ rows, so 200 is a floor against a near-empty bucket on a quiet day rendering as an alert or an all-clear, not a power calculation.",
+  "primary_slice": {
+    "anchor": "pending_at",
+    "reason_resolved": [
+      "completed"
+    ]
+  },
+  "schema": 1,
+  "target": "wait_time"
+}
