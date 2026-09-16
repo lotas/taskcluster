@@ -152,7 +152,30 @@ sudo -H -u research qf extract --target wait_time \
 
 R3 on or after 2026-09-18 (`--train-start 2026-08-22 --as-of 2026-09-11`),
 R4 on or after 2026-09-23 (`--train-start 2026-08-27 --as-of 2026-09-16`).
-One extract per day is the dispatcher's cap.
+One extract per day is the research loop's own cap (`MAX_EXTRACTS` in
+`tick.sh`, enforced by a shim), not the dispatcher's; an operator extract does
+not compete with it.
+
+**R1 provenance (record in the freeze commit).** `d3c5330d` (as_of 2026-09-01,
+holdout 08-27..08-31) was not cut by an operator: the research loop cut it at
+2026-09-12T02:12Z as its daily extract, then submitted five probes against it
+(09-12 03:08, 09-13 04:05, 09-14 03:05, 17:12, 19:13). All five FAILED before
+training: `_require_baselines` in `trainer/src/train.py` refuses a cohort
+whose holdout days have no per-day JSON in the pinned baseline, and `9c150d75`
+carries only 08-15..19 and 08-22..26. No model was trained or scored on R1's
+holdout, so its outcome is still unexamined -- but by a gate, not by policy.
+The loop auto-paused itself on 2026-09-15T14:09Z (three consecutive
+verification disagreements; `~research/qf-research/PAUSE`, issue
+lotas/qf-research#11) and the timer was stopped 2026-09-16T13:01Z.
+
+**Why the timer stays off until promotion.** Extract directories are
+world-readable (`/var/lib/qf-extracts/*/runs.parquet`, mode 0644), so a running
+leader can read a reserved holdout without a probe. And the tick prompt's
+highest-value action is "confirm on a cohort whose holdout does not overlap",
+which R2 (09-01..09-05) and R1 are, exactly; today only the per-day JSON gate
+stops that, and the v3 package removes the gate for both. The loop also has
+nothing else to do: its 2026-09-15 escalation says every PROMISING row is
+blocked on precisely the per-day files this package will promote.
 
 Whether the extractor supports an observed-at cutoff (protocol §2.3): it does
 not. `extract_spec` has a settlement lag and no snapshot cutoff; the extract
