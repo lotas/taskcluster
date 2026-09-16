@@ -1374,6 +1374,60 @@ class TestGuardedScoring(EvaluateCase):
             self.assertIn(name, verdict_mod.VALUE_OF, name)
 
 
+class TestPredictionTimeBucketGate(EvaluateCase):
+    """Gate 4 end to end: the per-row file carries the prediction-time bucket
+    and the verdict carries the metric bucketed by it."""
+
+    GATE4_METRICS = dict(V2_METRICS, p90_coverage_guarded_lt1m={
+        "direction": "band", "bucket": "<1m", "bucket_by": "baseline_p50",
+        "role": "report",
+        "bar": {"kind": "band", "low": 0.85, "high": 1.0}})
+
+    def test_the_per_row_file_carries_the_baseline_p50_bucket(self):
+        f = self.fixture(contract_metrics=self.GATE4_METRICS,
+                         baseline_levels=True)
+        f.run()
+        table = f.eval_table().to_pydict()
+        self.assertIn("bucket_bl_p50", table)
+        for bl, name in zip(table["bl_p50"], table["bucket_bl_p50"]):
+            want = next(n for n, lo, hi in ev.metrics_mod.WAIT_BUCKETS
+                        if lo <= bl < hi)
+            self.assertEqual(name, want)
+        # The fixture's baseline is 3x the actual, so the two bucket columns
+        # DISAGREE on some rows -- which is what makes the second column
+        # information rather than a copy.
+        self.assertNotEqual(table["bucket"], table["bucket_bl_p50"])
+
+    def test_the_verdict_carries_the_metric_bucketed_by_the_baseline(self):
+        f = self.fixture(contract_metrics=self.GATE4_METRICS,
+                         baseline_levels=True)
+        f.run()
+        doc = f.verdict_document()
+        entry = doc["metrics"]["p90_coverage_guarded_lt1m"]
+        self.assertEqual(entry["bucket"], "<1m")
+        self.assertEqual(entry["bucket_by"], "baseline_p50")
+        self.assertIn("buckets_by_baseline_p50", doc["model"])
+        self.assertIn("buckets_by_baseline_p50", doc["baseline"])
+        # Recomputable from the per-row file, over the KEY bucket.
+        table = f.eval_table().to_pydict()
+        y = np.array(table["y_true"], dtype=float)
+        g = np.array(table["p90_guarded"], dtype=float)
+        sel = np.array([b == "<1m" for b in table["bucket_bl_p50"]])
+        family = doc["model"]["buckets_by_baseline_p50"]["<1m"]
+        self.assertEqual(family["p90_coverage_guarded"]["eligible_n"],
+                         int(sel.sum()))
+        self.assertEqual(family["p90_coverage_guarded"]["covered_n"],
+                         int((y[sel] <= g[sel]).sum()))
+        self.assertEqual(entry["eligible_n"], int(sel.sum()))
+
+    def test_a_v1_contract_still_gets_the_column_and_no_family_is_read(self):
+        f = self.fixture()
+        f.run()
+        self.assertIn("bucket_bl_p50", f.eval_table().column_names)
+        doc = f.verdict_document()
+        self.assertNotIn("p90_coverage_guarded_lt1m", doc["metrics"])
+
+
 if __name__ == "__main__":
     # AT THE END. Two copies of this had drifted into the middle of the file as
     # classes were appended below them, so `python tests/test_evaluate.py` ran

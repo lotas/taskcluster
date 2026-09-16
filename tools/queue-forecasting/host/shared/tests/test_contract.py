@@ -646,6 +646,63 @@ class TestTheShippedV1ContractKeepsItsIdentity(unittest.TestCase):
         self.assertEqual(digest, self.V1_HASH)
 
 
+class TestBucketBy(unittest.TestCase):
+    """`bucket_by`: which quantity chooses a bucket metric's rows.
+
+    The realised wait (the default) is the outcome, and a gate selected on the
+    outcome rewards inflation; the pinned baseline's p50 is known at pending
+    time and is not the candidate's number. See `evaluation-protocol.md` §4.2.
+    """
+
+    def tail(self, **over):
+        spec = {"direction": "band", "bucket": "30m+",
+                "bar": {"kind": "band", "low": 0.85, "high": 0.95}}
+        spec.update(over)
+        body = a_contract()
+        body["metrics"]["p90_coverage_guarded_30m"] = spec
+        return body
+
+    def test_absent_is_the_default_and_does_not_enter_the_identity(self):
+        # Every contract written before `bucket_by` existed keeps its hash.
+        out = contract.validate(self.tail())
+        self.assertNotIn("bucket_by", out["metrics"]["p90_coverage_guarded_30m"])
+        explicit = contract.validate(self.tail(bucket_by="actual"))
+        self.assertNotIn("bucket_by",
+                         explicit["metrics"]["p90_coverage_guarded_30m"])
+        self.assertEqual(contract.contract_hash(out),
+                         contract.contract_hash(explicit))
+        self.assertNotIn("bucket_by", contract.canonical(out).decode())
+
+    def test_baseline_p50_is_kept_and_changes_the_identity(self):
+        out = contract.validate(self.tail(bucket_by="baseline_p50"))
+        self.assertEqual(
+            out["metrics"]["p90_coverage_guarded_30m"]["bucket_by"],
+            "baseline_p50")
+        self.assertNotEqual(contract.contract_hash(out),
+                            contract.contract_hash(
+                                contract.validate(self.tail())))
+
+    def test_a_null_bucket_by_is_the_default_like_a_null_role(self):
+        out = contract.validate(self.tail(bucket_by=None))
+        self.assertNotIn("bucket_by", out["metrics"]["p90_coverage_guarded_30m"])
+        self.assertEqual(contract.contract_hash(out),
+                         contract.contract_hash(
+                             contract.validate(self.tail())))
+
+    def test_an_unknown_bucket_by_is_refused(self):
+        with self.assertRaisesRegex(contract.ContractError, "bucket_by"):
+            contract.validate(self.tail(bucket_by="model_p50"))
+
+    def test_bucket_by_without_a_bucket_is_refused(self):
+        # A bucketing rule on a metric with no bucket reads as though it
+        # slices and does not.
+        body = a_contract()
+        body["metrics"]["mae"]["bucket_by"] = "baseline_p50"
+        with self.assertRaisesRegex(contract.ContractError,
+                                    "only meaningful with a bucket"):
+            contract.validate(body)
+
+
 if __name__ == "__main__":
     # AT THE END. This guard had drifted into the middle of the file as classes
     # were appended below it, so running the file directly executed only the

@@ -608,5 +608,100 @@ class TestEveryRatioReportsWhatItDividedBy(unittest.TestCase):
                 repr(bad))
 
 
+class TestThePredictionTimeBucketFamily(unittest.TestCase):
+    """`buckets_by_baseline_p50`: rows chosen by the pinned baseline's p50, not
+    by the outcome and not by the candidate. EVALUATOR-ONLY -- the trainer has
+    no counterpart, so the two-route cross-check does not cover it; these tests
+    are the whole of its verification."""
+
+    def test_rows_land_by_the_key_and_not_by_the_actual(self):
+        # Actuals in <1m and 30m+; keys in the OPPOSITE buckets.
+        yt = np.array([30.0, 3600.0])
+        key = np.array([3600.0, 30.0])
+        r = metrics.compute(y_true=yt, p50=yt, p90=None,
+                            days=np.array(["d", "d"]), buckets=True,
+                            bucket_key=key)
+        self.assertEqual(r["buckets"]["<1m"]["mae"]["eligible_n"], 1)
+        self.assertEqual(r["buckets"]["30m+"]["mae"]["eligible_n"], 1)
+        by = r["buckets_by_baseline_p50"]
+        # The <1m KEY bucket holds the 3600 s actual, and vice versa.
+        self.assertEqual(by["<1m"]["mae"]["eligible_n"], 1)
+        self.assertEqual(by["30m+"]["mae"]["eligible_n"], 1)
+        self.assertEqual(by["<1m"]["mae"]["sum_abs_error"], 0.0)
+        r2 = metrics.compute(y_true=yt, p50=np.array([30.0, 0.0]), p90=None,
+                             days=np.array(["d", "d"]), buckets=True,
+                             bucket_key=key)
+        # The 3600 s actual (key 30 -> "<1m") predicted as 0 -> error 3600
+        # in the <1m KEY bucket, where the actual-bucket family reads 0.
+        self.assertEqual(
+            r2["buckets_by_baseline_p50"]["<1m"]["mae"]["sum_abs_error"],
+            3600.0)
+        self.assertEqual(r2["buckets"]["<1m"]["mae"]["sum_abs_error"], 0.0)
+
+    def test_the_candidate_cannot_move_a_row_between_key_buckets(self):
+        # NEGATIVE CONTROL: same key, wildly different predictions -> the same
+        # eligible_n in every key bucket. A family a candidate could reshape
+        # by predicting differently would not be a slice it cannot escape.
+        rng = np.random.default_rng(3)
+        yt = rng.lognormal(5, 2, 400)
+        key = rng.lognormal(5, 2, 400)
+        days = np.array(["d"] * 400)
+        a = metrics.compute(y_true=yt, p50=yt, p90=yt * 1.5, days=days,
+                            buckets=True, bucket_key=key)
+        b = metrics.compute(y_true=yt, p50=yt * 1000.0, p90=yt * 0.001,
+                            days=days, buckets=True, bucket_key=key)
+        for name, _lo, _hi in metrics.WAIT_BUCKETS:
+            self.assertEqual(
+                a["buckets_by_baseline_p50"][name]["mae"]["eligible_n"],
+                b["buckets_by_baseline_p50"][name]["mae"]["eligible_n"], name)
+            self.assertEqual(
+                a["buckets_by_baseline_p50"][name]["p90_coverage"]
+                ["eligible_n"],
+                b["buckets_by_baseline_p50"][name]["p90_coverage"]
+                ["eligible_n"], name)
+
+    def test_an_empty_key_bucket_is_zero_counts_not_a_missing_key(self):
+        r = metrics.compute(y_true=np.array([3600.0]), p50=np.array([3600.0]),
+                            p90=np.array([4000.0]),
+                            p90_guarded=np.array([4000.0]),
+                            days=np.array(["d"]), buckets=True,
+                            bucket_key=np.array([30.0]))
+        empty = r["buckets_by_baseline_p50"]["30m+"]
+        self.assertEqual(empty, metrics._empty_counts(True, True))
+        self.assertEqual(
+            r["buckets_by_baseline_p50"]["<1m"]["p90_coverage_guarded"],
+            {"eligible_n": 1, "covered_n": 1})
+
+    def test_a_nan_key_belongs_to_no_bucket(self):
+        r = metrics.compute(y_true=np.array([30.0, 40.0]),
+                            p50=np.array([30.0, 40.0]), p90=None,
+                            days=np.array(["d", "d"]), buckets=True,
+                            bucket_key=np.array([np.nan, 30.0]))
+        total = sum(r["buckets_by_baseline_p50"][n]["mae"]["eligible_n"]
+                    for n, _lo, _hi in metrics.WAIT_BUCKETS)
+        self.assertEqual(total, 1)
+
+    def test_no_key_means_no_family(self):
+        # Absent, not empty: the verdict must refuse a `baseline_p50` metric
+        # by name rather than read zero rows from it.
+        r = metrics.compute(y_true=np.array([30.0]), p50=np.array([30.0]),
+                            days=np.array(["d"]), buckets=True)
+        self.assertNotIn("buckets_by_baseline_p50", r)
+        self.assertIn("buckets", r)
+
+    def test_a_key_of_the_wrong_length_is_refused(self):
+        with self.assertRaises(ValueError):
+            metrics.compute(y_true=np.array([30.0, 40.0]),
+                            p50=np.array([30.0, 40.0]),
+                            days=np.array(["d", "d"]), buckets=True,
+                            bucket_key=np.array([30.0]))
+
+    def test_the_four_per_bucket_names_cover_every_bucket_once(self):
+        self.assertEqual(sorted(metrics.BUCKET_COVERAGE_NAMES.values()),
+                         sorted(n for n, _lo, _hi in metrics.WAIT_BUCKETS))
+        for name in metrics.BUCKET_COVERAGE_NAMES:
+            self.assertIn(name, metrics.ELIGIBLE_OF)
+
+
 if __name__ == "__main__":
     unittest.main()

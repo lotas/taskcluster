@@ -51,6 +51,15 @@ details and are not:
     separates a calibrated tail from an inflated one. EVALUATOR-ONLY, like
     `p90_excess_guarded`: the trainer has no counterpart, so the two-route
     comparison does not cover it; it is a report, not a gate.
+  * `buckets_by_baseline_p50` is a SECOND bucket family, keyed by the same
+    names, whose rows are chosen by the PINNED BASELINE's predicted p50 rather
+    than by the realised wait. A gate on the served p90 per bucket needs a
+    bucket the candidate cannot move a row out of AND that does not condition
+    on the outcome; the realised-wait family gives the first and not the
+    second. EVALUATOR-ONLY, like `p90_excess_guarded`: the trainer has no
+    counterpart, so the two-route cross-check does not cover it. A gate on it
+    rests on this one implementation and its tests, and that is stated here
+    rather than implied away.
   * Counts, never ratios. Nothing here divides: the ratio is computed once, by
     the verdict, from summed counts -- which is what lets a trusted process
     recompute every number from the parts rather than trusting a quotient.
@@ -185,11 +194,18 @@ def _empty_counts(with_p90, with_guarded=False):
     return out
 
 
-def compute(*, y_true, p50, p90=None, p90_guarded=None, days, buckets=False):
-    """`{"aggregate": counts, "per_day": {day: counts}, "buckets": {...}}`.
+def compute(*, y_true, p50, p90=None, p90_guarded=None, days, buckets=False,
+            bucket_key=None):
+    """`{"aggregate": counts, "per_day": {day: counts}, "buckets": {...},
+    "buckets_by_baseline_p50": {...}}`.
 
     ONE PASS over the row set, with the per-day split derived from `days` rather
     than from a re-read. `days` is a per-row array of `YYYY-MM-DD` strings.
+
+    `bucket_key` is the pinned baseline's predicted p50 per row. When it is
+    given and `buckets` is on, the second family `buckets_by_baseline_p50` is
+    emitted beside `buckets`; when it is None the family is absent, so a verdict
+    naming it refuses by name rather than reading an empty slice.
     """
     yt = np.asarray(y_true, dtype=float)
     result = {"aggregate": _counts(yt, p50, p90, p90_guarded), "per_day": {}}
@@ -217,6 +233,34 @@ def compute(*, y_true, p50, p90=None, p90_guarded=None, days, buckets=False):
                 None if p90 is None else np.asarray(p90, dtype=float)[sel],
                 None if p90_guarded is None
                 else np.asarray(p90_guarded, dtype=float)[sel])
+        if bucket_key is not None:
+            # Bucketed on the PINNED BASELINE's p50, not on the actual and not
+            # on the candidate's prediction. The realised-wait family above
+            # selects on the outcome, so a coverage rate read from it rewards
+            # inflation; a family selected on the candidate's own p50 would let
+            # it move the rows it is bad at into another bucket. The baseline's
+            # p50 is known at pending time and is not the candidate's number,
+            # so neither is possible here. EVALUATOR-ONLY: the trainer emits no
+            # counterpart, so the two-route cross-check does not cover this
+            # family (see the module docstring).
+            key = np.asarray(bucket_key, dtype=float)
+            if key.shape != yt.shape:
+                raise ValueError(
+                    f"bucket_key has shape {key.shape}, y_true {yt.shape}:"
+                    f" a per-row key must be one value per row")
+            result["buckets_by_baseline_p50"] = {}
+            for name, lo, hi in WAIT_BUCKETS:
+                sel = np.isfinite(key) & (key >= lo) & (key < hi)
+                if not sel.any():
+                    result["buckets_by_baseline_p50"][name] = _empty_counts(
+                        p90 is not None, p90_guarded is not None)
+                    continue
+                result["buckets_by_baseline_p50"][name] = _counts(
+                    yt[sel], np.asarray(p50, dtype=float)[sel],
+                    None if p90 is None
+                    else np.asarray(p90, dtype=float)[sel],
+                    None if p90_guarded is None
+                    else np.asarray(p90_guarded, dtype=float)[sel])
     return result
 
 
@@ -357,6 +401,19 @@ def _eligible(key):
     return fn
 
 
+# The four PER-BUCKET names a gate-4 contract uses (`evaluation-protocol.md`
+# §4). Each computes `coverage_guarded` over whatever slice the verdict resolves
+# for it; the suffix is a distinct KEY, because `VALUE_OF` is keyed by metric
+# name and a contract could not otherwise carry four coverage bands at once.
+# `verdict._measure` refuses a name whose suffix disagrees with the contract's
+# `bucket`, so the suffix can never mislabel the slice it was read from.
+BUCKET_COVERAGE_NAMES = {
+    "p90_coverage_guarded_lt1m": "<1m",
+    "p90_coverage_guarded_1_5m": "1-5m",
+    "p90_coverage_guarded_5_30m": "5-30m",
+    "p90_coverage_guarded_30m": "30m+",
+}
+
 ELIGIBLE_OF = {
     "mae": _eligible("mae"),
     "within_2x": _eligible("within_2x"),
@@ -367,4 +424,5 @@ ELIGIBLE_OF = {
     "p90_miss_tail_guarded": _eligible("p90_coverage_guarded"),
     "p90_miss_severity_tail": _eligible("p90_excess_guarded"),
     "interval_width_guarded": _eligible("interval_width_guarded"),
+    **{name: _eligible("p90_coverage_guarded") for name in BUCKET_COVERAGE_NAMES},
 }

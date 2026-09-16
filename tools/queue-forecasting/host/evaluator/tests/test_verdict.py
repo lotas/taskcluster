@@ -501,6 +501,129 @@ class TestASliceTooThinToJudgeIsInconclusive(unittest.TestCase):
         self.assertEqual(out["verdict"], "go")
 
 
+def result_keyed(*, key_bucket_covered, p50_factor=1.02, n=30, ndays=3,
+                 seed=0):
+    """A guarded result with a baseline-p50 key that puts EVERY row in the
+    30m+ key bucket while the actuals stay short, so the two families
+    disagree on purpose. `key_bucket_covered` sets served-p90 coverage
+    (1.0 or 0.0) uniformly. `p50_factor` is deliberately not 1.0 by default:
+    a perfect p50 makes the `mae` gate's relative bar undefined for a
+    baseline built the same way."""
+    rng = np.random.default_rng(seed)
+    yt, p50, p90, g, key, days = [], [], [], [], [], []
+    for d in range(ndays):
+        actual = rng.lognormal(4, 0.3, n)               # ~1 minute: short
+        yt.extend(actual)
+        p50.extend(actual * p50_factor)
+        raw = actual * (2.0 if key_bucket_covered else 0.5)
+        p90.extend(raw)
+        g.extend(raw)
+        key.extend([3600.0] * n)                        # all "30m+" by key
+        days.extend([f"2026-08-{d + 1:02d}"] * n)
+    return metrics.compute(y_true=np.array(yt), p50=np.array(p50),
+                           p90=np.array(p90), p90_guarded=np.array(g),
+                           days=np.array(days), buckets=True,
+                           bucket_key=np.array(key))
+
+
+GATE4 = {"direction": "band", "bucket": "30m+", "bucket_by": "baseline_p50",
+         "bar": {"kind": "band", "low": 0.85, "high": 0.95}}
+
+
+class TestAPredictionTimeBucketGate(unittest.TestCase):
+    """Gate 4: served p90 coverage per bucket chosen by the baseline's p50."""
+
+    def contract(self, **over):
+        spec = dict(GATE4)
+        spec.update(over)
+        return a_contract(metrics={
+            "mae": {"direction": "lower_is_better",
+                    "bar": {"kind": "relative_improvement", "value": 0.15}},
+            "p90_coverage_guarded_30m": spec})
+
+    def test_it_reads_the_key_bucket_and_not_the_actual_one(self):
+        model = result_keyed(key_bucket_covered=True)
+        # The DISCRIMINATING FACT: by the actual there are no 30m+ rows at
+        # all, so a judge reading the wrong family would refuse for want of
+        # rows; by the key, every row is 30m+ and fully covered.
+        self.assertEqual(
+            model["buckets"]["30m+"]["p90_coverage_guarded"]["eligible_n"], 0)
+        out = verdict.decide(self.contract(), model=model,
+                             baseline=result_keyed(key_bucket_covered=False,
+                                                   p50_factor=2.0, seed=1))
+        entry = out["metrics"]["p90_coverage_guarded_30m"]
+        self.assertEqual(entry["bucket"], "30m+")
+        self.assertEqual(entry["bucket_by"], "baseline_p50")
+        self.assertEqual(entry["value"], 1.0)
+        self.assertEqual(entry["eligible_n"], 90)
+        self.assertIs(entry["passed"], False)      # 1.0 is above the band
+        self.assertEqual(out["verdict"], "no-go")
+
+    def test_the_default_family_is_the_actual_and_is_not_written(self):
+        # The same name with no `bucket_by` reads the realised-wait family,
+        # which here is empty, so a gate refuses.
+        c = self.contract()
+        del c["metrics"]["p90_coverage_guarded_30m"]["bucket_by"]
+        with self.assertRaises(verdict.VerdictError) as cm:
+            verdict.decide(c, model=result_keyed(key_bucket_covered=True),
+                           baseline=result_keyed(key_bucket_covered=False,
+                                                 p50_factor=2.0, seed=1))
+        self.assertIn("no eligible rows", str(cm.exception))
+
+    def test_below_the_minimum_a_gate_refuses_and_a_report_is_none(self):
+        model = result_keyed(key_bucket_covered=True)
+        base = result_keyed(key_bucket_covered=False, p50_factor=2.0,
+                            seed=1)
+        with self.assertRaises(verdict.VerdictError) as cm:
+            verdict.decide(self.contract(min_eligible_n=200), model=model,
+                           baseline=base)
+        self.assertIn("INCONCLUSIVE", str(cm.exception))
+        out = verdict.decide(self.contract(min_eligible_n=200, role="report"),
+                             model=model, baseline=base)
+        entry = out["metrics"]["p90_coverage_guarded_30m"]
+        self.assertEqual(entry["value"], 1.0)      # shown
+        self.assertIsNone(entry["passed"])         # judged by nothing
+        self.assertTrue(entry["inconclusive"])
+        self.assertEqual(out["verdict"], "go")
+
+    def test_it_does_not_enter_the_daily_consistency_count(self):
+        # Coverage 1.0 fails the band on every day; the aggregate gate fails,
+        # and the day count is unaffected by it.
+        out = verdict.decide(self.contract(),
+                             model=result_keyed(key_bucket_covered=True),
+                             baseline=result_keyed(key_bucket_covered=False,
+                                                   p50_factor=2.0, seed=1))
+        self.assertEqual(out["consistency"]["days_passed"], 3)
+        self.assertIs(out["metrics"]["p90_coverage_guarded_30m"]["passed"],
+                      False)
+
+    def test_a_name_whose_suffix_disagrees_with_its_bucket_is_refused(self):
+        # `p90_coverage_guarded_30m` reading the `<1m` slice would label every
+        # verdict with the wrong bucket.
+        with self.assertRaises(verdict.VerdictError) as cm:
+            verdict.decide(self.contract(bucket="<1m"),
+                           model=result_keyed(key_bucket_covered=True),
+                           baseline=result_keyed(key_bucket_covered=False,
+                                                 p50_factor=2.0, seed=1))
+        self.assertIn("mislabel", str(cm.exception))
+
+    def test_counts_without_the_family_are_refused_by_name(self):
+        # A result computed with no bucket key carries no second family;
+        # reading the realised-wait one instead would be the outcome-selected
+        # number under a prediction-time label.
+        model = result_guarded(1.0, p90_factor=1.2, guard_factor=1.2)
+        base = result_guarded(2.0, p90_factor=3.0, guard_factor=3.0)
+        self.assertNotIn("buckets_by_baseline_p50", model)
+        with self.assertRaises(verdict.VerdictError) as cm:
+            verdict.decide(self.contract(), model=model, baseline=base)
+        self.assertIn("buckets_by_baseline_p50", str(cm.exception))
+
+    def test_every_per_bucket_name_is_a_guarded_metric(self):
+        for name in metrics.BUCKET_COVERAGE_NAMES:
+            self.assertIn(name, verdict.GUARDED_METRICS)
+            self.assertIn(name, verdict.VALUE_OF)
+
+
 if __name__ == "__main__":
     # Without this, `python tests/test_verdict.py` runs NOTHING and exits 0 --
     # a file that reports success for having done no work.

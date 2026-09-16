@@ -725,6 +725,13 @@ def _eval_table(scored, contract):
     bucket = np.full(y_true.shape, "", dtype=object)
     for name, lo, hi in metrics_mod.WAIT_BUCKETS:
         bucket[np.isfinite(y_true) & (y_true >= lo) & (y_true < hi)] = name
+    # The PREDICTION-TIME bucket beside the realised one, so a per-bucket
+    # coverage gate (`bucket_by: baseline_p50`) is recomputable from this file
+    # exactly as the tail metrics are from `bucket`.
+    bucket_bl_p50 = np.full(y_true.shape, "", dtype=object)
+    for name, lo, hi in metrics_mod.WAIT_BUCKETS:
+        bucket_bl_p50[np.isfinite(bl_p50) & (bl_p50 >= lo)
+                      & (bl_p50 < hi)] = name
     return pyarrow.table({
         "row_id": pyarrow.array(scored["row_id"].tolist(), pyarrow.string()),
         "task_id": pyarrow.array(scored["task_id"].tolist(), pyarrow.string()),
@@ -741,6 +748,8 @@ def _eval_table(scored, contract):
         "p90_covered": pyarrow.array((y_true <= p90).tolist(),
                                      pyarrow.bool_()),
         "bucket": pyarrow.array(bucket.tolist(), pyarrow.string()),
+        "bucket_bl_p50": pyarrow.array(bucket_bl_p50.tolist(),
+                                       pyarrow.string()),
         "bl_p50": pyarrow.array(bl_p50, pyarrow.float64()),
         "bl_p90": pyarrow.array(scored["bl_p90"], pyarrow.float64()),
         "bl_abs_error": pyarrow.array(np.abs(bl_p50 - y_true),
@@ -978,13 +987,18 @@ def evaluate(cfg, req, contract_name):
         bl_guarded = None
     buckets = any(spec.get("bucket") is not None
                   for spec in contract["metrics"].values())
+    # BOTH sides are bucketed on the same key -- the pinned baseline's p50 --
+    # so a per-bucket relative bar compares two ratios over one row set, the
+    # same property the aggregate has.
     model = metrics_mod.compute(y_true=scored["y_true"], p50=scored["p50"],
                                p90=scored["p90_raw"],
                                p90_guarded=scored["p90_guarded"],
-                               days=scored["day"], buckets=buckets)
+                               days=scored["day"], buckets=buckets,
+                               bucket_key=scored["bl_p50"])
     baseline_result = metrics_mod.compute(
         y_true=scored["y_true"], p50=scored["bl_p50"], p90=scored["bl_p90"],
-        p90_guarded=bl_guarded, days=scored["day"], buckets=buckets)
+        p90_guarded=bl_guarded, days=scored["day"], buckets=buckets,
+        bucket_key=scored["bl_p50"])
 
     try:
         decision = verdict_mod.decide(contract, model=model,

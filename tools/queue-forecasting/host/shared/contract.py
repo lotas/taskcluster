@@ -41,9 +41,16 @@ WHAT A CONTRACT MUST NAME, and why each one is not optional:
                       `min_eligible_n`: the fewest eligible rows the metric may
                       be judged on, below which the result is INCONCLUSIVE
                       rather than a pass (for a gate, also per day in the
-                      consistency count). A metric with no declared direction is
-                      a number nobody can fail, and a bucket metric with no
-                      floor is a bar a one-row bucket can clear.
+                      consistency count). A bucket metric may also carry
+                      `bucket_by`: "actual" (the default; the bucket is chosen
+                      by the realised wait) or "baseline_p50" (chosen by the
+                      pinned baseline's predicted p50, which is known at
+                      prediction time and outside the candidate's control, so
+                      it neither conditions on the outcome nor lets a model
+                      move rows out of the bucket it is bad at). A metric with
+                      no declared direction is a number nobody can fail, and a
+                      bucket metric with no floor is a bar a one-row bucket can
+                      clear.
   `consistency`    -- >=3 of 5 holdout days, so a single outlier day cannot carry
                       a verdict.
   `p90_coverage`   -- the [85%, 95%] band, which is a two-sided check: a model
@@ -84,6 +91,14 @@ BAR_KINDS = ("relative_improvement", "absolute_improvement", "absolute", "band")
 # among actual 30m+ waits" is exactly what a candidate can game by inflating,
 # so it must be visible and must not choose models.
 ROLES = ("gate", "report")
+
+# What a `bucket` is chosen BY. `actual` is the realised wait -- the outcome --
+# which is the right slice for an operational alert and the wrong one for a
+# gate, because selecting on the outcome rewards inflation. `baseline_p50` is
+# the pinned baseline's predicted p50 at pending time: known before the wait
+# happens and not the candidate's number, so a gate bucketed on it can be
+# neither gamed by inflation nor escaped by moving rows.
+BUCKET_BY = ("actual", "baseline_p50")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 _HASH64_RE = re.compile(r"^[0-9a-f]{64}\Z")
@@ -174,7 +189,7 @@ def _check_metric(name, spec):
     _need_name(name, "metric name")
     _need_dict(spec, f"metrics.{name}")
     unknown = set(spec) - {"direction", "bar", "bucket", "role",
-                           "min_eligible_n"}
+                           "min_eligible_n", "bucket_by"}
     if unknown:
         _err(f"unknown key(s) in metrics.{name}: {sorted(unknown)}")
     direction = spec.get("direction")
@@ -210,6 +225,21 @@ def _check_metric(name, spec):
         if not isinstance(bucket, str) or not bucket:
             _err(f"metrics.{name}.bucket must be a non-empty string")
         out["bucket"] = bucket
+    bucket_by = spec.get("bucket_by")
+    if bucket_by is not None:
+        # Only meaningful WITH a bucket: a bucketing rule for a metric that has
+        # no bucket is a key that reads as though it slices and does not.
+        if bucket is None:
+            _err(f"metrics.{name}.bucket_by is only meaningful with a bucket;"
+                 f" this metric names none")
+        if bucket_by not in BUCKET_BY:
+            _err(f"metrics.{name}.bucket_by must be one of {list(BUCKET_BY)},"
+                 f" got {bucket_by!r}")
+        if bucket_by != "actual":
+            # Only the NON-default rule enters the canonical form, the same
+            # rule `role` and `min_eligible_n` follow, so every contract
+            # written before `bucket_by` existed keeps its hash.
+            out["bucket_by"] = bucket_by
     minimum = spec.get("min_eligible_n")
     if minimum is not None:
         # bool BEFORE int, and int rather than number, for the two reasons

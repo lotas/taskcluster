@@ -80,6 +80,12 @@ VALUE_OF = {
     "p90_miss_tail_guarded": metrics_mod.p90_miss_guarded,
     "p90_miss_severity_tail": metrics_mod.miss_severity_guarded,
     "interval_width_guarded": metrics_mod.interval_width_guarded,
+    # Gate 4 (`evaluation-protocol.md` §4): the served p90's coverage per
+    # PREDICTION-TIME bucket. Four names, one function -- the bucket comes from
+    # the contract's `bucket` key, and `_measure` refuses a name whose suffix
+    # disagrees with it.
+    **{name: metrics_mod.coverage_guarded
+       for name in metrics_mod.BUCKET_COVERAGE_NAMES},
 }
 
 # The subset of `VALUE_OF` that scores the SERVED p90, which is a function of the
@@ -90,7 +96,8 @@ VALUE_OF = {
 # HERE, beside the table it is a subset of, so the two cannot drift.
 GUARDED_METRICS = ("pinball_p90_guarded", "p90_coverage_guarded",
                    "p90_miss_tail_guarded", "p90_miss_severity_tail",
-                   "interval_width_guarded")
+                   "interval_width_guarded",
+                   *metrics_mod.BUCKET_COVERAGE_NAMES)
 
 
 class VerdictError(ValueError):
@@ -177,17 +184,37 @@ def _judge(name, spec, value, base, eligible):
         return None, None, inconclusive
 
 
-def _counts_for(name, counts, bucket):
+def _counts_for(name, counts, bucket, bucket_by="actual"):
     """The counts one metric is read from, bucket resolved.
 
     Written ONCE, and the refusal message with it: the value and the eligible
     count must come from the SAME slice, and two copies of this lookup is how
     one of them would come to read the aggregate while the other read a bucket.
+
+    `bucket_by` picks the family: `actual` (the realised wait, `buckets`) or
+    `baseline_p50` (the pinned baseline's predicted p50,
+    `buckets_by_baseline_p50`). A result computed without a bucket key carries
+    no second family, and a contract naming it is refused by name rather than
+    read from the wrong one.
     """
     if bucket is None:
         return counts
-    resolved = (counts.get("buckets") or {}).get(bucket)
+    expected = metrics_mod.BUCKET_COVERAGE_NAMES.get(name)
+    if expected is not None and expected != bucket:
+        raise VerdictError(
+            f"the contract's metric {name!r} is the per-bucket coverage name"
+            f" for bucket {expected!r} but names bucket {bucket!r}. A metric"
+            f" whose name says one slice and whose rule reads another would"
+            f" mislabel every verdict it appears in; refused.")
+    family = "buckets" if bucket_by == "actual" else "buckets_by_baseline_p50"
+    resolved = (counts.get(family) or {}).get(bucket)
     if resolved is None:
+        if bucket_by != "actual" and family not in counts:
+            raise VerdictError(
+                f"the contract's metric {name!r} is bucketed by {bucket_by!r},"
+                f" and these numbers carry no {family!r} family: the result"
+                f" was computed without a baseline p50 key. Refused by name"
+                f" rather than read from the realised-wait buckets.")
         raise VerdictError(
             f"the contract's metric {name!r} names bucket {bucket!r}, which"
             f" these numbers do not carry. `metrics.WAIT_BUCKETS` owns that"
@@ -207,17 +234,17 @@ def _fn_for(name, table, what):
     return fn
 
 
-def _measure(name, counts, bucket):
+def _measure(name, counts, bucket, bucket_by="actual"):
     """`(value, eligible_n)` for one metric, from ONE bucket-resolved slice."""
-    counts = _counts_for(name, counts, bucket)
+    counts = _counts_for(name, counts, bucket, bucket_by)
     value = _fn_for(name, VALUE_OF, "compute")(counts)
     eligible = _fn_for(name, metrics_mod.ELIGIBLE_OF, "count rows for")(counts)
     return value, eligible
 
 
-def _value(name, counts, bucket):
+def _value(name, counts, bucket, bucket_by="actual"):
     """The value alone. Kept for callers that do not need the row count."""
-    return _measure(name, counts, bucket)[0]
+    return _measure(name, counts, bucket, bucket_by)[0]
 
 
 def decide(contract, *, model, baseline=None):
@@ -229,15 +256,17 @@ def decide(contract, *, model, baseline=None):
     gate_names = []
     for name, spec in sorted(contract["metrics"].items()):
         bucket = spec.get("bucket")
+        bucket_by = spec.get("bucket_by", "actual")
         role = spec.get("role", "gate")
         if role == "gate":
             gate_names.append(name)
         value, eligible = _measure(
-            name, model["aggregate"] if bucket is None else model, bucket)
+            name, model["aggregate"] if bucket is None else model, bucket,
+            bucket_by)
         base = None
         if baseline is not None:
             base = _value(name, baseline["aggregate"] if bucket is None
-                          else baseline, bucket)
+                          else baseline, bucket, bucket_by)
         ok, measured, inconclusive = _judge(name, spec, value, base, eligible)
         per_metric[name] = {
             # `value` is kept even when the judgement was not reached, so the
@@ -249,6 +278,8 @@ def decide(contract, *, model, baseline=None):
         }
         if bucket is not None:
             per_metric[name]["bucket"] = bucket
+            if bucket_by != "actual":
+                per_metric[name]["bucket_by"] = bucket_by
         if role != "gate":
             per_metric[name]["role"] = role
         if inconclusive:
@@ -272,6 +303,9 @@ def decide(contract, *, model, baseline=None):
         ok = True
         for name, spec in sorted(contract["metrics"].items()):
             # Bucket metrics are aggregate-only; report metrics never judge.
+            # That covers BOTH bucket families: a gate bucketed on the
+            # baseline's p50 (`bucket_by: baseline_p50`) is judged on the
+            # window's aggregate slice and never per day.
             if (spec.get("bucket") is not None
                     or spec.get("role", "gate") != "gate"):
                 continue
