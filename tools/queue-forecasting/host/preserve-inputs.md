@@ -95,17 +95,27 @@ where the two exclusion lists differ. And every train+validation row of every
 cohort the package serves must have a baseline row.
 
 ```sh
+# Extract directories are named by REQUEST hash (`qf extracts --json` -> "dir"),
+# not by the extract_hash the `qf extract` command prints on success.
+X=/var/lib/qf-extracts
 REF=/var/lib/qf-baselines/9c150d75a8ea3ba49f113f4d04c30f514f89a19ef5aa5168f6fc6d011b7bafca
 REF_EXCL="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["exclude_dates"]))' $REF/MANIFEST.json)"
-sudo host/evaluator/env/.venv/bin/python host/check-baseline-coverage.py \
+# The evaluator venv lives in the TRUSTED checkout, not this one.
+PY=/srv/queue-forecasting/tools/queue-forecasting/host/evaluator/env/.venv/bin/python
+sudo $PY host/check-baseline-coverage.py \
   --ndjson "$STAGE/baseline_predictions.ndjson" --exclude-dates "$(cat $STAGE.exclude_dates)" \
   --reference "$REF/baseline_predictions.ndjson" --reference-exclude-dates "$REF_EXCL" \
-  --cohort 2026-08-20=/var/lib/qf-extracts/<975aea71...>/runs.parquet \
-  --cohort 2026-08-27=/var/lib/qf-extracts/<bd29b39a...>/runs.parquet \
-  --cohort 2026-09-01=/var/lib/qf-extracts/<d3c5330d...>/runs.parquet \
-  --cohort 2026-09-06=/var/lib/qf-extracts/<R2...>/runs.parquet \
+  --cohort 2026-08-20=$X/975aea71d759b83b199cdb697bf2ead204dbae04baa6681268d6ce56e7178c01/runs.parquet \
+  --cohort 2026-08-27=$X/bd29b39ab6254a3cf5de6a7413c1476a6caa178a0685f88aaa7d489c9a2db91f/runs.parquet \
+  --cohort 2026-09-01=$X/d3c5330dc78170c89daaedbd58b303076707b0f62f3769909e0fe87dc1c55d54/runs.parquet \
+  --cohort 2026-09-06=$X/8a0f96cb5d8b1bfbbba7ccd8ac248c186d9176b9f667da1d47b9f9538638280b/runs.parquet \
   --json "$STAGE.coverage.json"
 ```
+
+Result on 2026-09-16 (R2 cohort = the extract cut in step 3 the same day):
+all four cohorts 0 missing rows; 8,816,035 reference rows comparable, 0
+disagree, 0 absent; exclusion lists differ only on 2026-09-12..09-15 (flagged
+after 9c150d75 was cut). PROMOTABLE. Recorded in `$STAGE.coverage.json`.
 
 Read the last line. `NOT PROMOTABLE` with disagreeing reference rows means the
 early history had already been thinned when the export ran: the development
