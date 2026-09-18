@@ -122,7 +122,8 @@ early history had already been thinned when the export ran: the development
 windows cannot be reproduced under this package, and the freeze commit says so
 instead of shrinking the window silently. Do not substitute the reference's
 rows into the new set; that would be two histories under one declared policy.
-Re-run this check after step 4 with R3 and R4 added as cohorts.
+Re-run this check after step 4 with R3 and R4 added as cohorts. (Re-run on
+2026-09-18 with R3 added: still PROMOTABLE; see step 3.)
 
 Sanity checks before calling it preserved:
 
@@ -152,6 +153,22 @@ sudo -H -u research qf extract --target wait_time \
 
 R3 on or after 2026-09-18 (`--train-start 2026-08-22 --as-of 2026-09-11`),
 R4 on or after 2026-09-23 (`--train-start 2026-08-27 --as-of 2026-09-16`).
+
+**R3 cut 2026-09-18T12:50Z** (operator, same flags as R2: lookback 30,
+generation 1; timer inactive, loop PAUSE present; inventory showed
+still_pending 0 for 09-01..09-15 beforehand):
+
+```
+extract_hash: 01703bb0d436927ac5c208f11a44b272b835d2effff42801b022f9e4910cea21
+extract_dir:  /var/lib/qf-extracts/953588d58cf7c8b3b91db21e1b286e569da2b7a57d8b9197cddfcc8d8be52b8a
+watermark:    pending_at 2026-09-10T23:59:59Z, resolved_at 2026-09-11T21:51:34Z
+job:          extract-20260918T125053Z-953588d58cf7-7811
+```
+
+Step 2b re-run the same day with R3 added as `--cohort 2026-09-11`: 3,593,312
+train rows, 0 missing; reference 8,816,035 comparable, 0 disagree, 0 absent;
+PROMOTABLE. Recorded in `$STAGE.coverage.2026-09-18.json` (the 09-16 result
+is kept in `$STAGE.coverage.json`). R4 still waits for 2026-09-23.
 One extract per day is the research loop's own cap (`MAX_EXTRACTS` in
 `tick.sh`, enforced by a shim), not the dispatcher's; an operator extract does
 not compete with it.
