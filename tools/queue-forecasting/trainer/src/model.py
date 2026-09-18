@@ -132,6 +132,20 @@ class LightGBMQuantileModel(QuantileModel):
         return m
 
 
+class MissingBaselineError(ValueError):
+    """A residual model was handed rows whose baseline value is missing.
+
+    FATAL ON PURPOSE. Until 2026-09-18 `_clean_baseline` did `fillna(0.0)`, so a
+    row the baseline NDJSON did not cover (or covered with a null quantile) was
+    trained on `log((y+1)/(0+1)) = log(y+1)` -- a different target, silently,
+    for exactly the rows the export missed. Dropping the rows instead would
+    change the cohort. Either one changes the experiment being run without
+    changing its name, so the only honest outcome is to stop and say how many
+    rows, which `train.py:_require_residual_baseline_values` does per split and
+    per day before any model is built.
+    """
+
+
 class ResidualLightGBMQuantileModel(LightGBMQuantileModel):
     """Residual model — predicts a transformed target relative to a baseline feature.
 
@@ -154,7 +168,26 @@ class ResidualLightGBMQuantileModel(LightGBMQuantileModel):
         self.transform = transform
 
     def _clean_baseline(self, baseline: pd.Series) -> pd.Series:
-        return baseline.fillna(0.0).clip(lower=0.0)
+        """The baseline as floats, REFUSING any row that has none.
+
+        No `fillna`: see `MissingBaselineError`. The clip stays -- a negative
+        baseline wait or duration is not a value the predictor emits, and
+        clipping it to zero is a floor, not a substitution.
+        """
+        values = pd.to_numeric(baseline, errors="coerce").astype(float)
+        finite = np.isfinite(values.to_numpy(dtype=float))
+        if not finite.all():
+            missing = int((~finite).sum())
+            raise MissingBaselineError(
+                f"{missing:,} of {len(values):,} rows have no finite value in"
+                f" baseline feature {self.baseline_feature!r}; a residual model"
+                f" cannot transform them. Not filled with 0.0 and not dropped:"
+                f" either changes the experiment. The baseline NDJSON does not"
+                f" cover these rows (no row for the (task_id, run_id), or a"
+                f" null quantile) -- widen the export, or use a non-residual"
+                f" config."
+            )
+        return values.clip(lower=0.0)
 
     def _to_transformed(self, y: pd.Series, baseline: pd.Series) -> pd.Series:
         bl = self._clean_baseline(baseline)

@@ -75,8 +75,18 @@ WIDE_GEN1 = dict(
     snapshot_start_ts="2026-08-29T00:00:00Z")
 ALL = [WIDE_GEN1, NARROW_GEN2, WIDE_GEN2, NARROW_GEN1]
 
+# THE PER-DAY FILES, as `inventory` reads them off MANIFEST.json (`day_files`).
+# The trainer refuses a cohort whose holdout days lack one, and since
+# 2026-09-18 so does the resolver (`baseline_day_gaps`). The real e51a3210
+# carries 08-22..08-26 only; these fixtures carry 08-21..08-26 so that BOTH
+# as_of dates above (08-26 -> holdout 08-21..25, 08-27 -> holdout 08-22..26)
+# pass the gate and the tests below keep exercising the ranking they were
+# written for. The gate has its own class, `BaselineDayFilesGateTheExtract`,
+# with the real e51a3210 list.
+DAY_FILES = ["2026-08-21", "2026-08-22", "2026-08-23", "2026-08-24",
+             "2026-08-25", "2026-08-26"]
 BASELINE = dict(baseline_hash="e51a3210" + "f" * 56, broken=False,
-                promoted_at="2026-08-28T00:00:00Z")
+                promoted_at="2026-08-28T00:00:00Z", day_files=list(DAY_FILES))
 CONTRACT = dict(contract_hash="f740716d" + "a" * 56, target="wait_time",
                 created_at="2026-08-28T00:00:00Z",
                 # PINNED, because every published contract is: `baseline_hash`
@@ -89,7 +99,8 @@ CONTRACT = dict(contract_hash="f740716d" + "a" * 56, target="wait_time",
 # against a newly promoted baseline pins the NEW one -- which is the whole
 # reason the contract has to be resolved before the baseline.
 BASELINE_V2 = dict(baseline_hash="7c0ffee0" + "d" * 56, broken=False,
-                   promoted_at="2026-09-09T00:00:00Z")
+                   promoted_at="2026-09-09T00:00:00Z",
+                   day_files=list(DAY_FILES))
 CONTRACT_V1 = dict(CONTRACT, name="wait_time_v1")
 CONTRACT_V2 = dict(contract_hash="3ab19c2e" + "b" * 56, target="wait_time",
                    name="wait_time_v2", created_at="2026-09-09T00:00:00Z",
@@ -844,6 +855,203 @@ class ActiveContractBeatsUsage(unittest.TestCase):
             inv = X.inventory(limit=5)
         self.assertEqual(inv["active"], {})
         self.assertEqual(inv["active_unresolved"], {})
+
+
+# `qf extracts` on the host, 2026-09-15: the research loop's own daily extract,
+# as_of 2026-09-01, holdout 08-27..08-31. Every one of those five day files is
+# absent from 9c150d75 (08-15..19 and 08-22..26), so the trainer refused all
+# five probes the loop submitted against it -- after each probe was spent.
+R1 = dict(request_hash="d3c5330d" + "1" * 56, target="wait_time",
+          train_start="2026-08-06T00:00:00Z", as_of_date="2026-09-01T00:00:00Z",
+          generation=1, lookback_days=30, columns={"qctx_runs": QCTX},
+          snapshot_start_ts="2026-09-12T02:12:00Z")
+# The promoted v2 baseline's REAL day list.
+V2_DAYS = ["2026-08-15", "2026-08-16", "2026-08-17", "2026-08-18", "2026-08-19",
+           "2026-08-22", "2026-08-23", "2026-08-24", "2026-08-25", "2026-08-26"]
+BASELINE_9C15 = dict(baseline_hash="9c150d75" + "9" * 56, broken=False,
+                     promoted_at="2026-09-11T09:09:48Z", day_files=list(V2_DAYS))
+CONTRACT_9C15 = dict(contract_hash="da27748a" + "2" * 56, target="wait_time",
+                     name="wait_time_v2", created_at="2026-09-11T00:00:00Z",
+                     baseline_hash=BASELINE_9C15["baseline_hash"])
+
+
+class BaselineDayFilesGateTheExtract(unittest.TestCase):
+    """An extract can serve a config only if the PINNED BASELINE can report it.
+
+    THE FIVE WASTED PROBES THIS PINS. `train.py:_require_baselines` refuses a
+    cohort whose holdout days have no `<day>.json` in the baseline directory
+    the contract pins. Until 2026-09-18 the resolver chose the extract before
+    it resolved the contract, so it could not know which baseline that was,
+    and `plan` listed `d3c5330d` as "able to serve" configs the trainer then
+    refused: 09-12 03:08, 09-13 04:05, 09-14 03:05, 17:12, 19:13. The gate is
+    the same test the trainer makes, asked one probe earlier, on both the
+    ranked path and the `--extract` override.
+    """
+
+    def plan(self, extracts, named=None, baselines=None, contracts=None):
+        return X.plan(QUANTILE, extracts,
+                      [BASELINE_9C15] if baselines is None else baselines,
+                      [CONTRACT_9C15] if contracts is None else contracts,
+                      [], named=named)
+
+    def test_the_holdout_days_are_the_trainers(self):
+        """`holdout_day_starts`: `holdout_days` days ending at as_of, as_of
+        exclusive. QUANTILE has holdout_days 5."""
+        self.assertEqual(X.holdout_day_keys(QUANTILE, "2026-09-01T00:00:00Z"),
+                         ["2026-08-27", "2026-08-28", "2026-08-29",
+                          "2026-08-30", "2026-08-31"])
+        self.assertEqual(X.holdout_day_keys(QUANTILE, "not a date"), [])
+
+    def test_selection_skips_an_extract_the_baseline_cannot_report(self):
+        """R1 is the newest and no less used than NARROW_GEN2, and it is
+        rejected: its five holdout days are exactly the ones 9c150d75 lacks.
+        NARROW_GEN2's holdout 08-22..26 is covered, so it is chosen."""
+        resolved = self.plan([R1, NARROW_GEN2])
+        self.assertEqual(resolved["extract"]["request_hash"],
+                         NARROW_GEN2["request_hash"])
+        rejected = {e["request_hash"]: reasons
+                    for e, reasons in resolved["rejected"]}
+        self.assertIn(R1["request_hash"], rejected)
+        reason = " ".join(rejected[R1["request_hash"]])
+        self.assertTrue(reason.startswith(X.DAY_GATE), reason)
+        for day in ("2026-08-27", "2026-08-31"):
+            self.assertIn(day, reason)
+        self.assertIn("5 of this cohort's 5 holdout days", reason)
+        self.assertIn("_require_baselines", reason)
+
+    def test_the_plan_states_the_coverage_that_admitted_the_extract(self):
+        text = X.render_plan(self.plan([R1, NARROW_GEN2]))
+        self.assertIn("per-day files 2026-08-15..2026-08-26 (10 days)", text)
+        self.assertIn("holdout 2026-08-22..2026-08-26 is covered", text)
+        self.assertIn(X.DAY_GATE, text)          # R1 under "cannot serve"
+
+    def test_a_partial_gap_names_only_the_missing_days(self):
+        """WIDE_GEN2 (as_of 08-26, holdout 08-21..25) against the real list:
+        08-21 alone is missing, and the reason says so, not "all five"."""
+        resolved = self.plan([WIDE_GEN2, NARROW_GEN2])
+        rejected = {e["request_hash"]: " ".join(reasons)
+                    for e, reasons in resolved["rejected"]}
+        self.assertIn("1 of this cohort's 5 holdout days (2026-08-21)",
+                      rejected[WIDE_GEN2["request_hash"]])
+
+    def test_when_only_the_baseline_refuses_the_hint_is_to_promote(self):
+        """Every candidate has the right window and is turned away by the
+        day list alone. The refusal must NOT end with "cut this extract": a new
+        request_hash changes nothing about the baseline's files."""
+        with self.assertRaises(X.Refused) as caught:
+            self.plan([R1])
+        text = str(caught.exception)
+        self.assertIn("would serve this config if the pinned baseline", text)
+        self.assertIn("promote-baseline.sh", text)
+        self.assertIn("OPERATOR action", text)
+
+    def test_the_override_is_gated_too_and_says_why(self):
+        """--extract d3c5330d is exactly what the loop would type to confirm on
+        R1. It is refused before the probe, with the days, not after it."""
+        with self.assertRaises(X.Refused) as caught:
+            self.plan([R1, NARROW_GEN2], named=R1["request_hash"])
+        text = str(caught.exception)
+        self.assertIn("--extract named d3c5330d", text)
+        self.assertIn(X.DAY_GATE, text)
+        self.assertIn("2026-08-27, 2026-08-28, 2026-08-29, 2026-08-30,"
+                      " 2026-08-31", text)
+        self.assertIn("per-day files the pinned baseline holds", text)
+
+    def test_the_override_passes_when_the_baseline_covers_it(self):
+        resolved = self.plan([R1, NARROW_GEN2], named=NARROW_GEN2["request_hash"])
+        self.assertEqual(resolved["extract"]["request_hash"],
+                         NARROW_GEN2["request_hash"])
+        self.assertTrue(resolved["extract_named"])
+
+    def test_the_gate_moves_with_the_contract(self):
+        """A contract pinned to a baseline WITH the R1 day files admits R1.
+        Nothing about the extract changed; the contract did."""
+        full = dict(BASELINE_9C15, baseline_hash="a" * 64,
+                    day_files=V2_DAYS + ["2026-08-27", "2026-08-28",
+                                         "2026-08-29", "2026-08-30",
+                                         "2026-08-31"])
+        contract = dict(CONTRACT_9C15, contract_hash="b" * 64,
+                        baseline_hash=full["baseline_hash"])
+        resolved = self.plan([R1, NARROW_GEN2], named=R1["request_hash"],
+                             baselines=[BASELINE_9C15, full],
+                             contracts=[contract])
+        self.assertEqual(resolved["extract"]["request_hash"],
+                         R1["request_hash"])
+        self.assertEqual(resolved["baseline"]["baseline_hash"], "a" * 64)
+
+    def test_an_unknown_day_list_refuses_every_extract(self):
+        """FAIL CLOSED. A baseline whose manifest could not be read cannot be
+        shown to cover any cohort, and "assume it does" is the wasted probe."""
+        blind = dict(BASELINE_9C15)
+        del blind["day_files"]
+        blind["manifest_unreadable"] = "/var/lib/qf-baselines/x/MANIFEST.json: denied"
+        with self.assertRaises(X.Refused) as caught:
+            self.plan([R1, NARROW_GEN2], baselines=[blind])
+        text = str(caught.exception)
+        self.assertIn("unknown per-day coverage", text)
+        self.assertIn("denied", text)
+        # And the override does not sneak past it.
+        with self.assertRaises(X.Refused):
+            self.plan([R1, NARROW_GEN2], named=NARROW_GEN2["request_hash"],
+                      baselines=[blind])
+
+    def test_without_a_baseline_can_serve_checks_only_the_extract(self):
+        """Callers that have no baseline yet (none in `plan`, but the function
+        is public) get the pre-2026-09-18 answer, not a refusal."""
+        self.assertEqual(X.extract_can_serve(QUANTILE, R1), [])
+        self.assertEqual(X.baseline_day_gaps(QUANTILE, R1, None), [])
+
+
+class BaselineRowsCarryTheirDayFiles(unittest.TestCase):
+    """`qf baselines --json` reports `days` as a COUNT; the resolver needs the
+    dates, and `inventory` reads them off `<store>/<hash>/MANIFEST.json`."""
+
+    def store(self, manifests):
+        import json, shutil, tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for digest, body in manifests.items():
+            os.makedirs(os.path.join(root, digest))
+            with open(os.path.join(root, digest, "MANIFEST.json"), "w") as fh:
+                fh.write(body if isinstance(body, str) else json.dumps(body))
+        return root
+
+    def test_day_files_come_off_the_manifest_sorted(self):
+        digest = BASELINE_9C15["baseline_hash"]
+        root = self.store({digest: {"baseline_hash": digest,
+                                    "days": list(reversed(V2_DAYS))}})
+        rows = X.read_baseline_manifests([{"baseline_hash": digest, "days": 10}],
+                                         root)
+        self.assertEqual(rows[0]["day_files"], V2_DAYS)
+        self.assertEqual(rows[0]["days"], 10)        # the count is untouched
+        self.assertNotIn("manifest_unreadable", rows[0])
+
+    def test_a_missing_manifest_is_marked_not_dropped(self):
+        root = self.store({})
+        rows = X.read_baseline_manifests([{"baseline_hash": "c" * 64}], root)
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("day_files", rows[0])
+        self.assertIn("MANIFEST.json", rows[0]["manifest_unreadable"])
+
+    def test_no_store_directory_refuses_before_opening_anything(self):
+        rows = X.read_baseline_manifests([{"baseline_hash": "c" * 64}], None)
+        self.assertIn("no store directory", rows[0]["manifest_unreadable"])
+
+    def test_a_manifest_naming_another_hash_is_not_trusted(self):
+        digest = "c" * 64
+        root = self.store({digest: {"baseline_hash": "d" * 64,
+                                    "days": V2_DAYS}})
+        rows = X.read_baseline_manifests([{"baseline_hash": digest}], root)
+        self.assertNotIn("day_files", rows[0])
+        self.assertIn("the store changed after it was listed",
+                      rows[0]["manifest_unreadable"])
+
+    def test_a_malformed_day_list_is_unreadable(self):
+        digest = "c" * 64
+        root = self.store({digest: {"baseline_hash": digest,
+                                    "days": ["2026-08-15.json"]}})
+        rows = X.read_baseline_manifests([{"baseline_hash": digest}], root)
+        self.assertIn("not a list of YYYY-MM-DD", rows[0]["manifest_unreadable"])
 
 
 class ContractRowsAreEnriched(unittest.TestCase):

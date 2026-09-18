@@ -46,14 +46,25 @@ how three ticks were spent on one run on 2026-09-04.
    the new cohort to be judged against, and a `--vs` pointing back into the old
    one changes the cohort and the comparison at the same time.
 
-   **Check the second cohort's TRAIN window for baseline coverage first, and
-   say what you found.** A missing baseline row is filled with `0.0`, not
-   dropped (`_clean_baseline` in `trainer/src/model.py`), so an uncovered train
-   window silently trains on `log(y+1)` instead of `log((y+1)/(bl+1))` — the
-   target is redefined, the run differs from the PROMISING one in two things,
-   and it confirms nothing. The file that matters is the baseline's streamed
-   NDJSON, which is what the evaluator reads; the per-day JSONs beside it are
-   the trainer's report input and cover a different window.
+   **`plan` now refuses a cohort the pinned baseline cannot report.** The
+   trainer requires a `<day>.json` in the baseline the contract pins for every
+   holdout day (`_require_baselines`), and since 2026-09-18 `plan` applies the
+   same test before the probe is spent, on the ranked path and on `--extract`
+   alike: such an extract is listed under *"cannot serve this config"* with the
+   missing days, not under *"also able to serve"*. When every candidate is
+   refused for that reason alone, the fix is a promoted baseline carrying those
+   files — an operator action — and not a new extract; the refusal says so.
+
+   **Check the second cohort's TRAIN window for baseline coverage too, and say
+   what you found.** A residual config trains on `log((y+1)/(bl+1))`, and since
+   2026-09-18 a row with no baseline value FAILS the run before any model is
+   built (`_require_residual_baseline_values` in `trainer/src/train.py`, with
+   per-split and per-day counts) rather than being filled with `0.0` or
+   dropped — either would change the experiment under the same name. The file
+   that matters there is the baseline's streamed NDJSON, which is what the
+   evaluator reads; the per-day JSONs beside it are the trainer's report input
+   and cover the holdout, a different window. A run refused this way spent its
+   probe and produced no result; the counts it prints are the report.
 4. **The queue's top unblocked entry can run on a published extract.** Run it.
    Stop.
 5. **The queue's top entry needs a cohort that does not exist.** Submit one

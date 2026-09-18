@@ -163,12 +163,72 @@ def cohort_train_start(config, as_of):
         days=config["cohort_span_days"])
 
 
-def extract_can_serve(config, extract):
+def holdout_day_keys(config, as_of):
+    """The `YYYY-MM-DD` keys of this cohort's holdout days, oldest first.
+
+    Exactly `config.holdout_day_starts` in the trainer: the holdout is the
+    `holdout_days` days ending at as_of, as_of EXCLUSIVE. Kept as one function
+    so the resolver and the trainer cannot disagree about which day files a
+    cohort needs -- the disagreement that made `_require_baselines` refuse five
+    probes this resolver had already approved.
+    """
+    parsed = parse_day(as_of)
+    if parsed is None:
+        return []
+    return [(parsed - datetime.timedelta(days=n)).date().isoformat()
+            for n in range(config["holdout_days"], 0, -1)]
+
+
+# The prefix every per-day-file refusal starts with, so `no_extract_message`
+# can tell "the extract's window is wrong" (cut a new extract) apart from "the
+# pinned baseline lacks the files" (promote a baseline) without parsing prose.
+DAY_GATE = "pinned baseline"
+
+
+def baseline_day_gaps(config, extract, baseline):
+    """Why the pinned baseline cannot report this cohort; empty means it can.
+
+    THE GATE THE TRAINER ALREADY ENFORCES, moved to before the probe is spent.
+    `train.py:_require_baselines` refuses a cohort whose holdout days lack a
+    `<day>.json` in the pinned baseline directory, and until 2026-09-16 this
+    resolver did not know that: `plan` listed `d3c5330d` as able to serve
+    configs the trainer then refused, five times, one probe each. The day list
+    is `days` in the baseline's MANIFEST.json, which `inventory` reads off the
+    store as `day_files` (`read_baseline_manifests`).
+
+    FAILS CLOSED when the manifest could not be read: a baseline whose day
+    coverage is unknown cannot be shown to cover anything, and "assume it
+    does" is the five wasted probes again.
+    """
+    if baseline is None:
+        return []
+    days = baseline.get("day_files")
+    if not isinstance(days, list):
+        why = baseline.get("manifest_unreadable") or "no `day_files` on the row"
+        return [f"{DAY_GATE} {(baseline.get('baseline_hash') or '?')[:12]}"
+                f" has unknown per-day coverage ({why}), so no cohort can be"
+                f" shown to be reportable against it"]
+    need = holdout_day_keys(config, extract.get("as_of_date"))
+    missing = [d for d in need if d not in days]
+    if not missing:
+        return []
+    return [f"{DAY_GATE} {(baseline.get('baseline_hash') or '?')[:12]} has no"
+            f" per-day file for {len(missing)} of this cohort's"
+            f" {len(need)} holdout days ({', '.join(missing)}); the trainer's"
+            f" _require_baselines would refuse the run before training"]
+
+
+def extract_can_serve(config, extract, baseline=None):
     """Why this extract can or cannot run this config; empty means it can.
 
     Returns REASONS rather than a boolean because the explanation is the
     interesting output: whoever asks "why not the newest one" deserves the
     answer printed next to the candidate it lost to.
+
+    `baseline` is the one the selected contract pins. When given, the cohort's
+    holdout days must each have a per-day file in it (`baseline_day_gaps`);
+    when None, only the extract's own shape is checked. `plan` always passes
+    it, because the extract is chosen AFTER the contract and its baseline.
     """
     reasons = []
     if extract.get("target") != config["target"]:
@@ -190,6 +250,7 @@ def extract_can_serve(config, extract):
         if "task_created" not in columns:
             reasons.append("qctx_runs has no `task_created`, and this config"
                            " enables queue_context_features")
+    reasons += baseline_day_gaps(config, extract, baseline)
     return reasons
 
 
@@ -212,7 +273,7 @@ def usage_counts(history):
     return counts
 
 
-def choose_extract(config, extracts, counts):
+def choose_extract(config, extracts, counts, baseline=None):
     """The most-used, then narrowest, extract that can serve this config.
 
     Ordering, most significant first:
@@ -228,7 +289,7 @@ def choose_extract(config, extracts, counts):
     """
     ranked, rejected = [], []
     for extract in extracts or []:
-        reasons = extract_can_serve(config, extract)
+        reasons = extract_can_serve(config, extract, baseline)
         if reasons:
             rejected.append((extract, reasons))
             continue
@@ -277,6 +338,23 @@ def no_extract_message(config, rejected):
                      f"..{extract.get('as_of_date')}")
         lines += [f"        - {reason}" for reason in reasons]
 
+    # WHEN THE BASELINE IS WHAT REFUSED, SAY WHICH ACTION FIXES IT. The extract
+    # command below cures a window that is too short; it cures nothing when an
+    # extract with the right window was turned away because the pinned
+    # baseline has no per-day file for its holdout. That is a promotion, and
+    # promotion is an operator action with its own runbook.
+    gated_only = [e for e, reasons in rejected
+                  if reasons and all(r.startswith(DAY_GATE) for r in reasons)]
+    if gated_only:
+        lines += [
+            "",
+            f"  {len(gated_only)} of those extract(s) would serve this config"
+            " if the pinned baseline carried a per-day file for every holdout"
+            " day. A new extract does not change that: the missing files"
+            " belong to the baseline the ACTIVE contract pins, and only"
+            " `promote-baseline.sh` plus a contract stated against the new"
+            " hash supplies them. That is an OPERATOR action."]
+
     # The window this config needs, anchored on the as_of of the newest extract
     # with the right target, so a new extract stays as close to the existing
     # series as its window allows instead of starting an unrelated one.
@@ -313,7 +391,7 @@ def no_extract_message(config, rejected):
     return "\n".join(lines)
 
 
-def named_extract(config, extracts, request_hash):
+def named_extract(config, extracts, request_hash, baseline=None):
     """The extract an operator NAMED, checked by the same can-serve rules.
 
     AN OVERRIDE, NOT A PREFERENCE, and the reason it has to exist is that
@@ -359,15 +437,16 @@ def named_extract(config, extracts, request_hash):
             f"no published extract has request hash {request_hash[:12]}...."
             f" Published: {known}. `qf extracts` lists them; an extract that"
             f" is not published cannot be probed.")
-    reasons = extract_can_serve(config, chosen)
+    reasons = extract_can_serve(config, chosen, baseline)
     if reasons:
         raise Refused(
             f"--extract named {request_hash[:12]}..., which cannot serve"
             f" {config['path']}: {'; '.join(reasons)}. Naming an extract"
-            f" overrides which one is CHOSEN, not what the config needs.")
+            f" overrides which one is CHOSEN, not what the config needs"
+            f" -- and not which per-day files the pinned baseline holds.")
     rejected, runners_up = [], []
     for extract in others:
-        why = extract_can_serve(config, extract)
+        why = extract_can_serve(config, extract, baseline)
         (rejected.append((extract, why)) if why
          else runners_up.append(extract))
     return chosen, rejected, runners_up
@@ -588,25 +667,37 @@ def plan(config, extracts, baselines, contracts, history,
 
     THE CONTRACT IS RESOLVED BEFORE THE BASELINE, and the baseline is then read
     OFF it. They are one pair: see `baseline_for_contract`.
+
+    AND BOTH BEFORE THE EXTRACT. Whether an extract can serve a config depends
+    on the baseline: the trainer refuses a cohort whose holdout days have no
+    per-day file in the pinned baseline (`baseline_day_gaps`), and which
+    baseline that is follows from the contract. Choosing the extract first --
+    the order until 2026-09-18 -- approved cohorts the trainer then refused.
+    Selection and `--extract` overrides go through the same check.
     """
     counts = usage_counts(history)
-    if named:
-        extract, rejected, runners_up = named_extract(config, extracts, named)
-    else:
-        extract, rejected, runners_up = choose_extract(config, extracts,
-                                                       counts["extract"])
     if contract_hash:
         contract = named_contract(config["target"], contracts, contract_hash)
     else:
         contract = choose_contract(config["target"], contracts,
                                    counts["contract"], active=active,
                                    active_unresolved=active_unresolved)
+    baseline = baseline_for_contract(contract, baselines)
+    if named:
+        extract, rejected, runners_up = named_extract(config, extracts, named,
+                                                      baseline)
+    else:
+        extract, rejected, runners_up = choose_extract(config, extracts,
+                                                       counts["extract"],
+                                                       baseline)
     train_start = cohort_train_start(config, extract.get("as_of_date"))
     return {
         "config": config,
         "extract": extract,
         "contract": contract,
-        "baseline": baseline_for_contract(contract, baselines),
+        "baseline": baseline,
+        "holdout_days_needed": holdout_day_keys(config,
+                                                extract.get("as_of_date")),
         "as_of": extract.get("as_of_date"),
         "cohort_train_start": train_start.date().isoformat() if train_start
                               else None,
@@ -679,6 +770,11 @@ def inventory(limit=200):
         if not ok:
             raise Refused(f"cannot read `qf {op}`: {body}")
         out[name] = body.get(name) or []
+        if op == "baselines":
+            # THE DAY LIST, read off each MANIFEST.json. `qf baselines` carries
+            # `days` as a COUNT, and the resolver needs the dates: see
+            # `baseline_day_gaps` and `read_baseline_manifests`.
+            out[name] = read_baseline_manifests(out[name], body.get("store"))
         if op == "contracts":
             # Named explicitly rather than reusing the loop's last `body`: the
             # directory only comes back on this one op, and a reader should not
@@ -779,6 +875,73 @@ def read_contract_bodies(rows, directory):
         for field in ("name", "target", "baseline_hash"):
             if row.get(field) is None and body.get(field) is not None:
                 row[field] = body[field]
+        out.append(row)
+    return out
+
+
+def read_baseline_manifests(rows, store):
+    """Put the per-day file list on each baseline row, as `day_files`.
+
+    `qf baselines --json` reports `days` as a COUNT (`qfd._op_baselines`
+    summarises the manifest), and the resolver needs the DATES: the trainer's
+    `_require_baselines` refuses a cohort whose holdout days lack a
+    `<day>.json`, and `baseline_day_gaps` has to ask the same question before
+    the probe is spent. The list is `days` in `<store>/<hash>/MANIFEST.json`,
+    which `shared/baseline.describe` writes sorted and `promote-baseline.sh`
+    publishes world-readable.
+
+    Same discipline as `read_contract_bodies`: A ROW THAT COULD NOT BE ENRICHED
+    IS MARKED, NOT DROPPED AND NOT GUESSED. `manifest_unreadable` carries why,
+    and `baseline_day_gaps` turns it into a refusal of every extract. Failing
+    closed here is the point of the function: an unknown day list approved as
+    "probably fine" is the five wasted probes of 2026-09-12..14 again.
+    """
+    out = []
+    for row in rows or []:
+        row = dict(row)
+        digest = row.get("baseline_hash")
+        if not store or not digest:
+            # BEFORE THE OPEN, for the same reason as `read_contract_bodies`:
+            # `os.path.join("", hash)` is relative to the CWD, and a manifest
+            # found there would be whatever is sitting in the current
+            # directory deciding which cohorts the trainer will accept.
+            row["manifest_unreadable"] = (
+                "`qf baselines` returned no store directory"
+                if not store else "the row names no baseline_hash")
+            out.append(row)
+            continue
+        path = os.path.join(store, digest, "MANIFEST.json")
+        try:
+            with open(path) as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError) as e:
+            row["manifest_unreadable"] = f"{path}: {e}"
+            out.append(row)
+            continue
+        if not isinstance(manifest, dict):
+            row["manifest_unreadable"] = f"{path}: not a JSON object"
+            out.append(row)
+            continue
+        declared = manifest.get("baseline_hash")
+        if declared is not None and declared != digest:
+            # The file names another baseline: the directory was rewritten
+            # between the listing and this read. Its day list would be
+            # attached to a hash it does not describe.
+            row["manifest_unreadable"] = (
+                f"{path} declares baseline_hash {str(declared)[:12]}, not the"
+                f" {digest[:12]} this row names: the store changed after it"
+                f" was listed")
+            out.append(row)
+            continue
+        days = manifest.get("days")
+        if not isinstance(days, list) or not all(
+                isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)
+                for d in days):
+            row["manifest_unreadable"] = (
+                f"{path}: `days` is not a list of YYYY-MM-DD strings")
+            out.append(row)
+            continue
+        row["day_files"] = sorted(days)
         out.append(row)
     return out
 
@@ -1170,6 +1333,16 @@ def render_plan(resolved):
               if resolved.get("contract_active") else ""),
            f"baseline  {resolved['baseline'].get('baseline_hash')}",
            "          pinned by that contract, not chosen separately"]
+    days = resolved["baseline"].get("day_files") or []
+    need = resolved.get("holdout_days_needed") or []
+    if days and need:
+        # THE GATE, STATED. The extract above was admitted because every one
+        # of the cohort's holdout days has a per-day file in this baseline;
+        # an operator reading the plan should see the coverage that decided
+        # it, and see what the baseline could report beyond this cohort.
+        out.append(f"          per-day files {days[0]}..{days[-1]}"
+                   f" ({len(days)} days); this cohort's holdout"
+                   f" {need[0]}..{need[-1]} is covered")
 
     if not resolved.get("contract_active_hash"):
         # THE MODE, STATED. Without this line an operator cannot tell from the

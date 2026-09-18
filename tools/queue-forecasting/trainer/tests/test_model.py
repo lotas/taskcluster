@@ -260,3 +260,58 @@ def test_lightgbm_quantile_fit_predict_save_load(tmp_path: Path):
     m2 = LightGBMQuantileModel.load(p)
     preds2 = m2.predict(Xv)
     assert np.allclose(preds, preds2)
+
+
+# ---------------------------------------------------------------------------
+# A residual model REFUSES rows with no baseline value (2026-09-18).
+#
+# Until then `_clean_baseline` did `fillna(0.0)`, so a row the baseline NDJSON
+# did not cover was trained on log(y+1) instead of log((y+1)/(bl+1)): the target
+# redefined for a subset, silently. The research loop's 2026-09-15 escalation
+# named this as the reason an uncovered second cohort "confirms nothing".
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("transform", ["log_ratio", "log_diff", "additive"])
+def test_residual_model_refuses_a_missing_baseline_instead_of_zero_filling(transform: str):
+    from src.model import MissingBaselineError, ResidualLightGBMQuantileModel
+    m = ResidualLightGBMQuantileModel(alpha=0.5, params={}, baseline_feature="b",
+                                      transform=transform)
+    y = pd.Series([10.0, 20.0, 30.0, 40.0])
+    bl = pd.Series([8.0, np.nan, 25.0, np.inf])
+    with pytest.raises(MissingBaselineError) as caught:
+        m._to_transformed(y, bl)
+    text = str(caught.value)
+    assert "2 of 4 rows" in text
+    assert "'b'" in text
+    assert "Not filled with 0.0 and not dropped" in text
+    # The inverse path refuses too: a holdout row with no baseline cannot be
+    # turned back into a prediction, and 0.0 there is a prediction of nothing.
+    with pytest.raises(MissingBaselineError):
+        m._inverse(np.zeros(4), bl)
+
+
+def test_residual_model_fit_and_predict_refuse_missing_baseline():
+    from src.model import MissingBaselineError, ResidualLightGBMQuantileModel
+    X, y = _toy_data(n=200)
+    y = y.abs()                              # log_ratio needs y > -1
+    X["b"] = y.to_numpy() + 1.0
+    X_bad = X.copy()
+    X_bad.loc[X_bad.index[:7], "b"] = np.nan
+    m = ResidualLightGBMQuantileModel(alpha=0.5, params={"n_estimators": 5, "verbose": -1},
+                                      baseline_feature="b")
+    with pytest.raises(MissingBaselineError, match="7 of 200 rows"):
+        m.fit(X_bad, y, X, y)
+    m.fit(X, y, X, y)                       # clean data still trains
+    with pytest.raises(MissingBaselineError, match="7 of 200 rows"):
+        m.predict(X_bad)
+    assert np.isfinite(m.predict(X)).all()
+
+
+def test_residual_model_still_clips_negative_baselines_to_zero():
+    """The clip is a floor on a value that exists, not a substitute for one
+    that does not; it stays."""
+    from src.model import ResidualLightGBMQuantileModel
+    m = ResidualLightGBMQuantileModel(alpha=0.5, params={}, baseline_feature="b",
+                                      transform="additive")
+    out = m._to_transformed(pd.Series([5.0, 5.0]), pd.Series([-3.0, 2.0]))
+    assert list(out) == [5.0, 3.0]

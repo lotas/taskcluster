@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "name": "wait_time_v3",
+  "target": "wait_time",
+  "baseline_hash": "@BASELINE_HASH@",
+  "note": "v3, 2026-09-18. Changes ONLY the pinned baseline package: the promoted v3 baseline (Policy B, exclusion list as of 2026-09-16) carries per-day files and NDJSON rows for 2026-07-25..2026-09-15, so the reserved cohorts R1..R4 (holdouts 08-27..09-15) become trainable. Metrics, bars, gates, consistency rule, primary slice and holdout_days are byte-for-byte those of v2 (da27748abb7c). v3 is a FRESH series: results judged under v2 remain valid v2 results and do not carry over to, or count toward, v3 confirmation.",
+  "primary_slice": {
+    "reason_resolved": [
+      "completed"
+    ],
+    "anchor": "pending_at"
+  },
+  "holdout_days": 5,
+  "consistency": {
+    "days_required": 3
+  },
+  "metrics": {
+    "mae": {
+      "direction": "lower_is_better",
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.15
+      }
+    },
+    "within_2x": {
+      "direction": "higher_is_better",
+      "bar": {
+        "kind": "absolute_improvement",
+        "value": 0.05
+      }
+    },
+    "pinball_p90_guarded": {
+      "direction": "lower_is_better",
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.0
+      }
+    },
+    "p90_coverage_guarded": {
+      "direction": "band",
+      "bar": {
+        "kind": "band",
+        "low": 0.88,
+        "high": 0.93
+      }
+    },
+    "p90_coverage": {
+      "direction": "band",
+      "role": "report",
+      "bar": {
+        "kind": "band",
+        "low": 0.85,
+        "high": 0.95
+      }
+    },
+    "p90_miss_tail_guarded": {
+      "direction": "lower_is_better",
+      "bucket": "30m+",
+      "role": "report",
+      "min_eligible_n": 200,
+      "bar": {
+        "kind": "absolute",
+        "value": 0.3
+      }
+    },
+    "p90_miss_severity_tail": {
+      "direction": "lower_is_better",
+      "bucket": "30m+",
+      "role": "report",
+      "min_eligible_n": 200,
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.0
+      }
+    },
+    "interval_width_guarded": {
+      "direction": "lower_is_better",
+      "role": "report",
+      "bar": {
+        "kind": "relative_improvement",
+        "value": -0.1
+      }
+    }
+  }
+}

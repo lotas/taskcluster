@@ -19,6 +19,7 @@ from src import hazard_labels
 from src.features import FeatureBuilder, Split
 from src.hazard_model import DiscreteHazardModel
 from src.model import LightGBMQuantileModel, ResidualLightGBMQuantileModel
+from src.model import MissingBaselineError  # noqa: F401  (re-exported for callers)
 from src.evaluate import evaluate as do_eval, load_prior_manifest
 
 
@@ -286,6 +287,74 @@ def _require_baselines(holdout_day_keys: list[str], baseline_dir: Path) -> None:
             f"      --pending-eval-date YYYY-MM-DD \\\n"
             f"      --output-json /app/tools/queue-forecasting/{baseline_dir.relative_to(TRAINER_ROOT.parent)}/YYYY-MM-DD.json"
         )
+
+
+def _require_residual_baseline_values(c: cfg.Config, splits: dict[str, Split]) -> None:
+    """Refuse a residual run whose rows lack a baseline value, before training.
+
+    THE REPLACEMENT FOR A SILENT `fillna(0.0)`. `ResidualLightGBMQuantileModel`
+    transforms the target relative to `residual.baseline_feature`; until
+    2026-09-18 a missing value became 0.0, so a train window the baseline NDJSON
+    did not cover was trained on `log(y+1)` instead of `log((y+1)/(bl+1))` for
+    exactly the rows it missed -- the target redefined, for a subset, with
+    nothing in the output saying so. Dropping the rows would instead change the
+    cohort. Both change the experiment being run, so this stops and reports.
+
+    Counts are per split and per pending day, because the answer to "which
+    days does the export not cover" is the whole remedy: widen the baseline
+    export to those days, or pick a non-residual config. Rows where EVERY
+    `bl_*` feature is missing are reported separately as unjoined -- the NDJSON
+    has no row for that (task_id, run_id) -- from rows the NDJSON covered with
+    a null quantile.
+
+    The model's own `_clean_baseline` refuses too (`MissingBaselineError`), as
+    a backstop for any caller that skips this; it cannot see days, this can.
+    """
+    if not c.residual:
+        return
+    feature = c.residual["baseline_feature"]
+    lines: list[str] = []
+    total_missing = 0
+    total_rows = 0
+    for name, split in splits.items():
+        total_rows += len(split.X)
+        if feature not in split.X.columns:
+            raise SystemExit(
+                f"ERROR: residual baseline_feature {feature!r} is not a column of"
+                f" the {name} features ({len(split.X):,} rows). The baseline join"
+                f" did not produce it: check `residual.baseline_file` and the"
+                f" NDJSON's columns."
+            )
+        values = pd.to_numeric(split.X[feature], errors="coerce").to_numpy(dtype=float)
+        missing = ~np.isfinite(values)
+        n_missing = int(missing.sum())
+        if not n_missing:
+            continue
+        total_missing += n_missing
+        bl_cols = [col for col in split.X.columns if col.startswith("bl_")]
+        unjoined = int(split.X.loc[missing, bl_cols].isna().all(axis=1).sum()) if bl_cols else n_missing
+        lines.append(f"  {name}: {n_missing:,} of {len(split.X):,} rows missing"
+                     f" ({unjoined:,} with no baseline row at all,"
+                     f" {n_missing - unjoined:,} with a null {feature})")
+        if "pending_at" in split.meta.columns:
+            days = pd.to_datetime(split.meta["pending_at"], utc=True).dt.strftime("%Y-%m-%d")
+            per_day = days[missing].value_counts().sort_index()
+            for day, n in per_day.items():
+                n_day = int((days == day).sum())
+                lines.append(f"      {day}: {int(n):,} of {n_day:,} rows")
+    if not total_missing:
+        return
+    raise SystemExit(
+        f"ERROR: {total_missing:,} of {total_rows:,} rows across the splits have no"
+        f" finite value in residual baseline feature {feature!r}:\n"
+        + "\n".join(lines) + "\n\n"
+        f"A residual config transforms the target relative to this feature, so a"
+        f" missing value cannot be filled (0.0 would redefine the target as"
+        f" log(y+1) for those rows) and the rows cannot be dropped (that would"
+        f" change the cohort). Either one changes the experiment being run.\n"
+        f"The baseline NDJSON in {_baseline_dir(c)} does not cover those rows:"
+        f" widen the export to the days listed, or run a non-residual config."
+    )
 
 
 def _run_discrete_hazard_training(
@@ -603,6 +672,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"  peak RSS after predictions: {_peak_rss_mb():,.0f} MB")
         return 0
+
+    # THE RESIDUAL GATE, before any model is built: see the function.
+    _require_residual_baseline_values(c, {"train": train, "val": val, "hold": hold})
 
     # Train one model per quantile.
     def _make_model(alpha: float) -> LightGBMQuantileModel:
