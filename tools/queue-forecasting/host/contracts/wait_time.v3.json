@@ -1,0 +1,86 @@
+{
+  "baseline_hash": "bcede38a043ff40da767e9a019922e2c50c1aaa336c33cb3ad2cf5e089baf88d",
+  "consistency": {
+    "days_required": 3
+  },
+  "contract_hash": "05aa4edad7ce668a43dab588d6b4f275c17511fa9616f6273143e0f55064e479",
+  "holdout_days": 5,
+  "metrics": {
+    "interval_width_guarded": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": -0.1
+      },
+      "direction": "lower_is_better",
+      "role": "report"
+    },
+    "mae": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.15
+      },
+      "direction": "lower_is_better"
+    },
+    "p90_coverage": {
+      "bar": {
+        "high": 0.95,
+        "kind": "band",
+        "low": 0.85
+      },
+      "direction": "band",
+      "role": "report"
+    },
+    "p90_coverage_guarded": {
+      "bar": {
+        "high": 0.93,
+        "kind": "band",
+        "low": 0.88
+      },
+      "direction": "band"
+    },
+    "p90_miss_severity_tail": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.0
+      },
+      "bucket": "30m+",
+      "direction": "lower_is_better",
+      "min_eligible_n": 200,
+      "role": "report"
+    },
+    "p90_miss_tail_guarded": {
+      "bar": {
+        "kind": "absolute",
+        "value": 0.3
+      },
+      "bucket": "30m+",
+      "direction": "lower_is_better",
+      "min_eligible_n": 200,
+      "role": "report"
+    },
+    "pinball_p90_guarded": {
+      "bar": {
+        "kind": "relative_improvement",
+        "value": 0.0
+      },
+      "direction": "lower_is_better"
+    },
+    "within_2x": {
+      "bar": {
+        "kind": "absolute_improvement",
+        "value": 0.05
+      },
+      "direction": "higher_is_better"
+    }
+  },
+  "name": "wait_time_v3",
+  "note": "v3, 2026-09-18. Changes ONLY the pinned baseline package: the promoted v3 baseline (Policy B, exclusion list as of 2026-09-16) carries per-day files and NDJSON rows for 2026-07-25..2026-09-15, so the reserved cohorts R1..R4 (holdouts 08-27..09-15) become trainable. Metrics, bars, gates, consistency rule, primary slice and holdout_days are byte-for-byte those of v2 (da27748abb7c). v3 is a FRESH series: results judged under v2 remain valid v2 results and do not carry over to, or count toward, v3 confirmation.",
+  "primary_slice": {
+    "anchor": "pending_at",
+    "reason_resolved": [
+      "completed"
+    ]
+  },
+  "schema": 1,
+  "target": "wait_time"
+}

@@ -233,6 +233,34 @@ sudo ./host/promote-baseline.sh "$STAGE" ${EXCLUDED:+--exclude "$EXCLUDED"}
 sudo ./host/instantiate-contract.sh wait_time.v3 <NEW_HASH> --activate   # once wait_time.v3.json.in exists
 ```
 
+**Done 2026-09-23.** Inventory beforehand: still_pending 0 for every day
+through 09-21. R4 cut 13:43Z (operator, lookback 30, generation 1; timer
+inactive, loop PAUSE present):
+
+```
+extract_hash: b500ccd21f1723c0fd25653f6979d9adc7bab15eb0ad2a12770ecd457d616043
+extract_dir:  /var/lib/qf-extracts/6eaaf285976bc62fa23bca648e41344f7dfa198103987f8c0c5e1a3280f024e1
+watermark:    pending_at 2026-09-15T23:59:58Z, resolved_at 2026-09-16T23:15:44Z, sample_date 2026-09-22
+job:          extract-20260923T134358Z-6eaaf285976b-7825
+```
+
+Extension exported under the persisted list; per-day row counts for
+09-11..09-15 equal the inventory's. Days flagged since that list was taken:
+09-19 and 09-20, both outside the package, so no file in it departs from its
+declared list. Step 2b with R3 (`--cohort 2026-09-11`) and R4
+(`--cohort 2026-09-16`) added: six cohorts, 0 missing; reference 8,816,035
+comparable, 0 disagree, 0 absent; lists differ only on 09-12..09-15;
+PROMOTABLE (`$STAGE.coverage.2026-09-23.json`).
+
+Promoted baseline `bcede38a043ff40da767e9a019922e2c50c1aaa336c33cb3ad2cf5e089baf88d`
+(30 per-day files 08-15..09-15, 12,830,841 NDJSON rows); contract
+`wait_time_v3` = `05aa4edad7ce668a43dab588d6b4f275c17511fa9616f6273143e0f55064e479`,
+activated. The frozen protocol document (§7) was not available to the operator
+at promotion; the freeze rests on the record here: v3 rules are v2's verbatim
+(template committed 2026-09-18), and no model had been trained or scored on
+any R1..R4 holdout (R1's probes failed before training; loop paused since
+09-15, timer stopped since 09-16).
+
 ## 5. What this does not do
 
 It does not run any probe, does not evaluate anything, and does not touch the
