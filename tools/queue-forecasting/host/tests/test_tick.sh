@@ -75,15 +75,25 @@ setup() {  # setup <case-name>
   # be driven) -- and REAL in shape, because frontier.py parses it for real.
   cat >"$W/trusted/results.sh" <<EOF
 #!/usr/bin/env bash
+echo read >>"$W/results_reads"
 n=\$(cat "$W/runs_today" 2>/dev/null || echo 1)
-python3 - "\$n" "$TODAY" <<'PY'
-import json, sys
+python3 - "\$n" "$TODAY" "$W/evaluated" <<'PY'
+import json, pathlib, sys
 n, today = int(sys.argv[1]), sys.argv[2]
 rows = [{"evaluation": f"eval-{i}", "probe": f"probe-{i}",
          "when": f"{today} 0{i}:00", "verdict": "no-go",
          "extract": "e" * 16, "baseline": "b" * 16, "contract": "c" * 16,
          "metrics": {"mae": 225.1}, "passed": {"mae": False},
          "note": "cfg=configs/wait_time.yaml | legacy"} for i in range(n)]
+# A row that exists only once the fake \`qf evaluate\` has run, so a case can
+# tell whether the frontier was built from history read AFTER the tick scored.
+if pathlib.Path(sys.argv[3]).exists():
+    rows.append(dict(rows[0] if rows else {"extract": "e" * 16, "baseline": "b" * 16,
+                     "contract": "c" * 16, "metrics": {"mae": 225.1},
+                     "passed": {"mae": False}, "verdict": "no-go",
+                     "note": "cfg=configs/wait_time.yaml | legacy"},
+                     evaluation="eval-autoscored", probe="probe-autoscored",
+                     when=f"{today} 09:59"))
 print(json.dumps(rows))
 PY
 EOF
@@ -156,17 +166,35 @@ EOF
   # $W/unscored_today of them, so a capped day stops unless a case says so.
   # One evaluate is FAILED on purpose: an attempted score is not "unscored".
   # `probe-old` below is an orphan from another day that must never count.
+  # Every call other than `list` is logged to $W/qf_calls, one argv per line
+  # group, so a case can assert what the TICK submitted. $W/probe_baseline,
+  # when present, gives each probe a dispatcher spec pinning that baseline with
+  # note "prereg-<i>"; $W/evaluate_fails makes `qf evaluate` fail.
   cat >"$W/bin/qf" <<EOF
 #!/usr/bin/env bash
 [ ! -f "$W/qf_fails" ] || { echo "socket refused" >&2; exit 1; }
+if [ "\${1:-}" != "list" ]; then
+  { printf '%s\n' "\$@"; echo "--"; } >>"$W/qf_calls"
+  if [ "\${1:-}" = "evaluate" ] && [ -f "$W/evaluate_fails" ]; then
+    echo "evaluate FAILED" >&2; exit 1
+  fi
+  [ "\${1:-}" != "evaluate" ] || : >"$W/evaluated"
+fi
 p=\$(cat "$W/probes_today" 2>/dev/null || echo 0)
 x=\$(cat "$W/extracts_today" 2>/dev/null || echo 0)
 u=\$(cat "$W/unscored_today" 2>/dev/null || echo 0)
-python3 - "\$p" "\$x" "\$u" "$TODAY" <<'PYQF'
+b=\$(cat "$W/probe_baseline" 2>/dev/null || true)
+python3 - "\$p" "\$x" "\$u" "$TODAY" "\$b" <<'PYQF'
 import json, sys
 p, x, u, today = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+baseline = sys.argv[5]
+def spec(i):
+    if not baseline:
+        return {}
+    return {"spec_json": json.dumps({"args": {"baseline": baseline},
+                                     "note": f"prereg-{i}"})}
 jobs = [{"run_id": f"probe-{i}", "kind": "probe", "state": "SUCCEEDED",
-         "submitted_at": f"{today}T0{i%10}:00:00Z"} for i in range(p)]
+         "submitted_at": f"{today}T0{i%10}:00:00Z", **spec(i)} for i in range(p)]
 jobs += [{"run_id": f"evaluate-{i}", "kind": "evaluate",
           "state": "FAILED" if i == u else "SUCCEEDED",
           "submitted_at": f"{today}T0{i%10}:30:00Z",
@@ -339,6 +367,92 @@ out="$(run_tick QF_TICK_MAX_RUNS=4)"
   || bad "with probe budget left, qf probe is not shimmed (rc=$(cat "$W/probe_rc" 2>/dev/null)) -- $out"
 absent_from "$W/leader_prompt" "probe budget is spent" \
   "with probe budget left, the leader is not told it is spent"
+
+# --------------------------------------------------------------------------
+# THE TICK SCORES A FINISHED PROBE ITSELF. A contracts dir with one ACTIVE
+# contract on baseline b*64, and a second published contract on the same
+# baseline that is NOT active, so "the ACTIVE one" is what is asserted.
+contracts_world() {  # contracts_world -- after setup
+  mkdir -p "$W/trusted/contracts"
+  B="$(printf 'b%.0s' $(seq 64))"; C="$(printf 'c%.0s' $(seq 64))"
+  D="$(printf 'd%.0s' $(seq 64))"
+  printf '{"target":"wait_time","contract_hash":"%s","baseline_hash":"%s"}\n' \
+    "$C" "$B" >"$W/trusted/contracts/wait_time.v9.json"
+  printf '{"target":"wait_time","contract_hash":"%s","baseline_hash":"%s"}\n' \
+    "$D" "$B" >"$W/trusted/contracts/wait_time.v8.json"
+  printf '# comment\nwait_time %s\n' "$C" >"$W/trusted/contracts/ACTIVE"
+  echo "$B" >"$W/probe_baseline"
+}
+
+setup autoscore
+contracts_world
+echo 4 >"$W/probes_today"
+echo 1 >"$W/unscored_today"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick QF_TICK_MAX_RUNS=4)"
+# qf_calls holds argv one per line with `--` between calls.
+tr '\n' ' ' <"$W/qf_calls" 2>/dev/null >"$W/qf_calls_flat"
+present_in "$W/qf_calls_flat" "evaluate --run probe-0 --contract $C --note prereg-0 --wait" \
+  "the tick evaluates the unscored probe under the ACTIVE contract with the probe's own note"
+absent_from "$W/qf_calls_flat" "--contract $D" \
+  "a published but inactive contract on the same baseline is not used"
+absent_from "$W/qf_calls_flat" "--run probe-1 " \
+  "a probe whose evaluate exists (even FAILED) is not re-scored"
+absent_from "$W/qf_calls_flat" "probe-old" \
+  "an orphan outside the 36h window is not scored"
+present_in "$W/leader_prompt" "eval-autoscored" \
+  "the frontier is built from scored history read AFTER the tick scored"
+printf '%s' "$out" | grep -q "leader done" \
+  && ok "a capped day with a result the tick just scored runs the leader to write it up" \
+  || bad "a capped day with a just-scored result runs the leader -- got: $out"
+present_in "$W/leader_prompt" "This tick scored these finished probes itself" \
+  "the leader is told the tick scored it"
+absent_from "$W/leader_prompt" "not score them" \
+  "a scored probe is not also listed as unscorable"
+
+setup autoscorenothingtodo
+contracts_world
+echo 4 >"$W/probes_today"
+out="$(run_tick QF_TICK_MAX_RUNS=4)"
+[ ! -s "$W/qf_calls" ] \
+  && ok "with nothing unscored the tick submits nothing" \
+  || bad "with nothing unscored the tick submits nothing -- $(cat "$W/qf_calls")"
+[ "$(wc -l <"$W/results_reads" 2>/dev/null)" -eq 1 ] \
+  && ok "...and reads scored history once" \
+  || bad "...and reads scored history once (reads=$(wc -l <"$W/results_reads" 2>/dev/null))"
+
+setup autoscorenocontract
+contracts_world
+echo "$(printf 'e%.0s' $(seq 64))" >"$W/probe_baseline"  # no contract pins this
+echo 2 >"$W/probes_today"
+echo 1 >"$W/unscored_today"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick QF_TICK_MAX_RUNS=4)"
+grep -q '^evaluate$' "$W/qf_calls" 2>/dev/null \
+  && bad "a probe no ACTIVE contract pins is scored anyway -- $(cat "$W/qf_calls")" \
+  || ok "a probe no ACTIVE contract pins is left for the leader"
+present_in "$W/leader_prompt" "not score them" \
+  "...and the leader is told the tick could not score it"
+present_in "$W/leader_prompt" "  - probe-0\$" \
+  "...by id"
+
+setup autoscorefails
+contracts_world
+: >"$W/evaluate_fails"
+echo 4 >"$W/probes_today"
+echo 1 >"$W/unscored_today"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick QF_TICK_MAX_RUNS=4)"
+printf '%s' "$out" | grep -q "evaluate did not succeed" \
+  && ok "a failed tick evaluate is reported" \
+  || bad "a failed tick evaluate is reported -- got: $out"
+printf '%s' "$out" | grep -q "leader done" \
+  && ok "...and the capped tick still runs the leader for it" \
+  || bad "...and the capped tick still runs the leader -- got: $out"
+present_in "$W/leader_prompt" "not score them" \
+  "...which is told the probe is still unscored"
+absent_from "$W/leader_prompt" "This tick scored these" \
+  "...and not that the tick scored it"
 
 # --------------------------------------------------------------------------
 setup qfdown

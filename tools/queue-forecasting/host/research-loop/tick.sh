@@ -919,9 +919,10 @@ fi
 # So the leader is TOLD what is already running. Without it, action 4 looks
 # available while an experiment is mid-flight, and the only thing stopping a
 # second submission is the daily budget.
-read -r PROBES_TODAY EXTRACTS_TODAY IN_FLIGHT UNSCORED_TODAY <<EOF
+read -r PROBES_TODAY EXTRACTS_TODAY IN_FLIGHT UNSCORED_TODAY UNSCORED_RECENT <<EOF
 $(python3 - "$JOBS_JSON" "$TODAY" <<'PY2'
 import json, sys
+from datetime import datetime, timedelta, timezone
 jobs = (json.load(open(sys.argv[1])) or {}).get("jobs") or []
 today = sys.argv[2]
 def n(kind):
@@ -944,30 +945,118 @@ def run_arg(j):
     except (ValueError, AttributeError):
         return None
 scored = {run_arg(j) for j in jobs if j.get("kind") == "evaluate"}
-unscored = [j["run_id"] for j in jobs
+unscored = [j for j in jobs
             if j.get("kind") == "probe" and j.get("state") == "SUCCEEDED"
-            and (j.get("submitted_at") or "").startswith(today)
             and j.get("run_id") not in scored]
-print(n("probe"), n("extract"), live, ",".join(unscored) or "-")
+# RECENT is what the tick scores itself (below): 36h, so a probe submitted at
+# 23:00 and finishing after midnight is not missed, and still short enough that
+# an old orphan is never picked up. ISO-8601 UTC strings compare as times.
+since = (datetime.now(timezone.utc) - timedelta(hours=36)).strftime("%Y-%m-%dT%H:%M:%SZ")
+print(n("probe"), n("extract"), live,
+      ",".join(j["run_id"] for j in unscored
+               if (j.get("submitted_at") or "").startswith(today)) or "-",
+      ",".join(j["run_id"] for j in unscored
+               if (j.get("submitted_at") or "") >= since) or "-")
 PY2
 )
 EOF
-# A SPENT PROBE BUDGET STOPS THE TICK ONLY WHEN THERE IS NOTHING TO SCORE.
-# It used to stop unconditionally, and the chained evaluate `experiment.py run`
-# submits dies with the tick that launched the probe -- so the day's last probe
-# finished around 10:30Z on 2026-09-24 and sat unscored until the next UTC day,
-# every tick in between a two-second stop. Now, if one of today's probes
-# finished with no evaluate behind it, the tick runs with `qf probe` shimmed off
-# (below): scoring and writing up cost no probe. With nothing to score the stop
-# is as cheap as before, so a capped afternoon still burns no agent turns.
+
+# THE TICK SCORES A FINISHED PROBE ITSELF, before any agent runs. The evaluate
+# that `experiment.py run` chains is a child of the leader's shell, and systemd
+# stops this unit's whole cgroup when the tick ends -- `setsid`, `nohup` and
+# `&` included -- so every probe that outlived its tick (all of them, at ~40
+# minutes against an hourly timer) needed a later leader to notice and submit
+# the evaluate by hand, a turn spent on plumbing, and on 2026-09-24 07:18Z a
+# leader that declined to, correctly, since a hand-typed note is not the
+# pre-registration.
+#
+# Deterministic, so the tick may do it: the note is the probe's OWN, read from
+# its dispatcher spec and passed byte-for-byte, exactly as `cmd_run` would have;
+# the contract is the ACTIVE one whose baseline the probe pinned, and only when
+# that is exactly one -- otherwise (an explicit `--contract` against another
+# baseline, say) the probe is left for the leader, which is told about it. An
+# evaluate is a light job and spends no probe budget.
+AUTO_SCORED=""
+if [ "${UNSCORED_RECENT:--}" != "-" ]; then
+  for _run in ${UNSCORED_RECENT//,/ }; do
+    _contract="$(python3 - "$JOBS_JSON" "$_run" "$TRUSTED/contracts" \
+                   "$CTX/autoscore-note" <<'PY3'
+import json, pathlib, sys
+jobs_json, run, cdir, note_out = sys.argv[1:]
+jobs = (json.load(open(jobs_json)) or {}).get("jobs") or []
+spec = next((json.loads(j.get("spec_json") or "{}") for j in jobs
+             if j.get("run_id") == run), {})
+baseline = (spec.get("args") or {}).get("baseline")
+note = spec.get("note")
+active = {}
+try:
+    for line in (pathlib.Path(cdir) / "ACTIVE").read_text().splitlines():
+        parts = line.split("#", 1)[0].split()
+        if len(parts) == 2:
+            active.setdefault(parts[0], parts[1])  # README: first line wins
+except OSError:
+    pass
+hits = []
+for path in pathlib.Path(cdir).glob("*.json"):
+    try:
+        c = json.loads(path.read_text())
+    except ValueError:
+        continue
+    if (active.get(c.get("target")) == c.get("contract_hash")
+            and c.get("baseline_hash") == baseline):
+        hits.append(c["contract_hash"])
+if baseline and note and len(set(hits)) == 1:
+    pathlib.Path(note_out).write_text(note)
+    print(hits[0])
+PY3
+)"
+    if [ -z "$_contract" ]; then
+      say "probe $_run is unscored and no single ACTIVE contract pins its"
+      say "  baseline; leaving it to the leader"
+      continue
+    fi
+    say "scoring $_run under ACTIVE contract ${_contract:0:12}"
+    if timeout 1800 qf evaluate --run "$_run" --contract "$_contract" \
+         --note "$(cat "$CTX/autoscore-note")" --wait \
+         >"$CTX/autoscore-$_run.log" 2>&1; then
+      AUTO_SCORED="${AUTO_SCORED:+$AUTO_SCORED,}$_run"
+    else
+      say "  the evaluate did not succeed; the leader will see it:"
+      tail -c 600 "$CTX/autoscore-$_run.log"
+    fi
+  done
+  unset _run _contract
+  # Scored rows are what the frontier reads, and they were read above, before
+  # these existed. Read again, fail as loudly as the first read.
+  if [ -n "$AUTO_SCORED" ]; then
+    "$TRUSTED/results.sh" --json >"$CTX/results.json" 2>"$CTX/results.err" \
+      || die "results.sh failed after scoring $AUTO_SCORED: $(head -c 300 "$CTX/results.err")"
+  fi
+fi
+# What the tick just scored is no longer unscored; what is left is what the
+# tick could not score (no single ACTIVE contract, or a failed evaluate).
+LEFT_UNSCORED="$(python3 -c '
+import sys
+done = set(sys.argv[2].split(","))
+left = [r for r in sys.argv[1].split(",") if r != "-" and r not in done]
+print(",".join(left) or "-")' "${UNSCORED_TODAY:--}" "$AUTO_SCORED")"
+
+# A SPENT PROBE BUDGET STOPS THE TICK ONLY WHEN THERE IS NOTHING TO WRITE UP.
+# It used to stop unconditionally, so the day's last probe finished around
+# 10:30Z on 2026-09-24 and sat unscored until the next UTC day, every tick in
+# between a two-second stop. Now, if this tick just scored a probe, or one of
+# today's finished and the tick could not score it, the tick runs with `qf
+# probe` shimmed off (below): scoring and writing up cost no probe. With
+# neither, the stop is as cheap as before, so a capped afternoon burns no
+# agent turns.
 NO_MORE_PROBES=0
 if [ "${PROBES_TODAY:-999}" -ge "$MAX_RUNS" ]; then
-  if [ "${UNSCORED_TODAY:--}" = "-" ]; then
+  if [ -z "$AUTO_SCORED" ] && [ "$LEFT_UNSCORED" = "-" ]; then
     say "$PROBES_TODAY probe(s) submitted today (max $MAX_RUNS); stopping"
     exit 0
   fi
-  say "$PROBES_TODAY probe(s) submitted today (max $MAX_RUNS), but"
-  say "  finished and unscored: $UNSCORED_TODAY -- running to score and write up only"
+  say "$PROBES_TODAY probe(s) submitted today (max $MAX_RUNS), but there is a"
+  say "  result to write up -- running with probe submission refused"
   NO_MORE_PROBES=1
 fi
 if [ "${EXTRACTS_TODAY:-999}" -ge "$MAX_EXTRACTS" ]; then
@@ -1213,13 +1302,21 @@ fi
   fi
   [ "$NO_MORE_EXTRACTS" = 0 ] \
     || echo "**The extract budget is spent: action 5 is unavailable this tick.**"
-  if [ "$NO_MORE_PROBES" = 1 ]; then
-    echo "**The probe budget is spent: actions 3 and 4 are unavailable this tick,**"
-    echo "and \`qf probe\` is refused. This tick exists because these probes of"
-    echo "today's finished with no evaluate job behind them:"
-    printf '%s\n' "$UNSCORED_TODAY" | tr ',' '\n' | sed 's/^/  - /'
-    echo "Score one with \`qf evaluate --run <id>\` under the ACTIVE contract, carrying"
-    echo "its pre-registered note unchanged, and write the result up."
+  [ "$NO_MORE_PROBES" = 0 ] \
+    || echo "**The probe budget is spent: actions 3 and 4 are unavailable this tick, and \`qf probe\` is refused.**"
+  if [ -n "$AUTO_SCORED" ]; then
+    echo "**This tick scored these finished probes itself** (their own pre-registered"
+    echo "note, the ACTIVE contract for their baseline), so they are in the frontier"
+    echo "as scored runs; do not evaluate them again:"
+    printf '%s\n' "$AUTO_SCORED" | tr ',' '\n' | sed 's/^/  - /'
+  fi
+  if [ "$LEFT_UNSCORED" != "-" ]; then
+    echo "**These probes of today's finished with no evaluate job, and the tick could"
+    echo "not score them** (no single ACTIVE contract pins their baseline, or the"
+    echo "evaluate failed -- the tick's log says which):"
+    printf '%s\n' "$LEFT_UNSCORED" | tr ',' '\n' | sed 's/^/  - /'
+    echo "Score one with \`qf evaluate --run <id>\` under the contract it was planned"
+    echo "against, carrying its pre-registered note unchanged, and write the result up."
   fi
   echo
   # Leader-only, and placed before the briefing so it is read before the entry
