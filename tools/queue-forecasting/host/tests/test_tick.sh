@@ -152,16 +152,27 @@ PYAGENT
 EOF
   # `qf list --json`: the budget's only source. Driven by $W/probes_today and
   # $W/extracts_today, and able to FAIL so the fail-closed path is testable.
+  # Every probe of today's has an evaluate behind it except the first
+  # $W/unscored_today of them, so a capped day stops unless a case says so.
+  # One evaluate is FAILED on purpose: an attempted score is not "unscored".
+  # `probe-old` below is an orphan from another day that must never count.
   cat >"$W/bin/qf" <<EOF
 #!/usr/bin/env bash
 [ ! -f "$W/qf_fails" ] || { echo "socket refused" >&2; exit 1; }
 p=\$(cat "$W/probes_today" 2>/dev/null || echo 0)
 x=\$(cat "$W/extracts_today" 2>/dev/null || echo 0)
-python3 - "\$p" "\$x" "$TODAY" <<'PYQF'
+u=\$(cat "$W/unscored_today" 2>/dev/null || echo 0)
+python3 - "\$p" "\$x" "\$u" "$TODAY" <<'PYQF'
 import json, sys
-p, x, today = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+p, x, u, today = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 jobs = [{"run_id": f"probe-{i}", "kind": "probe", "state": "SUCCEEDED",
          "submitted_at": f"{today}T0{i%10}:00:00Z"} for i in range(p)]
+jobs += [{"run_id": f"evaluate-{i}", "kind": "evaluate",
+          "state": "FAILED" if i == u else "SUCCEEDED",
+          "submitted_at": f"{today}T0{i%10}:30:00Z",
+          "spec_json": json.dumps({"args": {"run": f"probe-{i}",
+                                            "contract": "c" * 64}})}
+         for i in range(u, p)]
 jobs += [{"run_id": f"extract-{i}", "kind": "extract", "state": "SUCCEEDED",
           "submitted_at": f"{today}T0{i%10}:00:00Z"} for i in range(x)]
 jobs += [{"run_id": "probe-old", "kind": "probe", "state": "SUCCEEDED",
@@ -260,6 +271,74 @@ fi
 [ ! -e "$W/research/journal/PENDING.md" ] \
   && ok "the budget stops it before the leader runs" \
   || bad "the budget stops it before the leader runs"
+# The world always carries `probe-old`, SUCCEEDED and never scored, from 2020.
+printf '%s' "$out" | grep -q "unscored" \
+  && bad "an orphan probe from another day holds the capped gate open -- got: $out" \
+  || ok "an orphan probe from another day does not hold the capped gate open"
+
+# --------------------------------------------------------------------------
+setup probebudgetunscored
+# THE 2026-09-24 CASE. The day's probes are spent and the last one finished
+# with no evaluate behind it. The tick must run -- to score it -- and must
+# refuse a fifth probe while still letting `qf evaluate` through.
+echo 4 >"$W/probes_today"
+echo 1 >"$W/unscored_today"
+cat >"$W/bin/claude" <<EOF
+#!/usr/bin/env bash
+cat > "$W/leader_prompt"
+qf probe --sha abc --extract c179c7f5b961 >/dev/null 2>&1
+echo "\$?" > "$W/probe_rc"
+qf evaluate --run probe-0 --contract cccccccc >/dev/null 2>&1
+echo "\$?" > "$W/evaluate_rc"
+qf extract --target wait_time --as-of 2026-07-27T00:00:00Z >/dev/null 2>&1
+echo "\$?" > "$W/extract_rc"
+echo "# a claim" > "$W/research/journal/PENDING.md"
+echo "leader done"
+EOF
+chmod +x "$W/bin/claude"
+echo "VERDICT: AGREE" >"$W/codex_reply"
+out="$(run_tick QF_TICK_MAX_RUNS=4 QF_TICK_MAX_EXTRACTS=1)"
+printf '%s' "$out" | grep -q "leader done" \
+  && ok "a spent probe budget with an unscored probe still runs the tick" \
+  || bad "a spent probe budget with an unscored probe still runs the tick -- got: $out"
+[ "$(cat "$W/probe_rc" 2>/dev/null)" = 3 ] \
+  && ok "...and MECHANICALLY refuses \`qf probe\`" \
+  || bad "...and refuses qf probe (rc=$(cat "$W/probe_rc" 2>/dev/null)) -- $out"
+[ "$(cat "$W/evaluate_rc" 2>/dev/null)" = 0 ] \
+  && ok "...while \`qf evaluate\` goes through" \
+  || bad "...while qf evaluate goes through (rc=$(cat "$W/evaluate_rc" 2>/dev/null))"
+[ "$(cat "$W/extract_rc" 2>/dev/null)" = 0 ] \
+  && ok "...and an unspent extract budget is not refused along with it" \
+  || bad "...and an unspent extract budget is not refused (rc=$(cat "$W/extract_rc" 2>/dev/null))"
+present_in "$W/leader_prompt" "probe budget is spent" \
+  "the leader is told actions 3 and 4 are unavailable"
+present_in "$W/leader_prompt" "  - probe-0\$" \
+  "the leader is given the unscored probe by id"
+absent_from "$W/leader_prompt" "  - probe-1\$" \
+  "a probe whose evaluate FAILED is not listed as unscored"
+absent_from "$W/leader_prompt" "probe-old" \
+  "another day's orphan is not listed as unscored"
+
+# --------------------------------------------------------------------------
+setup probeshimoffwhenbudgetleft
+# One unscored probe but budget left: nothing changes, `qf probe` works.
+echo 1 >"$W/probes_today"
+echo 1 >"$W/unscored_today"
+cat >"$W/bin/claude" <<EOF
+#!/usr/bin/env bash
+cat > "$W/leader_prompt"
+qf probe --sha abc --extract c179c7f5b961 >/dev/null 2>&1
+echo "\$?" > "$W/probe_rc"
+echo "# a claim" > "$W/research/journal/PENDING.md"
+echo "leader done"
+EOF
+chmod +x "$W/bin/claude"
+out="$(run_tick QF_TICK_MAX_RUNS=4)"
+[ "$(cat "$W/probe_rc" 2>/dev/null)" = 0 ] \
+  && ok "with probe budget left, \`qf probe\` is not shimmed" \
+  || bad "with probe budget left, qf probe is not shimmed (rc=$(cat "$W/probe_rc" 2>/dev/null)) -- $out"
+absent_from "$W/leader_prompt" "probe budget is spent" \
+  "with probe budget left, the leader is not told it is spent"
 
 # --------------------------------------------------------------------------
 setup qfdown

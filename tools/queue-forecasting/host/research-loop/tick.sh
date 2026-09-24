@@ -919,7 +919,7 @@ fi
 # So the leader is TOLD what is already running. Without it, action 4 looks
 # available while an experiment is mid-flight, and the only thing stopping a
 # second submission is the daily budget.
-read -r PROBES_TODAY EXTRACTS_TODAY IN_FLIGHT <<EOF
+read -r PROBES_TODAY EXTRACTS_TODAY IN_FLIGHT UNSCORED_TODAY <<EOF
 $(python3 - "$JOBS_JSON" "$TODAY" <<'PY2'
 import json, sys
 jobs = (json.load(open(sys.argv[1])) or {}).get("jobs") or []
@@ -934,13 +934,41 @@ TERMINAL = {"SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED", "REFUSED"}
 live = sum(1 for j in jobs
            if j.get("kind") in ("probe", "extract")
            and j.get("state") not in TERMINAL)
-print(n("probe"), n("extract"), live)
+# TODAY'S probes that finished and have no evaluate job naming them, in ANY
+# state -- a failed evaluate is a result to write up, not a reason to re-score.
+# Today only: the budget is per day, and an orphan from last week must not hold
+# the capped-day gate below open forever.
+def run_arg(j):
+    try:
+        return (json.loads(j.get("spec_json") or "{}").get("args") or {}).get("run")
+    except (ValueError, AttributeError):
+        return None
+scored = {run_arg(j) for j in jobs if j.get("kind") == "evaluate"}
+unscored = [j["run_id"] for j in jobs
+            if j.get("kind") == "probe" and j.get("state") == "SUCCEEDED"
+            and (j.get("submitted_at") or "").startswith(today)
+            and j.get("run_id") not in scored]
+print(n("probe"), n("extract"), live, ",".join(unscored) or "-")
 PY2
 )
 EOF
+# A SPENT PROBE BUDGET STOPS THE TICK ONLY WHEN THERE IS NOTHING TO SCORE.
+# It used to stop unconditionally, and the chained evaluate `experiment.py run`
+# submits dies with the tick that launched the probe -- so the day's last probe
+# finished around 10:30Z on 2026-09-24 and sat unscored until the next UTC day,
+# every tick in between a two-second stop. Now, if one of today's probes
+# finished with no evaluate behind it, the tick runs with `qf probe` shimmed off
+# (below): scoring and writing up cost no probe. With nothing to score the stop
+# is as cheap as before, so a capped afternoon still burns no agent turns.
+NO_MORE_PROBES=0
 if [ "${PROBES_TODAY:-999}" -ge "$MAX_RUNS" ]; then
-  say "$PROBES_TODAY probe(s) submitted today (max $MAX_RUNS); stopping"
-  exit 0
+  if [ "${UNSCORED_TODAY:--}" = "-" ]; then
+    say "$PROBES_TODAY probe(s) submitted today (max $MAX_RUNS); stopping"
+    exit 0
+  fi
+  say "$PROBES_TODAY probe(s) submitted today (max $MAX_RUNS), but"
+  say "  finished and unscored: $UNSCORED_TODAY -- running to score and write up only"
+  NO_MORE_PROBES=1
 fi
 if [ "${EXTRACTS_TODAY:-999}" -ge "$MAX_EXTRACTS" ]; then
   say "$EXTRACTS_TODAY extract(s) submitted today (max $MAX_EXTRACTS);"
@@ -967,21 +995,35 @@ REAL_QF="$(command -v qf)" || die "no \`qf\` on PATH"
 # WORD "extract" anywhere in argv would have been wrong and dangerous -- every
 # probe carries `--extract <hash>`, so a broad match would have blocked the one
 # action the loop most needs to keep working.
+#
+# THE SAME SHIM REFUSES `qf probe` when the probe budget is spent and the tick
+# is running only to score (above). `qf probe` is the one subcommand that
+# submits a probe -- `experiment.py run` goes through it too -- and `qf
+# evaluate`, the thing this tick is for, is forwarded untouched. Each refusal is
+# baked in only when its budget is spent, so the file never refuses more than
+# the tick decided.
 cat >"$SHIM/qf" <<SHIMEOF
 #!/usr/bin/env bash
-# Generated per tick by tick.sh. Refuses ONE subcommand; forwards everything
-# else untouched, including \`probe --extract <hash>\`.
-if [ "\${1:-}" = "extract" ]; then
+# Generated per tick by tick.sh. Refuses at most two subcommands; forwards
+# everything else untouched, including \`probe --extract <hash>\` when only the
+# extract budget is spent.
+if [ "$NO_MORE_EXTRACTS" = 1 ] && [ "\${1:-}" = "extract" ]; then
   echo "qf: refused: today's extract budget ($MAX_EXTRACTS) is spent." >&2
   echo "  Enforced by the tick, not by policy. Pick another action." >&2
+  exit 3
+fi
+if [ "$NO_MORE_PROBES" = 1 ] && [ "\${1:-}" = "probe" ]; then
+  echo "qf: refused: today's probe budget ($MAX_RUNS) is spent." >&2
+  echo "  This tick runs only to score and write up. \`qf evaluate\` still works." >&2
   exit 3
 fi
 exec "$REAL_QF" "\$@"
 SHIMEOF
 chmod +x "$SHIM/qf" || die "cannot make the shim executable"
-if [ "$NO_MORE_EXTRACTS" = 1 ]; then
+if [ "$NO_MORE_EXTRACTS" = 1 ] || [ "$NO_MORE_PROBES" = 1 ]; then
   LEADER_PATH="$SHIM:$PATH"
-  say "extract submission is shimmed off for this tick"
+  [ "$NO_MORE_EXTRACTS" = 0 ] || say "extract submission is shimmed off for this tick"
+  [ "$NO_MORE_PROBES" = 0 ] || say "probe submission is shimmed off for this tick"
 else
   LEADER_PATH="$PATH"
 fi
@@ -1171,6 +1213,14 @@ fi
   fi
   [ "$NO_MORE_EXTRACTS" = 0 ] \
     || echo "**The extract budget is spent: action 5 is unavailable this tick.**"
+  if [ "$NO_MORE_PROBES" = 1 ]; then
+    echo "**The probe budget is spent: actions 3 and 4 are unavailable this tick,**"
+    echo "and \`qf probe\` is refused. This tick exists because these probes of"
+    echo "today's finished with no evaluate job behind them:"
+    printf '%s\n' "$UNSCORED_TODAY" | tr ',' '\n' | sed 's/^/  - /'
+    echo "Score one with \`qf evaluate --run <id>\` under the ACTIVE contract, carrying"
+    echo "its pre-registered note unchanged, and write the result up."
+  fi
   echo
   # Leader-only, and placed before the briefing so it is read before the entry
   # is planned rather than after it is written.
@@ -1339,10 +1389,10 @@ say "leader input: $LEADER_BYTES bytes"
   || say "WARNING the leader prompt is $LEADER_BYTES bytes and growing with
   scored history. Nothing is truncated, but consider bounding the frontier."
 
-# PATH="$LEADER_PATH": when the extract budget is spent this puts the refusing
-# shim ahead of the real `qf` for the leader and everything it spawns, including
-# `experiment.py`, whose own `qf` calls (probe, evaluate, extracts, contracts)
-# pass through untouched.
+# PATH="$LEADER_PATH": when either budget is spent this puts the refusing shim
+# ahead of the real `qf` for the leader and everything it spawns, including
+# `experiment.py`, whose own `qf` calls (evaluate, extracts, contracts, and
+# probe unless that budget is the spent one) pass through untouched.
 LEADER_RAW="$CTX/leader.json"
 LEADER_ERR="$CTX/leader.err"
 LEADER_RC=0
