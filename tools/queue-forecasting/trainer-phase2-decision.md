@@ -1,17 +1,26 @@
 # Queue Forecasting — Phase 2 Decision
 
 **Created:** 2026-04-23
-**Last updated:** 2026-06-30 (tail-accuracy program / Bet 1 queue-context features — see §0)
+**Last updated:** 2026-09-25 (status refresh: live calibration, Bet 1 evidence under contract v3, research loop — see §0)
 **Companion to:** `trainer-spec.md`, `trainer-plan.md`, `bet1-queue-context-features-design.md`
 **Authors:** residual-model experiment, wait-time transform variants, run-duration residual experiment
 
-## 0. Current status & direction (2026-06-30)
+## 0. Current status & direction (2026-09-25)
 
-**Where we are.** The residual wait/duration models (Phase 2/3, below) are live and broadly calibrated, and a **priority-aware wait p90 guardrail** shipped 2026-06-04 — verified healthy on live data 2026-06-25 (overall wait & run bands ≈ 50% ≤ p50 / 40% / 10% > p90; the earlier priority-blind over-inflation, e.g. osx-1015 at ~30×, is gone). The one stubborn weakness is the **long-wait tail**: completed-only 30m+ waits still exceed their p90 ~38% of the time, and weak-fallback / capacity-sensitive pools underestimate.
+**Where we are.** The residual wait/duration models (Phase 2/3, below) have been live since 2026-05-15, with the **priority-aware wait p90 guardrail** since 2026-06-04. Live calibration, last 30 days (2026-08-26 → 09-25, ~6.6M completed tasks, from `aggregations.html`):
+
+| | ≤ p50 | p50–p90 | > p90 | within p90 |
+|---|---|---|---|---|
+| wait | 47.9% | 43.6% | 8.5% | **91.5%** |
+| run | 49.7% | 42.1% | 8.2% | **91.8%** |
+
+Read this as **calibration, not accuracy**: a p90 is meant to be exceeded ~10% of the time, so ~91% within it and a ~50/50 split at p50 mean the ranges are honest. The weakness is still the **long-wait tail**, by actual wait: within p90 for 97.4% of <1m waits, 90.7% at 1–5m, 83.3% at 5–30m, and **67.5% at 30m+** (32.5% miss). That 30m+ miss rate was ~38% on 2026-06-25 and is now inside the experimental gate (<35%) but not the broad one (<30%). The production model has not changed in that time, so the improvement is not attributed to any one change.
 
 **The north star.** The goal is a `mach try` **group ETA** — "when will my whole push finish." Group completion is the *max* over the push's tasks of (wait + run), and that max is dominated by the single slowest task — which lives in exactly the long tail above. So the tail has to be accurate *per task* before a group ETA can be trustworthy. We nail individual tasks first; group composition and dependency/priority-ordering are separate, later problems.
 
-**Current work — Bet 1: queue-context features.** The tail is first an *information* problem: at pending time the model knows the task's own priority and the aggregate queue depth, but not *what is ahead of it*. A `try` task with 50 low-priority tasks ahead and one with 50 beta/autoland tasks ahead look identical today, yet wait very differently. Bet 1 reconstructs, at the task's pending moment: the **priority backlog** ahead of it (higher / same / lower priority, FIFO-correct), recent **arrival & drain flow**, worker **capacity / utilization**, and **repo-family backlog** (try / autoland / central / beta-release) on shared pools. Status: **implemented, reviewed, and parity-verified locally; pending a walk-forward ablation on production data to decide go/no-go.** Gate: 30m+ wait p90 miss materially down (<35% experimental, <30% broad), no regression on overall p90 / p50 / within-2x / MAE.
+**Current work — Bet 1: queue-context features.** The tail is first an *information* problem: at pending time the model knows the task's own priority and the aggregate queue depth, but not *what is ahead of it*. A `try` task with 50 low-priority tasks ahead and one with 50 beta/autoland tasks ahead look identical today, yet wait very differently. Bet 1 reconstructs, at the task's pending moment: the **priority backlog** ahead of it (higher / same / lower priority, FIFO-correct), recent **arrival & drain flow**, worker **capacity / utilization**, and **repo-family backlog** (try / autoland / central / beta-release) on shared pools. Status (2026-09-25): **promising, not yet shippable.** Scored by the research loop under evaluation contract v3 (four gates on the *served* p90: MAE −15% vs baseline, within-2x, pinball p90, p90 coverage in [0.88, 0.93]; baseline `bcede38a`, contract `05aa4eda`). The leading config, `wait_qctx_d_priority_flow`, passes all four gates on **2 of 4** cohorts, with ~19–20% lower wait MAE than the historical baseline on those (holdouts 09-01..05 and 09-06..10; the loop marks it CONFIRMED). It fails on the other two: holdout 08-27..31 is ~16% *worse* than baseline on MAE, and on `bd29b39a` (08-22..26) MAE is much better (+27%) but served p90 coverage is 93.5%, just over the ceiling. So it does not hold across regimes yet. Variants tried this week (full `qctx`, a pool-class feature) did not fix that. Reserved cohort **R4 (holdout 09-11..15) is untouched** and is the final check before any ship decision.
+
+**Research loop.** Since 2026-08-29 an unattended loop (`host/research-loop/`) proposes, runs and writes up experiments hourly, capped at 4 training probes/day. Each hypothesis is pre-registered, each write-up is checked by a second agent, and results are judged only by committed contracts with reserved holdout periods. 50 runs scored so far (v1: 28, v2: 11, v3: 11). Contract v3 started a fresh series on 2026-09-23; v1/v2 results remain history and do not count toward v3 confirmation.
 
 **Next bets (after Bet 1).** Bet 2 — model the full predictive *distribution* of time-to-completion (a survival/hazard model for wait), giving a calibrated tail at any quantile and letting a prediction **update live as a task keeps waiting**. Bet 3 — compose per-task distributions into a group-max completion ETA for the push.
 
