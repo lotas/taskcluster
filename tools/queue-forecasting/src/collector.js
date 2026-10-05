@@ -60,6 +60,33 @@ const queueEvents = new taskcluster.QueueEvents({
   rootUrl: process.env.TASKCLUSTER_ROOT_URL,
 });
 
+// --- Credential Failure ---
+// A 401 means Taskcluster rejected the credentials themselves (expired client,
+// rotated token: "Bad mac"). Every authenticated call will keep failing until an
+// operator rotates them, so logging each failure only floods the logs -- in
+// 2026-10 an expired client did exactly that until the disk filled. Treat it as
+// fatal: log once, stop consuming (Pulse keeps the messages), wait, then exit
+// non-zero. The wait is the back-off: the restart policy brings the collector
+// back at most once per AUTH_FAILURE_EXIT_DELAY_MS while the credentials are bad.
+const AUTH_FAILURE_EXIT_DELAY_MS = parseInt(process.env.COLLECTOR_AUTH_FAILURE_EXIT_DELAY_MS || '600000', 10); // 10 min
+let authFailed = false;
+
+function isAuthFailure(err) {
+  return err?.statusCode === 401;
+}
+
+function failOnAuthError(err, context) {
+  if (authFailed) return;
+  authFailed = true;
+  logError('auth', `FATAL: Taskcluster rejected the credentials for ` +
+    `${process.env.TASKCLUSTER_CLIENT_ID} (${context}): ${err.message}. ` +
+    `Rotate TASKCLUSTER_ACCESS_TOKEN in .env and recreate the container.`, {
+    statusCode: err.statusCode,
+    code: err.code,
+  });
+  shutdown('auth-failure', { exitCode: 1, exitDelayMs: AUTH_FAILURE_EXIT_DELAY_MS });
+}
+
 // Seed a queue's counter from the API
 async function seedQueueCount(taskQueueId) {
   try {
@@ -67,6 +94,8 @@ async function seedQueueCount(taskQueueId) {
     pendingCounts.set(taskQueueId, counts.pendingTasks);
     pendingCountsSeeded.add(taskQueueId);
   } catch (err) {
+    if (isAuthFailure(err)) return failOnAuthError(err, `taskQueueCounts(${taskQueueId})`);
+    if (authFailed) return;
     logError('queue-counts', `Seed failed for ${taskQueueId}: ${err.message}`, {
       taskQueueId,
       statusCode: err.statusCode,
@@ -281,6 +310,8 @@ async function backgroundApiFetch(taskId, status) {
     await enrichTask(pool, taskId, enrichment);
     taskCache.set(taskId, enrichment);
   } catch (err) {
+    if (isAuthFailure(err)) return failOnAuthError(err, `task(${taskId})`);
+    if (authFailed) return;
     logError('api-fetch', `Failed for ${taskId}: ${err.message}`, {
       taskId,
       statusCode: err.statusCode,
@@ -425,9 +456,11 @@ checkPendingGaps(); // initial check on startup
 // --- Graceful Shutdown ---
 
 let shuttingDown = false;
-async function shutdown(signal) {
+let shutdownExitCode = 0;
+async function shutdown(signal, { exitCode = 0, exitDelayMs = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
+  shutdownExitCode = exitCode;
   console.log(`[collector] Received ${signal}, shutting down...`);
   clearInterval(backfillTimer);
   clearInterval(syncTimer);
@@ -461,9 +494,20 @@ async function shutdown(signal) {
   }
 
   errorLogStream.end();
+  if (exitDelayMs > 0) {
+    console.log(`[collector] Waiting ${Math.round(exitDelayMs / 1000)}s before exiting so restarts back off`);
+    await new Promise(resolve => setTimeout(resolve, exitDelayMs));
+  }
   console.log('[collector] Shutdown complete');
-  process.exit(0);
+  process.exit(exitCode);
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// A signal that arrives while already shutting down (e.g. `docker stop` during
+// the auth-failure back-off wait) means "stop now".
+function onSignal(signal) {
+  if (shuttingDown) process.exit(shutdownExitCode);
+  shutdown(signal);
+}
+
+process.on('SIGTERM', () => onSignal('SIGTERM'));
+process.on('SIGINT', () => onSignal('SIGINT'));
