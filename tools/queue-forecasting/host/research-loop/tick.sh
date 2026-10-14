@@ -75,7 +75,10 @@ COPILOT_BACKOFF="${QF_TICK_COPILOT_BACKOFF_S:-30}"
 # Configurable behaviour flags live here. The structured-output flags remain at
 # the two call sites because usage logging requires them and is not optional.
 LEADER_FLAGS=(${QF_LEADER_FLAGS:---permission-mode bypassPermissions})
-COPILOT_FLAGS=(${QF_COPILOT_FLAGS:---skip-git-repo-check})
+# The model is pinned (-m) so the verifier cost does not follow Codex's built-in
+# default or ~/.codex/config.toml: a default drifted to the far pricier
+# gpt-6-astra and went unnoticed for weeks. Override with QF_COPILOT_FLAGS.
+COPILOT_FLAGS=(${QF_COPILOT_FLAGS:---skip-git-repo-check -m gpt-6-sol})
 
 # ENFORCED HERE, not only in the unit. `install.sh once` and a hand-run tick
 # execute this script directly, so a default that lived only in
