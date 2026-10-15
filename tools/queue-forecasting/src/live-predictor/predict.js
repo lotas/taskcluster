@@ -13,6 +13,8 @@
  *        b. Run p50 + p90 ONNX inference.
  *        c. Apply residual inverse (log_ratio: exp(raw) * (baseline + 1) - 1).
  *   5. INSERT into queue_forecast_run_predictions ON CONFLICT DO NOTHING.
+ *   6. If a shadow wait bundle is loaded, score it from the same features and
+ *      INSERT into queue_forecast_run_predictions_shadow (fail-soft).
  *
  * Rows that have already started/resolved by the time we get here are STILL
  * predicted — the prediction is anchored at pending_at for NOTIFY-triggered
@@ -57,6 +59,18 @@ INSERT INTO queue_forecast_run_predictions (
 ON CONFLICT (task_id, run_id) DO NOTHING
 ;`;
 
+// Shadow wait model (see migrate-shadow-predictions.sql). Same key as the main
+// table so the two join 1:1; never read by anything that serves predictions.
+const INSERT_SHADOW_SQL = `
+INSERT INTO queue_forecast_run_predictions_shadow (
+  task_id, run_id,
+  wait_p50_s, wait_p90_s,
+  wait_model_version, wait_artifact_hash,
+  input_features
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (task_id, run_id) DO NOTHING
+;`;
+
 const ENRICHMENT_POLL_INTERVAL_MS = 200;
 const ENRICHMENT_POLL_TIMEOUT_MS  = 5000;
 
@@ -70,6 +84,32 @@ function logRatioInverse(raw, baseline) {
 async function runQuantile(session, tensor) {
   const out = await session.run({ [session.inputNames[0]]: tensor });
   return out[session.outputNames[0]].data[0];
+}
+
+/**
+ * Score one wait bundle: p50/p90 ONNX inference, log_ratio inverse, then the
+ * queue+bucket baseline p90 floor. Shared by the served model and the shadow
+ * model so both see identical inputs and identical post-processing.
+ */
+async function scoreWait(bundle, row, liveFeatures, waitBaseline) {
+  const vec = buildFeatureVector(row, liveFeatures, bundle.schema, bundle.categories);
+  const tensor = new ort.Tensor('float32', vec, [1, vec.length]);
+  const rawP50 = await runQuantile(bundle.sessionP50, tensor);
+  const rawP90 = await runQuantile(bundle.sessionP90, tensor);
+  const bl = liveFeatures[bundle.schema.residual.baseline_feature];
+  const p50 = Math.max(0.0, logRatioInverse(rawP50, bl));
+  const rawModelP90 = Math.max(p50, logRatioInverse(rawP90, bl));
+
+  // Floor the served wait p90 with the queue+bucket historical baseline p90
+  // when the model compresses the tail; only the strong queue+bucket level
+  // with enough samples qualifies (weak fallbacks are badly miscalibrated).
+  const guardrail = applyWaitP90Guardrail({
+    waitP50: p50,
+    rawModelP90,
+    baseline: waitBaseline,
+    minSampleSize: WAIT_P90_GUARDRAIL_MIN_SAMPLE,
+  });
+  return { vec, p50, rawModelP90, guardrail, p90: guardrail.finalP90 };
 }
 
 /** Poll until queue_forecast_tasks.enriched_at IS NOT NULL or timeout. */
@@ -131,24 +171,8 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
   };
 
   // ── Wait model ───────────────────────────────────────────────────────────
-  const waitVec = buildFeatureVector(row, liveFeatures, bundles.wait.schema, bundles.wait.categories);
-  const waitTensor = new ort.Tensor('float32', waitVec, [1, waitVec.length]);
-  const waitRawP50 = await runQuantile(bundles.wait.sessionP50, waitTensor);
-  const waitRawP90 = await runQuantile(bundles.wait.sessionP90, waitTensor);
-  const waitBl = liveFeatures[bundles.wait.schema.residual.baseline_feature];
-  const waitP50 = Math.max(0.0, logRatioInverse(waitRawP50, waitBl));
-  const rawModelWaitP90 = Math.max(waitP50, logRatioInverse(waitRawP90, waitBl));
-
-  // Floor the served wait p90 with the queue+bucket historical baseline p90
-  // when the model compresses the tail; only the strong queue+bucket level
-  // with enough samples qualifies (weak fallbacks are badly miscalibrated).
-  const waitGuardrail = applyWaitP90Guardrail({
-    waitP50,
-    rawModelP90: rawModelWaitP90,
-    baseline: waitBaseline,
-    minSampleSize: WAIT_P90_GUARDRAIL_MIN_SAMPLE,
-  });
-  const waitP90 = waitGuardrail.finalP90;
+  const wait = await scoreWait(bundles.wait, row, liveFeatures, waitBaseline);
+  const { vec: waitVec, p50: waitP50, rawModelP90: rawModelWaitP90, guardrail: waitGuardrail, p90: waitP90 } = wait;
 
   // ── Duration model ───────────────────────────────────────────────────────
   const durVec = buildFeatureVector(row, liveFeatures, bundles.duration.schema, bundles.duration.categories);
@@ -212,6 +236,33 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
     bundles.duration.schema.model_version, bundles.duration.artifact_hash,
     JSON.stringify(inputFeaturesAudit),
   ]);
+
+  // Shadow wait model: scored from the SAME row/features/baseline as the served
+  // model, after the served insert has landed. Fail-soft by construction -- an
+  // error here must never cost the served prediction.
+  if (bundles.shadowWait && ins.rowCount === 1) {
+    try {
+      const sh = await scoreWait(bundles.shadowWait, row, liveFeatures, waitBaseline);
+      await pool.query(INSERT_SHADOW_SQL, [
+        taskId, runId,
+        sh.p50, sh.p90,
+        bundles.shadowWait.schema.model_version, bundles.shadowWait.artifact_hash,
+        JSON.stringify({
+          wait_p90_guardrail: {
+            applied:         sh.guardrail.applied,
+            raw_model_p90_s: sh.rawModelP90,
+            baseline_p90_s:  sh.guardrail.baselineP90,
+            final_p90_s:     sh.guardrail.finalP90,
+          },
+          wait_feature_order: bundles.shadowWait.schema.feature_order,
+          wait_vector:        Array.from(sh.vec, (x) => (Number.isFinite(x) ? x : null)),
+        }),
+      ]);
+    } catch (err) {
+      console.error(new Date().toISOString(), '[live-predictor]',
+        `shadow wait failed for ${taskId}/${runId}:`, err.message);
+    }
+  }
 
   return {
     inserted: ins.rowCount === 1,

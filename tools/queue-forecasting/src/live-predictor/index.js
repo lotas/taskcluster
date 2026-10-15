@@ -31,6 +31,9 @@ const MODELS_ROOT = path.join(PROJECT_ROOT, 'trainer', 'data', 'models');
 
 const WAIT_STEM      = 'wait_time_residual_throughput_filtered_baseline';
 const DURATION_STEM  = 'run_duration_residual';
+// Optional shadow wait model, scored alongside WAIT_STEM and written to
+// queue_forecast_run_predictions_shadow. Unset = off = behaviour unchanged.
+const SHADOW_WAIT_STEM = process.env.SHADOW_WAIT_STEM || null;
 const MAX_INFLIGHT   = 4;
 const POLL_INTERVAL_MS = Number(process.env.LIVE_PREDICTOR_POLL_MS || 5000);
 
@@ -111,20 +114,39 @@ function makeLimiter(max) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Shadow is best-effort: any failure to load it is logged and the predictor
+// serves without it. Only the anomaly_filter check below is fatal, and that
+// is a misconfiguration rather than a missing file.
+async function loadShadowBundle(modelDir) {
+  if (!SHADOW_WAIT_STEM) return null;
+  try {
+    return await loadBundle(modelDir, SHADOW_WAIT_STEM);
+  } catch (err) {
+    logErr(`SHADOW DISABLED: could not load ${SHADOW_WAIT_STEM} from ${modelDir}:`, err.message);
+    return null;
+  }
+}
+
 async function main() {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
 
+  // The served dir is chosen from the served stems ONLY: a missing shadow bundle
+  // must never push the served model back to an older day.
   const modelDir = findLatestModelDir(MODELS_ROOT, [WAIT_STEM, DURATION_STEM]);
   if (!modelDir) throw new Error(`No complete model directories under ${MODELS_ROOT}`);
   log('loading bundles from', modelDir);
 
-  const [waitBundle, durationBundle] = await Promise.all([
+  const [waitBundle, durationBundle, shadowWaitBundle] = await Promise.all([
     loadBundle(modelDir, WAIT_STEM),
     loadBundle(modelDir, DURATION_STEM),
+    loadShadowBundle(modelDir),
   ]);
   log('wait model:',     waitBundle.schema.model_version,     'artifact', waitBundle.artifact_hash);
   log('duration model:', durationBundle.schema.model_version, 'artifact', durationBundle.artifact_hash);
+  if (shadowWaitBundle) {
+    log('shadow wait model:', shadowWaitBundle.schema.model_version, 'artifact', shadowWaitBundle.artifact_hash);
+  }
 
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 10 });
 
@@ -141,11 +163,18 @@ async function main() {
   });
   log(`baseline filter — wait: ${stats._opts.waitFilterAnomalous}, ` +
       `duration: ${stats._opts.durationFilterAnomalous}`);
+  // BaselineStats is built once from the served wait bundle's filter setting and
+  // shared by both models. A shadow trained against a differently-filtered
+  // baseline would be scored on inputs it never saw in training, so refuse it.
+  if (shadowWaitBundle && filterFromSchema(shadowWaitBundle.schema) !== stats._opts.waitFilterAnomalous) {
+    throw new Error(`shadow ${SHADOW_WAIT_STEM} anomaly_filter differs from ${WAIT_STEM}; ` +
+      'it cannot share the served baseline stats');
+  }
   await stats.refresh();
   log('baseline stats refreshed');
   stats.startPeriodicRefresh();
 
-  const bundles = { wait: waitBundle, duration: durationBundle };
+  const bundles = { wait: waitBundle, duration: durationBundle, shadowWait: shadowWaitBundle };
   const acquire = makeLimiter(MAX_INFLIGHT);
 
   async function processOne(taskId, runId) {

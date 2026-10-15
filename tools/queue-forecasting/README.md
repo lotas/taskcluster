@@ -315,6 +315,17 @@ Required artifacts: the latest `trainer/data/models/<date>/` must contain the
 two production bundles (`wait_time_residual_throughput_filtered_baseline_*`
 and `run_duration_residual_*`).
 
+**Shadow wait model (optional).** Set `SHADOW_WAIT_STEM=<config stem>` to score a
+second wait bundle from the same features in the same pass and write it to
+`queue_forecast_run_predictions_shadow` (apply `migrate-shadow-predictions.sql`
+first). It never affects what is served: the served model directory is chosen
+without it, a shadow bundle that fails to load is logged (`SHADOW DISABLED`) and
+skipped, and a shadow error cannot cost the served row. It must use the same
+`anomaly_filter` as the served wait model, because the two share one baseline
+cache. Compare the two on resolved runs with `shadow-compare.sql`. Roll back by
+unsetting the variable; `DROP TABLE queue_forecast_run_predictions_shadow`
+removes the data.
+
 ## Database tables
 
 | Table | Grain | Source |

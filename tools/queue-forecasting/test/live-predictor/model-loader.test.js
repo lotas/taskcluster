@@ -119,3 +119,18 @@ test('findLatestModelDir returns null when no date has every required bundle', (
     null,
   );
 });
+
+test('findLatestModelDir is chosen from the served stems, so a shadow stem cannot be required by it', () => {
+  // index.js passes only the served stems; a night that has them but not the
+  // shadow bundle must still be selected rather than falling back a day.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'model-dates-'));
+  const served = ['wait_time_demo', 'run_duration_demo'];
+  const previous = path.join(root, '2026-08-29');
+  const latest = path.join(root, '2026-08-30');
+
+  for (const stem of [...served, 'wait_shadow_demo']) writeBundleFiles(previous, stem);
+  for (const stem of served) writeBundleFiles(latest, stem);
+
+  assert.equal(findLatestModelDir(root, served), latest);
+  assert.equal(findLatestModelDir(root, [...served, 'wait_shadow_demo']), previous);
+});
