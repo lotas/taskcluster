@@ -32,6 +32,7 @@ SUMMARY_CONFIGS="${SUMMARY_CONFIGS:-}"
 SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-walk_forward_summary.csv}"
 SKIP_SUMMARY=0
 DRY_RUN=0
+RESTART_LIVE_PREDICTOR="${RESTART_LIVE_PREDICTOR:-1}"
 
 usage() {
   cat >&2 <<USAGE
@@ -67,6 +68,8 @@ Environment overrides:
   SUMMARY_FROM, SUMMARY_TO    Summary date range.
   SUMMARY_CONFIGS             Summary config stems.
   SUMMARY_OUTPUT              Summary CSV path.
+  RESTART_LIVE_PREDICTOR      1 (default) restarts live-predictor onto the new
+                              models after a successful run; 0 skips it.
 USAGE
 }
 
@@ -288,6 +291,7 @@ lock_file:         ${LOCK_FILE}
 intent_dir:        ${INTENT_DIR}
 lock_wait_s:       ${LOCK_WAIT_S}
 dry_run:           ${DRY_RUN}
+restart_live:      ${RESTART_LIVE_PREDICTOR}
 CONFIG
 
 section "Postgres"
@@ -311,6 +315,39 @@ if [[ "$SKIP_SUMMARY" != 1 ]]; then
 else
   section "Summary"
   echo "skipped"
+fi
+
+# The live predictor loads models only at startup (findLatestModelDir picks the
+# newest COMPLETE day dir), so without a restart a retrain never reaches serving:
+# from 2026-10-14 to 2026-11-02 it served the 10-13 models through two retrains.
+# Restart only when this run produced the day dir for TO_DATE, and verify that the
+# predictor came back on it. Failure here is reported but does not fail the run:
+# the training it follows has already succeeded.
+section "Live predictor"
+if [[ "$RESTART_LIVE_PREDICTOR" != 1 ]]; then
+  echo "skipped (RESTART_LIVE_PREDICTOR=${RESTART_LIVE_PREDICTOR})"
+elif [[ "$DRY_RUN" == 1 ]]; then
+  print_cmd docker compose restart live-predictor
+elif [[ ! -d "trainer/data/models/${TO_DATE}" ]]; then
+  echo "WARN: trainer/data/models/${TO_DATE} not found; live predictor left on its current models" >&2
+else
+  restarted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if run_cmd docker compose restart live-predictor; then
+    loaded=""
+    for _ in $(seq 1 24); do
+      loaded="$(docker compose logs --no-log-prefix --since "$restarted_at" live-predictor 2>&1 \
+        | grep -m1 -o 'wait model: v_[0-9-]*' || true)"
+      [[ -n "$loaded" ]] && break
+      sleep 5
+    done
+    if [[ "$loaded" == "wait model: v_${TO_DATE}" ]]; then
+      echo "live predictor now serving models from ${TO_DATE}"
+    else
+      echo "WARN: live predictor restarted but reports '${loaded:-no model line within 120s}', expected v_${TO_DATE}" >&2
+    fi
+  else
+    echo "WARN: live predictor restart failed" >&2
+  fi
 fi
 
 section "Done"
