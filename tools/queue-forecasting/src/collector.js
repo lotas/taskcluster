@@ -1,4 +1,3 @@
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import taskcluster from '@taskcluster/client';
@@ -8,10 +7,13 @@ import { createTaskCache } from './cache.js';
 import { createPool, upsertTask, upsertTaskRun, enrichTask, getUnenrichedTaskIds } from './db.js';
 import { normalizeMetadataName } from './utils.js';
 import { deriveRepoFamily } from './repo-family.js';
+import { createQueueCounter } from './queue-counts.js';
+import { createErrorLog } from './error-log.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ERROR_LOG_PATH = process.env.COLLECTOR_ERROR_LOG || path.join(__dirname, '..', 'collector-errors.log');
-const errorLogStream = fs.createWriteStream(ERROR_LOG_PATH, { flags: 'a' });
+const ERROR_LOG_MAX_BYTES = parseInt(process.env.COLLECTOR_ERROR_LOG_MAX_BYTES || String(100 * 1024 * 1024), 10);
+const errorLogStream = createErrorLog(ERROR_LOG_PATH, { maxBytes: ERROR_LOG_MAX_BYTES });
 
 function logError(category, message, details = {}) {
   const entry = JSON.stringify({ ts: new Date().toISOString(), category, message, ...details });
@@ -26,9 +28,6 @@ const BACKFILL_INTERVAL_MS = 60_000; // 1 minute
 const MAX_BACKFILL_RETRIES = 3;
 const backfillFailCounts = new Map(); // taskId -> attempt count
 
-// --- Queue Pending Counter ---
-const pendingCounts = new Map();       // taskQueueId -> number
-const pendingCountsSeeded = new Set(); // queues that have been seeded from API
 const SYNC_INTERVAL_MS = 60_000;
 
 const pool = createPool(process.env.DATABASE_URL);
@@ -87,49 +86,24 @@ function failOnAuthError(err, context) {
   shutdown('auth-failure', { exitCode: 1, exitDelayMs: AUTH_FAILURE_EXIT_DELAY_MS });
 }
 
-// Seed a queue's counter from the API
-async function seedQueueCount(taskQueueId) {
-  try {
-    const counts = await queueClient.taskQueueCounts(taskQueueId);
-    pendingCounts.set(taskQueueId, counts.pendingTasks);
-    pendingCountsSeeded.add(taskQueueId);
-  } catch (err) {
-    if (isAuthFailure(err)) return failOnAuthError(err, `taskQueueCounts(${taskQueueId})`);
-    if (authFailed) return;
-    logError('queue-counts', `Seed failed for ${taskQueueId}: ${err.message}`, {
-      taskQueueId,
-      statusCode: err.statusCode,
-      code: err.code,
-    });
-  }
-}
+// --- Queue Pending Counter --- (see src/queue-counts.js for the 2026-10-29 incident)
+const queueCounter = createQueueCounter({
+  fetchCounts: taskQueueId => queueClient.taskQueueCounts(taskQueueId),
+  logError,
+  onFetchError: (err, context) => {
+    if (isAuthFailure(err)) {
+      failOnAuthError(err, context);
+      return true;
+    }
+    return authFailed;
+  },
+  maxConcurrent: MAX_CONCURRENT_FETCHES,
+});
 
-// Get current pending count (seeds from API on first encounter)
-async function getQueuePending(taskQueueId) {
-  if (!taskQueueId) return null;
-  if (!pendingCountsSeeded.has(taskQueueId)) {
-    await seedQueueCount(taskQueueId);
-  }
-  return pendingCounts.get(taskQueueId) ?? null;
-}
-
-function incrementQueuePending(taskQueueId) {
-  if (!taskQueueId || !pendingCountsSeeded.has(taskQueueId)) return;
-  pendingCounts.set(taskQueueId, (pendingCounts.get(taskQueueId) || 0) + 1);
-}
-
-function decrementQueuePending(taskQueueId) {
-  if (!taskQueueId || !pendingCountsSeeded.has(taskQueueId)) return;
-  const current = pendingCounts.get(taskQueueId) || 0;
-  pendingCounts.set(taskQueueId, Math.max(0, current - 1));
-}
-
-// Periodic sync — re-fetch counts for all seeded queues to correct drift
 async function syncAllQueueCounts() {
-  const queues = [...pendingCountsSeeded];
-  for (let i = 0; i < queues.length; i += MAX_CONCURRENT_FETCHES) {
-    const batch = queues.slice(i, i + MAX_CONCURRENT_FETCHES);
-    await Promise.all(batch.map(qid => seedQueueCount(qid)));
+  const res = await queueCounter.sync();
+  if (!res.skipped && res.evicted > 0) {
+    console.log(`[queue-counts] sync: ${res.synced} queues, ${res.failed} failed, ${res.evicted} idle evicted`);
   }
 }
 
@@ -190,8 +164,8 @@ async function handleTaskPending(payload) {
   // includes this task's pending event (Pulse delivers after state change),
   // but our local counter hasn't counted it yet. Incrementing first keeps
   // the snapshot aligned with reality.
-  incrementQueuePending(taskQueueId);
-  const queuePending = await getQueuePending(taskQueueId);
+  queueCounter.increment(taskQueueId);
+  const queuePending = await queueCounter.getPending(taskQueueId);
 
   await upsertTask(pool, {
     task_id: status.taskId,
@@ -221,7 +195,7 @@ async function handleTaskRunning(payload) {
     run_id: runId,
     ...runFields,
   });
-  decrementQueuePending(status.taskQueueId || null);
+  queueCounter.decrement(status.taskQueueId || null);
 }
 
 async function handleResolved(payload) {
@@ -245,7 +219,7 @@ async function handleResolved(payload) {
   // counter was incremented at task-pending but never decremented at
   // task-running. Correct the drift here.
   if (!runFields.started_at) {
-    decrementQueuePending(status.taskQueueId || null);
+    queueCounter.decrement(status.taskQueueId || null);
   }
 }
 
@@ -271,7 +245,7 @@ async function handleTaskException(payload) {
 
     // Exception without starting — pending counter was never decremented
     if (!runFields.started_at) {
-      decrementQueuePending(status.taskQueueId || null);
+      queueCounter.decrement(status.taskQueueId || null);
     }
   }
 }
@@ -424,7 +398,9 @@ async function backfillSweep() {
 }
 
 const backfillTimer = setInterval(backfillSweep, BACKFILL_INTERVAL_MS);
-const syncTimer = setInterval(syncAllQueueCounts, SYNC_INTERVAL_MS);
+const syncTimer = setInterval(() => {
+  syncAllQueueCounts().catch(err => logError('queue-counts', `Sync error: ${err.message}`));
+}, SYNC_INTERVAL_MS);
 
 // --- Missing queue_pending Monitor ---
 
