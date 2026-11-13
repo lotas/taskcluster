@@ -29,6 +29,7 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 # at a time, so the blast radius is just this query, not max_connections × the
 # global value. The modest global default lives in docker-compose.yml.
 TRAINER_WORK_MEM = os.environ.get("TRAINER_WORK_MEM", "512MB")
+MAIN_FETCH_CHUNK_ROWS = int(os.environ.get("QF_MAIN_FETCH_CHUNK_ROWS", "500000"))
 
 # High-cardinality string columns that repeat heavily across rows (queue ids,
 # scheduler ids, task/normalized names, repo family, priority). These stay
@@ -637,18 +638,76 @@ def _fetch_main_dataset_from_db(c: Config) -> pd.DataFrame:
         "train_start": w.train_start,
         "as_of_date": w.as_of_date,
     }
+    # Stream through a server-side cursor in chunks, downcasting each chunk as
+    # it arrives. The previous read_sql_query/fetchall path held every row as
+    # Python tuples AND the object-dtype frame at once; on 2026-11-11 that
+    # peaked past the 22g trainer cgroup for run_duration_residual (~7.9M rows)
+    # and the weekly walk-forward was OOM-killed.
+    chunks: list[pd.DataFrame] = []
     with _connect(dsn) as conn:
-        try:
-            df = pd.read_sql_query(query, conn, params=params)
-        except Exception:
-            # pandas may not support psycopg3 connections directly;
-            # fall back to manual cursor fetch.
-            with conn.cursor() as cur:
-                cur.execute(query, params)
-                rows = cur.fetchall()
-                columns = [d.name for d in cur.description]
-                df = pd.DataFrame(rows, columns=columns)
-    return _downcast_categorical_columns(df)
+        with conn.cursor(name="qf_main_dataset") as cur:
+            cur.itersize = MAIN_FETCH_CHUNK_ROWS
+            cur.execute(query, params)
+            columns: list[str] | None = None
+            while True:
+                rows = cur.fetchmany(MAIN_FETCH_CHUNK_ROWS)
+                if columns is None:
+                    columns = [d.name for d in cur.description]
+                if not rows:
+                    break
+                chunk = _frame_from_rows(rows, columns)
+                del rows
+                chunks.append(_downcast_categorical_columns(chunk))
+    if not chunks:
+        return _downcast_categorical_columns(pd.DataFrame(columns=columns or []))
+    return _concat_fetched_chunks(chunks)
+
+
+def _frame_from_rows(rows: list[tuple], columns: list[str]) -> pd.DataFrame:
+    """Build a chunk exactly as ``pd.read_sql_query`` (the previous fetch path)
+    would: coerce_float turns Decimal into float64 and tz-aware datetimes are
+    normalized to UTC. Falls back to the public equivalent if pandas moves the
+    private helper."""
+    try:
+        from pandas.io.sql import _wrap_result
+    except ImportError:  # pragma: no cover - pandas internals moved
+        return pd.DataFrame.from_records(rows, columns=columns, coerce_float=True)
+    return _wrap_result(rows, columns, coerce_float=True)
+
+
+def _concat_fetched_chunks(chunks: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate per-chunk frames so the result's dtypes match a single
+    whole-result fetch.
+
+    Two per-chunk inference artifacts are undone before concat:
+    - a chunk whose column is entirely NULL infers ``object``; when the
+      non-null chunks agree on a float/int/datetime dtype it is cast to that
+      (int becomes float64, as a whole fetch with NULLs would infer);
+    - categoricals with differing category sets would concat to ``object``,
+      so their categories are unified first.
+    """
+    if len(chunks) == 1:
+        return chunks[0]
+    for col in chunks[0].columns:
+        if isinstance(chunks[0][col].dtype, pd.CategoricalDtype):
+            cats = pd.api.types.union_categoricals(
+                [ch[col] for ch in chunks], ignore_order=True
+            ).categories
+            for ch in chunks:
+                ch[col] = ch[col].cat.set_categories(cats)
+            continue
+        informative = {str(ch[col].dtype) for ch in chunks if ch[col].notna().any()}
+        if len(informative) != 1:
+            continue
+        target = chunks[next(i for i, ch in enumerate(chunks) if ch[col].notna().any())][col].dtype
+        if pd.api.types.is_integer_dtype(target):
+            target = "float64"
+        elif not (pd.api.types.is_float_dtype(target) or pd.api.types.is_datetime64_any_dtype(target)):
+            continue
+        for ch in chunks:
+            if not ch[col].notna().any() and str(ch[col].dtype) != str(target):
+                ch[col] = ch[col].astype(target)
+    return pd.concat(chunks, ignore_index=True)
 
 
 def _write_main_cache(df: pd.DataFrame, path: Path) -> None:

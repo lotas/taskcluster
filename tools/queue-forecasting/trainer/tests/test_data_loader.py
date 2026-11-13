@@ -433,3 +433,101 @@ def test_resolve_baseline_file_raises_when_both_set():
     )
     with pytest.raises(ValueError, match="both"):
         dl.resolve_baseline_file(c)
+
+
+class _FakeServerCursor:
+    """Mimics a psycopg server-side cursor: fetchmany over fixed rows."""
+
+    def __init__(self, columns, rows):
+        self._columns = columns
+        self._rows = list(rows)
+        self.description = None
+        self.itersize = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, _query, _params):
+        from types import SimpleNamespace
+
+        self.description = [SimpleNamespace(name=c) for c in self._columns]
+
+    def fetchmany(self, n):
+        out, self._rows = self._rows[:n], self._rows[n:]
+        return out
+
+
+class _FakeConn:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.cursor_names = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self, name=None):
+        self.cursor_names.append(name)
+        return self._cursor
+
+
+def _fetch_with_rows(monkeypatch, columns, rows, chunk):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(dl, "MAIN_FETCH_CHUNK_ROWS", chunk)
+    monkeypatch.setattr(dl, "_build_query", lambda _c: "SELECT 1")
+    conn = _FakeConn(_FakeServerCursor(columns, rows))
+    monkeypatch.setattr(dl, "_connect", lambda _dsn: conn)
+    return dl._fetch_main_dataset_from_db(_cfg()), conn
+
+
+def test_fetch_main_dataset_chunked_matches_single_fetch(monkeypatch):
+    import datetime as dt
+
+    import pandas as pd
+
+    cat_col = dl.CATEGORICAL_DOWNCAST_COLUMNS[0]
+    columns = ["task_id", cat_col, "n", "x", "ts"]
+    t = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)
+    rows = [
+        ("a", "p1", 1, 0.5, t),
+        ("b", "p2", 2, 1.5, t),
+        # chunk 2: all NULL in n/x/ts -> per-chunk inference gives object
+        ("c", "p3", None, None, None),
+        ("d", None, None, None, None),
+        ("e", "p1", 5, 2.5, t),
+    ]
+    whole, _ = _fetch_with_rows(monkeypatch, columns, rows, chunk=1000)
+    assert str(whole["ts"].dtype).startswith("datetime64")
+    chunked, conn = _fetch_with_rows(monkeypatch, columns, rows, chunk=2)
+
+    assert conn.cursor_names == ["qf_main_dataset"]
+    assert isinstance(chunked[cat_col].dtype, pd.CategoricalDtype)
+    assert dict(chunked.dtypes.astype(str)) == dict(whole.dtypes.astype(str))
+    pd.testing.assert_frame_equal(
+        chunked.astype({cat_col: object}), whole.astype({cat_col: object})
+    )
+
+
+def test_fetch_main_dataset_keeps_bool_with_nulls_as_object(monkeypatch):
+    rows = [("a", True), ("b", False), ("c", None), ("d", None)]
+    chunked, _ = _fetch_with_rows(monkeypatch, ["task_id", "flag"], rows, chunk=2)
+    assert chunked["flag"].tolist() == [True, False, None, None]
+
+
+def test_fetch_main_dataset_empty_result(monkeypatch):
+    df, _ = _fetch_with_rows(monkeypatch, ["task_id", "n"], [], chunk=2)
+    assert list(df.columns) == ["task_id", "n"] and len(df) == 0
+
+
+def test_fetch_main_dataset_coerces_decimal_like_read_sql(monkeypatch):
+    from decimal import Decimal
+
+    rows = [("a", Decimal("1.5")), ("b", Decimal("2")), ("c", None), ("d", None)]
+    chunked, _ = _fetch_with_rows(monkeypatch, ["task_id", "num"], rows, chunk=2)
+    assert str(chunked["num"].dtype) == "float64"
+    assert chunked["num"].tolist()[:2] == [1.5, 2.0]

@@ -262,7 +262,7 @@ tmp="$INTENT_FILE.tmp"
   || { echo "ERROR: cannot write $tmp" >&2; exit 1; }
 chmod 0640 "$tmp" && mv -f "$tmp" "$INTENT_FILE" \
   || { echo "ERROR: cannot publish $INTENT_FILE" >&2; rm -f "$tmp"; exit 1; }
-trap 'rm -f "$INTENT_FILE" "$tmp"' EXIT
+trap 'rc=$?; rm -f "$INTENT_FILE" "$tmp"; if [[ $rc -ne 0 ]]; then echo "ERROR: daily walk-forward FAILED (exit ${rc}) at $(date -u +%Y-%m-%dT%H:%M:%SZ) for ${FROM_DATE}..${TO_DATE}; live predictor NOT restarted (exit 137 = OOM-killed; check journalctl -k)" >&2; fi' EXIT
 
 exec 9>"$LOCK_FILE"
 # Bounded wait, not -n: light experiments hold this lock SHARED for their
