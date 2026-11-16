@@ -30,6 +30,7 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 # global value. The modest global default lives in docker-compose.yml.
 TRAINER_WORK_MEM = os.environ.get("TRAINER_WORK_MEM", "512MB")
 MAIN_FETCH_CHUNK_ROWS = int(os.environ.get("QF_MAIN_FETCH_CHUNK_ROWS", "500000"))
+BASELINE_PARSE_CHUNK_ROWS = int(os.environ.get("QF_BASELINE_PARSE_CHUNK_ROWS", "500000"))
 
 # High-cardinality string columns that repeat heavily across rows (queue ids,
 # scheduler ids, task/normalized names, repo family, priority). These stay
@@ -299,7 +300,32 @@ def load_baseline_predictions(
     import json as _json
     lo = _utc_second_prefix(pending_from) if pending_from is not None else None
     hi = _utc_second_prefix(pending_to) if pending_to is not None else None
+    # Join keys + the baseline quantiles, always; the guardrail inputs
+    # (`*_level`, `*_sample_size`) when the export carried them. Exports before
+    # 2026-09 did not, and a missing optional column is the trainer's cue to
+    # fall back to the legacy priority-blind floor (see compute_guarded_p90).
+    keep = ["task_id", "run_id", "bl_duration_p50", "bl_duration_p90",
+            "bl_wait_p50", "bl_wait_p90"]
+    optional = ["bl_duration_level", "bl_duration_sample_size",
+                "bl_wait_level", "bl_wait_sample_size"]
+
+    # CHUNKED, projected as it goes. Materialising every in-window record as a
+    # dict before building the frame cost ~15GB transient for run_duration's
+    # 9.25M-row window (profiled 2026-11-13: 7.1GB -> 22.0GB peak against a
+    # 22g cap, for a frame that ends at 1.2GB). Each chunk of dicts is turned
+    # into a narrow frame and dropped before the next is parsed.
+    chunks: list[pd.DataFrame] = []
+    seen_optional: set[str] = set()
     records: list[dict] = []
+
+    def _flush() -> None:
+        if not records:
+            return
+        chunk = pd.DataFrame.from_records(records)
+        seen_optional.update(col for col in optional if col in chunk.columns)
+        chunks.append(chunk[[col for col in keep + optional if col in chunk.columns]])
+        records.clear()
+
     with Path(path).open() as fh:
         for line in fh:
             line = line.strip()
@@ -313,17 +339,14 @@ def load_baseline_predictions(
                 if (lo is not None and at < lo) or (hi is not None and at > hi):
                     continue
             records.append(rec)
-    df = pd.DataFrame.from_records(records)
-    # Join keys + the baseline quantiles, always; the guardrail inputs
-    # (`*_level`, `*_sample_size`) when the export carried them. Exports before
-    # 2026-09 did not, and a missing optional column is the trainer's cue to
-    # fall back to the legacy priority-blind floor (see compute_guarded_p90).
-    keep = ["task_id", "run_id", "bl_duration_p50", "bl_duration_p90",
-            "bl_wait_p50", "bl_wait_p90"]
-    optional = ["bl_duration_level", "bl_duration_sample_size",
-                "bl_wait_level", "bl_wait_sample_size"]
-    keep += [col for col in optional if col in df.columns]
-    return df[keep]
+            if len(records) >= BASELINE_PARSE_CHUNK_ROWS:
+                _flush()
+    _flush()
+
+    cols = keep + [col for col in optional if col in seen_optional]
+    if not chunks:
+        return pd.DataFrame(columns=cols)
+    return _concat_fetched_chunks([ch.reindex(columns=cols) for ch in chunks])
 
 
 def load_worker_counts(
@@ -680,8 +703,9 @@ def _concat_fetched_chunks(chunks: list[pd.DataFrame]) -> pd.DataFrame:
     whole-result fetch.
 
     Two per-chunk inference artifacts are undone before concat:
-    - a chunk whose column is entirely NULL infers ``object``; when the
-      non-null chunks agree on a float/int/datetime dtype it is cast to that
+    - a chunk whose column is entirely NULL (or absent, reindexed in) infers
+      ``object``/float; when the
+      non-null chunks agree on a float/int/datetime/str dtype it is cast to that
       (int becomes float64, as a whole fetch with NULLs would infer);
     - categoricals with differing category sets would concat to ``object``,
       so their categories are unified first.
@@ -702,7 +726,9 @@ def _concat_fetched_chunks(chunks: list[pd.DataFrame]) -> pd.DataFrame:
         target = chunks[next(i for i, ch in enumerate(chunks) if ch[col].notna().any())][col].dtype
         if pd.api.types.is_integer_dtype(target):
             target = "float64"
-        elif not (pd.api.types.is_float_dtype(target) or pd.api.types.is_datetime64_any_dtype(target)):
+        elif not (pd.api.types.is_float_dtype(target)
+                  or pd.api.types.is_datetime64_any_dtype(target)
+                  or isinstance(target, pd.StringDtype)):
             continue
         for ch in chunks:
             if not ch[col].notna().any() and str(ch[col].dtype) != str(target):
@@ -787,6 +813,14 @@ def load(
     # cheap no-op) -- also covers cache-hit reads of parquet files written
     # before this downcast existed, without needing a cache-format bump.
     df = _downcast_categorical_columns(df)
+
+    # Pull the configured tag keys out and DROP the per-row `tags` dict column
+    # here, before the sort/merge/split copies multiply it. Nothing downstream
+    # reads `tags` except this extraction (FeatureBuilder skips it when the
+    # column is gone); it was 3.7GB of run_duration's 5.3GB frame, and the
+    # dicts outlived `del df` because every split copy shares them.
+    from src.features import extract_tag_columns
+    df = extract_tag_columns(df, c, drop_tags=True)
 
     # CANONICAL ROW ORDER. Not cosmetic, and not for the extract path's benefit.
     #

@@ -199,6 +199,28 @@ services:
     entrypoint: ["uv", "run", "python", "-m", "src.train"]
     working_dir: /app/trainer
 
+  # Live shadow task-group ETA (group-eta-plan.md P2; scripts/group_eta_live.sh).
+  # Same image as trainer but a small cap: it fits edge-free quantile tables,
+  # not boosted models, and must never compete with the 22g heavy trainer.
+  group-eta:
+    image: queue-forecasting-trainer:latest
+    mem_limit: "6g"
+    oom_score_adj: 300
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - trainer
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
+    volumes:
+      - ./trainer:/app/trainer
+    entrypoint: ["uv", "run", "python", "-m", "scripts.group_eta_live"]
+    working_dir: /app/trainer
+
   worker-counter:
     build:
       context: ../..

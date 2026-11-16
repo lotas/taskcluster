@@ -22,6 +22,47 @@ OPTIONAL_META_COLUMNS = ["bl_wait_level", "bl_wait_sample_size",
                          "bl_duration_level", "bl_duration_sample_size"]
 
 
+def tag_feature_names(config: Config) -> list[str]:
+    return [c for c in config.categorical_features + config.numeric_features
+            if c.startswith("tags.")]
+
+
+def extract_tag_columns(df: pd.DataFrame, config: Config, *, drop_tags: bool = False) -> pd.DataFrame:
+    """Materialise each configured `tags.<key>` feature as its own column.
+
+    With ``drop_tags`` the per-row dict column is dropped afterwards. That
+    column is the single largest thing in a tag-heavy frame -- 3.7GB of the
+    5.3GB run_duration frame (8.58M rows, profiled 2026-11-13) -- and nothing
+    reads it except this extraction, so the loader drops it as soon as the
+    keys it needs are out.
+    """
+    tag_features = tag_feature_names(config)
+    if not tag_features or "tags" not in df.columns:
+        return df
+
+    def _get(tags, key):
+        if tags is None:
+            return None
+        if isinstance(tags, dict):
+            return tags.get(key)
+        return None
+
+    categorical = set(config.categorical_features)
+    for feat in tag_features:
+        key = feat.split(".", 1)[1]
+        series = df["tags"].apply(lambda t, k=key: _get(t, k))
+        # .apply() always produces object dtype (dict values aren't
+        # natively categorical); downcast immediately for declared
+        # categorical tag features rather than leaving them object dtype
+        # through the rest of this wide intermediate frame -- for a
+        # tag-heavy config (run_duration_residual has 9 of these) that's
+        # real, avoidable peak memory (observed live 2026-07-15).
+        df[feat] = series.astype("category") if feat in categorical else series
+    if drop_tags:
+        df = df.drop(columns=["tags"])
+    return df
+
+
 @dataclass
 class Split:
     X: pd.DataFrame
@@ -96,28 +137,9 @@ class FeatureBuilder:
         return X, y, meta
 
     def _extract_tags(self, df: pd.DataFrame) -> pd.DataFrame:
-        tag_features = [c for c in self.config.categorical_features + self.config.numeric_features
-                        if c.startswith("tags.")]
-        if not tag_features or "tags" not in df.columns:
-            return df
-        def _get(tags, key):
-            if tags is None:
-                return None
-            if isinstance(tags, dict):
-                return tags.get(key)
-            return None
-        categorical = set(self.config.categorical_features)
-        for feat in tag_features:
-            key = feat.split(".", 1)[1]
-            series = df["tags"].apply(lambda t, k=key: _get(t, k))
-            # .apply() always produces object dtype (dict values aren't
-            # natively categorical); downcast immediately for declared
-            # categorical tag features rather than leaving them object dtype
-            # through the rest of this wide intermediate frame -- for a
-            # tag-heavy config (run_duration_residual has 9 of these) that's
-            # real, avoidable peak memory (observed live 2026-07-15).
-            df[feat] = series.astype("category") if feat in categorical else series
-        return df
+        # data_loader.load() normally extracts these and drops `tags` already
+        # (see extract_tag_columns); this covers frames built any other way.
+        return extract_tag_columns(df, self.config)
 
     def _apply_derived(self, df: pd.DataFrame) -> pd.DataFrame:
         derived = self.config.derived_features or {}

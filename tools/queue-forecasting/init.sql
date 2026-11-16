@@ -25,8 +25,22 @@ CREATE TABLE IF NOT EXISTS queue_forecast_tasks (
     repo_family        TEXT,
     repo_family_source TEXT,
     repo_family_evidence TEXT,
-    repo_family_derivation_version INTEGER
+    repo_family_derivation_version INTEGER,
+    -- group-eta-plan.md P0 (see migrate-task-deps.sql)
+    requires           TEXT,
+    deadline           TIMESTAMPTZ,
+    dependency_count   INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS queue_forecast_task_deps (
+    task_id             TEXT NOT NULL
+                        REFERENCES queue_forecast_tasks(task_id) ON DELETE CASCADE,
+    dependency_task_id  TEXT NOT NULL,
+    PRIMARY KEY (task_id, dependency_task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_qf_task_deps_dependency
+    ON queue_forecast_task_deps (dependency_task_id);
 
 -- ==========================================
 -- TABLE 2: Per-run execution data

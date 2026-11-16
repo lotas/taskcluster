@@ -101,8 +101,21 @@ UPDATE queue_forecast_tasks SET
   repo_family_source             = COALESCE($13, repo_family_source),
   repo_family_evidence           = COALESCE($14, repo_family_evidence),
   repo_family_derivation_version = COALESCE($15, repo_family_derivation_version),
+  requires          = COALESCE($16, requires),
+  deadline          = COALESCE($17, deadline),
+  dependency_count  = COALESCE($18, dependency_count),
   enriched_at       = COALESCE(enriched_at, now())
 WHERE task_id = $1;
+`;
+
+// Dependency edges for task-group ETA (group-eta-plan.md P0). Rows cascade-delete
+// with their task, so retention needs no extra target. Only inserted when the
+// task row exists (UPDATE matched); otherwise the backfill cache path retries.
+const INSERT_TASK_DEPS_SQL = `
+INSERT INTO queue_forecast_task_deps (task_id, dependency_task_id)
+SELECT $1, d FROM unnest($2::text[]) AS d
+WHERE d IS NOT NULL AND d <> $1
+ON CONFLICT DO NOTHING;
 `;
 
 export async function enrichTask(pool, taskId, enrichment) {
@@ -114,9 +127,12 @@ export async function enrichTask(pool, taskId, enrichment) {
     max_run_time_s = null,
     repo_family = null, repo_family_source = null,
     repo_family_evidence = null, repo_family_derivation_version = null,
+    requires = null, deadline = null, dependencies = null,
   } = enrichment;
 
-  await pool.query(ENRICH_TASK_SQL, [
+  const deps = Array.isArray(dependencies) ? [...new Set(dependencies)] : null;
+
+  const res = await pool.query(ENRICH_TASK_SQL, [
     taskId,
     metadata_name, normalized_name,
     tags ? JSON.stringify(tags) : null,
@@ -125,7 +141,12 @@ export async function enrichTask(pool, taskId, enrichment) {
     scheduler_id, project_id,
     max_run_time_s,
     repo_family, repo_family_source, repo_family_evidence, repo_family_derivation_version,
+    requires, deadline, deps ? deps.length : null,
   ]);
+
+  if (deps && deps.length > 0 && res?.rowCount > 0) {
+    await pool.query(INSERT_TASK_DEPS_SQL, [taskId, deps]);
+  }
 }
 
 // --- Unenriched task query ---

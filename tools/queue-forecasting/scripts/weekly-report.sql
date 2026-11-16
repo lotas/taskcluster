@@ -99,3 +99,56 @@ SELECT CASE WHEN a < 60 THEN '1:<1m' WHEN a < 300 THEN '2:1-5m'
        round(avg(sp90)::numeric, 1) AS served_mean_p90_s,
        round(avg(hp90)::numeric, 1) AS shadow_mean_p90_s
 FROM scored GROUP BY 1 ORDER BY 1;
+
+\echo
+\echo '## 5. Dependency-edge collection (group-eta-plan.md P0, live since 2026-11-16 14:38Z)'
+\echo 'deps_cov = share of created tasks with edges collected (dependency_count NOT NULL); should be ~1.0 after 11-16.'
+SELECT d.day::date AS day,
+       x.tasks, x.deps_cov, x.zero_deps, x.avg_deps, x.max_deps, x.edges
+FROM generate_series(date_trunc('day', now()) - (:days || ' days')::interval,
+                     date_trunc('day', now()), '1 day') AS d(day)
+LEFT JOIN LATERAL (
+  SELECT count(*) AS tasks,
+         round(avg((t.dependency_count IS NOT NULL)::int), 3) AS deps_cov,
+         count(*) FILTER (WHERE t.dependency_count = 0) AS zero_deps,
+         round(avg(t.dependency_count), 2) AS avg_deps,
+         max(t.dependency_count) AS max_deps,
+         sum(t.dependency_count) AS edges
+  FROM queue_forecast_tasks t
+  WHERE t.task_created >= d.day AND t.task_created < d.day + interval '1 day'
+) x ON true
+ORDER BY 1;
+
+SELECT pg_size_pretty(pg_total_relation_size('queue_forecast_task_deps')) AS deps_table_size;
+
+\echo
+\echo '## 6. Shadow task-group ETA (group-eta-plan.md P2), groups predicted since' :since
+\echo 'label = completion of the original graph (tasks created <= t_pred) - t0; only fully-resolved groups older than 1 day.'
+\echo 'internal bars (try): cov90 in [0.85, 0.93], w2x >= 0.70.'
+WITH pg AS (
+  SELECT DISTINCT task_group_id, t0, t_pred
+  FROM queue_forecast_group_predictions_shadow
+  WHERE t_pred >= :since::timestamptz AND t_pred < now() - interval '1 day'
+), lab AS (
+  SELECT pg.task_group_id,
+         extract(epoch FROM max(r.resolved_at) - pg.t0) AS span,
+         bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS incomplete
+  FROM pg
+  JOIN queue_forecast_tasks t
+    ON t.task_group_id = pg.task_group_id
+   AND t.task_created >= pg.t0 AND t.task_created <= pg.t_pred
+  LEFT JOIN queue_forecast_task_runs r ON r.task_id = t.task_id
+  GROUP BY pg.task_group_id, pg.t0
+), s AS (
+  SELECT p.repo_family, p.estimator, l.span AS y, p.p50_s AS p50, p.p90_s AS p90
+  FROM queue_forecast_group_predictions_shadow p
+  JOIN lab l USING (task_group_id)
+  WHERE NOT l.incomplete AND l.span > 0
+)
+SELECT repo_family, estimator, count(*) AS n,
+       round((percentile_cont(0.5) WITHIN GROUP (ORDER BY y) / 60)::numeric, 1) AS med_span_min,
+       round((avg(abs(y - p50)) / 60)::numeric, 1) AS mae_min,
+       round(avg((y BETWEEN p50 / 2 AND p50 * 2)::int)::numeric, 3) AS w2x,
+       round(avg((y <= p90)::int)::numeric, 3) AS cov90,
+       round((avg(CASE WHEN y >= p90 THEN 0.9 * (y - p90) ELSE 0.1 * (p90 - y) END) / 60)::numeric, 1) AS pin90_min
+FROM s GROUP BY 1, 2 ORDER BY 1, 2;

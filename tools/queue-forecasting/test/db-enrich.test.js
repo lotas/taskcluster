@@ -29,3 +29,53 @@ test('enrichTask leaves repo_family params null when not provided', async () => 
   assert.equal(captured.params[11], null);
   assert.equal(captured.params[14], null);
 });
+
+function capturingPool(rowCount = 1) {
+  const calls = [];
+  return { calls, async query(sql, params) { calls.push({ sql, params }); return { rows: [], rowCount }; } };
+}
+
+test('enrichTask writes requires/deadline/dependency_count as $16..$18', async () => {
+  const pool = capturingPool();
+  await enrichTask(pool, 'T3', {
+    metadata_name: 'x', requires: 'all-completed', deadline: '2026-11-17T00:00:00.000Z',
+    dependencies: ['D1', 'D2', 'D1'],
+  });
+  const [upd] = pool.calls;
+  assert.ok(/requires\s*=\s*COALESCE\(\$16/.test(upd.sql));
+  assert.ok(/deadline\s*=\s*COALESCE\(\$17/.test(upd.sql));
+  assert.ok(/dependency_count\s*=\s*COALESCE\(\$18/.test(upd.sql));
+  assert.equal(upd.params[15], 'all-completed');
+  assert.equal(upd.params[16], '2026-11-17T00:00:00.000Z');
+  assert.equal(upd.params[17], 2, 'dependency_count counts unique deps');
+});
+
+test('enrichTask inserts deduplicated dependency edges after a matched UPDATE', async () => {
+  const pool = capturingPool(1);
+  await enrichTask(pool, 'T4', { metadata_name: 'x', dependencies: ['D1', 'D2', 'D1'] });
+  assert.equal(pool.calls.length, 2);
+  const ins = pool.calls[1];
+  assert.ok(ins.sql.includes('queue_forecast_task_deps'));
+  assert.equal(ins.params[0], 'T4');
+  assert.deepEqual(ins.params[1], ['D1', 'D2']);
+});
+
+test('enrichTask records dependency_count 0 and skips insert for no deps', async () => {
+  const pool = capturingPool(1);
+  await enrichTask(pool, 'T5', { metadata_name: 'x', dependencies: [] });
+  assert.equal(pool.calls.length, 1);
+  assert.equal(pool.calls[0].params[17], 0);
+});
+
+test('enrichTask leaves dependency_count NULL when deps were not fetched', async () => {
+  const pool = capturingPool(1);
+  await enrichTask(pool, 'T6', { metadata_name: 'x' });
+  assert.equal(pool.calls.length, 1);
+  assert.equal(pool.calls[0].params[17], null);
+});
+
+test('enrichTask skips edge insert when the task row does not exist yet', async () => {
+  const pool = capturingPool(0);
+  await enrichTask(pool, 'T7', { metadata_name: 'x', dependencies: ['D1'] });
+  assert.equal(pool.calls.length, 1, 'FK would fail; backfill cache path retries later');
+});

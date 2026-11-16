@@ -41,6 +41,7 @@ const TARGETS = [
   { table: 'queue_forecast_tasks',           column: 'task_created' },
   { table: 'queue_forecast_run_predictions', column: 'predicted_at' },
   { table: 'queue_forecast_worker_counts',   column: 'sampled_at' },
+  { table: 'queue_forecast_group_predictions_shadow', column: 'predicted_at' },
 ];
 
 // Batched delete by physical row id (ctid). The cutoff filter uses each

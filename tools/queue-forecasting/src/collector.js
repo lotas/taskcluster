@@ -280,6 +280,9 @@ async function backgroundApiFetch(taskId, status) {
       repo_family_source: rf.source,
       repo_family_evidence: rf.evidence,
       repo_family_derivation_version: rf.version,
+      requires: taskDef.requires || null,
+      deadline: taskDef.deadline || null,
+      dependencies: Array.isArray(taskDef.dependencies) ? taskDef.dependencies : [],
     };
     await enrichTask(pool, taskId, enrichment);
     taskCache.set(taskId, enrichment);

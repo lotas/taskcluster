@@ -682,3 +682,13 @@ def test_canonical_sort_breaks_ties_on_a_total_key(tmp_path):
     xs.configure(write_extract(tmp_path / "extract", runs_rows=rows))
     got = dl.load(_cfg())
     assert list(got["task_id"]) == ["t-a", "t-b", "t-c"]
+
+
+def test_load_extracts_tag_features_and_drops_tags_dicts(tmp_path):
+    xs.configure(write_extract(tmp_path / "extract"))
+    df = dl.load(_cfg())  # _cfg declares tags.kind
+    assert "tags" not in df.columns
+    assert "tags.kind" in df.columns
+    assert isinstance(df["tags.kind"].dtype, pd.CategoricalDtype)
+    assert df["tags.kind"].notna().all()
+    assert "tags.worker-implementation" not in df.columns  # only declared keys

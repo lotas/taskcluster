@@ -531,3 +531,66 @@ def test_fetch_main_dataset_coerces_decimal_like_read_sql(monkeypatch):
     chunked, _ = _fetch_with_rows(monkeypatch, ["task_id", "num"], rows, chunk=2)
     assert str(chunked["num"].dtype) == "float64"
     assert chunked["num"].tolist()[:2] == [1.5, 2.0]
+
+
+def test_load_baseline_predictions_chunked_matches_single_chunk(tmp_path, monkeypatch):
+    import json
+
+    import pandas as pd
+
+    from src import data_loader as dl
+
+    recs = [
+        # chunk 1 (size 2): old export format, no optional columns
+        {"task_id": "a", "run_id": 0, "pending_at": "2026-08-01T00:00:00Z",
+         "bl_duration_p50": 1.0, "bl_duration_p90": 2.0, "bl_wait_p50": 3.0, "bl_wait_p90": 4.0},
+        {"task_id": "b", "run_id": 0, "pending_at": "2026-08-01T01:00:00Z",
+         "bl_duration_p50": None, "bl_duration_p90": None, "bl_wait_p50": 3.5, "bl_wait_p90": None},
+        # out of window: filtered while streaming
+        {"task_id": "z", "run_id": 0, "pending_at": "2026-09-01T00:00:00Z",
+         "bl_duration_p50": 9.0, "bl_duration_p90": 9.0, "bl_wait_p50": 9.0, "bl_wait_p90": 9.0},
+        # chunk 2: all-NULL duration quantiles, new format
+        {"task_id": "c", "run_id": 1, "pending_at": "2026-08-02T00:00:00Z",
+         "bl_duration_p50": None, "bl_duration_p90": None, "bl_wait_p50": 5.0, "bl_wait_p90": 6.0,
+         "bl_duration_level": "metadata_name", "bl_duration_sample_size": 30,
+         "bl_wait_level": "queue", "bl_wait_sample_size": 25},
+        {"task_id": "d", "run_id": 2, "pending_at": "2026-08-02T01:00:00Z",
+         "bl_duration_p50": None, "bl_duration_p90": None, "bl_wait_p50": 7.0, "bl_wait_p90": 8.0,
+         "bl_duration_level": "global", "bl_duration_sample_size": 3,
+         "bl_wait_level": "queue+priority", "bl_wait_sample_size": 12},
+        # chunk 3
+        {"task_id": "e", "run_id": 0, "pending_at": "2026-08-03T00:00:00Z",
+         "bl_duration_p50": 10.0, "bl_duration_p90": 20.0, "bl_wait_p50": 1.0, "bl_wait_p90": 2.0,
+         "bl_duration_level": "global", "bl_duration_sample_size": 7,
+         "bl_wait_level": "queue", "bl_wait_sample_size": 9},
+    ]
+    p = tmp_path / "bl.ndjson"
+    p.write_text("".join(json.dumps(r) + "\n" for r in recs) + "\n")
+    kw = dict(pending_from=pd.Timestamp("2026-08-01", tz="UTC"),
+              pending_to=pd.Timestamp("2026-08-04", tz="UTC"))
+
+    monkeypatch.setattr(dl, "BASELINE_PARSE_CHUNK_ROWS", 10_000)
+    whole = dl.load_baseline_predictions(p, **kw)
+    monkeypatch.setattr(dl, "BASELINE_PARSE_CHUNK_ROWS", 2)
+    chunked = dl.load_baseline_predictions(p, **kw)
+
+    assert list(whole["task_id"]) == ["a", "b", "c", "d", "e"]
+    assert list(chunked.columns) == list(whole.columns)
+    assert dict(chunked.dtypes.astype(str)) == dict(whole.dtypes.astype(str))
+    pd.testing.assert_frame_equal(chunked, whole)
+
+
+def test_load_baseline_predictions_empty_window(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from src.data_loader import load_baseline_predictions
+
+    p = tmp_path / "bl.ndjson"
+    p.write_text(json.dumps({"task_id": "a", "run_id": 0, "pending_at": "2026-01-01T00:00:00Z",
+                             "bl_duration_p50": 1.0, "bl_duration_p90": 2.0,
+                             "bl_wait_p50": 3.0, "bl_wait_p90": 4.0}) + "\n")
+    df = load_baseline_predictions(p, pending_from=pd.Timestamp("2026-08-01", tz="UTC"))
+    assert len(df) == 0
+    assert list(df.columns)[:2] == ["task_id", "run_id"]

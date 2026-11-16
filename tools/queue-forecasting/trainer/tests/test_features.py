@@ -244,3 +244,30 @@ def test_meta_columns_unchanged_when_baseline_guardrail_columns_absent():
     tr = FeatureBuilder(c).fit_transform(df)
     assert list(tr.meta.columns) == ["pending_at", "resolved_at", "reason_resolved",
                                      "task_id", "run_id"]
+
+
+def test_loader_side_tag_extraction_gives_identical_features():
+    """data_loader.load() now extracts tag columns and drops `tags` up front.
+    The features the builder produces must be identical either way."""
+    from src.features import extract_tag_columns
+
+    c = _cfg(categorical_features=["task_queue_id", "tags.kind", "tags.os"],
+             numeric_features=["queue_pending"], derived_features={})
+    rows = [
+        {"task_id": "a", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 01:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 5.0, "task_queue_id": "q1",
+         "tags": {"kind": "build", "os": "linux"}, "queue_pending": 10},
+        {"task_id": "b", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 02:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 6.0, "task_queue_id": "q2",
+         "tags": {"kind": "test"}, "queue_pending": 20},
+        {"task_id": "c", "run_id": 0, "pending_at": pd.Timestamp("2026-04-10 03:00", tz="UTC"),
+         "reason_resolved": "completed", "y": 7.0, "task_queue_id": "q1",
+         "tags": None, "queue_pending": 30},
+    ]
+    old = FeatureBuilder(c).fit_transform(_frame(rows))
+    pre = extract_tag_columns(_frame(rows), c, drop_tags=True)
+    assert "tags" not in pre.columns
+    new = FeatureBuilder(c).fit_transform(pre)
+    pd.testing.assert_frame_equal(new.X, old.X)
+    pd.testing.assert_series_equal(new.y, old.y)
+    assert new.X["tags.os"].isna().tolist() == [False, True, True]
