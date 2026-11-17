@@ -247,11 +247,17 @@ def _lookup_tables(model):
 
 def predict_b1(model, known: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (B1c, B1i) predictions indexed by gid."""
+    if known.empty:
+        empty = pd.DataFrame(columns=["p50", "p90"], dtype=float)
+        return empty, empty.copy()
     rk = _resolve_keys(model, known)
     q, cdf = _lookup_tables(model)
     # Unknown family entirely -> drop those tasks (group falls back to its other tasks).
     have = rk.isin(q.index)
     kk = known[have].assign(rk=rk[have])
+    if kk.empty:
+        empty = pd.DataFrame(columns=["p50", "p90"], dtype=float)
+        return empty, empty.copy()
 
     qv = q.reindex(kk["rk"])
     b1c = pd.DataFrame({"p50": qv[0.5].to_numpy(), "p90": qv[0.9].to_numpy(), "gid": kk["gid"].to_numpy()})
@@ -328,9 +334,11 @@ def fit_all(train_groups: pd.DataFrame, known: pd.DataFrame, d0: float) -> dict:
     B1c/B1i use the full window; the calibrated variants refit B1 on the window
     minus its last CAL_DAYS and fit per-family factors on those held-out days.
     """
-    cal_start = d0 - CAL_DAYS * 86400
-    fit_g = train_groups[train_groups["t0"] < cal_start]
-    cal_g = train_groups[train_groups["t0"] >= cal_start]
+    # Calibrate on the last CAL_DAYS *present* days (excluded days leave gaps).
+    days = sorted(train_groups["day"].unique())
+    cal_days = set(days[-CAL_DAYS:]) if len(days) > CAL_DAYS else set(days[-1:])
+    is_cal = train_groups["day"].isin(cal_days)
+    fit_g, cal_g = train_groups[~is_cal], train_groups[is_cal]
     b1_fit = fit_b1(known[known["gid"].isin(fit_g.index)])
     c_cal, i_cal = predict_b1(b1_fit, known[known["gid"].isin(cal_g.index)])
     return {

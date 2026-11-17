@@ -39,14 +39,13 @@ contract (05aa4eda) — it gets its own contract later (auto-research Phase 7).
 
 ## Plan
 
-### P0 — Start collecting edges (day 0–1, highest urgency)
-- New table `queue_forecast_task_deps(task_id, dependency_task_id, task_group_id, collected_at)`
-  plus `requires TEXT`, `deadline TIMESTAMPTZ` on `queue_forecast_tasks`; migration file.
-- Write edges in `backgroundApiFetch` from `taskDef.dependencies` (no extra API calls).
-- Add to retention targets (same 60d policy).
-- Unit test in `test/`; deploy = collector restart (dev tree is bind-mounted).
-- Add "deps collected per day / tasks with deps" row to the weekly report.
-- No backfill (would need millions of API calls); history starts at deploy.
+### P0 — Collect edges — DONE (live 2026-11-16 14:38Z)
+- `queue_forecast_tasks.dependencies TEXT[]` + `requires`, `deadline`, `dependency_count`,
+  written by the enrichment UPDATE from `taskDef` (no extra API calls). NULL count =
+  not collected; 0 = no deps. Full coverage from 2026-11-17.
+- First shipped as an edge table; moved inline 2026-11-17 09:31Z after measuring
+  ~173 B/edge incl. PK (~26 GB at 60d). Inline is ~65 MB/day before TOAST.
+- Weekly report §5 tracks coverage. No backfill: history starts 2026-11-16.
 
 ### P1 — Group dataset + edge-free baselines (days 1–4, existing data)
 Script `trainer/scripts/group_eta_dataset.py` (run as a normal foreground

@@ -128,3 +128,24 @@ def test_parse_days():
 def test_md_table():
     out = g.md(pd.DataFrame({"a": [1], "b": ["x"]}))
     assert out.splitlines() == ["| a | b |", "|---|---|", "| 1 | x |"]
+
+
+def test_fit_all_calibrates_on_last_present_days_across_gap():
+    rng = np.random.default_rng(5)
+    rows = _group("Z", DAY0 + 10)
+    for i in range(300):
+        day = 1 + i // 30          # days 1..10
+        if day >= 7:
+            day += 5               # gap: days 7..11 missing, like an excluded outage
+        rows += _group(f"G{i}", DAY0 + day * 86400 + (i % 30) * 2000, offsets=list(rng.uniform(600, 3000, 6)))
+    groups, known = g.build_groups(_tasks(rows), DAY0 + 60 * 86400, set())
+    use = groups[groups["usable"]]
+    d0 = DAY0 + 17 * 86400
+    model = g.fit_all(use[use["end"] < d0], known, d0)  # must not raise on the gap
+    assert model["cal_c"].loc["try", "n"] > 0
+
+
+def test_predict_b1_empty_known():
+    train = pd.concat([_known(i, [("a", 100 + i)]) for i in range(50)], ignore_index=True)
+    c, i = g.predict_b1(g.fit_b1(train), _known(1, [("a", 0)]).iloc[0:0])
+    assert c.empty and i.empty

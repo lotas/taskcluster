@@ -1,3 +1,6 @@
+-- SUPERSEDED 2026-11-17 by migrate-task-deps-inline.sql (edges now live in
+-- queue_forecast_tasks.dependencies TEXT[]). Kept for history; do not re-apply the
+-- CREATE TABLE part on a fresh DB.
 -- Task dependency edges + scheduling fields for task-group ETA (group-eta-plan.md P0).
 -- Idempotent: safe to re-run. Apply BEFORE restarting the collector with the
 -- matching src/db.js change, otherwise enrichment UPDATEs fail on unknown columns:

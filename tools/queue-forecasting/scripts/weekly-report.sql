@@ -101,7 +101,7 @@ SELECT CASE WHEN a < 60 THEN '1:<1m' WHEN a < 300 THEN '2:1-5m'
 FROM scored GROUP BY 1 ORDER BY 1;
 
 \echo
-\echo '## 5. Dependency-edge collection (group-eta-plan.md P0, live since 2026-11-16 14:38Z)'
+\echo '## 5. Dependency-edge collection (group-eta-plan.md P0, live since 2026-11-16 14:38Z; inline TEXT[] since 2026-11-17 09:31Z)'
 \echo 'deps_cov = share of created tasks with edges collected (dependency_count NOT NULL); should be ~1.0 after 11-16.'
 SELECT d.day::date AS day,
        x.tasks, x.deps_cov, x.zero_deps, x.avg_deps, x.max_deps, x.edges
@@ -119,7 +119,7 @@ LEFT JOIN LATERAL (
 ) x ON true
 ORDER BY 1;
 
-SELECT pg_size_pretty(pg_total_relation_size('queue_forecast_task_deps')) AS deps_table_size;
+SELECT pg_size_pretty(pg_total_relation_size('queue_forecast_tasks')) AS tasks_table_size;
 
 \echo
 \echo '## 6. Shadow task-group ETA (group-eta-plan.md P2), groups predicted since' :since

@@ -50,32 +50,25 @@ test('enrichTask writes requires/deadline/dependency_count as $16..$18', async (
   assert.equal(upd.params[17], 2, 'dependency_count counts unique deps');
 });
 
-test('enrichTask inserts deduplicated dependency edges after a matched UPDATE', async () => {
+test('enrichTask stores deduplicated dependencies inline as $19', async () => {
   const pool = capturingPool(1);
-  await enrichTask(pool, 'T4', { metadata_name: 'x', dependencies: ['D1', 'D2', 'D1'] });
-  assert.equal(pool.calls.length, 2);
-  const ins = pool.calls[1];
-  assert.ok(ins.sql.includes('queue_forecast_task_deps'));
-  assert.equal(ins.params[0], 'T4');
-  assert.deepEqual(ins.params[1], ['D1', 'D2']);
+  await enrichTask(pool, 'T4', { metadata_name: 'x', dependencies: ['D1', 'D2', 'D1', 'T4'] });
+  assert.equal(pool.calls.length, 1, 'single UPDATE, no edge-table insert');
+  assert.ok(/dependencies\s*=\s*COALESCE\(\$19/.test(pool.calls[0].sql));
+  assert.deepEqual(pool.calls[0].params[18], ['D1', 'D2']);
+  assert.equal(pool.calls[0].params[17], 2);
 });
 
-test('enrichTask records dependency_count 0 and skips insert for no deps', async () => {
+test('enrichTask records dependency_count 0 and an empty array for no deps', async () => {
   const pool = capturingPool(1);
   await enrichTask(pool, 'T5', { metadata_name: 'x', dependencies: [] });
-  assert.equal(pool.calls.length, 1);
   assert.equal(pool.calls[0].params[17], 0);
+  assert.deepEqual(pool.calls[0].params[18], []);
 });
 
-test('enrichTask leaves dependency_count NULL when deps were not fetched', async () => {
+test('enrichTask leaves dependency fields NULL when deps were not fetched', async () => {
   const pool = capturingPool(1);
   await enrichTask(pool, 'T6', { metadata_name: 'x' });
-  assert.equal(pool.calls.length, 1);
   assert.equal(pool.calls[0].params[17], null);
-});
-
-test('enrichTask skips edge insert when the task row does not exist yet', async () => {
-  const pool = capturingPool(0);
-  await enrichTask(pool, 'T7', { metadata_name: 'x', dependencies: ['D1'] });
-  assert.equal(pool.calls.length, 1, 'FK would fail; backfill cache path retries later');
+  assert.equal(pool.calls[0].params[18], null);
 });
