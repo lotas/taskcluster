@@ -304,8 +304,10 @@ def apply_calibration(pred: pd.DataFrame, groups: pd.DataFrame, f: pd.DataFrame)
     fam = groups["repo_family"].astype(str).where(
         groups["repo_family"].astype(str).isin(f.index[f["n"] >= MIN_KEY_SAMPLES]), "__global__")
     ff = f.reindex(fam.reindex(pred.index))
-    return pd.DataFrame({"p50": pred["p50"].to_numpy() * ff["f50"].to_numpy(),
-                         "p90": pred["p90"].to_numpy() * ff["f90"].to_numpy()}, index=pred.index)
+    p50 = pred["p50"].to_numpy() * ff["f50"].to_numpy()
+    p90 = pred["p90"].to_numpy() * ff["f90"].to_numpy()
+    # Factors are fitted independently; keep the quantiles ordered.
+    return pd.DataFrame({"p50": p50, "p90": np.fmax(p90, p50)}, index=pred.index)
 
 
 # ---------------------------------------------------------------- metrics ---

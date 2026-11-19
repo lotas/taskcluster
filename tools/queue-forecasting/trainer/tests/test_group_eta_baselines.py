@@ -149,3 +149,12 @@ def test_predict_b1_empty_known():
     train = pd.concat([_known(i, [("a", 100 + i)]) for i in range(50)], ignore_index=True)
     c, i = g.predict_b1(g.fit_b1(train), _known(1, [("a", 0)]).iloc[0:0])
     assert c.empty and i.empty
+
+
+def test_calibration_keeps_p90_at_or_above_p50():
+    groups = pd.DataFrame({"repo_family": ["try"] * 2})
+    pred = pd.DataFrame({"p50": [100.0, 100.0], "p90": [110.0, 110.0]})
+    f = pd.DataFrame({"n": [100], "f50": [3.0], "f90": [1.0]}, index=["try"])
+    f.loc["__global__"] = [100, 1.0, 1.0]
+    out = g.apply_calibration(pred, groups, f)
+    assert (out["p90"] >= out["p50"]).all()
