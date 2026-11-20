@@ -24,6 +24,7 @@ import pandas as pd
 
 from scripts import group_eta_baselines as g
 
+MAX_DECISION_HOURS = 6
 DEFAULT_DATA_DIR = Path(os.environ.get("QF_GROUP_ETA_DIR", "data/group_eta"))
 
 # Groups whose decision task resolved in the window. The decision task is the
@@ -40,6 +41,10 @@ WHERE r.resolved_at > now() - make_interval(mins => %(lookback)s)
   AND NOT EXISTS (SELECT 1 FROM queue_forecast_group_predictions_shadow s
                   WHERE s.task_group_id = t.task_group_id)
 GROUP BY 1, 2
+-- A decision task that resolves hours after creation (e.g. never ran and hit its
+-- deadline) is not a fresh graph; it would also stretch LIVE_TASKS_SQL's scan
+-- window to a day+ and time out (seen 2026-11-19 23:10Z).
+HAVING max(r.resolved_at) - min(t.task_created) < make_interval(hours => %(max_dec_hours)s)
 """
 
 # Known tasks: created in [min t0, max t_pred]; uses idx_qf_tasks_task_created.
@@ -102,7 +107,8 @@ def predict(data_dir: Path, lookback_min: int, estimators: list[str]) -> None:
 
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute("SET statement_timeout = '120s'")
-        dec = pd.DataFrame(conn.execute(LIVE_GROUPS_SQL, {"lookback": lookback_min, "delay": g.PRED_DELAY_S}).fetchall(),
+        dec = pd.DataFrame(conn.execute(LIVE_GROUPS_SQL, {"lookback": lookback_min, "delay": g.PRED_DELAY_S,
+                                                       "max_dec_hours": MAX_DECISION_HOURS}).fetchall(),
                            columns=["task_group_id", "dec_created", "dec_resolved"])
         if dec.empty:
             print("[group-eta predict] no new groups")
@@ -156,7 +162,9 @@ def main(argv=None) -> None:
     p = sub.add_parser("predict")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument("--lookback-min", type=int, default=30)
-    p.add_argument("--estimators", default=",".join(g.ESTIMATORS))
+    # B1i/B1i* dropped from live 2026-11-20: independence assumption over-covers
+    # (offline try cov90 0.996, w2x 0.52). Still computed offline for reference.
+    p.add_argument("--estimators", default="B0,B1c,B1c*")
     a = ap.parse_args(argv)
     if a.cmd == "fit":
         fit(a.data_dir.expanduser(), set(g.DEFAULT_EXCLUDED))
