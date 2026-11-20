@@ -43,37 +43,69 @@ function formatInterval(ms) {
 }
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
 
-function readAggregationsCache() {
-  if (!fs.existsSync(AGGREGATIONS_CACHE_PATH)) return null;
+// Generic JSON result cache for slow historical queries (aggregations, shadow).
+// `spec` = { label, path, version, windowDays, refreshMs, compute(pool) }.
+function readResultCache(spec) {
+  if (!fs.existsSync(spec.path)) return null;
 
   try {
-    const cache = JSON.parse(fs.readFileSync(AGGREGATIONS_CACHE_PATH, 'utf8'));
+    const cache = JSON.parse(fs.readFileSync(spec.path, 'utf8'));
     const generatedAtMs = Date.parse(cache.generatedAt);
-    if (cache.version !== AGGREGATIONS_CACHE_VERSION ||
-        cache.windowDays !== AGGREGATIONS_WINDOW_DAYS ||
+    if (cache.version !== spec.version ||
+        cache.windowDays !== spec.windowDays ||
         !Number.isFinite(generatedAtMs) ||
         !cache.data || typeof cache.data !== 'object') {
-      console.warn('[dashboard-gen] ignoring incompatible aggregations cache');
+      console.warn(`[dashboard-gen] ignoring incompatible ${spec.label} cache`);
       return null;
     }
     return { ...cache, generatedAtMs };
   } catch (err) {
-    console.warn(`[dashboard-gen] ignoring unreadable aggregations cache: ${err.message}`);
+    console.warn(`[dashboard-gen] ignoring unreadable ${spec.label} cache: ${err.message}`);
     return null;
   }
 }
 
-function writeAggregationsCache(result) {
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  const tmpPath = `${AGGREGATIONS_CACHE_PATH}.${process.pid}.tmp`;
+function writeResultCache(spec, result) {
+  fs.mkdirSync(path.dirname(spec.path), { recursive: true });
+  const tmpPath = `${spec.path}.${process.pid}.tmp`;
   const cache = {
-    version: AGGREGATIONS_CACHE_VERSION,
-    windowDays: AGGREGATIONS_WINDOW_DAYS,
+    version: spec.version,
+    windowDays: spec.windowDays,
     generatedAt: result.generatedAt,
     data: result.data,
   };
   fs.writeFileSync(tmpPath, JSON.stringify(cache));
-  fs.renameSync(tmpPath, AGGREGATIONS_CACHE_PATH);
+  fs.renameSync(tmpPath, spec.path);
+}
+
+async function getCachedResult(pool, spec) {
+  const cached = readResultCache(spec);
+  const cacheAgeMs = cached ? Date.now() - cached.generatedAtMs : null;
+  if (cached && cacheAgeMs >= 0 && cacheAgeMs < spec.refreshMs) {
+    console.log(
+      `[dashboard-gen] using ${spec.label} cache from ${cached.generatedAt} ` +
+      `(age ${formatInterval(cacheAgeMs)})`,
+    );
+    return cached;
+  }
+
+  console.log(`[dashboard-gen] ${spec.label} cache is missing or stale; refreshing`);
+  try {
+    const refreshed = await spec.compute(pool);
+    try {
+      writeResultCache(spec, refreshed);
+    } catch (err) {
+      console.warn(`[dashboard-gen] could not persist ${spec.label} cache: ${err.message}`);
+    }
+    return refreshed;
+  } catch (err) {
+    if (!cached) throw err;
+    console.warn(
+      `[dashboard-gen] ${spec.label} refresh failed; using stale cache from ` +
+      `${cached.generatedAt}: ${err.message}`,
+    );
+    return cached;
+  }
 }
 
 // ─── DB Queries ──────────────────────────────────────────────────────────────
@@ -702,34 +734,15 @@ async function queryAggregationsData(pool) {
   return { generatedAt: new Date().toISOString(), data };
 }
 
-async function getAggregationsData(pool) {
-  const cached = readAggregationsCache();
-  const cacheAgeMs = cached ? Date.now() - cached.generatedAtMs : null;
-  if (cached && cacheAgeMs >= 0 && cacheAgeMs < AGGREGATIONS_REFRESH_MS) {
-    console.log(
-      `[dashboard-gen] using aggregations cache from ${cached.generatedAt} ` +
-      `(age ${formatInterval(cacheAgeMs)})`,
-    );
-    return cached;
-  }
-
-  console.log('[dashboard-gen] aggregations cache is missing or stale; refreshing');
-  try {
-    const refreshed = await queryAggregationsData(pool);
-    try {
-      writeAggregationsCache(refreshed);
-    } catch (err) {
-      console.warn(`[dashboard-gen] could not persist aggregations cache: ${err.message}`);
-    }
-    return refreshed;
-  } catch (err) {
-    if (!cached) throw err;
-    console.warn(
-      `[dashboard-gen] aggregations refresh failed; using stale cache from ` +
-      `${cached.generatedAt}: ${err.message}`,
-    );
-    return cached;
-  }
+function getAggregationsData(pool) {
+  return getCachedResult(pool, {
+    label: 'aggregations',
+    path: AGGREGATIONS_CACHE_PATH,
+    version: AGGREGATIONS_CACHE_VERSION,
+    windowDays: AGGREGATIONS_WINDOW_DAYS,
+    refreshMs: AGGREGATIONS_REFRESH_MS,
+    compute: queryAggregationsData,
+  });
 }
 
 // ─── Manifest Loading ────────────────────────────────────────────────────────
@@ -1362,8 +1375,18 @@ function loadWalkForwardSummary() {
   });
 }
 
+// Role of each walk-forward config in live serving (live-predictor WAIT_STEM /
+// DURATION_STEM / SHADOW_WAIT_STEM). Unknown configs are shown unlabelled.
+const WF_CONFIG_ROLE = {
+  wait_time_residual_throughput_filtered_baseline: 'served',
+  run_duration_residual: 'served',
+  wait_qctx_d_priority_flow: 'shadow',
+};
+const WF_ROWS_PER_CONFIG = 20;
+
 function renderWalkForwardSummary(rows) {
   if (!rows.length) return '<p class="muted">No walk_forward_summary.csv found.</p>';
+  rows = [...rows].sort((a, b) => (a.cohort_as_of < b.cohort_as_of ? 1 : a.cohort_as_of > b.cohort_as_of ? -1 : 0));
 
   // Group by config, preserving insertion order
   const byConfig = {};
@@ -1376,12 +1399,16 @@ function renderWalkForwardSummary(rows) {
   let html = '<div class="tabs">';
   configs.forEach((cfg, i) => {
     const active = i === 0 ? ' active' : '';
-    html += `<button class="tab-btn${active}" onclick="switchTab('wf', ${i}, this)">${esc(cfg)}</button>`;
+    const role = WF_CONFIG_ROLE[cfg];
+    const roleBadge = role ? ` <span class="badge ${role === 'served' ? 'badge-ok' : 'badge-blue'}">${role}</span>` : '';
+    html += `<button class="tab-btn${active}" onclick="switchTab('wf', ${i}, this)">${esc(cfg)}${roleBadge}</button>`;
   });
   html += '</div>';
 
   configs.forEach((cfg, i) => {
-    const cfgRows = byConfig[cfg];
+    const allCfgRows = byConfig[cfg];
+    const cfgRows = allCfgRows.slice(0, WF_ROWS_PER_CONFIG);
+    const hasTail = cfgRows.some(r => r['30mplus_wait_p90_miss_guarded'] != null && r['30mplus_wait_p90_miss_guarded'] !== '');
     const display = i === 0 ? 'block' : 'none';
     html += `<div class="tab-panel wf-panel" id="wf-${i}" style="display:${display}">`;
     html += `<table><thead><tr>
@@ -1392,6 +1419,7 @@ function renderWalkForwardSummary(rows) {
       <th class="r">Model within-2x</th>
       <th class="r">Δ within-2x pp</th>
       <th class="r">p90 cov</th>
+      ${hasTail ? '<th class="r" title="share of 30m+ waits above the guarded p90">30m+ p90 miss</th>' : ''}
       <th class="r">Hold rows</th>
     </tr></thead><tbody>`;
     for (const r of cfgRows) {
@@ -1409,10 +1437,15 @@ function renderWalkForwardSummary(rows) {
         <td class="r">${fmtPct(r.model_within_2x)}</td>
         <td class="r"${deltaW2xStyle}>${!isNaN(deltaW2x) ? (deltaW2x > 0 ? '+' : '') + deltaW2x.toFixed(1) + 'pp' : '—'}</td>
         <td class="r">${fmtPct(r.p90_coverage)}</td>
+        ${hasTail ? `<td class="r">${r['30mplus_wait_p90_miss_guarded'] ? fmtPct(r['30mplus_wait_p90_miss_guarded']) : '—'}</td>` : ''}
         <td class="r">${fmtNum(r.hold_rows)}</td>
       </tr>`;
     }
-    html += '</tbody></table></div>';
+    html += '</tbody></table>';
+    if (allCfgRows.length > cfgRows.length) {
+      html += `<div class="meta">Showing newest ${cfgRows.length} of ${allCfgRows.length} cohorts.</div>`;
+    }
+    html += '</div>';
   });
   return html;
 }
@@ -1878,6 +1911,17 @@ const CSS = `
     padding: 6px 8px; font-size: 12px; color: var(--fg); white-space: nowrap;
   }
   .chart-tooltip-anom { color: var(--yellow); }
+  .badge-bad { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge-blue { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge-dim { background: var(--bg3); color: var(--fg2); }
+  .row-highlight { background: rgba(88,166,255,0.06); }
+  .site-nav { display: flex; gap: 2px; flex-wrap: wrap; margin: 6px 0 4px; }
+  .site-nav a {
+    color: var(--fg2); text-decoration: none; padding: 3px 10px; border-radius: 6px;
+    border: 1px solid transparent; font-size: 12px;
+  }
+  .site-nav a:hover { color: var(--fg); background: var(--bg3); }
+  .site-nav a.active { color: var(--blue); border-color: var(--border); background: var(--bg2); }
 `;
 
 const TAB_JS = `
@@ -1945,9 +1989,574 @@ function chartHoverEnd(svg) {
 }
 `;
 
+// ─── Shadow (qctx_d) vs served ──────────────────────────────────────────────
+// Same population and metric definitions as scripts/weekly-report.sql §2–4:
+// completed runs with an observed wait, scored by both the served wait model
+// and the shadow wait model (queue_forecast_run_predictions_shadow). Both p90s
+// are the guarded values. ~2 min at 14 days, so cached like the aggregations.
+
+const SHADOW_WINDOW_DAYS = parseInt(process.env.SHADOW_WINDOW_DAYS || '14', 10);
+const SHADOW_REFRESH_MS = parseInt(process.env.DASHBOARD_SHADOW_INTERVAL_MS || '21600000', 10); // 6 hours
+const SHADOW_CACHE_PATH = path.join(OUTPUT_DIR, 'shadow-cache.json');
+const SHADOW_CACHE_VERSION = 1;
+
+// v3 contract bars (shadow vs served), as printed by the weekly report.
+const V3_BARS = { maeGain: 0.15, w2xGainPp: 5, pinballGain: 0, covLo: 0.88, covHi: 0.93 };
+
+async function queryShadowVsServed(pool, windowDays) {
+  const { rows } = await pool.query(`
+    WITH scored AS (
+      SELECT date_trunc('day', r.pending_at)::date AS d,
+             r.wait_duration_s AS a,
+             p.wait_p50_s AS sp50, p.wait_p90_s AS sp90,
+             s.wait_p50_s AS hp50, s.wait_p90_s AS hp90,
+             p.wait_model_version AS sv, s.wait_model_version AS hv,
+             CASE WHEN r.wait_duration_s < 60 THEN '1:<1m'
+                  WHEN r.wait_duration_s < 300 THEN '2:1-5m'
+                  WHEN r.wait_duration_s < 1800 THEN '3:5-30m'
+                  ELSE '4:30m+' END AS bucket
+      FROM queue_forecast_run_predictions_shadow s
+      JOIN queue_forecast_run_predictions p USING (task_id, run_id)
+      JOIN queue_forecast_task_runs r USING (task_id, run_id)
+      WHERE r.reason_resolved = 'completed'
+        AND r.started_at IS NOT NULL
+        AND r.wait_duration_s >= 0
+        AND s.predicted_at >= now() - make_interval(days => $1)
+        AND r.pending_at  >= now() - make_interval(days => $1)
+    )
+    SELECT CASE WHEN GROUPING(d) = 0 THEN 'day'
+                WHEN GROUPING(bucket) = 0 THEN 'bucket'
+                ELSE 'all' END AS kind,
+           d::text AS d, bucket,
+           count(*)::int AS n,
+           string_agg(DISTINCT sv, ',') AS served_versions,
+           string_agg(DISTINCT hv, ',') AS shadow_versions,
+           avg(abs(a - sp50))::float8 AS s_mae,
+           avg(abs(a - hp50))::float8 AS h_mae,
+           avg((a BETWEEN sp50 / 2 AND sp50 * 2)::int)::float8 AS s_w2x,
+           avg((a BETWEEN hp50 / 2 AND hp50 * 2)::int)::float8 AS h_w2x,
+           avg(CASE WHEN a >= sp90 THEN 0.9 * (a - sp90) ELSE 0.1 * (sp90 - a) END)::float8 AS s_pin,
+           avg(CASE WHEN a >= hp90 THEN 0.9 * (a - hp90) ELSE 0.1 * (hp90 - a) END)::float8 AS h_pin,
+           avg((a <= sp90)::int)::float8 AS s_cov,
+           avg((a <= hp90)::int)::float8 AS h_cov,
+           avg(sp90)::float8 AS s_p90,
+           avg(hp90)::float8 AS h_p90
+    FROM scored
+    GROUP BY GROUPING SETS ((d), (bucket), ())
+  `, [windowDays]);
+  return {
+    overall: rows.find(r => r.kind === 'all') || null,
+    byDay: rows.filter(r => r.kind === 'day').sort((a, b) => (a.d < b.d ? -1 : 1)),
+    byBucket: rows.filter(r => r.kind === 'bucket').sort((a, b) => (a.bucket < b.bucket ? -1 : 1)),
+  };
+}
+
+async function queryShadowData(pool) {
+  const data = await timed('queryShadowVsServed', queryShadowVsServed(pool, SHADOW_WINDOW_DAYS));
+  return { generatedAt: new Date().toISOString(), data };
+}
+
+function gainOf(served, shadow) {
+  if (served == null || shadow == null || !served) return null;
+  return 1 - shadow / served;
+}
+
+function fmtSigned(v, digits, suffix = '') {
+  if (v == null || !Number.isFinite(v)) return '—';
+  return (v > 0 ? '+' : '') + v.toFixed(digits) + suffix;
+}
+
+function passBadge(ok) {
+  if (ok == null) return '<span class="muted">—</span>';
+  return ok ? '<span class="badge badge-ok">PASS</span>' : '<span class="badge badge-bad">MISS</span>';
+}
+
+function renderShadowScorecard(o) {
+  if (!o || !o.n) return '<p class="muted">No shadow-scored completed runs in window.</p>';
+  const maeGain = gainOf(o.s_mae, o.h_mae);
+  const pinGain = gainOf(o.s_pin, o.h_pin);
+  const w2xPp = (o.h_w2x - o.s_w2x) * 100;
+  const rows = [
+    ['MAE (p50)', fmtDuration(o.s_mae), fmtDuration(o.h_mae), fmtSigned(maeGain * 100, 1, '%'),
+      `gain &ge; ${V3_BARS.maeGain * 100}%`, maeGain >= V3_BARS.maeGain],
+    ['within 2x (p50)', fmtPct(o.s_w2x), fmtPct(o.h_w2x), fmtSigned(w2xPp, 1, 'pp'),
+      `&ge; +${V3_BARS.w2xGainPp}pp`, w2xPp >= V3_BARS.w2xGainPp],
+    ['pinball (p90)', fmtDuration(o.s_pin), fmtDuration(o.h_pin), fmtSigned(pinGain * 100, 1, '%'),
+      'gain &gt; 0', pinGain > V3_BARS.pinballGain],
+    ['p90 coverage', fmtPct(o.s_cov), fmtPct(o.h_cov), fmtSigned((o.h_cov - o.s_cov) * 100, 1, 'pp'),
+      `shadow in [${V3_BARS.covLo}, ${V3_BARS.covHi}]`, o.h_cov >= V3_BARS.covLo && o.h_cov <= V3_BARS.covHi],
+  ];
+  let html = `<div class="pred-counters">
+    <span class="pred-counter"><strong>${fmtNum(o.n)}</strong> completed runs scored by both</span>
+  </div>
+  <table><thead><tr><th>Metric</th><th class="r">Served</th><th class="r">Shadow</th><th class="r">Δ / gain</th><th>v3 bar</th><th></th></tr></thead><tbody>`;
+  for (const [label, s, h, g, bar, ok] of rows) {
+    html += `<tr><td>${label}</td><td class="r">${s}</td><td class="r">${h}</td><td class="r">${g}</td><td class="mono">${bar}</td><td>${passBadge(ok)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  html += `<div class="meta">Served versions: <span class="mono">${esc(o.served_versions)}</span><br>Shadow versions: <span class="mono">${esc(o.shadow_versions)}</span></div>`;
+  return html;
+}
+
+function renderShadowByDay(rows) {
+  if (!rows.length) return '<p class="muted">No data.</p>';
+  let html = `<table><thead><tr>
+    <th>Day (pending, UTC)</th><th class="r">Runs</th>
+    <th class="r">MAE srv</th><th class="r">MAE shd</th><th class="r">MAE gain</th>
+    <th class="r">w2x srv</th><th class="r">w2x shd</th>
+    <th class="r">cov90 srv</th><th class="r">cov90 shd</th>
+    <th class="r">pin90 srv</th><th class="r">pin90 shd</th><th>Shadow model</th>
+  </tr></thead><tbody>`;
+  for (const r of [...rows].reverse()) {
+    const g = gainOf(r.s_mae, r.h_mae);
+    const gCls = g == null ? '' : (g >= V3_BARS.maeGain ? ' cell-good' : (g > 0 ? ' cell-warn' : ' cell-bad'));
+    const covCls = r.h_cov > V3_BARS.covHi || r.h_cov < V3_BARS.covLo ? ' cell-warn' : ' cell-good';
+    const pinCls = r.h_pin < r.s_pin ? ' cell-good' : ' cell-bad';
+    html += `<tr>
+      <td>${esc(r.d)}</td><td class="r">${fmtNum(r.n)}</td>
+      <td class="r">${fmtDuration(r.s_mae)}</td><td class="r">${fmtDuration(r.h_mae)}</td>
+      <td class="r${gCls}">${fmtSigned(g == null ? null : g * 100, 1, '%')}</td>
+      <td class="r">${fmtPct(r.s_w2x)}</td><td class="r">${fmtPct(r.h_w2x)}</td>
+      <td class="r">${fmtPct(r.s_cov)}</td><td class="r${covCls}">${fmtPct(r.h_cov)}</td>
+      <td class="r">${fmtDuration(r.s_pin)}</td><td class="r${pinCls}">${fmtDuration(r.h_pin)}</td>
+      <td class="mono">${esc(r.shadow_versions)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderShadowByBucket(rows) {
+  if (!rows.length) return '<p class="muted">No data.</p>';
+  let html = `<table><thead><tr>
+    <th>Actual wait</th><th class="r">Runs</th>
+    <th class="r">cov90 srv</th><th class="r">cov90 shd</th>
+    <th class="r">miss srv</th><th class="r">miss shd</th>
+    <th class="r">mean p90 srv</th><th class="r">mean p90 shd</th>
+    <th class="r">MAE srv</th><th class="r">MAE shd</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const tail = r.bucket === '4:30m+';
+    html += `<tr${tail ? ' class="row-highlight"' : ''}>
+      <td>${esc(String(r.bucket).replace(/^\d:/, ''))}${tail ? ' <span class="badge badge-warn">tail</span>' : ''}</td>
+      <td class="r">${fmtNum(r.n)}</td>
+      <td class="r">${fmtPct(r.s_cov)}</td><td class="r">${fmtPct(r.h_cov)}</td>
+      <td class="r">${fmtPct(1 - r.s_cov)}</td><td class="r">${fmtPct(1 - r.h_cov)}</td>
+      <td class="r">${fmtDuration(r.s_p90)}</td><td class="r">${fmtDuration(r.h_p90)}</td>
+      <td class="r">${fmtDuration(r.s_mae)}</td><td class="r">${fmtDuration(r.h_mae)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+// ─── Shadow task-group ETA (group-eta-plan.md P2) ───────────────────────────
+// Label = completion of the original graph (tasks created <= t_pred) - t0, as
+// in weekly-report.sql §6. The weekly report scores groups >= 1 day old; here
+// the default is 6h (try p90 span is ~3.2h) so the page is useful while P2 is
+// young. Groups still running at that age are excluded and counted on the page,
+// since dropping them biases coverage upward.
+
+const GROUP_SCORE_DAYS = parseInt(process.env.GROUP_SCORE_DAYS || '7', 10);
+const GROUP_RECENT_HOURS = parseInt(process.env.GROUP_RECENT_HOURS || '6', 10);
+const GROUP_SCORE_MIN_AGE_HOURS = parseInt(process.env.GROUP_SCORE_MIN_AGE_HOURS || '6', 10);
+const GROUP_TRY_BARS = { covLo: 0.85, covHi: 0.93, w2x: 0.70 };
+const GROUP_SIZE_BUCKETS = [
+  { label: '5–49', lo: 0, hi: 50 },
+  { label: '50–199', lo: 50, hi: 200 },
+  { label: '200–999', lo: 200, hi: 1000 },
+  { label: '1000+', lo: 1000, hi: Infinity },
+];
+
+async function queryGroupEtaMeta(pool) {
+  const { rows } = await pool.query(`
+    SELECT estimator, count(*)::int AS n_24h,
+           max(predicted_at) AS last_predicted_at,
+           max(model_version) AS model_version
+    FROM queue_forecast_group_predictions_shadow
+    WHERE predicted_at > now() - interval '24 hours'
+    GROUP BY estimator ORDER BY estimator
+  `);
+  return rows;
+}
+
+async function queryGroupEtaScored(pool, days, estimators, minAgeHours) {
+  const { rows } = await pool.query(`
+    WITH pg AS (
+      SELECT DISTINCT task_group_id, t0, t_pred
+      FROM queue_forecast_group_predictions_shadow
+      WHERE t_pred >= now() - make_interval(days => $1, hours => $3)
+        AND t_pred <  now() - make_interval(hours => $3)
+        AND estimator = ANY($2)
+    ), lab AS (
+      SELECT pg.task_group_id,
+             extract(epoch FROM max(r.resolved_at) - pg.t0)::float8 AS span,
+             bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS incomplete
+      FROM pg
+      JOIN queue_forecast_tasks t
+        ON t.task_group_id = pg.task_group_id
+       AND t.task_created >= pg.t0 AND t.task_created <= pg.t_pred
+      LEFT JOIN queue_forecast_task_runs r ON r.task_id = t.task_id
+      GROUP BY pg.task_group_id, pg.t0
+    )
+    SELECT p.task_group_id, coalesce(p.repo_family, '(none)') AS repo_family,
+           p.estimator, p.n_known, p.t_pred::date::text AS d,
+           l.span AS y, p.p50_s AS p50, p.p90_s AS p90, l.incomplete
+    FROM queue_forecast_group_predictions_shadow p
+    JOIN lab l USING (task_group_id)
+    WHERE p.estimator = ANY($2)
+  `, [days, estimators, minAgeHours]);
+  return rows;
+}
+
+async function queryGroupEtaRecent(pool, hours, estimator) {
+  const { rows } = await pool.query(`
+    WITH p AS (
+      SELECT * FROM queue_forecast_group_predictions_shadow
+      WHERE estimator = $2 AND t_pred > now() - make_interval(hours => $1)
+    ), lab AS (
+      SELECT p.task_group_id,
+             max(r.resolved_at) AS done_at,
+             bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS running
+      FROM p
+      JOIN queue_forecast_tasks t ON t.task_group_id = p.task_group_id
+       AND t.task_created >= p.t0 AND t.task_created <= p.t_pred
+      LEFT JOIN queue_forecast_task_runs r ON r.task_id = t.task_id
+      GROUP BY 1
+    )
+    SELECT p.task_group_id, coalesce(p.repo_family, '(none)') AS repo_family, p.n_known,
+           p.t0, p.p50_s, p.p90_s,
+           p.t0 + make_interval(secs => p.p50_s) AS finish_p50,
+           p.t0 + make_interval(secs => p.p90_s) AS finish_p90,
+           l.running, l.done_at
+    FROM p JOIN lab l USING (task_group_id)
+    ORDER BY p.t0 DESC
+    LIMIT 300
+  `, [hours, estimator]);
+  return rows;
+}
+
+// Preferred estimator for single-estimator views: calibrated B1c* when live.
+function pickGroupEstimator(meta) {
+  const live = meta.map(m => m.estimator);
+  for (const e of ['B1c*', 'B1c', 'B0']) if (live.includes(e)) return e;
+  return live[0] || null;
+}
+
+async function queryGroupEtaData(pool) {
+  const allMeta = await timed('queryGroupEtaMeta', queryGroupEtaMeta(pool));
+  // Live = predicted within 1h of the newest prediction, so estimators dropped
+  // from the pipeline vanish at once but a stalled pipeline hides nothing.
+  const newest = Math.max(0, ...allMeta.map(m => new Date(m.last_predicted_at).getTime()));
+  const meta = allMeta.filter(m => newest - new Date(m.last_predicted_at).getTime() <= 3600 * 1000);
+  const estimators = meta.map(m => m.estimator);
+  const primary = pickGroupEstimator(meta);
+  const scored = estimators.length
+    ? await timed('queryGroupEtaScored', queryGroupEtaScored(pool, GROUP_SCORE_DAYS, estimators, GROUP_SCORE_MIN_AGE_HOURS))
+    : [];
+  const recent = primary
+    ? await timed('queryGroupEtaRecent', queryGroupEtaRecent(pool, GROUP_RECENT_HOURS, primary))
+    : [];
+  return { meta, estimators, primary, scored, recent };
+}
+
+function groupMetrics(rows) {
+  const n = rows.length;
+  if (!n) return { n: 0 };
+  const ys = rows.map(r => r.y).sort((a, b) => a - b);
+  const med = n % 2 ? ys[(n - 1) / 2] : (ys[n / 2 - 1] + ys[n / 2]) / 2;
+  let ae = 0, w2x = 0, cov = 0, pin = 0;
+  for (const r of rows) {
+    ae += Math.abs(r.y - r.p50);
+    if (r.y >= r.p50 / 2 && r.y <= r.p50 * 2) w2x++;
+    if (r.y <= r.p90) cov++;
+    pin += r.y >= r.p90 ? 0.9 * (r.y - r.p90) : 0.1 * (r.p90 - r.y);
+  }
+  return { n, medSpan: med, mae: ae / n, w2x: w2x / n, cov90: cov / n, pin90: pin / n };
+}
+
+function groupBy(rows, keyFn) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = keyFn(r);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(r);
+  }
+  return m;
+}
+
+function groupBarCells(m, isTry) {
+  if (!m.n) return '<td class="r">0</td>' + '<td class="r">—</td>'.repeat(5);
+  const w2xCls = isTry ? (m.w2x >= GROUP_TRY_BARS.w2x ? ' cell-good' : ' cell-bad') : '';
+  const covCls = isTry
+    ? (m.cov90 >= GROUP_TRY_BARS.covLo && m.cov90 <= GROUP_TRY_BARS.covHi ? ' cell-good' : ' cell-warn')
+    : '';
+  return `<td class="r">${fmtNum(m.n)}</td>
+    <td class="r">${fmtDuration(m.medSpan)}</td>
+    <td class="r">${fmtDuration(m.mae)}</td>
+    <td class="r${w2xCls}">${fmtPct(m.w2x)}</td>
+    <td class="r${covCls}">${fmtPct(m.cov90)}</td>
+    <td class="r">${fmtDuration(m.pin90)}</td>`;
+}
+
+const GROUP_METRIC_HEADERS = '<th class="r">Groups</th><th class="r">Median span</th><th class="r">MAE</th><th class="r">w2x</th><th class="r">cov90</th><th class="r">pin90</th>';
+
+function scoredComplete(scored) {
+  return scored.filter(r => !r.incomplete && r.y > 0);
+}
+
+function renderGroupScorecard(g) {
+  const done = scoredComplete(g.scored);
+  if (!done.length) return '<p class="muted">No fully-resolved predicted groups older than 1 day yet.</p>';
+  const byKey = groupBy(done, r => `${r.repo_family}\u0000${r.estimator}`);
+  const keys = [...byKey.keys()].sort((a, b) => {
+    const [fa, ea] = a.split('\u0000');
+    const [fb, eb] = b.split('\u0000');
+    if (fa === 'try' && fb !== 'try') return -1;
+    if (fb === 'try' && fa !== 'try') return 1;
+    return fa === fb ? (ea < eb ? -1 : 1) : (fa < fb ? -1 : 1);
+  });
+  let html = `<table><thead><tr><th>Family</th><th>Estimator</th>${GROUP_METRIC_HEADERS}</tr></thead><tbody>`;
+  for (const k of keys) {
+    const [fam, est] = k.split('\u0000');
+    html += `<tr><td>${esc(fam)}</td><td class="mono">${esc(est)}</td>${groupBarCells(groupMetrics(byKey.get(k)), fam === 'try')}</tr>`;
+  }
+  html += '</tbody></table>';
+  const groupsAll = new Set(g.scored.map(r => r.task_group_id)).size;
+  const groupsInc = new Set(g.scored.filter(r => r.incomplete).map(r => r.task_group_id)).size;
+  html += `<div class="meta">${fmtNum(groupsAll)} predicted groups in window; ${fmtNum(groupsInc)} excluded as not fully resolved (still running, or a task with no resolved run). A large excluded share means coverage is optimistic.</div>`;
+  return html;
+}
+
+function renderGroupTryTrend(g) {
+  const done = scoredComplete(g.scored).filter(r => r.repo_family === 'try');
+  if (!done.length) return '<p class="muted">No scored try groups yet.</p>';
+  const ests = g.estimators.filter(e => done.some(r => r.estimator === e));
+  const days = [...new Set(done.map(r => r.d))].sort().reverse();
+  const by = groupBy(done, r => `${r.d}\u0000${r.estimator}`);
+  let html = `<table><thead><tr><th>Day (t_pred)</th>${ests.map(e => `<th class="r">${esc(e)} n</th><th class="r">${esc(e)} w2x</th><th class="r">${esc(e)} cov90</th>`).join('')}</tr></thead><tbody>`;
+  for (const d of days) {
+    html += `<tr><td>${esc(d)}</td>`;
+    for (const e of ests) {
+      const m = groupMetrics(by.get(`${d}\u0000${e}`) || []);
+      if (!m.n) { html += '<td class="r">0</td><td class="r">—</td><td class="r">—</td>'; continue; }
+      const w2xCls = m.w2x >= GROUP_TRY_BARS.w2x ? ' cell-good' : ' cell-bad';
+      const covCls = m.cov90 >= GROUP_TRY_BARS.covLo && m.cov90 <= GROUP_TRY_BARS.covHi ? ' cell-good' : ' cell-warn';
+      html += `<td class="r">${fmtNum(m.n)}</td><td class="r${w2xCls}">${fmtPct(m.w2x)}</td><td class="r${covCls}">${fmtPct(m.cov90)}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderGroupTryBySize(g) {
+  const done = scoredComplete(g.scored).filter(r => r.repo_family === 'try');
+  if (!done.length) return '<p class="muted">No scored try groups yet.</p>';
+  const ests = g.estimators.filter(e => done.some(r => r.estimator === e));
+  let html = `<table><thead><tr><th>Tasks known at t_pred</th><th>Estimator</th>${GROUP_METRIC_HEADERS}</tr></thead><tbody>`;
+  for (const b of GROUP_SIZE_BUCKETS) {
+    for (const e of ests) {
+      const rows = done.filter(r => r.estimator === e && r.n_known >= b.lo && r.n_known < b.hi);
+      html += `<tr><td>${b.label}</td><td class="mono">${esc(e)}</td>${groupBarCells(groupMetrics(rows), true)}</tr>`;
+    }
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function fmtTs(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toISOString().replace('T', ' ').slice(5, 16);
+}
+
+function groupLink(id) {
+  const url = `https://firefox-ci-tc.services.mozilla.com/tasks/groups/${encodeURIComponent(id)}`;
+  return `<a class="task-link" href="${url}" target="_blank" rel="noopener">${esc(id)}</a>`;
+}
+
+function renderGroupRecent(g) {
+  if (!g.recent.length) return '<p class="muted">No group predictions in the window.</p>';
+  let html = `<table><thead><tr>
+    <th>Task group</th><th>Family</th><th class="r">Tasks</th><th>Pushed (t0)</th>
+    <th class="r">p50</th><th class="r">p90</th><th>Finish p50</th><th>Finish p90</th>
+    <th>Actual finish</th><th></th><th>API</th>
+  </tr></thead><tbody>`;
+  for (const r of g.recent) {
+    let verdict = '<span class="muted">running</span>';
+    let cls = '';
+    if (!r.running && r.done_at) {
+      const late = new Date(r.done_at) > new Date(r.finish_p90);
+      verdict = late ? '<span class="badge badge-bad">LATE</span>' : '<span class="badge badge-ok">in p90</span>';
+      cls = late ? ' cell-bad' : (new Date(r.done_at) <= new Date(r.finish_p50) ? ' cell-good' : ' cell-warn');
+    } else if (r.running && Date.now() > new Date(r.finish_p90).getTime()) {
+      verdict = '<span class="badge badge-warn">past p90</span>';
+    }
+    html += `<tr>
+      <td>${groupLink(r.task_group_id)}</td><td>${esc(r.repo_family)}</td>
+      <td class="r">${fmtNum(r.n_known)}</td><td class="ts">${fmtTs(r.t0)}</td>
+      <td class="r">${fmtDuration(r.p50_s)}</td><td class="r">${fmtDuration(r.p90_s)}</td>
+      <td class="ts">${fmtTs(r.finish_p50)}</td><td class="ts">${fmtTs(r.finish_p90)}</td>
+      <td class="ts${cls}">${r.running ? '' : fmtTs(r.done_at)}</td><td>${verdict}</td>
+      <td><a class="task-link" href="/api/v0/group/${encodeURIComponent(r.task_group_id)}">json</a></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderGroupMeta(g, fitMtime) {
+  if (!g.meta.length) return '<p class="muted">No group predictions in the last 24h. Check ~/qf-reports/group-eta.log.</p>';
+  const lastAgeMs = Math.min(...g.meta.map(m => Date.now() - new Date(m.last_predicted_at).getTime()));
+  let html = `<div class="pred-counters">
+    <span class="pred-counter"><strong>${fmtAge(Date.now() - lastAgeMs)}</strong> last predict ${healthBadge(lastAgeMs < 30 * 60 * 1000)}</span>
+    <span class="pred-counter"><strong>${fitMtime ? fmtAge(fitMtime) : '—'}</strong> last fit ${healthBadge(fitMtime && Date.now() - fitMtime.getTime() < 30 * 3600 * 1000)}</span>
+  </div>
+  <table><thead><tr><th>Estimator</th><th class="r">Groups (24h)</th><th>Last prediction</th><th>Model version</th></tr></thead><tbody>`;
+  for (const m of g.meta) {
+    html += `<tr><td class="mono">${esc(m.estimator)}</td><td class="r">${fmtNum(m.n_24h)}</td><td class="ts">${fmtTs(m.last_predicted_at)}</td><td class="mono">${esc(m.model_version)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function groupEtaFitMtime() {
+  const p = path.join(PROJECT_ROOT, 'trainer', 'data', 'group_eta', 'live_model.pkl');
+  try { return fs.statSync(p).mtime; } catch { return null; }
+}
+
+// ─── Generated status page ──────────────────────────────────────────────────
+
+async function queryShadowLive(pool) {
+  const { rows } = await pool.query(`
+    SELECT wait_model_version AS version, count(*)::int AS n, max(predicted_at) AS last_predicted_at
+    FROM queue_forecast_run_predictions_shadow
+    WHERE predicted_at >= now() - interval '1 hour'
+    GROUP BY 1 ORDER BY n DESC
+  `);
+  return rows;
+}
+
+function latestModelDirs() {
+  if (!fs.existsSync(MODELS_DIR)) return [];
+  return fs.readdirSync(MODELS_DIR).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort().reverse();
+}
+
+function statusCard(title, bodyHtml) {
+  return `<div class="manifest-card"><h3>${title}</h3>${bodyHtml}</div>`;
+}
+
+function kvTable(pairs) {
+  return `<table class="metrics"><tbody>${pairs.map(([k, v]) => `<tr><td class="muted">${k}</td><td>${v}</td></tr>`).join('')}</tbody></table>`;
+}
+
+const PROGRAMME_STATUS = [
+  ['Task-level wait/run predictions', 'LIVE', 'Served by live-predictor; models retrained weekly (Wed 00:00Z walk-forward) and reloaded on restart.'],
+  ['qctx_d wait model (Bet 1)', 'SHADOW', 'Scored alongside served since 2026-10-16; judged against the v3 bars on the Shadow page.'],
+  ['Hazard / survival tail model (Bet 2)', 'OFFLINE', 'Built in trainer; not walk-forwarded or shadowed yet (group-eta-plan P4).'],
+  ['Group ETA P0: dependency edges', 'LIVE', 'Collected inline on queue_forecast_tasks since 2026-11-16.'],
+  ['Group ETA P1: edge-free baselines', 'DONE', 'Offline eval 10-08..11-12: B1c* passes the try bars.'],
+  ['Group ETA P2: shadow estimates', 'SHADOW', 'B0 / B1c / B1c* predicted every 10 min since 2026-11-19; see Group ETA page.'],
+  ['Group ETA P3: critical-path replay', 'PLANNED', 'Needs 2-3 weeks of edges (~Dec 7+).'],
+  ['Prediction API', 'EXPERIMENTAL', '<a href="#api">/api/v0</a>: read-only JSON by taskId / taskGroupId.'],
+];
+
+function programmeBadge(s) {
+  const cls = { LIVE: 'badge-ok', DONE: 'badge-ok', SHADOW: 'badge-blue', EXPERIMENTAL: 'badge-blue' }[s] || 'badge-dim';
+  return `<span class="badge ${cls}">${s}</span>`;
+}
+
+function renderStatusBody(d) {
+  const ph = d.predictorHealth || {};
+  const versions = (list) => (list && list.length)
+    ? list.map(v => `<span class="mono">${esc(v.version || '(null)')}</span> <span class="muted">(${fmtNum(v.n)}/h)</span>`).join('<br>')
+    : '<span class="muted">none in last hour</span>';
+  const lastAge = ph.last_predicted_at ? Date.now() - new Date(ph.last_predicted_at).getTime() : null;
+  const shadowLast = d.shadowLive.length ? d.shadowLive[0].last_predicted_at : null;
+
+  const servingCard = statusCard('Serving', kvTable([
+    ['Live predictor', `${fmtAge(ph.last_predicted_at)} ${healthBadge(lastAge != null && lastAge < 5 * 60 * 1000)} · ${fmtNum(ph.preds_1h)} predictions/h`],
+    ['Served wait model', versions(ph.wait_versions)],
+    ['Served run model', versions(ph.duration_versions)],
+    ['Shadow wait model', `${versions(d.shadowLive)} ${shadowLast ? '' : healthBadge(false, 'OFF')}`],
+  ]));
+
+  const wfLast = {};
+  for (const r of d.wfRows) {
+    if (!WF_CONFIG_ROLE[r.config]) continue;
+    if (!wfLast[r.config] || r.cohort_as_of > wfLast[r.config]) wfLast[r.config] = r.cohort_as_of;
+  }
+  const trainingCard = statusCard('Training', kvTable([
+    ['Newest model dir', d.modelDirs.length ? `<span class="mono">trainer/data/models/${esc(d.modelDirs[0])}/</span>` : '—'],
+    ['Walk-forward last cohort', Object.keys(wfLast).length
+      ? Object.entries(wfLast).map(([c, dt]) => `<span class="mono">${esc(c)}</span> <span class="muted">(${WF_CONFIG_ROLE[c]})</span>: ${esc(dt)}`).join('<br>')
+      : '—'],
+    ['Schedule', 'Walk-forward Wed 00:00Z → live-predictor restart; weekly report Tue 06:00Z'],
+  ]));
+
+  const f = d.freshness || {};
+  const freshAge = (ts) => ts ? Date.now() - new Date(ts).getTime() : Infinity;
+  const collectorCard = statusCard('Collection', kvTable([
+    ['Latest pending_at', `${fmtAge(f.latest_pending)} ${healthBadge(freshAge(f.latest_pending) < 30 * 60 * 1000)}`],
+    ['Latest enrichment', `${fmtAge(f.latest_enriched)} ${healthBadge(freshAge(f.latest_enriched) < 30 * 60 * 1000)}`],
+    ['Worker sampler', `${fmtAge(f.latest_worker_sample)} ${healthBadge(freshAge(f.latest_worker_sample) < 30 * 60 * 1000)}`],
+    ['Retention', '60 days by task_created'],
+  ]));
+
+  const g = d.groupEta;
+  const lastGroupPred = g.meta.length ? g.meta.map(m => m.last_predicted_at).sort().reverse()[0] : null;
+  const groupCard = statusCard('Group ETA (shadow)', kvTable([
+    ['Live estimators', g.meta.length ? g.meta.map(m => `<span class="mono">${esc(m.estimator)}</span>`).join(', ') : '<span class="muted">none</span>'],
+    ['Last predict', `${fmtAge(lastGroupPred)} ${healthBadge(lastGroupPred && freshAge(lastGroupPred) < 30 * 60 * 1000)}`],
+    ['Last fit', d.fitMtime ? `${fmtAge(d.fitMtime)} ${healthBadge(freshAge(d.fitMtime) < 30 * 3600 * 1000)}` : '—'],
+    ['Model version', g.meta.length ? `<span class="mono">${esc(g.meta[0].model_version)}</span>` : '—'],
+  ]));
+
+  const programme = `<table><thead><tr><th>Workstream</th><th>State</th><th>Notes</th></tr></thead><tbody>${
+    PROGRAMME_STATUS.map(([w, s, n]) => `<tr><td>${w}</td><td>${programmeBadge(s)}</td><td class="muted">${n}</td></tr>`).join('')
+  }</tbody></table>`;
+
+  const api = `<p>Read-only JSON. CORS open, rate-limited per IP. Shadow values are experimental and not used by Taskcluster.</p>
+<table><thead><tr><th>Endpoint</th><th>Returns</th></tr></thead><tbody>
+<tr><td class="mono">GET /api/v0/task/&lt;taskId&gt;</td><td>Task metadata and each run's served wait/run p50/p90, shadow wait p50/p90, and expected start/finish times.</td></tr>
+<tr><td class="mono">GET /api/v0/group/&lt;taskGroupId&gt;</td><td>Shadow group-completion estimates per estimator (finish p50/p90), group status, and per-task predictions (latest run, up to 5000 tasks).</td></tr>
+<tr><td class="mono">GET /api/v0/health</td><td>Service liveness and latest prediction time.</td></tr>
+</tbody></table>`;
+
+  return `
+<h2>Live now</h2>
+<div class="grid">${servingCard}${trainingCard}</div>
+<div class="grid">${collectorCard}${groupCard}</div>
+
+<h2>Programme</h2>
+<div class="meta">Design and status docs live in the repo: <span class="mono">tools/queue-forecasting/group-eta-plan.md</span>, <span class="mono">next-steps.md</span>, <span class="mono">bet2-hazard-survival-design.md</span>.</div>
+${programme}
+
+<h2 id="api">Prediction API (v0, experimental)</h2>
+${api}
+
+<h2>Archive</h2>
+<p><a class="task-link" href="archive.html">Phase 2 decision log (trainer-phase2-decision.md, last updated 2026-09)</a></p>
+`;
+}
+
 // ─── Page Builders ───────────────────────────────────────────────────────────
 
-function renderPage({ title, h1Html, headerMetaHtml, bodyHtml, extraStyle = '', extraScript = '' }) {
+const NAV_PAGES = [
+  ['index.html', 'Dashboard'],
+  ['status.html', 'Status'],
+  ['predictions.html', 'Predictions'],
+  ['shadow.html', 'Shadow'],
+  ['groups.html', 'Group ETA'],
+  ['aggregations.html', 'Aggregations'],
+];
+
+function renderNav(active) {
+  return `<nav class="site-nav">${NAV_PAGES.map(([href, label]) =>
+    `<a href="${href === 'index.html' ? '/' : href}"${href === active ? ' class="active"' : ''}>${label}</a>`).join('')}</nav>`;
+}
+
+function renderPage({ title, h1Html, headerMetaHtml, bodyHtml, extraStyle = '', extraScript = '', active = '' }) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1960,6 +2569,7 @@ function renderPage({ title, h1Html, headerMetaHtml, bodyHtml, extraStyle = '', 
 </head>
 <body>
 <h1>${h1Html}</h1>
+${renderNav(active)}
 <div class="header-meta">${headerMetaHtml}</div>
 ${bodyHtml}
 <footer>queue-forecasting · generated ${now}</footer>
@@ -1970,7 +2580,7 @@ ${extraScript ? `<script>${extraScript}</script>` : ''}
 
 function buildPage(data) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-  const headerMetaHtml = `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="status.html">Project Status</a> · <a href="predictions.html">Predictions</a> · <a href="aggregations.html">Aggregations</a>`;
+  const headerMetaHtml = `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)}`;
   const bodyHtml = `
 <h2>Today (UTC)</h2>
 ${data.todayHourly}
@@ -2006,6 +2616,7 @@ ${data.todayHourly}
 ${data.manifests}
 
 <h2>Walk-Forward Evaluation</h2>
+<div class="meta">Weekly retrain cohorts (newest first). <b>served</b> = model behind live predictions; <b>shadow</b> = scored live but not served. Source: <span class="mono">trainer/walk_forward_summary.csv</span>, written by the Wednesday walk-forward.</div>
 ${data.walkForward}
 
 <h2>Daily Health (last ${DAILY_HEALTH_WINDOW_DAYS}d)</h2>
@@ -2018,10 +2629,11 @@ ${data.dailyHealth}
     headerMetaHtml,
     bodyHtml,
     extraScript: TAB_JS,
+    active: 'index.html',
   });
 }
 
-function buildStatusPage(mdContent) {
+function buildArchivePage(mdContent) {
   const body = markdownToHtml(mdContent);
   const extraStyle = `
   /* Markdown overrides */
@@ -2048,9 +2660,10 @@ function buildStatusPage(mdContent) {
   .md-body strong { color: var(--fg); }`;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   return renderPage({
-    title: 'Project Status — Queue Forecasting',
-    h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Project Status',
-    headerMetaHtml: `Rendered from trainer-phase2-decision.md · generated ${now} · <a href="/">Back to Dashboard</a>`,
+    title: 'Archive: Phase 2 decision log — Queue Forecasting',
+    h1Html: 'Archive: Phase 2 decision log',
+    headerMetaHtml: `Historical document, rendered from trainer-phase2-decision.md (last edited 2026-09). For current state see <a href="status.html">Status</a> · generated ${now}`,
+    active: 'status.html',
     bodyHtml: `<div class="md-body">\n${body}\n</div>`,
     extraStyle,
   });
@@ -2070,8 +2683,9 @@ ${data.unresolvedSample}
 `;
   return renderPage({
     title: 'Predictions — Queue Forecasting',
-    h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Predictions',
-    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · <a href="/">Back to Dashboard</a> · <a href="aggregations.html">Aggregations</a>`,
+    h1Html: 'Predictions',
+    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)}`,
+    active: 'predictions.html',
     bodyHtml,
   });
 }
@@ -2186,11 +2800,101 @@ ${data.topRunMisses}
 
   return renderPage({
     title: 'Aggregations — Queue Forecasting',
-    h1Html: '<a href="/" style="color:var(--fg);text-decoration:none">&larr;</a> Prediction Aggregations',
-    headerMetaHtml: `Aggregations computed ${generatedAt} · page rendered ${now} · refreshes every ${formatInterval(AGGREGATIONS_REFRESH_MS)} · <a href="/">Back to Dashboard</a> · <a href="predictions.html">Predictions</a>`,
+    h1Html: 'Prediction Aggregations (served model)',
+    headerMetaHtml: `Aggregations computed ${generatedAt} · page rendered ${now} · refreshes every ${formatInterval(AGGREGATIONS_REFRESH_MS)}`,
+    active: 'aggregations.html',
     bodyHtml,
     extraStyle: tocStyle,
     extraScript: tocScript,
+  });
+}
+
+function buildStatusPage(data) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  return renderPage({
+    title: 'Status — Queue Forecasting',
+    h1Html: 'Project Status',
+    headerMetaHtml: `Generated ${now} from live data · refreshes every ${formatInterval(INTERVAL_MS)}`,
+    bodyHtml: renderStatusBody(data),
+    active: 'status.html',
+  });
+}
+
+function buildShadowPage(result) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const computed = new Date(result.generatedAt).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const d = result.data;
+  const bodyHtml = `
+<div class="caveat-banner"><strong>Shadow = scored, not served.</strong> The shadow wait model
+(<span class="mono">wait_qctx_d_priority_flow</span>) predicts every run alongside the served model, but only the served
+prediction is used. Population: completed runs with an observed wait, pending in the last ${SHADOW_WINDOW_DAYS} days,
+scored by both models (same definitions as weekly report §2–4). Both p90s are guarded values. Promotion is judged against the
+v3 contract bars below; shadow over-coverage (&gt; 0.93) is the recurring failure.</div>
+
+<h2>Scorecard (last ${SHADOW_WINDOW_DAYS} days)</h2>
+${renderShadowScorecard(d.overall)}
+
+<h2>Per day</h2>
+<div class="meta">MAE gain cell: green &ge; 15% (bar), amber 0–15%, red &lt; 0. Shadow cov90 amber when outside [0.88, 0.93]. pin90 shadow green when lower than served. Today's row is partial.</div>
+${renderShadowByDay(d.byDay)}
+
+<h2>By actual wait bucket</h2>
+<div class="meta">p90 coverage and miss rate per actual-wait bucket. The <b>30m+</b> row is the tail headline: the group ETA is a max over tasks, so tail misses dominate it.</div>
+${renderShadowByBucket(d.byBucket)}
+`;
+  return renderPage({
+    title: 'Shadow vs Served — Queue Forecasting',
+    h1Html: 'Shadow vs Served (wait)',
+    headerMetaHtml: `Computed ${computed} · page rendered ${now} · recomputed every ${formatInterval(SHADOW_REFRESH_MS)}`,
+    bodyHtml,
+    active: 'shadow.html',
+  });
+}
+
+function buildGroupsPage(g, fitMtime) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const bodyHtml = `
+<div class="caveat-banner"><strong>Internal shadow estimates.</strong> For each task group (push), we predict when
+the original graph will finish: <b>label</b> = latest resolution among tasks created by the prediction time, minus
+<b>t0</b> (earliest task_created). The prediction is made once, ~2 min after the decision task resolves. Estimators:
+<b>B0</b> history by family &times; size; <b>B1c</b> max over tasks of per-task-name offset quantiles; <b>B1c*</b>
+B1c with per-family calibration. Not shown to users. Internal try bars: cov90 in [${GROUP_TRY_BARS.covLo}, ${GROUP_TRY_BARS.covHi}], w2x &ge; ${GROUP_TRY_BARS.w2x}.</div>
+
+<h2>Pipeline</h2>
+${renderGroupMeta(g, fitMtime)}
+
+<h2>Scorecard (last ${GROUP_SCORE_DAYS} days, groups &ge; ${GROUP_SCORE_MIN_AGE_HOURS}h old)</h2>
+<div class="meta">Only fully resolved groups (the weekly report uses &ge; 1 day; the official scorecard is there). w2x = actual within [p50/2, 2&times;p50]; cov90 = actual &le; p90. Bars colour try rows only.</div>
+${renderGroupScorecard(g)}
+
+<h2>Try: per day</h2>
+${renderGroupTryTrend(g)}
+
+<h2>Try: by group size</h2>
+<div class="meta">Known weak spot: try groups with 200+ tasks are under-covered after calibration (offline cov90 0.78; 0.68 at 1000+). Next step in the plan is per family &times; size calibration.</div>
+${renderGroupTryBySize(g)}
+
+<h2>Recent groups (last ${GROUP_RECENT_HOURS}h, ${esc(g.primary || '—')})</h2>
+<div class="meta">Times UTC (MM-DD HH:MM). Actual finish cell: green &le; p50, amber &le; p90, red late. Newest first, max 300.</div>
+${renderGroupRecent(g)}
+`;
+  return renderPage({
+    title: 'Group ETA — Queue Forecasting',
+    h1Html: 'Task-Group ETA (shadow)',
+    headerMetaHtml: `Generated ${now} · refreshes every ${formatInterval(INTERVAL_MS)} · design: group-eta-plan.md`,
+    bodyHtml,
+    active: 'groups.html',
+  });
+}
+
+function getShadowData(pool) {
+  return getCachedResult(pool, {
+    label: 'shadow',
+    path: SHADOW_CACHE_PATH,
+    version: SHADOW_CACHE_VERSION,
+    windowDays: SHADOW_WINDOW_DAYS,
+    refreshMs: SHADOW_REFRESH_MS,
+    compute: queryShadowData,
   });
 }
 
@@ -2240,16 +2944,47 @@ async function generate() {
     });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'predictions.html'), predictionsHtml);
 
-    // Status page from markdown
+    // Archived decision log (was the status page until 2026-11).
     const mdPath = path.join(PROJECT_ROOT, 'trainer-phase2-decision.md');
     if (fs.existsSync(mdPath)) {
       const md = fs.readFileSync(mdPath, 'utf8');
-      fs.writeFileSync(path.join(OUTPUT_DIR, 'status.html'), buildStatusPage(md));
+      fs.writeFileSync(path.join(OUTPUT_DIR, 'archive.html'), buildArchivePage(md));
     }
+
+    // Group ETA is cheap (a few thousand shadow rows); query live every cycle.
+    let groupEta = { meta: [], estimators: [], primary: null, scored: [], recent: [] };
+    try {
+      groupEta = await queryGroupEtaData(pool);
+    } catch (err) {
+      console.error(`[dashboard-gen] group ETA queries failed: ${err.message}`);
+    }
+    const fitMtime = groupEtaFitMtime();
+    fs.writeFileSync(path.join(OUTPUT_DIR, 'groups.html'), buildGroupsPage(groupEta, fitMtime));
+
+    let shadowLive = [];
+    try {
+      shadowLive = await timed('queryShadowLive', queryShadowLive(pool));
+    } catch (err) {
+      console.error(`[dashboard-gen] shadow live query failed: ${err.message}`);
+    }
+    fs.writeFileSync(path.join(OUTPUT_DIR, 'status.html'), buildStatusPage({
+      predictorHealth, freshness, shadowLive, groupEta, fitMtime,
+      modelDirs: latestModelDirs(), wfRows,
+    }));
 
     // Publish the frequently-changing pages before a due aggregation refresh.
     // A cold refresh can take around 30 minutes at production volume.
     console.log(`[${new Date().toISOString()}] live dashboard written to ${OUTPUT_DIR}/`);
+
+    // Shadow comparison (~2 min) on its own cache so it never invalidates the
+    // much slower aggregations cache, and runs before it.
+    try {
+      const shadowResult = await getShadowData(pool);
+      fs.writeFileSync(path.join(OUTPUT_DIR, 'shadow.html'), buildShadowPage(shadowResult));
+      console.log(`[${new Date().toISOString()}] shadow page written to ${OUTPUT_DIR}/`);
+    } catch (err) {
+      console.error(`[dashboard-gen] shadow page failed: ${err.message}`);
+    }
 
     const aggregationResult = await getAggregationsData(pool);
     const {

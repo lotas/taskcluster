@@ -1,6 +1,18 @@
 {$DASHBOARD_DOMAIN} {
-	root * /usr/share/caddy
-	file_server
 	encode gzip
-	header Cache-Control "no-cache"
+
+	# Read-only prediction API (src/api.js, compose service `api`).
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+	handle /api {
+		reverse_proxy api:8080
+	}
+
+	# Static dashboard written by dashboard-gen.
+	handle {
+		root * /usr/share/caddy
+		header Cache-Control "no-cache"
+		file_server
+	}
 }

@@ -138,6 +138,10 @@ CREATE INDEX IF NOT EXISTS idx_qf_task_runs_coalesce_exit
 CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_created
     ON queue_forecast_tasks (task_created);
 
+-- Per-group lookups (API /api/v0/group/:id, dashboard groups.html).
+CREATE INDEX IF NOT EXISTS idx_qf_tasks_task_group_id
+    ON queue_forecast_tasks (task_group_id);
+
 CREATE INDEX IF NOT EXISTS idx_qf_task_runs_resolved_at
     ON queue_forecast_task_runs (resolved_at)
     WHERE resolved_at IS NOT NULL;

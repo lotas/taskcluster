@@ -271,8 +271,37 @@ services:
       - ./src:/app/tools/queue-forecasting/src
       - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
       - ./trainer-phase2-decision.md:/app/tools/queue-forecasting/trainer-phase2-decision.md:ro
-      - ./walk_forward_summary.csv:/app/tools/queue-forecasting/walk_forward_summary.csv:ro
+      # daily_walk_forward.sh runs the summary inside the trainer container
+      # (working_dir /app/trainer), so the live CSV is trainer/walk_forward_summary.csv.
+      # The top-level ./walk_forward_summary.csv is a stale 2026-08 copy.
+      - ./trainer/walk_forward_summary.csv:/app/tools/queue-forecasting/walk_forward_summary.csv:ro
       - dashboard-html:/dashboard
+
+  # Minimal read-only prediction API (src/api.js), proxied by Caddy at /api/*.
+  # Not published on the host; index lookups only, statement_timeout 5s,
+  # per-IP rate limit.
+  api:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    image: queue-forecasting-dashboard-gen
+    command: ["node", "src/api.js"]
+    mem_limit: "512m"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 5s
+    restart: unless-stopped
+    profiles:
+      - dashboard
+      - full
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
+      API_PORT: "8080"
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
 
   dashboard:
     image: caddy:2-alpine
@@ -294,6 +323,7 @@ services:
       - full
     depends_on:
       - dashboard-gen
+      - api
 
   health-monitor:
     build:
