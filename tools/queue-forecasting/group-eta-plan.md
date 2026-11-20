@@ -1,6 +1,6 @@
 # Task-Group ETA — Fast-Path Plan
 
-Date: 2026-11-16. Status: proposed. Owner: ykurmyza.
+Date: 2026-11-16 (updated 2026-11-20). Status: P0-P2 live; see "Status and next steps". Owner: ykurmyza.
 
 Goal: produce *internal* group-completion estimates (p50/p90 ranges) as soon as
 possible, measure them honestly, and get to a user-visible experiment
@@ -47,31 +47,35 @@ contract (05aa4eda) — it gets its own contract later (auto-research Phase 7).
   ~173 B/edge incl. PK (~26 GB at 60d). Inline is ~65 MB/day before TOAST.
 - Weekly report §5 tracks coverage. No backfill: history starts 2026-11-16.
 
-### P1 — Group dataset + edge-free baselines (days 1–4, existing data)
-Script `trainer/scripts/group_eta_dataset.py` (run as a normal foreground
-job, not a CC background shell — see OOM note) → per-group parquet:
-group id, family, n_tasks, created_at, task-set signature (sorted normalized names hash),
-actual completion, span, per-task created/pending/started/resolved offsets.
+### P1 — Edge-free baselines — DONE 2026-11-17
+- `trainer/scripts/group_eta_baselines.py` (`extract` per-day cache, `eval` walk-forward).
+  Host run: `/tmp/qf-trainer-venv/bin/python -m scripts.group_eta_baselines ...` from trainer/,
+  `DATABASE_URL` from ../.env with `@postgres:5432` -> `@127.0.0.1:5433`. Cache:
+  `~/qf-group-eta/tasks/<day>.parquet` (09-20..11-15). Report: `~/qf-group-eta/report.md`.
+- Definitions: t0 = earliest task_created; t_pred = decision task (task_id == task_group_id,
+  97% of groups) resolved + 120s; label = completion of tasks created <= t_pred, minus t0.
+  Groups need >= 5 known tasks, all resolved. Train 14d, calibrate on the last 4 present days.
+- Estimators: B0 history (family × size), B1c = max over tasks of the per-(family,name)
+  offset quantile (comonotone), B1i = independent product (over-covers, dropped), `*` =
+  per-family multiplicative calibration.
+- Offline result, try, n=31k, 10-08..11-12: **B1c\* w2x 0.731, cov90 0.893 (passes)**;
+  B1c 0.783/0.944; B0 0.615/0.897; B1i 0.52/0.996. Weak spot: try groups with 200+ tasks
+  under-covered after calibration (cov 0.78; 0.68 for 1000+). Late Oct dip (w2x 0.54-0.65,
+  10-21..28), probably pre-outage degradation.
 
-Estimators, all predicted "at group creation" (t0 + 10 min, once task definitions settle):
-- **B0 history**: span quantiles by `repo_family × n_tasks bucket`.
-- **B1 offset-max**: for each task, historical quantiles of
-  `resolved_at - group_created` by `normalized_name × repo_family`;
-  group estimate = quantile of max over tasks (Monte Carlo from per-task marginals).
-  Offsets implicitly include upstream dependency depth, so no edges needed.
-- **B2 live-remaining** (in-flight updates, internal only): for an in-flight group,
-  remaining = max over unresolved tasks of (B1 offset remaining, or served
-  wait+run p50/p90 once pending).
-
-Eval: walk-forward by day over Oct 6–28 + Nov 3 onward (skip degraded Oct 29–Nov 2).
-Metrics per family (try first): MAE on span, within-2x, p90 coverage, pinball p90.
-Proposed internal bars for try: p90 coverage in [0.85, 0.93], within-2x ≥ 0.70.
-
-### P2 — Internal shadow estimates (days 4–7)
-- Small job (in live-predictor or a cron) writes B0/B1 group estimates at t0+10min to
-  `queue_forecast_group_predictions_shadow`; scored nightly against actual completion.
-- Section in weekly report. Dashboard-only, labelled experimental, shown as a range.
-  This is the "start giving estimates" milestone — internal audience only.
+### P2 — Internal shadow estimates — LIVE since 2026-11-19
+- `trainer/scripts/group_eta_live.py` (`fit`, `predict`) via `scripts/group_eta_live.sh`,
+  compose service `group-eta` (trainer image, 6g). Cron (user's crontab): fit 04:15Z daily,
+  predict every 10 min; log `~/qf-reports/group-eta.log`. Model + cache:
+  `trainer/data/group_eta/` (gitignored). Live estimators: B0, B1c, B1c\*.
+- Table `queue_forecast_group_predictions_shadow` (PK group+estimator, retention on predicted_at).
+- Viewer: `scripts/group_eta_show.sh [hours=6] [family=try] [estimator=B1c*]`.
+- Scoring: weekly report §6 (groups older than 1 day). The first full scorecard will be in the 11-24 report.
+- Early live read 11-20 (try n=1285, groups >= 3h old): B1c w2x 0.795 / cov 0.927 (passes);
+  B1c\* 0.781 / 0.945 (slightly wide). Try spans rose 11-18/19 (median 29 min vs 11-13);
+  confirmed in offline data too, so this is a real shift.
+- Fixed 11-20: decision tasks that expire at their 24h deadline stretched the scan window and
+  caused a timeout. Groups whose decision task took >= 6h are now skipped.
 
 ### P3 — Critical-path replay (after ≥2–3 weeks of edges, ~Dec 7+)
 Per `next-steps.md` §6: (a) critical path with actual durations → graph sufficiency;
@@ -87,7 +91,40 @@ Only after two consecutive weeks of P2 shadow meeting bars on try, and a separat
 group contract. Range + confidence, never a single "finished at" timestamp
 (`next-steps.md` §5).
 
-## Open decisions (user)
-- Approve P0 schema + collector restart.
-- Internal bars for P2 (numbers above are proposals).
-- Who is the first internal audience for P2 estimates.
+## Status and next steps (handoff 2026-11-20)
+
+Nothing long-running is in flight; everything is committed (HEAD 97a694eb7f).
+
+Next, in order:
+1. **Size-aware calibration**: fit the `*` factors per (family × size bucket) with a
+   family fallback when n is small. Re-run `eval` and compare against B1c/B1c\* by size bucket. If it wins,
+   add it as a new live estimator (e.g. `B1c**`) next to B1c\*. Don't replace B1c\*
+   until a week of live data agrees.
+2. **11-24 weekly report**: read §6 (first full-day live scorecard), §5 (edge coverage
+   ~1.0, tasks table growth). Decide which estimator is the one to share: B1c or B1c\*.
+3. **Sharing with other teams** (the user is starting this): show the p50–p90 range for try only.
+   Since 11-20 the dashboard has a section for this (`groups.html`), plus `GET /api/v0/group/<id>`; see below.
+4. **In-flight re-estimates (B2)**: update the remaining time for running groups as tasks
+   resolve. Not built.
+5. **P3 critical-path replay** from ~12-07, once there are 3 weeks of `dependencies`.
+6. **P4**: put the hazard model into walk-forward + shadow (still offline only).
+
+Dashboard + API (2026-11-20):
+- https://queue-forecasting.taskcluster.net/groups.html has the live group-ETA scorecard (default: groups ≥ 6h old;
+  the weekly §6 report, which uses ≥ 1 day, stays the official one), try per-day/per-size tables, and recent groups.
+  `shadow.html` shows qctx_d vs served against the v3 bars (14d, 6h cache). `status.html` is now a generated
+  "live now" page; the old phase-2 doc moved to `archive.html`.
+- `src/api.js` (compose `api`, proxied by Caddy at `/api/*`): `GET /api/v0/task/<taskId>`, `/api/v0/group/<taskGroupId>`,
+  `/api/v0/health`. Read-only, statement_timeout 5s, 10 req/s per IP. Group lookups use
+  `idx_qf_tasks_task_group_id` (migrate-task-group-index.sql, 129 MB, built 11-20).
+- The walk-forward table had been reading a stale 2026-08 CSV. dashboard-gen now mounts `trainer/walk_forward_summary.csv`.
+
+Watch items:
+- The tasks table was 13 GB on 11-17. Inline deps add about 65 MB/day before TOAST. Disk was 57 GB free on 11-17.
+- A collector restart causes a few hours of ResourceNotFound backfill retries (benign).
+- The live job doesn't take the heavy-training lock. It's capped at 6g, and the fit uses ~1-2 GB.
+
+## Decisions taken
+- P0 schema + collector restart: approved 11-16.
+- Internal bars for try: cov90 in [0.85, 0.93], w2x >= 0.70 (accepted).
+- First audience for P2: the user, who then shares with other teams to get feedback.
