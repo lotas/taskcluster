@@ -222,6 +222,7 @@ export class BaselineStats {
       waitFilterAnomalous:     opts.waitFilterAnomalous     ?? true,
       durationFilterAnomalous: opts.durationFilterAnomalous ?? false,
     };
+    this._refreshIntervalMs = opts.refreshIntervalMs ?? REFRESH_INTERVAL_MS;
     this._waitFilter     = this._opts.waitFilterAnomalous;
     this._durationFilter = this._opts.durationFilterAnomalous;
     this._refreshTimer   = null;
@@ -247,7 +248,7 @@ export class BaselineStats {
     if (this._refreshTimer) return;
     this._refreshTimer = setInterval(() => {
       this.refresh().catch(() => {});
-    }, REFRESH_INTERVAL_MS);
+    }, this._refreshIntervalMs);
     this._refreshTimer.unref?.();
   }
 

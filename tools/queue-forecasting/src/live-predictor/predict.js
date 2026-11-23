@@ -91,7 +91,7 @@ async function runQuantile(session, tensor) {
  * queue+bucket baseline p90 floor. Shared by the served model and the shadow
  * model so both see identical inputs and identical post-processing.
  */
-async function scoreWait(bundle, row, liveFeatures, waitBaseline) {
+export async function scoreWait(bundle, row, liveFeatures, waitBaseline) {
   const vec = buildFeatureVector(row, liveFeatures, bundle.schema, bundle.categories);
   const tensor = new ort.Tensor('float32', vec, [1, vec.length]);
   const rawP50 = await runQuantile(bundle.sessionP50, tensor);
@@ -110,6 +110,80 @@ async function scoreWait(bundle, row, liveFeatures, waitBaseline) {
     minSampleSize: WAIT_P90_GUARDRAIL_MIN_SAMPLE,
   });
   return { vec, p50, rawModelP90, guardrail, p90: guardrail.finalP90 };
+}
+
+/**
+ * Compute served wait + run predictions for one task/run row WITHOUT touching
+ * the prediction tables. predictAndStore() wraps this for the live loop; the
+ * playground scorer calls it directly with rows built from Taskcluster data.
+ *
+ * `row` has the FETCH_ROW_SQL shape. `pending_at` is the anchor for the
+ * throughput and queue-context windows; excludeTaskId/excludeRunId keep the
+ * target itself out of those windows (null for a hypothetical row).
+ */
+export async function computePrediction({ pool, bundles, baselineStats, row, excludeTaskId = null, excludeRunId = null }) {
+  const waitBaseline     = baselineStats.predictWait(row);
+  const durationBaseline = baselineStats.predictDuration(row);
+
+  const throughput = await getThroughput(pool, row.task_queue_id, row.pending_at, excludeTaskId, excludeRunId);
+
+  // A hypothetical row has no id to exclude. SQL `NOT (task_id = NULL AND ...)`
+  // is NULL and would drop every peer, so use non-matching sentinels instead
+  // (same as getThroughput's '' / -1).
+  // With no id to exclude the target is not in the DB, so it is also missing
+  // from the "incl target" pending count; targetInDb tells getQueueContext.
+  const queueContext = await getQueueContext(pool, { ...row, task_id: excludeTaskId ?? '', run_id: excludeRunId ?? -1 },
+    { targetInDb: excludeTaskId != null });
+
+  // liveFeatures supplies every column not on `row` directly: baseline
+  // values + throughput aggregates. Baseline-feature names match the
+  // training config: bl_wait_p50 / bl_duration_p50 (used by residual inverse).
+  const liveFeatures = {
+    bl_wait_p50:     waitBaseline     ? Number(waitBaseline.p50)     : NaN,
+    bl_wait_p90:     waitBaseline     ? Number(waitBaseline.p90)     : NaN,
+    bl_duration_p50: durationBaseline ? Number(durationBaseline.p50) : NaN,
+    bl_duration_p90: durationBaseline ? Number(durationBaseline.p90) : NaN,
+    ...throughput,
+    ...queueContext,
+  };
+
+  // ── Wait model ───────────────────────────────────────────────────────────
+  const wait = await scoreWait(bundles.wait, row, liveFeatures, waitBaseline);
+
+  // ── Duration model ───────────────────────────────────────────────────────
+  const durVec = buildFeatureVector(row, liveFeatures, bundles.duration.schema, bundles.duration.categories);
+  const durTensor = new ort.Tensor('float32', durVec, [1, durVec.length]);
+  const durRawP50 = await runQuantile(bundles.duration.sessionP50, durTensor);
+  const durRawP90 = await runQuantile(bundles.duration.sessionP90, durTensor);
+  const durBl = liveFeatures[bundles.duration.schema.residual.baseline_feature];
+  const runP50 = Math.max(0.0, logRatioInverse(durRawP50, durBl));
+  const rawModelRunP90 = Math.max(runP50, logRatioInverse(durRawP90, durBl));
+
+  // Floor the served p90 with the exact-name historical baseline p90 when the
+  // model compresses the tail; only metadata_name with enough samples qualifies.
+  const guardrail = applyDurationP90Guardrail({
+    runP50,
+    rawModelP90: rawModelRunP90,
+    baseline: durationBaseline,
+    minSampleSize: DURATION_P90_GUARDRAIL_MIN_SAMPLE,
+  });
+
+  return {
+    waitBaseline, durationBaseline, throughput, queueContext, liveFeatures,
+    wait,
+    run: { p50: runP50, p90: guardrail.finalP90 },
+    guardrail, rawModelRunP90, durVec,
+    featureCoverage: {
+      wait:     coverage(wait.vec),
+      duration: coverage(durVec),
+    },
+  };
+}
+
+function coverage(vec) {
+  let missing = 0;
+  for (const x of vec) if (!Number.isFinite(x)) missing++;
+  return { total: vec.length, missing };
 }
 
 /** Poll until queue_forecast_tasks.enriched_at IS NOT NULL or timeout. */
@@ -151,47 +225,12 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
   // which is a "current approximation" for catch-up rows — see the
   // anchoring caveat in baseline-stats.js.
 
-  const waitBaseline     = baselineStats.predictWait(row);
-  const durationBaseline = baselineStats.predictDuration(row);
-
-  const throughput = await getThroughput(pool, row.task_queue_id, row.pending_at, taskId, runId);
-
-  const queueContext = await getQueueContext(pool, row);
-
-  // liveFeatures supplies every column not on `row` directly: baseline
-  // values + throughput aggregates. Baseline-feature names match the
-  // training config: bl_wait_p50 / bl_duration_p50 (used by residual inverse).
-  const liveFeatures = {
-    bl_wait_p50:     waitBaseline     ? Number(waitBaseline.p50)     : NaN,
-    bl_wait_p90:     waitBaseline     ? Number(waitBaseline.p90)     : NaN,
-    bl_duration_p50: durationBaseline ? Number(durationBaseline.p50) : NaN,
-    bl_duration_p90: durationBaseline ? Number(durationBaseline.p90) : NaN,
-    ...throughput,
-    ...queueContext,
-  };
-
-  // ── Wait model ───────────────────────────────────────────────────────────
-  const wait = await scoreWait(bundles.wait, row, liveFeatures, waitBaseline);
+  const {
+    waitBaseline, durationBaseline, throughput, queueContext, liveFeatures,
+    wait, run, guardrail, rawModelRunP90, durVec,
+  } = await computePrediction({ pool, bundles, baselineStats, row, excludeTaskId: taskId, excludeRunId: runId });
   const { vec: waitVec, p50: waitP50, rawModelP90: rawModelWaitP90, guardrail: waitGuardrail, p90: waitP90 } = wait;
-
-  // ── Duration model ───────────────────────────────────────────────────────
-  const durVec = buildFeatureVector(row, liveFeatures, bundles.duration.schema, bundles.duration.categories);
-  const durTensor = new ort.Tensor('float32', durVec, [1, durVec.length]);
-  const durRawP50 = await runQuantile(bundles.duration.sessionP50, durTensor);
-  const durRawP90 = await runQuantile(bundles.duration.sessionP90, durTensor);
-  const durBl = liveFeatures[bundles.duration.schema.residual.baseline_feature];
-  const runP50 = Math.max(0.0, logRatioInverse(durRawP50, durBl));
-  const rawModelRunP90 = Math.max(runP50, logRatioInverse(durRawP90, durBl));
-
-  // Floor the served p90 with the exact-name historical baseline p90 when the
-  // model compresses the tail; only metadata_name with enough samples qualifies.
-  const guardrail = applyDurationP90Guardrail({
-    runP50,
-    rawModelP90: rawModelRunP90,
-    baseline: durationBaseline,
-    minSampleSize: DURATION_P90_GUARDRAIL_MIN_SAMPLE,
-  });
-  const runP90 = guardrail.finalP90;
+  const { p50: runP50, p90: runP90 } = run;
 
   // Audit payload — full enough to reproduce a prediction offline.
   // JSON.stringify drops NaN to null; that's fine for audit.

@@ -176,3 +176,10 @@ test('coverage NaN when queue_pending <= 0', async () => {
   assert.ok(Number.isNaN(f.pending_total_per_capacity));
   assert.equal(f.pending_higher_or_equal_per_capacity, (1 + 1) / 5);
 });
+
+test('targetInDb=false (hypothetical row) counts the target in backlog_coverage_ratio', async () => {
+  const pool = fakePool({ queue_context_backlog: [{ pending_total_incl_target: 3, pending_higher_or_equal_excl_target: 1 }] });
+  const row = { task_queue_id: 'q/a', pending_at: new Date(), priority_at_pending: 'low', queue_pending: 4, repo_family: 'try' };
+  assert.equal((await getQueueContext(pool, row)).backlog_coverage_ratio, 3 / 4);
+  assert.equal((await getQueueContext(pool, row, { targetInDb: false })).backlog_coverage_ratio, 1);
+});

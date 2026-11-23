@@ -348,6 +348,11 @@ else
   else
     echo "WARN: live predictor restart failed" >&2
   fi
+  # The playground scorer (internal, dashboard profile) also loads models only
+  # at startup. Best effort: restart it only if it is running.
+  if [[ -n "$(docker compose ps -q playground-scorer 2>/dev/null)" ]]; then
+    run_cmd docker compose restart playground-scorer || echo "WARN: playground-scorer restart failed" >&2
+  fi
 fi
 
 section "Done"

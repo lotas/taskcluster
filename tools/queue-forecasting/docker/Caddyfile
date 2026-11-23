@@ -1,7 +1,19 @@
 {$DASHBOARD_DOMAIN} {
 	encode gzip
 
-	# Read-only prediction API (src/api.js, compose service `api`).
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+	}
+
+	# The playground renders API data client-side: lock it to same-origin
+	# script and fetches (src/dashboard/playground.js; no inline script).
+	@playground path /playground.html /playground.js
+	header @playground Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+	# Read-only prediction API (src/api.js, compose service `api`). The
+	# playground scorer is internal only and is deliberately not proxied.
 	handle /api/* {
 		reverse_proxy api:8080
 	}

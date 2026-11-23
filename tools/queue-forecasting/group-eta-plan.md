@@ -119,6 +119,41 @@ Dashboard + API (2026-11-20):
   `idx_qf_tasks_task_group_id` (migrate-task-group-index.sql, 129 MB, built 11-20).
 - The walk-forward table had been reading a stale 2026-08 CSV. dashboard-gen now mounts `trainer/walk_forward_summary.csv`.
 
+Playground (2026-11-20): `playground.html` + `GET /api/v0/playground/{task,group}/<id>`.
+- A stored prediction is returned if there is one (`source: stored`). Otherwise the api fetches what is missing
+  from Taskcluster (anonymous client) and asks the internal `playground-scorer` service
+  (`src/playground-scorer.js`; no port, not proxied; never writes) to compute one. The result is cached for
+  5 min in memory and **never stored**, so the served/shadow eval tables stay pure.
+- Task modes:
+  - `at-pending`: the run is in the DB and its pending time is inside 59 days. Scored at the real pending time.
+    Baseline stats are current, so the result approximates the live value: 11-20 check, 30 runs, ratio vs stored
+    within ±3%, median 1.000.
+  - `hypothetical-now`: old, unscheduled or unseen tasks. Scored as if pending now, using the current
+    `taskQueueCounts`.
+- Group: the same B0/B1c/B1c* estimators, ported to Node (`src/scorer/group-eta.js`). The model comes from
+  `live_model.json`, written by `group_eta_live.py fit` (or `export-json`), and holds only the quantile tables
+  (6 MB, vs a 200 MB pkl). Parity on 11-20: 1191/1191 estimates exact against the shadow rows
+  (`scripts/check_group_eta_parity.js`). Large groups are slow, because `listTaskGroup` pages are fetched one
+  after another: 4k tasks took ~18 s. Pages are ~5 MB (1000 full task definitions) and took 0.8-3.8 s each on
+  11-23, so listing uses its own client (20 s timeout, 1 retry). Each page is reduced to slim rows as it arrives:
+  two concurrent 7.6k-task groups peaked at 205 MB RSS in the api (limit 512 MB). Computed groups use a separate
+  32-entry cache (~1.5 MB each). Past the 10-page / 10k-task cap the group is listed but not estimated
+  (`mode: truncated`), since its decision task and original graph are unknown.
+- Limits:
+  - Per-IP compute budget of 6/min (burst 3), plus 60/min globally and 2 concurrent. Stored answers and cache
+    hits are free. Admission checks concurrency first (free), then the per-IP bucket, then the global
+    bucket (refunding the per-IP token if the global one refuses), so refused requests cost the client nothing.
+  - Ids must match Taskcluster's v4 slugid regex.
+  - Caddy adds a CSP on the playground (script-src 'self', no inline script), and site-wide nosniff,
+    no-referrer and DENY framing.
+  - The api no longer gets `.env`, so it holds no TC or Pulse credentials.
+- If the scorer's first stats refresh fails, it retries in-process (backoff 1 min doubling to 30 min) with
+  `/score` returning 503, rather than exiting and re-running the heavy queries on every container restart.
+- Hypothetical task rows are not in the DB, so `getQueueContext(..., {targetInDb:false})` adds the target to
+  `backlog_coverage_ratio`'s numerator. The live path is unchanged (default `targetInDb: true`).
+- The scorer loads its models at startup, and `daily_walk_forward.sh` restarts it with live-predictor. Its
+  BaselineStats refresh takes ~5 min and runs every 6h.
+
 Watch items:
 - The tasks table was 13 GB on 11-17. Inline deps add about 65 MB/day before TOAST. Disk was 57 GB free on 11-17.
 - A collector restart causes a few hours of ResourceNotFound backfill retries (benign).

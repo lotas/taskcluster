@@ -2521,6 +2521,8 @@ function renderStatusBody(d) {
 <tr><td class="mono">GET /api/v0/task/&lt;taskId&gt;</td><td>Task metadata and each run's served wait/run p50/p90, shadow wait p50/p90, and expected start/finish times.</td></tr>
 <tr><td class="mono">GET /api/v0/group/&lt;taskGroupId&gt;</td><td>Shadow group-completion estimates per estimator (finish p50/p90), group status, and per-task predictions (latest run, up to 5000 tasks).</td></tr>
 <tr><td class="mono">GET /api/v0/health</td><td>Service liveness and latest prediction time.</td></tr>
+<tr><td class="mono">GET /api/v0/playground/task/&lt;taskId&gt;</td><td>Stored prediction if there is one; otherwise computed on demand (old or not-yet-pending tasks: hypothetical "if it went pending now"). Not stored. Strict per-IP compute limit. See <a class="task-link" href="playground.html">Playground</a>.</td></tr>
+<tr><td class="mono">GET /api/v0/playground/group/&lt;taskGroupId&gt;</td><td>Stored group ETA if there is one; otherwise computed on demand from the Taskcluster task list.</td></tr>
 </tbody></table>`;
 
   return `
@@ -2549,6 +2551,7 @@ const NAV_PAGES = [
   ['shadow.html', 'Shadow'],
   ['groups.html', 'Group ETA'],
   ['aggregations.html', 'Aggregations'],
+  ['playground.html', 'Playground'],
 ];
 
 function renderNav(active) {
@@ -2556,15 +2559,14 @@ function renderNav(active) {
     `<a href="${href === 'index.html' ? '/' : href}"${href === active ? ' class="active"' : ''}>${label}</a>`).join('')}</nav>`;
 }
 
-function renderPage({ title, h1Html, headerMetaHtml, bodyHtml, extraStyle = '', extraScript = '', active = '' }) {
+function renderPage({ title, h1Html, headerMetaHtml, bodyHtml, extraStyle = '', extraScript = '', scriptSrc = '', active = '', refresh = true }) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="900">
-<title>${title}</title>
+${refresh ? '<meta http-equiv="refresh" content="900">\n' : ''}<title>${title}</title>
 <style>${CSS}${extraStyle}</style>
 </head>
 <body>
@@ -2574,6 +2576,7 @@ ${renderNav(active)}
 ${bodyHtml}
 <footer>queue-forecasting · generated ${now}</footer>
 ${extraScript ? `<script>${extraScript}</script>` : ''}
+${scriptSrc ? `<script src="${scriptSrc}" defer></script>` : ''}
 </body>
 </html>`;
 }
@@ -2898,9 +2901,73 @@ function getShadowData(pool) {
   });
 }
 
+// ─── Playground ──────────────────────────────────────────────────────────────
+
+// Static page; all data comes from /api/v0/playground/* at view time, rendered
+// by src/dashboard/playground.js (external file: the page's CSP forbids inline
+// script). No meta refresh, so a reload never wipes what the user typed.
+const PLAYGROUND_JS = path.join(__dirname, 'dashboard', 'playground.js');
+
+const PLAYGROUND_STYLE = `
+  .pg-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; margin: 12px 0 20px; }
+  .pg-forms form { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .pg-forms label { display: block; color: var(--fg2); margin-bottom: 6px; }
+  .pg-forms input { font: inherit; width: 100%; padding: 6px 8px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px; margin-bottom: 8px; }
+  .pg-forms input:invalid:not(:placeholder-shown) { border-color: var(--red); }
+  .pg-forms button { font: inherit; padding: 5px 14px; background: var(--bg3); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+  .pg-forms button:hover { border-color: var(--blue); }
+  #pg-result h3 { margin: 16px 0 6px; }
+`;
+
+function buildPlaygroundPage() {
+  const input = (id, label) => `<label for="${id}">${label}</label>
+<input id="${id}" name="${id}" type="text" inputmode="text" autocomplete="off" spellcheck="false"
+  maxlength="22" minlength="22" pattern="[A-Za-z0-9_\\-]{22}" placeholder="22-character slugid, e.g. fYGu9NkrSB6-1esocoAHYw" required>`;
+  return renderPage({
+    title: 'Playground — queue-forecasting',
+    h1Html: 'Playground',
+    headerMetaHtml: 'Look up a task or task group. Stored predictions are shown as is; otherwise one is computed on demand (rate-limited per IP).',
+    active: 'playground.html',
+    refresh: false,
+    extraStyle: PLAYGROUND_STYLE,
+    scriptSrc: 'playground.js',
+    bodyHtml: `
+<div class="pg-forms">
+<form id="pg-task-form" autocomplete="off">
+${input('pg-task', 'Task id')}
+<button type="submit">Predict task</button>
+<div class="meta">Wait and run time. Old (60+ days) or not-yet-pending tasks are predicted as if they went pending now.</div>
+</form>
+<form id="pg-group-form" autocomplete="off">
+${input('pg-group', 'Task group id')}
+<button type="submit">Predict group</button>
+<div class="meta">Edge-free group completion estimate (B0, B1c, B1c*), from the tasks known 2 min after the decision task resolved.</div>
+</form>
+</div>
+<div id="pg-result"></div>
+<noscript><p class="text-warn">The playground needs JavaScript.</p></noscript>
+<div class="caveat-banner"><strong>Experimental.</strong> Not used by Taskcluster scheduling. On-demand results are cached for 5 minutes and never stored.</div>
+`,
+  });
+}
+
+function writePlayground() {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  fs.writeFileSync(path.join(OUTPUT_DIR, 'playground.html'), buildPlaygroundPage());
+  fs.copyFileSync(PLAYGROUND_JS, path.join(OUTPUT_DIR, 'playground.js'));
+}
+
 // ─── Main Loop ───────────────────────────────────────────────────────────────
 
 async function generate() {
+  // Static, DB-independent: publish first so a failing query never hides it.
+  try {
+    writePlayground();
+  } catch (err) {
+    console.error(`[dashboard-gen] playground page failed: ${err.message}`);
+  }
   // Keep the pool at one as defense in depth: adding a Promise.all here later
   // must not reintroduce concurrent temp-file-heavy dashboard queries.
   const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 1 });
@@ -3034,7 +3101,11 @@ async function loop() {
   }
 }
 
-if (process.argv.includes('--once')) {
+if (process.argv.includes('--playground-only')) {
+  // Publish just the static playground page + script (no DB), then exit.
+  writePlayground();
+  console.log(`[dashboard-gen] playground written to ${OUTPUT_DIR}/`);
+} else if (process.argv.includes('--once')) {
   generate().catch(err => { console.error(err); process.exit(1); });
 } else {
   loop();

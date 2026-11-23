@@ -195,7 +195,7 @@ function emptyFeatures() {
  * @param {object} row - { task_queue_id, pending_at, priority_at_pending,
  *                         queue_pending, repo_family, task_id?, run_id? }
  */
-export async function getQueueContext(pool, row) {
+export async function getQueueContext(pool, row, { targetInDb = true } = {}) {
   const f = emptyFeatures();
 
   if (!row || !row.task_queue_id || !row.pending_at) {
@@ -241,8 +241,9 @@ export async function getQueueContext(pool, row) {
   const heExcl = num(b.pending_higher_or_equal_excl_target);
   const heInclTarget = Number.isNaN(heExcl) ? NaN : heExcl + 1;
 
-  // Coverage: (pending-at-T all-rank incl target) / queue_pending.
-  const pendingTotalInclTarget = num(b.pending_total_incl_target);
+  // Coverage: (pending-at-T all-rank incl target) / queue_pending. A
+  // hypothetical row (playground) has no DB run, so add the target here.
+  const pendingTotalInclTarget = num(b.pending_total_incl_target) + (targetInDb ? 0 : 1);
   f.backlog_coverage_ratio = qp > 0 ? pendingTotalInclTarget / qp : NaN;
 
   // Capacity. Default already set to no_sample / NaN by emptyFeatures().

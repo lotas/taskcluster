@@ -2,6 +2,8 @@
 
   fit      extract any missing days into the cache, fit all edge-free estimators
            on the last TRAIN_DAYS of completed groups, save <data-dir>/live_model.pkl
+           and its quantile-table subset <data-dir>/live_model.json
+  export-json  rewrite live_model.json from the existing live_model.pkl (no refit)
   predict  for groups whose decision task resolved in (now - lookback, now - 120s],
            predict with the saved model and insert into
            queue_forecast_group_predictions_shadow (idempotent: ON CONFLICT DO NOTHING)
@@ -15,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
+import math
 import os
 import pickle
 import time
@@ -93,6 +97,7 @@ def fit(data_dir: Path, excluded: set[dt.date]) -> None:
     with open(tmp, "wb") as f:
         pickle.dump(model, f)
     tmp.rename(data_dir / "live_model.pkl")
+    write_json(model, data_dir)
     print(f"[group-eta fit] {model['version']}: {len(tr):,} training groups, {time.time() - t:.0f}s", flush=True)
 
 
@@ -138,6 +143,64 @@ def predict(data_dir: Path, lookback_min: int, estimators: list[str]) -> None:
     print(f"[group-eta predict] {len(groups)} groups, {len(rows)} rows ({model['version']})", flush=True)
 
 
+JSON_ESTIMATORS = ("B0", "B1c", "B1c*")
+
+
+def _f(x):
+    x = float(x)
+    return None if math.isnan(x) else x
+
+
+def _qtable(df: pd.DataFrame) -> dict:
+    """quantile frame (index -> columns 0.5, 0.9) as {str(key): [p50, p90]}."""
+    return {str(k): [_f(r[0.5]), _f(r[0.9])] for k, r in df.iterrows()}
+
+
+def model_json(model: dict) -> dict:
+    """The subset of a fitted model that B0, B1c and B1c* need, as plain JSON.
+
+    Consumed by src/scorer/group-eta.js (the playground scorer). The per-key CDFs
+    (B1i only) are left out; they are what makes the pickle ~200 MB.
+    """
+    fs, fam, glob = model["b0"]
+    b0_fs: dict = {}
+    for (family, sb), r in fs.iterrows():
+        b0_fs.setdefault(str(family), {})[str(int(sb))] = [_f(r[0.5]), _f(r[0.9])]
+    cal = model["cal_c"]
+    return {
+        "format": "group-eta-tables-v1",
+        "version": model["version"],
+        "trained_before": float(model["trained_before"]),
+        "estimators": list(JSON_ESTIMATORS),
+        "params": {
+            "size_buckets": [b if math.isfinite(b) else None for b in g.SIZE_BUCKETS],
+            "min_key_samples": g.MIN_KEY_SAMPLES,
+            "min_group_tasks": g.MIN_GROUP_TASKS,
+            "pred_delay_s": g.PRED_DELAY_S,
+        },
+        "b0": {"fs": b0_fs, "fam": _qtable(fam), "glob": [_f(glob[0.5]), _f(glob[0.9])]},
+        "b1_full": {"q_key": _qtable(model["b1_full"]["q_key"]), "q_fam": _qtable(model["b1_full"]["q_fam"])},
+        "b1_fit": {"q_key": _qtable(model["b1_fit"]["q_key"]), "q_fam": _qtable(model["b1_fit"]["q_fam"])},
+        "cal_c": {str(k): {"n": int(r["n"]), "f50": _f(r["f50"]), "f90": _f(r["f90"])} for k, r in cal.iterrows()},
+    }
+
+
+def write_json(model: dict, data_dir: Path) -> Path:
+    out = data_dir / "live_model.json"
+    tmp = data_dir / "live_model.json.tmp"
+    with open(tmp, "w") as f:
+        json.dump(model_json(model), f, separators=(",", ":"), allow_nan=False)
+    tmp.rename(out)
+    return out
+
+
+def export_json(data_dir: Path) -> None:
+    with open(data_dir / "live_model.pkl", "rb") as f:
+        model = pickle.load(f)
+    out = write_json(model, data_dir)
+    print(f"[group-eta export-json] {model['version']} -> {out} ({out.stat().st_size / 1e6:.1f} MB)", flush=True)
+
+
 def live_frames(dec: pd.DataFrame, tasks: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build (groups, known) in the shapes predict_all expects, from live rows."""
     tasks = tasks.merge(dec[["task_group_id", "t_pred"]], on="task_group_id")
@@ -159,6 +222,8 @@ def main(argv=None) -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fit")
     f.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    e = sub.add_parser("export-json")
+    e.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p = sub.add_parser("predict")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument("--lookback-min", type=int, default=30)
@@ -168,6 +233,8 @@ def main(argv=None) -> None:
     a = ap.parse_args(argv)
     if a.cmd == "fit":
         fit(a.data_dir.expanduser(), set(g.DEFAULT_EXCLUDED))
+    elif a.cmd == "export-json":
+        export_json(a.data_dir.expanduser())
     else:
         predict(a.data_dir.expanduser(), a.lookback_min, a.estimators.split(","))
 

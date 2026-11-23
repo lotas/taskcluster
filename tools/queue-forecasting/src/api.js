@@ -4,15 +4,21 @@
  *   GET /api/v0/task/:taskId        served + shadow per-run predictions
  *   GET /api/v0/group/:taskGroupId  shadow group ETA + per-task predictions
  *   GET /api/v0/health              liveness + latest prediction time
+ *   GET /api/v0/playground/task/:taskId        stored, else on-demand (src/playground.js)
+ *   GET /api/v0/playground/group/:taskGroupId  stored, else on-demand
  *
  * Served publicly behind Caddy (docker/Caddyfile: /api/* -> api:8080). Every
  * lookup is an index probe (pkeys, idx_qf_tasks_task_group_id); a per-IP token
  * bucket and a statement_timeout bound the load one client can put on the
- * production database. No writes, no new dependencies.
+ * production database. No writes, no new dependencies. The playground routes
+ * add Taskcluster reads (anonymous) and calls to the internal scorer, behind a
+ * much stricter compute budget; they never write either.
  */
 import http from 'http';
 import pg from 'pg';
+import taskcluster from '@taskcluster/client';
 import { fileURLToPath } from 'url';
+import { createPlayground, createScorerClient, PlaygroundError } from './playground.js';
 
 const PORT = parseInt(process.env.API_PORT || '8080', 10);
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
@@ -20,6 +26,13 @@ const STATEMENT_TIMEOUT_MS = parseInt(process.env.API_STATEMENT_TIMEOUT_MS || '5
 const RATE_PER_S = parseFloat(process.env.API_RATE_PER_S || '10');
 const RATE_BURST = parseFloat(process.env.API_RATE_BURST || '30');
 export const GROUP_TASK_LIMIT = parseInt(process.env.API_GROUP_TASK_LIMIT || '5000', 10);
+// Fixed configuration, never derived from a request (SSRF).
+const PLAYGROUND_TC_ROOT_URL = process.env.PLAYGROUND_TC_ROOT_URL || 'https://firefox-ci-tc.services.mozilla.com';
+const SCORER_URL = process.env.SCORER_URL || 'http://playground-scorer:8081';
+const PLAYGROUND_PER_MIN = parseFloat(process.env.PLAYGROUND_COMPUTE_PER_MIN || '6');
+const PLAYGROUND_BURST = parseFloat(process.env.PLAYGROUND_COMPUTE_BURST || '3');
+const PLAYGROUND_GLOBAL_PER_MIN = parseFloat(process.env.PLAYGROUND_GLOBAL_PER_MIN || '60');
+const PLAYGROUND_MAX_CONCURRENT = parseInt(process.env.PLAYGROUND_MAX_CONCURRENT || '2', 10);
 
 // Taskcluster slugids: 22 chars of URL-safe base64.
 const SLUGID_RE = /^[A-Za-z0-9_-]{22}$/;
@@ -257,11 +270,16 @@ export function createRateLimiter({ ratePerS = RATE_PER_S, burst = RATE_BURST, n
     b.tokens -= 1;
     return true;
   }
+  /** Give back a token taken by allow() for a request that was then refused. */
+  function refund(key) {
+    const b = buckets.get(key);
+    if (b) b.tokens = Math.min(burst, b.tokens + 1);
+  }
   function sweep() {
     const t = now();
     for (const [k, b] of buckets) if (t - b.t > 10 * 60 * 1000) buckets.delete(k);
   }
-  return { allow, sweep, size: () => buckets.size };
+  return { allow, refund, sweep, size: () => buckets.size };
 }
 
 // Caddy overwrites X-Forwarded-For with the real peer unless trusted_proxies is
@@ -283,6 +301,7 @@ function send(res, status, body, extraHeaders = {}) {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Cache-Control': status === 200 ? 'public, max-age=30' : 'no-store',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff',
     ...extraHeaders,
   });
@@ -292,6 +311,8 @@ function send(res, status, body, extraHeaders = {}) {
 export function route(pathname) {
   const m = /^\/api\/v0\/(task|group)\/([^/]+)\/?$/.exec(pathname);
   if (m) return { kind: m[1], id: decodeURIComponentSafe(m[2]) };
+  const pm = /^\/api\/v0\/playground\/(task|group)\/([^/]+)\/?$/.exec(pathname);
+  if (pm) return { kind: pm[1], playground: true, id: decodeURIComponentSafe(pm[2]) };
   if (pathname === '/api/v0/health' || pathname === '/api/v0/health/') return { kind: 'health' };
   if (pathname === '/api/v0' || pathname === '/api/v0/' || pathname === '/api' || pathname === '/api/') return { kind: 'index' };
   return null;
@@ -309,11 +330,13 @@ const INDEX = {
     'GET /api/v0/task/{taskId}': 'served + shadow per-run wait/run predictions',
     'GET /api/v0/group/{taskGroupId}': `shadow group ETA + per-task predictions (latest run, up to ${GROUP_TASK_LIMIT} tasks)`,
     'GET /api/v0/health': 'liveness',
+    'GET /api/v0/playground/task/{taskId}': 'stored prediction if any, else computed on demand (old or not-yet-pending tasks: hypothetical "if pending now"); strict per-IP compute limit',
+    'GET /api/v0/playground/group/{taskGroupId}': 'stored group ETA if any, else computed on demand from Taskcluster; strict per-IP compute limit',
   },
   docs: '/status.html#api',
 };
 
-export function createHandler(pool, { limiter = createRateLimiter(), log = console } = {}) {
+export function createHandler(pool, { limiter = createRateLimiter(), playground = null, log = console } = {}) {
   return async function handler(req, res) {
     const t0 = Date.now();
     let status = 500;
@@ -343,6 +366,20 @@ export function createHandler(pool, { limiter = createRateLimiter(), log = conso
       if (!isSlugid(r.id)) {
         status = 400;
         return send(res, 400, { error: `invalid ${r.kind === 'task' ? 'taskId' : 'taskGroupId'}: expected a 22-character slugid` });
+      }
+      if (r.playground) {
+        if (!playground) { status = 503; return send(res, 503, { error: 'playground disabled' }); }
+        try {
+          const body = r.kind === 'task'
+            ? await playground.task(r.id, clientKey(req))
+            : await playground.group(r.id, clientKey(req));
+          status = 200;
+          return send(res, 200, body, { 'Cache-Control': 'private, max-age=60' });
+        } catch (err) {
+          if (!(err instanceof PlaygroundError)) throw err;
+          status = err.status;
+          return send(res, err.status, { error: err.message }, err.headers);
+        }
       }
       const body = r.kind === 'task' ? await getTask(pool, r.id) : await getGroup(pool, r.id);
       if (!body) {
@@ -375,8 +412,25 @@ function main() {
   });
   pool.on('error', err => console.error('[api] pg pool error:', err.message));
   const limiter = createRateLimiter();
-  setInterval(() => limiter.sweep(), 60 * 1000).unref();
-  const server = http.createServer(createHandler(pool, { limiter }));
+  const ipLimiter = createRateLimiter({ ratePerS: PLAYGROUND_PER_MIN / 60, burst: PLAYGROUND_BURST });
+  const globalLimiter = createRateLimiter({ ratePerS: PLAYGROUND_GLOBAL_PER_MIN / 60, burst: PLAYGROUND_GLOBAL_PER_MIN / 4 });
+  setInterval(() => { limiter.sweep(); ipLimiter.sweep(); }, 60 * 1000).unref();
+  // Anonymous client: task/status/listTaskGroup/taskQueueCounts are public on
+  // firefox-ci, and the api must not hold Taskcluster credentials.
+  const queue = new taskcluster.Queue({ rootUrl: PLAYGROUND_TC_ROOT_URL, timeout: 5000, retries: 0 });
+  // listTaskGroup pages are ~5 MB each (1000 full task definitions); measured
+  // 0.8-3.8 s per page on firefox-ci (11-23), so they get a longer timeout
+  // and one retry: a failed page wastes every page before it.
+  const listQueue = new taskcluster.Queue({ rootUrl: PLAYGROUND_TC_ROOT_URL, timeout: 20000, retries: 1 });
+  const playground = createPlayground({
+    pool, queue, listQueue, scorer: createScorerClient(SCORER_URL),
+    getTask, getGroup, runPrediction,
+    ipLimiter, globalLimiter,
+    ipRetryAfterS: Math.ceil(60 / PLAYGROUND_PER_MIN),
+    globalRetryAfterS: Math.ceil(60 / PLAYGROUND_GLOBAL_PER_MIN),
+    maxConcurrent: PLAYGROUND_MAX_CONCURRENT,
+  });
+  const server = http.createServer(createHandler(pool, { limiter, playground }));
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
   server.listen(PORT, () => console.log(`[api] listening on :${PORT}`));

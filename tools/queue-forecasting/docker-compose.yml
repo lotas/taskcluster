@@ -279,7 +279,10 @@ services:
 
   # Minimal read-only prediction API (src/api.js), proxied by Caddy at /api/*.
   # Not published on the host; index lookups only, statement_timeout 5s,
-  # per-IP rate limit.
+  # per-IP rate limit. Also serves /api/v0/playground/* (src/playground.js):
+  # anonymous Taskcluster reads + calls to playground-scorer, under a separate
+  # compute budget. No env_file: the api must not hold Taskcluster or Pulse
+  # credentials, so it only gets what it needs.
   api:
     build:
       context: ../..
@@ -295,13 +298,47 @@ services:
     profiles:
       - dashboard
       - full
-    env_file:
-      - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
       API_PORT: "8080"
+      SCORER_URL: http://playground-scorer:8081
+      PLAYGROUND_TC_ROOT_URL: https://firefox-ci-tc.services.mozilla.com
+      PLAYGROUND_COMPUTE_PER_MIN: "${PLAYGROUND_COMPUTE_PER_MIN:-6}"
+      PLAYGROUND_COMPUTE_BURST: "${PLAYGROUND_COMPUTE_BURST:-3}"
+      PLAYGROUND_GLOBAL_PER_MIN: "${PLAYGROUND_GLOBAL_PER_MIN:-60}"
+      PLAYGROUND_MAX_CONCURRENT: "${PLAYGROUND_MAX_CONCURRENT:-2}"
     volumes:
       - ./src:/app/tools/queue-forecasting/src
+
+  # On-demand scorer for the playground (src/playground-scorer.js). Internal
+  # only: no published port, not proxied by Caddy; the api is its only client.
+  # Separate from live-predictor so public traffic cannot slow the service
+  # that writes served predictions. Never writes to the DB; no Taskcluster
+  # credentials. Loads models at startup (restart after a model refresh, see
+  # scripts/daily_walk_forward.sh); reloads the group-ETA JSON on change.
+  playground-scorer:
+    build:
+      context: ../..
+      dockerfile: tools/queue-forecasting/Dockerfile
+    image: queue-forecasting-dashboard-gen
+    command: ["node", "src/playground-scorer.js"]
+    mem_limit: "1536m"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 5s
+    restart: unless-stopped
+    profiles:
+      - dashboard
+      - full
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env (see host/README.md)}
+      SCORER_PORT: "8081"
+      SHADOW_WAIT_STEM: "${SHADOW_WAIT_STEM:-}"
+      SCORER_STATS_REFRESH_MS: "21600000"
+    volumes:
+      - ./src:/app/tools/queue-forecasting/src
+      - ./trainer/data:/app/tools/queue-forecasting/trainer/data:ro
 
   dashboard:
     image: caddy:2-alpine

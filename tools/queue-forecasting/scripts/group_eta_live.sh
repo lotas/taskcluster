@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-cmd="${1:?usage: group_eta_live.sh fit|predict [args...]}"
+cmd="${1:?usage: group_eta_live.sh fit|predict|export-json [args...]}"
 shift || true
 
 # flock: never overlap two runs of the same subcommand (a slow fit must not stack).
