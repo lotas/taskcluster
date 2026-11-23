@@ -13,7 +13,7 @@ import { createPool } from './db.js';
 //
 // `queue_forecast_task_runs` is intentionally NOT listed: it has an
 // `ON DELETE CASCADE` FK to `queue_forecast_tasks`, so deleting an old task
-// removes its runs automatically. The other two tables age out on their own
+// removes its runs automatically. The other tables age out on their own
 // timestamp columns.
 //
 // Sizing note: a single training run reads `lookback_days + holdout + val`
@@ -42,6 +42,7 @@ const TARGETS = [
   { table: 'queue_forecast_run_predictions', column: 'predicted_at' },
   { table: 'queue_forecast_worker_counts',   column: 'sampled_at' },
   { table: 'queue_forecast_group_predictions_shadow', column: 'predicted_at' },
+  { table: 'queue_forecast_run_predictions_shadow',   column: 'predicted_at' },
 ];
 
 // Batched delete by physical row id (ctid). The cutoff filter uses each
