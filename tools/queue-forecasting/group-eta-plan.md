@@ -91,6 +91,30 @@ Only after two consecutive weeks of P2 shadow meeting bars on try, and a separat
 group contract. Range + confidence, never a single "finished at" timestamp
 (`next-steps.md` §5).
 
+## Update 2026-11-24
+
+- **Week-1 live scorecard** (weekly report 11-24 §6, try n=3354, groups >= 1 day old): B1c w2x 0.754 / cov 0.918 /
+  pinball 40.5 min; B1c\* 0.719 / 0.894 / 43.9; B0 0.359 / 0.886. Both B1c variants pass the try bars.
+- **Size-aware calibration (B1c\*\*) tried and not deployed.** `fit_calibration_sized` in group_eta_baselines.py:
+  per (family x size bucket) factors where the bucket has >= 30 calibration groups, family fallback otherwise.
+  Offline eval 10-08..11-20 (cache extended to 11-23; report `~/qf-group-eta/report.md`, previous one kept as
+  `report-2026-11-17.md`), try n=42.9k:
+
+  | estimator | w2x | cov90 | pinball90 min | cov 200-1000 | cov 1000+ |
+  |---|---|---|---|---|---|
+  | B1c | **0.774** | 0.937 | **40.0** | 0.893 | 0.921 |
+  | B1c\* | 0.731 | 0.889 | 47.1 | 0.773 | 0.695 |
+  | B1c\*\* | 0.735 | 0.895 | 44.8 | 0.868 | 0.757 |
+
+  B1c\*\* fixes most of B1c\*'s large-group under-coverage, but uncalibrated B1c beats both on w2x and pinball
+  in every week 10-05..11-22. Calibration refits B1 on the window minus the 4 cal days, and that loss outweighs
+  the correction. B1c is slightly over the 0.93 cov ceiling offline (0.937) but inside it live (0.918) and in the
+  latest offline week (0.906). B1c\*\* stays offline-only (computed by `predict_all` when the fit has `cal_cs`;
+  the live default `--estimators` is unchanged).
+- **Decision proposal: share B1c for try** (p50-p90 range).
+- Weak spot is unchanged and is not a calibration problem: try 200-1000 tasks w2x 0.60, 1000+ w2x 0.45.
+  The levers are in-flight re-estimates (B2) and critical path (P3).
+
 ## Status and next steps (handoff 2026-11-20)
 
 Nothing long-running is in flight; everything is committed (HEAD 97a694eb7f).

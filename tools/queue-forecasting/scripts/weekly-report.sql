@@ -47,6 +47,7 @@ SELECT count(*) AS unenriched_tasks_total FROM queue_forecast_tasks WHERE metada
 -- (completed, wait observed); both p90s are the guarded values actually served.
 CREATE TEMP TABLE scored AS
 SELECT date_trunc('day', r.pending_at)::date AS d,
+       r.pending_at AS pa,
        r.wait_duration_s AS a,
        p.wait_p50_s AS sp50, p.wait_p90_s AS sp90,
        s.wait_p50_s AS hp50, s.wait_p90_s AS hp90,
@@ -74,6 +75,31 @@ SELECT count(*) AS n,
        round(avg((a <= sp90)::int)::numeric, 4) AS served_cov,
        round(avg((a <= hp90)::int)::numeric, 4) AS shadow_cov
 FROM scored;
+
+\echo
+\echo '## 2b. Same, since the wait deadline cap went live (2026-11-24 13:09Z; src/live-predictor/wait-deadline-cap.js)'
+\echo 'Both models are capped at deadline - pending_at. Before the cap one deep very-low queue inflated served MAE and shadow pinball.'
+SELECT count(*) AS n,
+       round((1 - avg(abs(a - hp50)) / nullif(avg(abs(a - sp50)), 0))::numeric, 3) AS mae_gain,
+       round((100 * (avg((a BETWEEN hp50 / 2 AND hp50 * 2)::int)
+                   - avg((a BETWEEN sp50 / 2 AND sp50 * 2)::int)))::numeric, 2) AS w2x_gain_pp,
+       round((1 - avg(CASE WHEN a >= hp90 THEN 0.9 * (a - hp90) ELSE 0.1 * (hp90 - a) END)
+                / nullif(avg(CASE WHEN a >= sp90 THEN 0.9 * (a - sp90) ELSE 0.1 * (sp90 - a) END), 0))::numeric, 3) AS pinball_gain,
+       round(avg((a <= sp90)::int)::numeric, 4) AS served_cov,
+       round(avg((a <= hp90)::int)::numeric, 4) AS shadow_cov
+FROM scored WHERE pa >= '2026-11-24 13:09+00';
+
+SELECT 'served' AS model, count(*) AS predictions,
+       count(*) FILTER (WHERE (input_features->'wait_deadline_cap'->>'applied')::bool) AS cap_applied,
+       count(*) FILTER (WHERE input_features ? 'wait_deadline_cap'
+                          AND input_features->'wait_deadline_cap'->>'cap_s' IS NULL) AS no_deadline
+FROM queue_forecast_run_predictions WHERE predicted_at >= greatest(:since::timestamptz, '2026-11-24 13:09+00')
+UNION ALL
+SELECT 'shadow', count(*),
+       count(*) FILTER (WHERE (input_features->'wait_deadline_cap'->>'applied')::bool),
+       count(*) FILTER (WHERE input_features ? 'wait_deadline_cap'
+                          AND input_features->'wait_deadline_cap'->>'cap_s' IS NULL)
+FROM queue_forecast_run_predictions_shadow WHERE predicted_at >= greatest(:since::timestamptz, '2026-11-24 13:09+00');
 
 \echo
 \echo '## 3. Shadow vs served, per day'

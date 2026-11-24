@@ -26,6 +26,7 @@ import * as ort from 'onnxruntime-node';
 import { buildFeatureVector } from './feature-builder.js';
 import { applyDurationP90Guardrail } from './duration-p90-guardrail.js';
 import { applyWaitP90Guardrail } from './wait-p90-guardrail.js';
+import { applyWaitDeadlineCap } from './wait-deadline-cap.js';
 import { getThroughput } from './throughput.js';
 import { getQueueContext, QUEUE_CONTEXT_FEATURE_VERSION } from './queue-context.js';
 
@@ -42,7 +43,7 @@ SELECT r.task_id, r.run_id, r.pending_at, r.queue_pending,
        r.priority_at_pending, r.started_at, r.resolved_at,
        t.task_queue_id, t.scheduler_id, t.metadata_name,
        t.normalized_name, t.max_run_time_s, t.tags, t.enriched_at,
-       t.repo_family
+       t.repo_family, t.deadline
 FROM queue_forecast_task_runs r
 JOIN queue_forecast_tasks t ON r.task_id = t.task_id
 WHERE r.task_id = $1 AND r.run_id = $2
@@ -109,7 +110,10 @@ export async function scoreWait(bundle, row, liveFeatures, waitBaseline) {
     baseline: waitBaseline,
     minSampleSize: WAIT_P90_GUARDRAIL_MIN_SAMPLE,
   });
-  return { vec, p50, rawModelP90, guardrail, p90: guardrail.finalP90 };
+  // Then cap both quantiles at the time left before the task's deadline: a
+  // completed run can never wait longer than that (see wait-deadline-cap.js).
+  const deadlineCap = applyWaitDeadlineCap({ p50, p90: guardrail.finalP90, row });
+  return { vec, p50: deadlineCap.p50, rawModelP90, guardrail, deadlineCap, p90: deadlineCap.p90 };
 }
 
 /**
@@ -229,7 +233,7 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
     waitBaseline, durationBaseline, throughput, queueContext, liveFeatures,
     wait, run, guardrail, rawModelRunP90, durVec,
   } = await computePrediction({ pool, bundles, baselineStats, row, excludeTaskId: taskId, excludeRunId: runId });
-  const { vec: waitVec, p50: waitP50, rawModelP90: rawModelWaitP90, guardrail: waitGuardrail, p90: waitP90 } = wait;
+  const { vec: waitVec, p50: waitP50, rawModelP90: rawModelWaitP90, guardrail: waitGuardrail, deadlineCap: waitDeadlineCap, p90: waitP90 } = wait;
   const { p50: runP50, p90: runP90 } = run;
 
   // Audit payload — full enough to reproduce a prediction offline.
@@ -262,6 +266,7 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
       baseline_level:       waitGuardrail.baselineLevel,
       baseline_sample_size: waitGuardrail.baselineSampleSize,
     },
+    wait_deadline_cap: { applied: waitDeadlineCap.applied, cap_s: waitDeadlineCap.capS },
     wait_feature_order:     bundles.wait.schema.feature_order,
     wait_vector:            Array.from(waitVec, (x) => (Number.isFinite(x) ? x : null)),
     duration_feature_order: bundles.duration.schema.feature_order,
@@ -293,6 +298,7 @@ export async function predictAndStore({ pool, bundles, baselineStats, taskId, ru
             baseline_p90_s:  sh.guardrail.baselineP90,
             final_p90_s:     sh.guardrail.finalP90,
           },
+          wait_deadline_cap: { applied: sh.deadlineCap.applied, cap_s: sh.deadlineCap.capS },
           wait_feature_order: bundles.shadowWait.schema.feature_order,
           wait_vector:        Array.from(sh.vec, (x) => (Number.isFinite(x) ? x : null)),
         }),

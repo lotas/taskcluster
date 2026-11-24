@@ -158,3 +158,49 @@ def test_calibration_keeps_p90_at_or_above_p50():
     f.loc["__global__"] = [100, 1.0, 1.0]
     out = g.apply_calibration(pred, groups, f)
     assert (out["p90"] >= out["p50"]).all()
+
+
+def test_sized_calibration_fixes_under_covered_large_bucket():
+    # Family-only factors fit the (majority) small groups; large groups run 3x longer
+    # relative to their raw prediction and stay under-covered. B1c** fixes that.
+    rng = np.random.default_rng(2)
+    n_small, n_large = 900, 100
+    n_known = np.r_[np.full(n_small, 20), np.full(n_large, 300)]
+    span = np.r_[rng.uniform(100, 300, n_small), rng.uniform(300, 900, n_large)]
+    groups = pd.DataFrame({"repo_family": ["try"] * 1000, "n_known": n_known, "span": span})
+    pred = pd.DataFrame({"p50": np.full(1000, 100.0), "p90": np.full(1000, 100.0)})
+    large = n_known >= 200
+    fam_only = g.apply_calibration(pred, groups, g.fit_calibration(pred, groups))
+    sized_f = g.fit_calibration_sized(pred, groups)
+    assert {"try", "__global__", "try|1", "try|3"} <= set(sized_f.index)
+    sized = g.apply_calibration(pred, groups, sized_f)
+    assert np.mean(span[large] <= fam_only["p90"][large]) < 0.5
+    assert np.mean(span[large] <= sized["p90"][large]) == pytest.approx(0.9, abs=0.02)
+    assert np.mean(span[~large] <= sized["p90"][~large]) == pytest.approx(0.9, abs=0.02)
+
+
+def test_sized_calibration_small_bucket_falls_back_to_family():
+    groups = pd.DataFrame({"repo_family": ["try"] * 120, "n_known": [20] * 100 + [300] * 20,
+                           "span": [200.0] * 100 + [900.0] * 20})
+    pred = pd.DataFrame({"p50": np.full(120, 100.0), "p90": np.full(120, 100.0)})
+    f = g.fit_calibration_sized(pred, groups)
+    assert "try|3" not in f.index  # 20 < MIN_CAL_SIZE_SAMPLES
+    out = g.apply_calibration(pred, groups, f)
+    fam = f.loc["try"]
+    assert out["p90"].iloc[-1] == pytest.approx(100.0 * fam["f90"])
+    assert out["p50"].iloc[0] == pytest.approx(100.0 * f.loc["try|1", "f50"])
+
+
+def test_fit_all_predict_all_include_sized_estimator():
+    rows = []
+    for d in range(10):
+        for i in range(30):
+            rows += _group(f"g{d}_{i}", DAY0 + d * 86400 + i * 600, n=8)
+    tasks = _tasks(rows)
+    groups, known = g.build_groups(tasks, DAY0 + 20 * 86400, set())
+    use = groups[groups["usable"]]
+    model = g.fit_all(use, known, DAY0 + 10 * 86400)
+    out = g.predict_all(model, use, known)
+    assert "B1c**" in out and out["B1c**"]["p90"].notna().all()
+    legacy = {k: v for k, v in model.items() if k != "cal_cs"}
+    assert "B1c**" not in g.predict_all(legacy, use, known)

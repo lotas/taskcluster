@@ -38,12 +38,12 @@ const ROW = {
   max_run_time_s: 3600, tags: { kind: 'test' }, enriched_at: new Date(), repo_family: 'try',
 };
 
-function fakePool(inserts) {
+function fakePool(inserts, row = ROW) {
   return {
     async query(sql, params) {
       if (sql.includes('SELECT enriched_at')) return { rows: [{ enriched_at: new Date() }], rowCount: 1 };
       if (sql.includes('FROM queue_forecast_task_runs r\nJOIN queue_forecast_tasks t ON r.task_id = t.task_id\nWHERE r.task_id = $1 AND r.run_id = $2')) {
-        return { rows: [{ ...ROW }], rowCount: 1 };
+        return { rows: [{ ...row }], rowCount: 1 };
       }
       if (sql.includes('INSERT INTO')) { inserts.push({ sql: sql.split('(')[0].trim(), params }); return { rowCount: 1, rows: [] }; }
       // throughput / queue-context: deterministic numbers
@@ -101,4 +101,27 @@ test('computePrediction writes nothing and reports feature coverage', async () =
   assert.strictEqual(out.featureCoverage.wait.total, 5);
   assert.strictEqual(out.featureCoverage.duration.missing, 0);
   assert.ok(out.run.p90 >= out.run.p50);
+});
+
+test('wait quantiles are capped at deadline - pending_at, served and shadow alike', async () => {
+  const inserts = [];
+  // 100 s to the deadline: served p50 ~67 s stays, served p90 ~149 s and both shadow quantiles hit it.
+  const row = { ...ROW, deadline: new Date(ROW.pending_at.getTime() + 100_000) };
+  const r = await predictAndStore({ pool: fakePool(inserts, row), bundles: mkBundles(), baselineStats: stats, taskId: 'T', runId: 0 });
+  assert.strictEqual(r.inserted, true);
+  const [served, shadow] = inserts;
+  assert.strictEqual(served.params[2], Math.exp(0.1) * 61 - 1);   // p50 ~67 s, under the cap
+  assert.strictEqual(served.params[3], 100);                      // p90 ~149 -> 100
+  assert.strictEqual(served.params[5], 900);                      // run p90 untouched
+  const audit = JSON.parse(served.params[10]);
+  assert.deepStrictEqual(audit.wait_deadline_cap, { applied: true, cap_s: 100 });
+  assert.strictEqual(audit.wait_p90_guardrail.final_p90_s, Math.exp(0.9) * 61 - 1); // pre-cap value kept for audit
+  assert.ok(shadow.params[2] <= 100 && shadow.params[3] === 100);
+  assert.deepStrictEqual(JSON.parse(shadow.params[6]).wait_deadline_cap, { applied: true, cap_s: 100 });
+});
+
+test('no deadline on the row: predictions unchanged, cap reported as not applied', async () => {
+  const inserts = [];
+  await predictAndStore({ pool: fakePool(inserts), bundles: mkBundles(), baselineStats: stats, taskId: 'T', runId: 0 });
+  assert.deepStrictEqual(JSON.parse(inserts[0].params[10]).wait_deadline_cap, { applied: false, cap_s: null });
 });

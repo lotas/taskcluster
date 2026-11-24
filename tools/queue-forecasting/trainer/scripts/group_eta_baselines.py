@@ -47,6 +47,7 @@ FALLBACK_DELAY_S = 300
 TRAIN_DAYS = 14
 CAL_DAYS = 4
 MIN_KEY_SAMPLES = 20
+MIN_CAL_SIZE_SAMPLES = 30
 MIN_GROUP_TASKS = 5
 SIZE_BUCKETS = [5, 10, 50, 200, 1000, np.inf]
 GRID = np.geomspace(30, 4 * 86400, 400)  # seconds, 30s .. 4d
@@ -300,9 +301,32 @@ def fit_calibration(pred: pd.DataFrame, groups: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
+def _size_key(groups: pd.DataFrame) -> pd.Series:
+    """'<family>|<size bucket index>' calibration key."""
+    return groups["repo_family"].astype(str) + "|" + size_bucket(groups["n_known"]).astype(str)
+
+
+def fit_calibration_sized(pred: pd.DataFrame, groups: pd.DataFrame) -> pd.DataFrame:
+    """Per-family factors plus per-(family x size bucket) factors where the bucket has
+    >= MIN_CAL_SIZE_SAMPLES calibration groups (B1c**). Large try groups are
+    under-covered by the family-only factor (group-eta-plan.md P1 weak spot)."""
+    f = fit_calibration(pred, groups)
+    g = groups.loc[pred.index]
+    r = pd.DataFrame({"k": _size_key(g), "r50": g["span"] / pred["p50"],
+                      "r90": g["span"] / pred["p90"]}).dropna()
+    fs = r.groupby("k").agg(n=("r50", "size"), f50=("r50", "median"),
+                            f90=("r90", lambda s: s.quantile(0.9)))
+    return pd.concat([f, fs[fs["n"] >= MIN_CAL_SIZE_SAMPLES]])
+
+
 def apply_calibration(pred: pd.DataFrame, groups: pd.DataFrame, f: pd.DataFrame) -> pd.DataFrame:
+    ok = f.index[f["n"] >= MIN_KEY_SAMPLES]
     fam = groups["repo_family"].astype(str).where(
-        groups["repo_family"].astype(str).isin(f.index[f["n"] >= MIN_KEY_SAMPLES]), "__global__")
+        groups["repo_family"].astype(str).isin(ok), "__global__")
+    # Size-aware tables (B1c**) also carry 'family|bucket' rows; prefer them when present.
+    if ok.astype(str).str.contains("|", regex=False).any():
+        sk = _size_key(groups)
+        fam = sk.where(sk.isin(ok), fam)
     ff = f.reindex(fam.reindex(pred.index))
     p50 = pred["p50"].to_numpy() * ff["f50"].to_numpy()
     p90 = pred["p90"].to_numpy() * ff["f90"].to_numpy()
@@ -327,7 +351,7 @@ def metrics(y: np.ndarray, p50: np.ndarray, p90: np.ndarray) -> dict:
 
 # ------------------------------------------------------- fit / predict all ---
 
-ESTIMATORS = ("B0", "B1c", "B1i", "B1c*", "B1i*")
+ESTIMATORS = ("B0", "B1c", "B1i", "B1c*", "B1i*", "B1c**")
 
 
 def fit_all(train_groups: pd.DataFrame, known: pd.DataFrame, d0: float) -> dict:
@@ -349,6 +373,7 @@ def fit_all(train_groups: pd.DataFrame, known: pd.DataFrame, d0: float) -> dict:
         "b1_fit": b1_fit,
         "cal_c": fit_calibration(c_cal, cal_g.loc[c_cal.index]),
         "cal_i": fit_calibration(i_cal, cal_g.loc[i_cal.index]),
+        "cal_cs": fit_calibration_sized(c_cal, cal_g),
         "trained_before": d0,
         "n_train_groups": len(train_groups),
     }
@@ -361,6 +386,8 @@ def predict_all(model: dict, groups: pd.DataFrame, known: pd.DataFrame) -> dict[
     c, i = predict_b1(model["b1_fit"], known)
     out["B1c*"] = apply_calibration(c, groups, model["cal_c"])
     out["B1i*"] = apply_calibration(i, groups, model["cal_i"])
+    if "cal_cs" in model:  # pickles fitted before B1c** existed lack it
+        out["B1c**"] = apply_calibration(c, groups, model["cal_cs"])
     return {k: v.reindex(groups.index) for k, v in out.items()}
 
 
