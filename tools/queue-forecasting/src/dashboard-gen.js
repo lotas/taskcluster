@@ -6,6 +6,7 @@ import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { pickEstimator } from './scorer/group-eta.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.join(__dirname, '..');
@@ -2236,11 +2237,9 @@ async function queryGroupEtaRecent(pool, hours, estimator) {
   return rows;
 }
 
-// Preferred estimator for single-estimator views: calibrated B1c* when live.
+// Preferred estimator for single-estimator views (B1c; see ESTIMATOR_PREFERENCE).
 function pickGroupEstimator(meta) {
-  const live = meta.map(m => m.estimator);
-  for (const e of ['B1c*', 'B1c', 'B0']) if (live.includes(e)) return e;
-  return live[0] || null;
+  return pickEstimator(meta.map(m => m.estimator));
 }
 
 async function queryGroupEtaData(pool) {
@@ -2455,8 +2454,8 @@ const PROGRAMME_STATUS = [
   ['qctx_d wait model (Bet 1)', 'SHADOW', 'Scored alongside served since 2026-10-16; judged against the v3 bars on the Shadow page.'],
   ['Hazard / survival tail model (Bet 2)', 'OFFLINE', 'Built in trainer; not walk-forwarded or shadowed yet (group-eta-plan P4).'],
   ['Group ETA P0: dependency edges', 'LIVE', 'Collected inline on queue_forecast_tasks since 2026-11-16.'],
-  ['Group ETA P1: edge-free baselines', 'DONE', 'Offline eval 10-08..11-12: B1c* passes the try bars.'],
-  ['Group ETA P2: shadow estimates', 'SHADOW', 'B0 / B1c / B1c* predicted every 10 min since 2026-11-19; see Group ETA page.'],
+  ['Group ETA P1: edge-free baselines', 'DONE', 'Offline eval 10-08..11-20: B1c passes the try bars (w2x 0.774, cov90 0.937) and is the default.'],
+  ['Group ETA P2: shadow estimates', 'SHADOW', 'B0 / B1c (default) / B1c* predicted every 10 min since 2026-11-19; see Group ETA page.'],
   ['Group ETA P3: critical-path replay', 'PLANNED', 'Needs 2-3 weeks of edges (~Dec 7+).'],
   ['Prediction API', 'EXPERIMENTAL', '<a href="#api">/api/v0</a>: read-only JSON by taskId / taskGroupId.'],
 ];
@@ -2519,7 +2518,7 @@ function renderStatusBody(d) {
   const api = `<p>Read-only JSON. CORS open, rate-limited per IP. Shadow values are experimental and not used by Taskcluster.</p>
 <table><thead><tr><th>Endpoint</th><th>Returns</th></tr></thead><tbody>
 <tr><td class="mono">GET /api/v0/task/&lt;taskId&gt;</td><td>Task metadata and each run's served wait/run p50/p90, shadow wait p50/p90, and expected start/finish times.</td></tr>
-<tr><td class="mono">GET /api/v0/group/&lt;taskGroupId&gt;</td><td>Shadow group-completion estimates per estimator (finish p50/p90), group status, and per-task predictions (latest run, up to 5000 tasks).</td></tr>
+<tr><td class="mono">GET /api/v0/group/&lt;taskGroupId&gt;</td><td>Shadow group-completion estimates per estimator (finish p50/p90; <code>eta.recommended</code> names the default, currently B1c), group status, and per-task predictions (latest run, up to 5000 tasks).</td></tr>
 <tr><td class="mono">GET /api/v0/health</td><td>Service liveness and latest prediction time.</td></tr>
 <tr><td class="mono">GET /api/v0/playground/task/&lt;taskId&gt;</td><td>Stored prediction if there is one; otherwise computed on demand (old or not-yet-pending tasks: hypothetical "if it went pending now"). Not stored. Strict per-IP compute limit. See <a class="task-link" href="playground.html">Playground</a>.</td></tr>
 <tr><td class="mono">GET /api/v0/playground/group/&lt;taskGroupId&gt;</td><td>Stored group ETA if there is one; otherwise computed on demand from the Taskcluster task list.</td></tr>
@@ -2860,8 +2859,8 @@ function buildGroupsPage(g, fitMtime) {
 <div class="caveat-banner"><strong>Internal shadow estimates.</strong> For each task group (push), we predict when
 the original graph will finish: <b>label</b> = latest resolution among tasks created by the prediction time, minus
 <b>t0</b> (earliest task_created). The prediction is made once, ~2 min after the decision task resolves. Estimators:
-<b>B0</b> history by family &times; size; <b>B1c</b> max over tasks of per-task-name offset quantiles; <b>B1c*</b>
-B1c with per-family calibration. Not shown to users. Internal try bars: cov90 in [${GROUP_TRY_BARS.covLo}, ${GROUP_TRY_BARS.covHi}], w2x &ge; ${GROUP_TRY_BARS.w2x}.</div>
+<b>B0</b> history by family &times; size; <b>B1c</b> (default) max over tasks of per-task-name offset quantiles; <b>B1c*</b>
+B1c with per-family calibration (worse than B1c offline and live, kept for comparison). Not shown to users. Internal try bars: cov90 in [${GROUP_TRY_BARS.covLo}, ${GROUP_TRY_BARS.covHi}], w2x &ge; ${GROUP_TRY_BARS.w2x}.</div>
 
 <h2>Pipeline</h2>
 ${renderGroupMeta(g, fitMtime)}

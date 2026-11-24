@@ -157,6 +157,7 @@ test('handler: group -> eta, original-graph status, truncation', async () => {
   assert.strictEqual(res.status, 200);
   const b = res.json();
   assert.strictEqual(b.eta.estimates[0].finish_p50, '2026-11-20T11:00:00.000Z');
+  assert.strictEqual(b.eta.recommended, 'B1c*'); // B1c not live here -> next preference
   assert.strictEqual(b.eta.originalGraph.state, 'done');
   assert.strictEqual(b.eta.originalGraph.actualFinish, '2026-11-20T11:30:00.000Z');
   assert.strictEqual(b.truncated, true);

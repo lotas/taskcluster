@@ -19,6 +19,20 @@
 
 export const MODEL_FORMAT = 'group-eta-tables-v1';
 
+/**
+ * Default estimator wherever one estimate is shown (dashboard, API `recommended`).
+ * B1c since 2026-11-24: offline try 10-08..11-20 w2x 0.774 / cov90 0.937 / pinball 40.0 min,
+ * better than B1c* (0.731 / 0.889 / 47.1) in every week; live week 1 0.754 / 0.918
+ * (group-eta-plan.md "Update 2026-11-24"). Fallbacks if it is not live.
+ */
+export const ESTIMATOR_PREFERENCE = ['B1c', 'B1c*', 'B0'];
+
+/** First preferred estimator present in `names`, else the first name, else null. */
+export function pickEstimator(names) {
+  for (const e of ESTIMATOR_PREFERENCE) if (names.includes(e)) return e;
+  return names[0] ?? null;
+}
+
 export function validateModel(m) {
   if (!m || m.format !== MODEL_FORMAT) throw new Error(`group-eta model: expected format ${MODEL_FORMAT}`);
   for (const k of ['b0', 'b1_full', 'b1_fit', 'cal_c', 'params']) {

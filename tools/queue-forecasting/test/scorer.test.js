@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { predictGroup, sizeBucket, mode, validateModel } from '../src/scorer/group-eta.js';
+import { predictGroup, sizeBucket, mode, validateModel, pickEstimator } from '../src/scorer/group-eta.js';
 import { validateRow, validateExclude, validateGroupBody, createGate, BadRequest } from '../src/playground-scorer.js';
 
 const MODEL = validateModel({
@@ -127,4 +127,12 @@ test('createGate: a released slot goes to the waiter, not to a later enter()', a
   assert.deepStrictEqual(g.stats(), { active: 1, queued: 0 });
   r3();
   assert.deepStrictEqual(g.stats(), { active: 0, queued: 0 });
+});
+
+test('pickEstimator: B1c is the default, then B1c*, then B0, then whatever is live', () => {
+  assert.strictEqual(pickEstimator(['B0', 'B1c', 'B1c*']), 'B1c');
+  assert.strictEqual(pickEstimator(['B0', 'B1c*']), 'B1c*');
+  assert.strictEqual(pickEstimator(['B0']), 'B0');
+  assert.strictEqual(pickEstimator(['X9']), 'X9');
+  assert.strictEqual(pickEstimator([]), null);
 });

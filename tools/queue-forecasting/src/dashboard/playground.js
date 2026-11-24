@@ -196,7 +196,7 @@
           ? (Date.parse(eta.originalGraph.actualFinish) - Date.parse(eta.t0)) / 1000 : null;
         nodes.push(table(['Estimator', 'Span p50', 'Span p90', 'Finish p50', 'Finish p90', 'Actual span', 'Tasks known', 'Model'],
           eta.estimates.map(function (e) {
-            return [e.estimator, fmtDur(e.p50_s), fmtDur(e.p90_s), fmtTs(e.finish_p50), fmtTs(e.finish_p90),
+            return [e.estimator + (e.estimator === eta.recommended ? ' (default)' : ''), fmtDur(e.p50_s), fmtDur(e.p90_s), fmtTs(e.finish_p50), fmtTs(e.finish_p90),
               fmtDur(actualSpan), String(e.tasksKnown), e.modelVersion];
           })));
       }

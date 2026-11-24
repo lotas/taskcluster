@@ -19,6 +19,7 @@ import pg from 'pg';
 import taskcluster from '@taskcluster/client';
 import { fileURLToPath } from 'url';
 import { createPlayground, createScorerClient, PlaygroundError } from './playground.js';
+import { pickEstimator } from './scorer/group-eta.js';
 
 const PORT = parseInt(process.env.API_PORT || '8080', 10);
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
@@ -210,6 +211,7 @@ export async function getGroup(pool, taskGroupId) {
       definition: 'Completion of the tasks that existed at predictionTime (the original graph), measured from t0 = earliest task_created.',
       t0: iso(est.rows[0].t0),
       predictionTime: iso(tPred),
+      recommended: pickEstimator(est.rows.map(e => e.estimator)),
       originalGraph: {
         tasks: sm.orig_n,
         state: origDone ? 'done' : 'running',

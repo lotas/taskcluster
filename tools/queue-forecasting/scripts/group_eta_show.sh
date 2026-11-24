@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Show recent shadow task-group ETAs (group-eta-plan.md P2) next to actuals.
-#   scripts/group_eta_show.sh [hours=6] [family=try] [estimator=B1c*]
+#   scripts/group_eta_show.sh [hours=6] [family=try] [estimator=B1c]
 # finish_p50/p90 are wall-clock UTC estimates; actual is filled once every task
 # of the original graph has resolved (blank = still running).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-hours="${1:-6}"; fam="${2:-try}"; est="${3:-B1c*}"
+hours="${1:-6}"; fam="${2:-try}"; est="${3:-B1c}"
 docker compose exec -T postgres psql -U postgres -d forecasting -X -q \
   -v hours="$hours" -v fam="$fam" -v est="$est" <<'SQL'
 \pset footer off

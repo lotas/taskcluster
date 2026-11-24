@@ -20,6 +20,7 @@
  */
 import QuickLRU from 'quick-lru';
 import { taskDefToEnrichment } from './task-enrichment.js';
+import { pickEstimator } from './scorer/group-eta.js';
 
 export const WINDOW_DAYS = 59;            // retention is 60d; keep a day of margin
 export const GROUP_PAGE_LIMIT = 10;       // listTaskGroup pages (<= 1000 tasks each)
@@ -424,6 +425,7 @@ export function createPlayground({
         definition: 'Completion of the tasks that existed at predictionTime (the original graph), measured from t0 = earliest task created.',
         t0: iso(g.t0 * 1000),
         predictionTime: iso(tPred * 1000),
+        recommended: pickEstimator(g.estimates.map(e => e.estimator)),
         originalGraph: {
           tasks: orig.length,
           state: origDone ? 'done' : 'running',

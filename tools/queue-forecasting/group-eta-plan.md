@@ -111,9 +111,33 @@ group contract. Range + confidence, never a single "finished at" timestamp
   the correction. B1c is slightly over the 0.93 cov ceiling offline (0.937) but inside it live (0.918) and in the
   latest offline week (0.906). B1c\*\* stays offline-only (computed by `predict_all` when the fit has `cal_cs`;
   the live default `--estimators` is unchanged).
-- **Decision proposal: share B1c for try** (p50-p90 range).
+- **Decision (user, 11-24): B1c is the default estimator.** `ESTIMATOR_PREFERENCE` / `pickEstimator` in
+  `src/scorer/group-eta.js` drive groups.html and `eta.recommended` in `/api/v0/group` and the playground.
 - Weak spot is unchanged and is not a calibration problem: try 200-1000 tasks w2x 0.60, 1000+ w2x 0.45.
   The levers are in-flight re-estimates (B2) and critical path (P3).
+
+### B2 in-flight re-estimates — offline eval 2026-11-24
+`trainer/scripts/group_eta_inflight.py` (tests `tests/test_group_eta_inflight.py`). At tau = t_pred + {15,30,60,120} min,
+tasks that have already resolved drop out. Each running task contributes its per-key offset quantile conditioned on
+offset > elapsed (B1 CDFs), and the group value is the max over tasks. **B2\*** = B2 x per-(checkpoint, family) factors on
+remaining time, fitted on the last 4 training days. Scored on REMAINING time for groups still running at tau, against static B1c
+floored at elapsed. Test 10-08..11-20; report `~/qf-group-eta/report-inflight.md`.
+
+| try, checkpoint | n | static w2x / cov / pin | B2\* w2x / cov / pin |
+|---|---|---|---|
+| +15 min | 18.4k | 0.490 / 0.862 / 88.0 | 0.558 / 0.870 / 77.7 |
+| +30 min | 14.2k | 0.402 / 0.836 / 109.3 | 0.492 / 0.869 / 83.5 |
+| +60 min | 9.9k | 0.278 / 0.791 / 144.0 | 0.465 / 0.868 / 86.5 |
+| +120 min | 6.3k | 0.163 / 0.712 / 179.0 | 0.458 / 0.873 / 76.0 |
+
+- Uncalibrated B2 over-covers (0.93-0.98): the max of many conditional p90s is wide. B2\* lands at ~0.87 at every
+  checkpoint and in every size bucket, at the same pinball.
+- Mid-flight, the static estimate degrades fast (coverage 0.71 and w2x 0.16 at +120 min). B2\* holds its accuracy.
+- Within-2x on remaining time (0.46-0.56) is still under 0.70. Remaining-time ratios are a harsher metric than span
+  ratios, so a remaining-time bar needs to be agreed before anything user-facing.
+- Next: live shadow. Re-estimate running groups at each checkpoint in `group_eta_live.py predict`. This needs task
+  resolution state in LIVE_TASKS_SQL and B2\* factors fitted in `fit`. Store as estimator `B2*+<c>m` in the existing
+  table (PK group+estimator). Then add §6 scoring by checkpoint.
 
 ## Status and next steps (handoff 2026-11-20)
 

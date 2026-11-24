@@ -265,6 +265,7 @@ test('group: t_pred = decision resolved + 120s; tasks created later are not in t
   assert.strictEqual(r.eta.originalGraph.tasks, 7);
   assert.strictEqual(r.eta.originalGraph.state, 'done');
   assert.strictEqual(r.eta.estimates[0].finish_p50, '2026-11-20T10:10:00.000Z');
+  assert.strictEqual(r.eta.recommended, 'B0');
   assert.strictEqual(r.status.tasks, 8);
 });
 
