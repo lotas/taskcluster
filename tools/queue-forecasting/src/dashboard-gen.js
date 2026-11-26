@@ -6,7 +6,7 @@ import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { pickEstimator } from './scorer/group-eta.js';
+import { pickEstimator, isStaticEstimator } from './scorer/group-eta.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.join(__dirname, '..');
@@ -2243,7 +2243,8 @@ function pickGroupEstimator(meta) {
 }
 
 async function queryGroupEtaData(pool) {
-  const allMeta = await timed('queryGroupEtaMeta', queryGroupEtaMeta(pool));
+  // B2* in-flight rows are scored separately (remaining time, weekly report §6b).
+  const allMeta = (await timed('queryGroupEtaMeta', queryGroupEtaMeta(pool))).filter(m => isStaticEstimator(m.estimator));
   // Live = predicted within 1h of the newest prediction, so estimators dropped
   // from the pipeline vanish at once but a stalled pipeline hides nothing.
   const newest = Math.max(0, ...allMeta.map(m => new Date(m.last_predicted_at).getTime()));

@@ -155,6 +155,7 @@ WITH pg AS (
   SELECT DISTINCT task_group_id, t0, t_pred
   FROM queue_forecast_group_predictions_shadow
   WHERE t_pred >= :since::timestamptz AND t_pred < now() - interval '1 day'
+    AND left(estimator, 4) <> 'B2*+'
 ), lab AS (
   SELECT pg.task_group_id,
          extract(epoch FROM max(r.resolved_at) - pg.t0) AS span,
@@ -169,7 +170,7 @@ WITH pg AS (
   SELECT p.repo_family, p.estimator, l.span AS y, p.p50_s AS p50, p.p90_s AS p90
   FROM queue_forecast_group_predictions_shadow p
   JOIN lab l USING (task_group_id)
-  WHERE NOT l.incomplete AND l.span > 0
+  WHERE NOT l.incomplete AND l.span > 0 AND left(p.estimator, 4) <> 'B2*+'
 )
 SELECT repo_family, estimator, count(*) AS n,
        round((percentile_cont(0.5) WITHIN GROUP (ORDER BY y) / 60)::numeric, 1) AS med_span_min,
@@ -178,3 +179,48 @@ SELECT repo_family, estimator, count(*) AS n,
        round(avg((y <= p90)::int)::numeric, 3) AS cov90,
        round((avg(CASE WHEN y >= p90 THEN 0.9 * (y - p90) ELSE 0.1 * (p90 - y) END) / 60)::numeric, 1) AS pin90_min
 FROM s GROUP BY 1, 2 ORDER BY 1, 2;
+
+\echo
+\echo '## 6b. B2* in-flight re-estimates (group-eta-plan.md B2), groups predicted since' :since
+\echo 'estimator B2*+<c>m = re-estimate at tau = t_pred + c for groups still running at tau; t_pred column = static t_pred.'
+\echo 'scored on REMAINING time R = span - e (e = tau - t0), floors 60 s; B1c-static = the t_pred B1c estimate floored at e.'
+\echo 'offline try (10-08..11-20): B2* cov90 ~0.87, w2x 0.46-0.56; static w2x 0.49 -> 0.16 by +120m.'
+WITH b AS (
+  SELECT task_group_id, repo_family, t0, t_pred, p50_s, p90_s,
+         substring(estimator FROM '^B2\*\+([0-9]+)m$')::int AS c_min
+  FROM queue_forecast_group_predictions_shadow
+  WHERE left(estimator, 4) = 'B2*+'
+    AND t_pred >= :since::timestamptz AND t_pred < now() - interval '1 day'
+), pg AS (
+  SELECT DISTINCT task_group_id, t0, t_pred FROM b
+), lab AS (
+  SELECT pg.task_group_id,
+         extract(epoch FROM max(r.resolved_at) - pg.t0) AS span,
+         bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS incomplete
+  FROM pg
+  JOIN queue_forecast_tasks t
+    ON t.task_group_id = pg.task_group_id
+   AND t.task_created >= pg.t0 AND t.task_created <= pg.t_pred
+  LEFT JOIN queue_forecast_task_runs r ON r.task_id = t.task_id
+  GROUP BY pg.task_group_id, pg.t0
+), s AS (
+  SELECT b.repo_family, b.c_min, v.estimator,
+         greatest(l.span - e.e, 60) AS y,
+         greatest(v.p50 - e.e, 60) AS r50,
+         greatest(v.p90 - e.e, 60) AS r90
+  FROM b
+  JOIN lab l USING (task_group_id)
+  CROSS JOIN LATERAL (SELECT b.c_min * 60 + extract(epoch FROM b.t_pred - b.t0) AS e) e
+  LEFT JOIN queue_forecast_group_predictions_shadow st
+    ON st.task_group_id = b.task_group_id AND st.estimator = 'B1c'
+  CROSS JOIN LATERAL (VALUES ('B2*', b.p50_s, b.p90_s),
+                             ('B1c-static', greatest(st.p50_s, e.e), greatest(st.p90_s, e.e))) v(estimator, p50, p90)
+  WHERE NOT l.incomplete AND l.span > 0 AND v.p50 IS NOT NULL
+)
+SELECT repo_family, c_min, estimator, count(*) AS n,
+       round((percentile_cont(0.5) WITHIN GROUP (ORDER BY y) / 60)::numeric, 1) AS med_remaining_min,
+       round((avg(abs(y - r50)) / 60)::numeric, 1) AS mae_min,
+       round(avg((y BETWEEN r50 / 2 AND r50 * 2)::int)::numeric, 3) AS w2x,
+       round(avg((y <= r90)::int)::numeric, 3) AS cov90,
+       round((avg(CASE WHEN y >= r90 THEN 0.9 * (y - r90) ELSE 0.1 * (r90 - y) END) / 60)::numeric, 1) AS pin90_min
+FROM s GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;

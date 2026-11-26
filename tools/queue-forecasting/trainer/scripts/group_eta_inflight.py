@@ -121,6 +121,32 @@ def b2_live(model, known: pd.DataFrame, groups: pd.DataFrame, c_s: float):
     return pred, e
 
 
+def fit_b2_factors(b1, cal_groups: pd.DataFrame, cal_known: pd.DataFrame) -> dict[int, pd.DataFrame]:
+    """B2* remaining-time factors per checkpoint (minutes -> per-family frame).
+
+    cal_groups: completed groups (t0, t_pred, end, span, repo_family); cal_known: their
+    known tasks (gid, repo_family, normalized_name, t0, last_resolved). Same B1 tables
+    as prediction (in-sample on the calibration days, as in the offline eval)."""
+    out = {}
+    for c in CHECKPOINTS_MIN:
+        cp, ce = b2_live(b1, cal_known, cal_groups, c * 60.0)
+        out[c] = remaining_factors(cp, cal_groups, ce)
+    return out
+
+
+def predict_b2_star(b1, factors: pd.DataFrame, groups: pd.DataFrame, known: pd.DataFrame, c_s: float) -> pd.DataFrame:
+    """B2* spans (from t0), floored at elapsed, for groups with >= 1 task running at
+    tau = t_pred + c_s. groups: t0, t_pred, repo_family (indexed by gid). known: gid,
+    repo_family, normalized_name, t0, last_resolved (inf = not resolved yet)."""
+    raw = predict_b2(b1, known, groups, c_s).dropna()
+    if raw.empty:
+        return raw
+    e = groups["t_pred"] + c_s - groups["t0"]
+    out = apply_remaining_factors(raw, groups, e, factors)
+    ee = e.loc[out.index].to_numpy()
+    return out.assign(p50=np.fmax(out["p50"].to_numpy(), ee), p90=np.fmax(out["p90"].to_numpy(), ee))
+
+
 def evaluate(data_dir: Path, test_days, excluded) -> pd.DataFrame:
     t = time.time()
     tasks = g.load_tasks(data_dir)
@@ -144,6 +170,7 @@ def evaluate(data_dir: Path, test_days, excluded) -> pd.DataFrame:
         tk = known[known["gid"].isin(test.index)]
         static, _ = g.predict_b1(model, tk)
         static = static.reindex(test.index)
+        factors = fit_b2_factors(model, cal, ck)
         for c in CHECKPOINTS_MIN:
             c_s = c * 60.0
             tau = test["t_pred"] + c_s
@@ -152,8 +179,7 @@ def evaluate(data_dir: Path, test_days, excluded) -> pd.DataFrame:
             if len(live) == 0:
                 continue
             b2 = predict_b2(model, tk[tk["gid"].isin(live)], test, c_s).reindex(live)
-            cp, ce = b2_live(model, ck, cal, c_s)
-            b2s = apply_remaining_factors(b2.dropna(), test, e, remaining_factors(cp, cal, ce)).reindex(live)
+            b2s = predict_b2_star(model, factors[c], test, tk[tk["gid"].isin(live)], c_s).reindex(live)
             base = pd.DataFrame({"day": d, "gid": live, "c_min": c,
                                  "repo_family": test.loc[live, "repo_family"].astype(str).to_numpy(),
                                  "n_known": test.loc[live, "n_known"].to_numpy(),

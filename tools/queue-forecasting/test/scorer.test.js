@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { predictGroup, sizeBucket, mode, validateModel, pickEstimator } from '../src/scorer/group-eta.js';
+import { predictGroup, sizeBucket, mode, validateModel, pickEstimator, isStaticEstimator } from '../src/scorer/group-eta.js';
 import { validateRow, validateExclude, validateGroupBody, createGate, BadRequest } from '../src/playground-scorer.js';
 
 const MODEL = validateModel({
@@ -135,4 +135,9 @@ test('pickEstimator: B1c is the default, then B1c*, then B0, then whatever is li
   assert.strictEqual(pickEstimator(['B0']), 'B0');
   assert.strictEqual(pickEstimator(['X9']), 'X9');
   assert.strictEqual(pickEstimator([]), null);
+});
+
+test('isStaticEstimator: B2* in-flight re-estimates are not static', () => {
+  for (const e of ['B0', 'B1c', 'B1c*', 'B1c**']) assert.ok(isStaticEstimator(e), e);
+  for (const e of ['B2*+15m', 'B2*+120m']) assert.ok(!isStaticEstimator(e), e);
 });

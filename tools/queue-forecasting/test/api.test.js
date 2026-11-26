@@ -163,6 +163,10 @@ test('handler: group -> eta, original-graph status, truncation', async () => {
   assert.strictEqual(b.truncated, true);
   assert.strictEqual(b.tasks.length, GROUP_TASK_LIMIT);
   assert.strictEqual(b.tasks[0].latestRun, null);
+  // B2* in-flight shadow rows are excluded from the API
+  const shadowQ = pool.calls.find(c => c.sql.includes('FROM queue_forecast_group_predictions_shadow'));
+  assert.match(shadowQ.sql, /left\(estimator, length\(\$2\)\) <> \$2/);
+  assert.deepStrictEqual(shadowQ.params, [TID, 'B2*+']);
 });
 
 test('handler: unknown group -> 404', async () => {

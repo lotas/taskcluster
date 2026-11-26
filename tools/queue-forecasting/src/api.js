@@ -19,7 +19,7 @@ import pg from 'pg';
 import taskcluster from '@taskcluster/client';
 import { fileURLToPath } from 'url';
 import { createPlayground, createScorerClient, PlaygroundError } from './playground.js';
-import { pickEstimator } from './scorer/group-eta.js';
+import { pickEstimator, INFLIGHT_PREFIX } from './scorer/group-eta.js';
 
 const PORT = parseInt(process.env.API_PORT || '8080', 10);
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5433/forecasting';
@@ -149,6 +149,7 @@ export async function getTask(pool, taskId) {
 export async function getGroup(pool, taskGroupId) {
   // Only estimators still produced by the pipeline (predicted within 1h of the
   // newest prediction); retired ones (B1i, B1i*) keep old rows until retention.
+  // B2* in-flight rows are internal shadow only (not exposed yet).
   const est = await pool.query(`
     WITH live AS (
       SELECT estimator FROM queue_forecast_group_predictions_shadow
@@ -158,7 +159,8 @@ export async function getGroup(pool, taskGroupId) {
     SELECT estimator, t0, t_pred, p50_s, p90_s, n_known, repo_family, model_version, predicted_at
     FROM queue_forecast_group_predictions_shadow
     WHERE task_group_id = $1 AND estimator IN (SELECT estimator FROM live)
-    ORDER BY estimator`, [taskGroupId]);
+      AND left(estimator, length($2)) <> $2
+    ORDER BY estimator`, [taskGroupId, INFLIGHT_PREFIX]);
   const tPred = est.rows.length ? est.rows[0].t_pred : null;
 
   const summary = await pool.query(`

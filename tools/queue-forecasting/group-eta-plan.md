@@ -139,6 +139,23 @@ floored at elapsed. Test 10-08..11-20; report `~/qf-group-eta/report-inflight.md
   resolution state in LIVE_TASKS_SQL and B2\* factors fitted in `fit`. Store as estimator `B2*+<c>m` in the existing
   table (PK group+estimator). Then add §6 scoring by checkpoint.
 
+### B2\* live shadow — 2026-11-26
+- `group_eta_live.py fit` also fits B2\* remaining-time factors per (checkpoint, family) on the last `CAL_DAYS` present
+  training days, with the full-window B1 tables (`group_eta_inflight.fit_b2_factors`; the offline eval now calls the same
+  helpers, `predict_b2_star`). Pickle key `b2_factors`; first fit 2026-11-26 12:13Z (try f90 0.77/0.64/0.53/0.57 at
+  +15/30/60/120 min).
+- `predict` (B2\* on by default, `--no-b2` to skip): for every static row whose tau = t_pred + c fell in
+  (now - lookback, now - 120 s] and that has no `B2*+<c>m` row yet, rebuild the original graph (created in [t0, t_pred])
+  with per-task resolution state and score B2\* **at tau**: a task counts as running unless it has runs, none unresolved,
+  and its last resolution is <= tau. A late cron run therefore gives the same answer. Only groups with a task running at
+  tau get a row. Cost: ~7 s cold per cycle (task_group_id + task_created bitmap, ~40k tasks).
+- Rows: estimator `B2*+15m` ... `B2*+120m` in `queue_forecast_group_predictions_shadow`. **t_pred column = the static
+  t_pred**, not tau. Every reader defines the label (original graph) by t_pred, so keeping it static keeps them
+  correct; tau comes from the name. p50/p90 are spans from t0, floored at elapsed.
+- Kept out of the static views: §6 and groups.html (`isStaticEstimator` in src/scorer/group-eta.js), the API and the
+  playground (`getGroup` filter). Scored in weekly report **§6b** on remaining time by checkpoint, next to B1c-static
+  floored at elapsed (as offline). Viewer: `scripts/group_eta_show.sh 6 try 'B2*+30m'`.
+
 ## Status and next steps (handoff 2026-11-20)
 
 Nothing long-running is in flight; everything is committed (HEAD 97a694eb7f).

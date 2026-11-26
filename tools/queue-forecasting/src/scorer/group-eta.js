@@ -27,6 +27,15 @@ export const MODEL_FORMAT = 'group-eta-tables-v1';
  */
 export const ESTIMATOR_PREFERENCE = ['B1c', 'B1c*', 'B0'];
 
+/**
+ * Prefix of the B2* in-flight re-estimates ('B2*+15m' ... 'B2*+120m', trainer
+ * scripts/group_eta_live.py --b2). Same table, but a re-estimate at t_pred + c for
+ * still-running groups, scored on remaining time (weekly report §6b). Internal
+ * shadow only: kept out of static scorecards, the API and the playground.
+ */
+export const INFLIGHT_PREFIX = 'B2*+';
+export const isStaticEstimator = name => !name.startsWith(INFLIGHT_PREFIX);
+
 /** First preferred estimator present in `names`, else the first name, else null. */
 export function pickEstimator(names) {
   for (const e of ESTIMATOR_PREFERENCE) if (names.includes(e)) return e;
