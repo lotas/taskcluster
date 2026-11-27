@@ -11,6 +11,12 @@ Definitions
   known    = tasks with task_created <= t_pred (the original graph). Later tasks
              (actions, retriggers) are excluded from the label and reported.
   label    = max(last_resolved over known tasks) - t0, in seconds ("span").
+  blocked  = known task that never ran: its only run was created as an exception at
+             the deadline (n_runs 1, deadline-exceeded, pending_at == resolved_at),
+             e.g. a dependent of a failed task. With --label ran (LABEL_MODES) blocked
+             tasks don't set the group end and are left out of the per-task offset fits;
+             they stay in `known` as prediction inputs (unknowable at t_pred). Default
+             'all' keeps the original label (the live fit uses it; 2026-11-27).
 
 Estimators (p50 and p90 of span)
   B0   history: span quantiles by (repo_family, known-size bucket), fallbacks
@@ -49,6 +55,7 @@ CAL_DAYS = 4
 MIN_KEY_SAMPLES = 20
 MIN_CAL_SIZE_SAMPLES = 30
 MIN_GROUP_TASKS = 5
+LABEL_MODES = ("all", "ran")
 SIZE_BUCKETS = [5, 10, 50, 200, 1000, np.inf]
 GRID = np.geomspace(30, 4 * 86400, 400)  # seconds, 30s .. 4d
 
@@ -129,7 +136,16 @@ def load_tasks(data_dir: Path) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
-def build_groups(tasks: pd.DataFrame, data_end_ts: float, excluded: set[dt.date]):
+def blocked_mask(tasks: pd.DataFrame) -> pd.Series:
+    """Tasks that never ran and were resolved deadline-exceeded (see module doc)."""
+    return ((tasks["n_runs"].fillna(0) == 1)
+            & (tasks["last_reason"].astype(str) == "deadline-exceeded")
+            & (tasks["first_pending"] == tasks["last_resolved"]))
+
+
+def build_groups(tasks: pd.DataFrame, data_end_ts: float, excluded: set[dt.date], label: str = "all"):
+    if label not in LABEL_MODES:
+        raise ValueError(f"label must be one of {LABEL_MODES}, got {label!r}")
     """Return (groups, known_tasks). groups indexed by task_group_id codes."""
     tasks = tasks.copy()
     tasks["gid"] = tasks["task_group_id"].cat.codes
@@ -144,9 +160,11 @@ def build_groups(tasks: pd.DataFrame, data_end_ts: float, excluded: set[dt.date]
     tasks["t_pred"] = tasks["gid"].map(t_pred)
     known_mask = tasks["created"] <= tasks["t_pred"]
     known = tasks[known_mask].copy()
+    known["blocked"] = blocked_mask(known).to_numpy() if label == "ran" else False
     late = tasks[~known_mask].groupby("gid", observed=True).size()
 
     kg = known.groupby("gid", observed=True)
+    ends = known["last_resolved"].where(~known["blocked"]).groupby(known["gid"], observed=True).max()
     groups = pd.DataFrame({
         "t0": t0,
         "t_pred": t_pred,
@@ -154,7 +172,8 @@ def build_groups(tasks: pd.DataFrame, data_end_ts: float, excluded: set[dt.date]
         "n_known": kg.size(),
         "n_unresolved": kg["n_unresolved"].sum(),
         "n_no_runs": kg["n_runs"].apply(lambda s: int((s.fillna(0) == 0).sum())),
-        "end": kg["last_resolved"].max(),
+        "end": ends,
+        "n_blocked": kg["blocked"].sum(),
         "repo_family": kg["repo_family"].agg(lambda s: s.mode().iat[0]),
         "n_late": late,
     })
@@ -212,7 +231,10 @@ def _key(df: pd.DataFrame) -> pd.Series:
 
 
 def fit_b1(train_known: pd.DataFrame):
-    """Per-key empirical CDF on GRID + quantiles; key = family|name, fallback family."""
+    """Per-key empirical CDF on GRID + quantiles; key = family|name, fallback family.
+    Blocked tasks (label 'ran') carry no run-time signal and are skipped."""
+    if "blocked" in train_known:
+        train_known = train_known[~train_known["blocked"].astype(bool)]
     tk = train_known.assign(key=_key(train_known))
     log_off = np.log(np.clip(tk["offset"].to_numpy(), 1.0, None))
     tk = tk.assign(lo=log_off)
@@ -408,11 +430,14 @@ def _ts(d: dt.date) -> float:
     return dt.datetime.combine(d, dt.time(), tzinfo=dt.timezone.utc).timestamp()
 
 
-def evaluate(data_dir: Path, test_days: list[dt.date], excluded: set[dt.date]) -> None:
+def evaluate(data_dir: Path, test_days: list[dt.date], excluded: set[dt.date], label: str = "all",
+             out_dir: Path | None = None) -> None:
     t = time.time()
+    out_dir = out_dir or data_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
     tasks = load_tasks(data_dir)
     data_end = tasks["created"].max()
-    groups, known = build_groups(tasks, data_end, excluded)
+    groups, known = build_groups(tasks, data_end, excluded, label)
     del tasks
     use = groups[groups["usable"]]
     print(f"[eval] {len(groups):,} groups, {len(use):,} usable; built in {time.time() - t:.0f}s", flush=True)
@@ -441,9 +466,9 @@ def evaluate(data_dir: Path, test_days: list[dt.date], excluded: set[dt.date]) -
         print(f"[eval] {d}: test={len(test)} train={len(tr)} ({time.time() - t:.0f}s)", flush=True)
 
     P = pd.concat(preds, ignore_index=True).dropna(subset=["p50", "p90"])
-    P.to_parquet(data_dir / "predictions.parquet", index=False)
-    write_report(data_dir / "report.md", P, groups, test_days, excluded)
-    print(f"[eval] wrote {data_dir / 'report.md'}")
+    P.to_parquet(out_dir / "predictions.parquet", index=False)
+    write_report(out_dir / "report.md", P, groups, test_days, excluded, label)
+    print(f"[eval] wrote {out_dir / 'report.md'}")
 
 
 def md(df: pd.DataFrame) -> str:
@@ -462,7 +487,7 @@ def _table(P: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows).round(3)
 
 
-def write_report(path: Path, P: pd.DataFrame, groups: pd.DataFrame, test_days, excluded) -> None:
+def write_report(path: Path, P: pd.DataFrame, groups: pd.DataFrame, test_days, excluded, label: str = "all") -> None:
     u = groups[groups["usable"]]
     lines = [
         f"# Group ETA edge-free baselines — {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%MZ}",
@@ -472,6 +497,8 @@ def write_report(path: Path, P: pd.DataFrame, groups: pd.DataFrame, test_days, e
         f"Groups: {len(groups):,} total, {len(u):,} usable (>= {MIN_GROUP_TASKS} known tasks, all resolved). "
         f"Share of usable groups with decision task: {u['has_decision'].mean():.3f}; "
         f"with late (post-t_pred) tasks: {(u['n_late'] > 0).mean():.3f}.",
+        f"Label mode: {label}" + (f" (usable groups with blocked tasks: {(u['n_blocked'] > 0).mean():.3f})"
+                                  if label == "ran" else "") + ".",
         "",
         "Proposed internal bars (try): cov90 in [0.85, 0.93], w2x >= 0.70.",
         "",
@@ -508,12 +535,16 @@ def main(argv=None) -> None:
     v.add_argument("--data-dir", required=True, type=Path)
     v.add_argument("--test-days", required=True)
     v.add_argument("--exclude", default="", help="extra excluded days, same syntax as --test-days")
+    v.add_argument("--label", choices=LABEL_MODES, default="all",
+                   help="'ran': blocked (never-ran, deadline-exceeded) tasks don't set the group end")
+    v.add_argument("--out-dir", type=Path, help="report/predictions dir (default: --data-dir)")
     a = ap.parse_args(argv)
     if a.cmd == "extract":
         extract(a.data_dir.expanduser(), a.start, a.end, a.force)
     else:
         excl = set(DEFAULT_EXCLUDED) | (set(parse_days(a.exclude)) if a.exclude else set())
-        evaluate(a.data_dir.expanduser(), parse_days(a.test_days), excl)
+        evaluate(a.data_dir.expanduser(), parse_days(a.test_days), excl, a.label,
+                 a.out_dir.expanduser() if a.out_dir else None)
 
 
 if __name__ == "__main__":

@@ -156,6 +156,51 @@ floored at elapsed. Test 10-08..11-20; report `~/qf-group-eta/report-inflight.md
   playground (`getGroup` filter). Scored in weekly report **§6b** on remaining time by checkpoint, next to B1c-static
   floored at elapsed (as offline). Viewer: `scripts/group_eta_show.sh 6 try 'B2*+30m'`.
 
+### G4 Label: blocked tasks — offline 2026-11-27 (not live)
+
+Groups can resolve more than once. In try 11-13..11-17 (6,852 usable groups) the group end was set by a
+`deadline-exceeded` task in 3.9% of groups and by a canceled task in 4.3%. Blocked tasks are dependents of a
+failed task that never run: one run, created `exception` at the deadline, never started,
+`pending_at == resolved_at` (verified in `queue_forecast_task_runs`). Each one pinned the span at ~24h and put a
+24h spike in the per-task offset CDFs. Other cases were small in 537 live try groups:
+- manual reruns: 6 groups (1 set the end);
+- auto retries: 81 groups (kept; they are real);
+- tasks added after t_pred (actions/retriggers): 30 groups, already excluded from the label.
+
+Code: `group_eta_baselines.py --label ran` (and `group_eta_inflight.py --label ran`). `blocked_mask` tasks
+don't set `end` and are dropped from `fit_b1`; they stay in `known` as prediction inputs. Default `all` is
+unchanged and is what the live fit uses. Reports: `~/qf-group-eta/label-{all,ran}/`. The `all` run reproduces
+11-24 (try B1c 0.774/0.937/40.0).
+
+Test 10-08..11-20, try (label ran vs all):
+
+| est | w2x | cov90 | MAE min | pin90 min |
+|---|---|---|---|---|
+| B1c | 0.795 (0.774) | 0.917 (0.937) | 45 (94) | 19.5 (40.0) |
+| B1c* | 0.752 (0.731) | 0.891 (0.889) | 48 (100) | 22.2 (47.1) |
+| B0 | 0.607 (0.581) | 0.888 (0.893) | 55 (109) | 30.2 (51.3) |
+
+B1c is still the best and now sits inside the cov90 band [0.85, 0.93]. Autoland B1c MAE 93 -> 29 min.
+
+B2* (try, remaining time, label ran; `all` in brackets):
+
+| c | w2x | cov90 |
+|---|---|---|
+| +15 | 0.608 (0.558) | 0.856 (0.870) |
+| +30 | 0.535 (0.492) | 0.837 (0.869) |
+| +60 | 0.465 (0.465) | 0.813 (0.868) |
+| +120 | 0.363 (0.458) | 0.774 (0.873) |
+
+B2* still beats static at every checkpoint (static cov 0.81/0.77/0.69/0.58). With the clean label it
+UNDER-covers from +30m. This is not specific to groups with blocked tasks: the without/with split is
+0.836/0.843 at +30 and 0.775/0.772 at +120. It is also not mainly in-sample calibration: a B2*o variant (B1 refit
+without the cal days, like B1c*) gained only +0.01..0.03 cov and lost w2x/pinball, so it was dropped. Open
+suspects: the e*TAIL_MULT branch for overdue tasks (the 24h mass used to pad these), and drift between the last
+4 cal days and test.
+
+Not done: switching the live fit to `ran`; live B2* still counts no-run tasks as running (needs failed-dependency
+detection from `dependencies`).
+
 ## Status and next steps (handoff 2026-11-20)
 
 Nothing long-running is in flight; everything is committed (HEAD 97a694eb7f).

@@ -147,10 +147,10 @@ def predict_b2_star(b1, factors: pd.DataFrame, groups: pd.DataFrame, known: pd.D
     return out.assign(p50=np.fmax(out["p50"].to_numpy(), ee), p90=np.fmax(out["p90"].to_numpy(), ee))
 
 
-def evaluate(data_dir: Path, test_days, excluded) -> pd.DataFrame:
+def evaluate(data_dir: Path, test_days, excluded, label: str = "all") -> pd.DataFrame:
     t = time.time()
     tasks = g.load_tasks(data_dir)
-    groups, known = g.build_groups(tasks, tasks["created"].max(), excluded)
+    groups, known = g.build_groups(tasks, tasks["created"].max(), excluded, label)
     del tasks
     use = groups[groups["usable"]]
     print(f"[inflight] {len(use):,} usable groups ({time.time() - t:.0f}s)", flush=True)
@@ -231,13 +231,18 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", required=True, type=Path)
     ap.add_argument("--test-days", required=True)
+    ap.add_argument("--label", choices=g.LABEL_MODES, default="all",
+                    help="'ran': blocked (never-ran, deadline-exceeded) tasks don't set the group end")
+    ap.add_argument("--out-dir", type=Path, help="report/predictions dir (default: --data-dir)")
     a = ap.parse_args(argv)
     data_dir = a.data_dir.expanduser()
+    out_dir = a.out_dir.expanduser() if a.out_dir else data_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
     days = g.parse_days(a.test_days)
-    P = evaluate(data_dir, days, set(g.DEFAULT_EXCLUDED))
-    P.to_parquet(data_dir / "inflight_predictions.parquet", index=False)
-    write_report(data_dir / "report-inflight.md", P, days)
-    print(f"[inflight] wrote {data_dir / 'report-inflight.md'}")
+    P = evaluate(data_dir, days, set(g.DEFAULT_EXCLUDED), a.label)
+    P.to_parquet(out_dir / "inflight_predictions.parquet", index=False)
+    write_report(out_dir / "report-inflight.md", P, days)
+    print(f"[inflight] wrote {out_dir / 'report-inflight.md'}")
 
 
 if __name__ == "__main__":

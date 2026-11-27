@@ -204,3 +204,44 @@ def test_fit_all_predict_all_include_sized_estimator():
     assert "B1c**" in out and out["B1c**"]["p90"].notna().all()
     legacy = {k: v for k, v in model.items() if k != "cal_cs"}
     assert "B1c**" not in g.predict_all(legacy, use, known)
+
+
+def _with_blocked(rows, gid, t0, deadline_off=86400):
+    """rows + one blocked task in gid: never ran, resolved deadline-exceeded at t0 + deadline_off."""
+    df = _tasks(rows + [(gid, "try", "blocked", t0 + 60, False, 1, 0, t0 + deadline_off)])
+    df["last_reason"] = df["last_reason"].cat.add_categories(["deadline-exceeded"])
+    b = (df["task_group_id"] == gid) & (df["normalized_name"] == "blocked")
+    df.loc[b, "last_reason"] = "deadline-exceeded"
+    df.loc[b, "first_pending"] = df.loc[b, "last_resolved"]
+    return df
+
+
+def test_blocked_mask_needs_single_never_started_deadline_run():
+    t0 = DAY0 + 2 * 86400
+    df = _with_blocked(_group("G1", t0), "G1", t0)
+    assert g.blocked_mask(df).sum() == 1
+    ran = df.copy()
+    ran.loc[g.blocked_mask(df), "first_pending"] = t0 + 120  # pending earlier: it ran into the deadline
+    assert g.blocked_mask(ran).sum() == 0
+
+
+def test_label_ran_ignores_blocked_tasks_for_end_and_offsets():
+    t0 = DAY0 + 2 * 86400
+    df = _with_blocked(_group("G1", t0) + _group("Z", DAY0 + 10), "G1", t0)
+    for label, span in (("all", 86400), ("ran", 1400)):
+        groups, known = g.build_groups(df, data_end_ts=t0 + 10 * 86400, excluded=set(), label=label)
+        gi = groups.loc[groups.index[groups["t0"] == t0][0]]
+        assert gi["span"] == span and gi["usable"] and gi["n_known"] == 7
+        assert gi["n_blocked"] == (1 if label == "ran" else 0)
+    # fit_b1 drops the blocked task: no "blocked" key survives (and family CDF has no 24h mass)
+    groups, known = g.build_groups(df, data_end_ts=t0 + 10 * 86400, excluded=set(), label="ran")
+    kk = known[known["gid"].isin(groups.index[groups["usable"]])]
+    kk = kk.assign(offset=kk["last_resolved"] - kk["t0"])
+    m = g.fit_b1(pd.concat([kk] * 30, ignore_index=True))
+    assert m["q_fam"].loc["try", 0.9] < 86400
+    assert not any(k.endswith("\x1fblocked") for k in m["q_key"].index)
+
+
+def test_build_groups_rejects_unknown_label():
+    with pytest.raises(ValueError):
+        g.build_groups(_tasks(_group("Z", DAY0 + 10)), DAY0 + 10 * 86400, set(), label="nope")
