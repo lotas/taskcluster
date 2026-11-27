@@ -198,8 +198,17 @@ without the cal days, like B1c*) gained only +0.01..0.03 cov and lost w2x/pinbal
 suspects: the e*TAIL_MULT branch for overdue tasks (the 24h mass used to pad these), and drift between the last
 4 cal days and test.
 
-Not done: switching the live fit to `ran`; live B2* still counts no-run tasks as running (needs failed-dependency
-detection from `dependencies`).
+**Live since 2026-11-27 14:03Z (user OK):** the live fit uses `label="ran"` and the offline default is `ran`.
+The same blocked rule is in SQL: weekly §6/§6b, `group_eta_show.sh`, and api.js `originalGraph.actualFinish`.
+The SQL rule is `run_id = 0 AND started_at IS NULL AND reason_resolved = 'deadline-exceeded' AND
+pending_at = resolved_at`, tested with `IS NOT TRUE`. The model version string is unchanged
+(`edgefree-v1-2026-11-27`): rows predicted after 14:03Z use the new fit. Live check: today's (old-label) models
+scored on the new label over 11-24..11-26 try groups give B1c w2x 0.735 / cov 0.905 (old label 0.721 / 0.887).
+Canceled groups (4.3%): left as-is by decision (not predictable).
+
+Open: (1) B2* under-coverage on the clean label (above); (2) live blocked-task detection. Before its deadline a
+blocked task has no run, so B2* and the API count it as running and a group with a failed task stays "running"
+for up to ~24h. Fix: no-run task + failed dependency (from `dependencies`) = blocked.
 
 ## Status and next steps (handoff 2026-11-20)
 

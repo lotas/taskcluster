@@ -3,6 +3,8 @@
 #   scripts/group_eta_show.sh [hours=6] [family=try] [estimator=B1c]
 # finish_p50/p90 are wall-clock UTC estimates; actual is filled once every task
 # of the original graph has resolved (blank = still running).
+# Blocked tasks (never ran, deadline-exceeded) don't set actual (label 'ran'); before their
+# deadline they have no run yet, so such groups stay blank for up to ~24h.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 hours="${1:-6}"; fam="${2:-try}"; est="${3:-B1c}"
@@ -15,7 +17,7 @@ WITH p AS (
     AND t_pred > now() - make_interval(hours => :hours)
 ), lab AS (
   SELECT p.task_group_id,
-         max(r.resolved_at) AS done_at,
+         max(r.resolved_at) FILTER (WHERE (r.run_id = 0 AND r.started_at IS NULL AND r.reason_resolved = 'deadline-exceeded' AND r.pending_at = r.resolved_at) IS NOT TRUE) AS done_at,
          bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS running
   FROM p
   JOIN queue_forecast_tasks t ON t.task_group_id = p.task_group_id

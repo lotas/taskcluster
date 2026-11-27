@@ -147,7 +147,7 @@ def predict_b2_star(b1, factors: pd.DataFrame, groups: pd.DataFrame, known: pd.D
     return out.assign(p50=np.fmax(out["p50"].to_numpy(), ee), p90=np.fmax(out["p90"].to_numpy(), ee))
 
 
-def evaluate(data_dir: Path, test_days, excluded, label: str = "all") -> pd.DataFrame:
+def evaluate(data_dir: Path, test_days, excluded, label: str = "ran") -> pd.DataFrame:
     t = time.time()
     tasks = g.load_tasks(data_dir)
     groups, known = g.build_groups(tasks, tasks["created"].max(), excluded, label)
@@ -231,7 +231,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", required=True, type=Path)
     ap.add_argument("--test-days", required=True)
-    ap.add_argument("--label", choices=g.LABEL_MODES, default="all",
+    ap.add_argument("--label", choices=g.LABEL_MODES, default="ran",
                     help="'ran': blocked (never-ran, deadline-exceeded) tasks don't set the group end")
     ap.add_argument("--out-dir", type=Path, help="report/predictions dir (default: --data-dir)")
     a = ap.parse_args(argv)

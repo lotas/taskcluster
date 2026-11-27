@@ -171,10 +171,12 @@ export async function getGroup(pool, taskGroupId) {
            max(r.resolved_at) AS last_resolved,
            count(*) FILTER (WHERE t.task_created <= $2)::int AS orig_n,
            count(*) FILTER (WHERE t.task_created <= $2 AND r.resolved_at IS NULL)::int AS orig_unresolved,
-           max(r.resolved_at) FILTER (WHERE t.task_created <= $2) AS orig_last_resolved
+           -- blocked tasks (never ran, deadline-exceeded) don't set the finish (label 'ran', 2026-11-27)
+           max(r.resolved_at) FILTER (WHERE t.task_created <= $2
+                                        AND (r.run_id = 0 AND r.started_at IS NULL AND r.reason_resolved = 'deadline-exceeded' AND r.pending_at = r.resolved_at) IS NOT TRUE) AS orig_last_resolved
     FROM queue_forecast_tasks t
     LEFT JOIN LATERAL (
-      SELECT resolved_at FROM queue_forecast_task_runs r
+      SELECT run_id, started_at, pending_at, resolved_at, reason_resolved FROM queue_forecast_task_runs r
       WHERE r.task_id = t.task_id ORDER BY run_id DESC LIMIT 1
     ) r ON true
     WHERE t.task_group_id = $1`, [taskGroupId, tPred]);
@@ -210,7 +212,8 @@ export async function getGroup(pool, taskGroupId) {
     },
     eta: est.rows.length ? {
       note: SHADOW_NOTE,
-      definition: 'Completion of the tasks that existed at predictionTime (the original graph), measured from t0 = earliest task_created.',
+      definition: 'Completion of the tasks that existed at predictionTime (the original graph), measured from t0 = earliest task_created. '
+        + 'Tasks that never ran and expired at their deadline (e.g. dependents of a failed task) do not count.',
       t0: iso(est.rows[0].t0),
       predictionTime: iso(tPred),
       recommended: pickEstimator(est.rows.map(e => e.estimator)),

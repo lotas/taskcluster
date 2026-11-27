@@ -137,7 +137,8 @@ def fit(data_dir: Path, excluded: set[dt.date]) -> None:
     d0 = g._ts(today)
     # data_end = now: groups need 3 days to count as settled in eval, but live we
     # want the freshest window; completion-before-d0 already guarantees labels.
-    groups, known = g.build_groups(tasks, data_end_ts=d0 + 3 * 86400, excluded=excluded)
+    # Label 'ran' since 2026-11-27 (group-eta-plan.md G4): blocked tasks don't set the end.
+    groups, known = g.build_groups(tasks, data_end_ts=d0 + 3 * 86400, excluded=excluded, label="ran")
     use = groups[groups["usable"]]
     tr = use[(use["t0"] >= d0 - g.TRAIN_DAYS * 86400) & (use["end"] < d0)]
     model = g.fit_all(tr, known, d0)

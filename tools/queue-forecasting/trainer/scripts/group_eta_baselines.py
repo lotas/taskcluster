@@ -13,10 +13,10 @@ Definitions
   label    = max(last_resolved over known tasks) - t0, in seconds ("span").
   blocked  = known task that never ran: its only run was created as an exception at
              the deadline (n_runs 1, deadline-exceeded, pending_at == resolved_at),
-             e.g. a dependent of a failed task. With --label ran (LABEL_MODES) blocked
-             tasks don't set the group end and are left out of the per-task offset fits;
-             they stay in `known` as prediction inputs (unknowable at t_pred). Default
-             'all' keeps the original label (the live fit uses it; 2026-11-27).
+             e.g. a dependent of a failed task. With label 'ran' (default and live since
+             2026-11-27; LABEL_MODES) blocked tasks don't set the group end and are left
+             out of the per-task offset fits; they stay in `known` as prediction inputs
+             (unknowable at t_pred). 'all' = the pre-11-27 label, for comparisons.
 
 Estimators (p50 and p90 of span)
   B0   history: span quantiles by (repo_family, known-size bucket), fallbacks
@@ -143,7 +143,7 @@ def blocked_mask(tasks: pd.DataFrame) -> pd.Series:
             & (tasks["first_pending"] == tasks["last_resolved"]))
 
 
-def build_groups(tasks: pd.DataFrame, data_end_ts: float, excluded: set[dt.date], label: str = "all"):
+def build_groups(tasks: pd.DataFrame, data_end_ts: float, excluded: set[dt.date], label: str = "ran"):
     if label not in LABEL_MODES:
         raise ValueError(f"label must be one of {LABEL_MODES}, got {label!r}")
     """Return (groups, known_tasks). groups indexed by task_group_id codes."""
@@ -430,7 +430,7 @@ def _ts(d: dt.date) -> float:
     return dt.datetime.combine(d, dt.time(), tzinfo=dt.timezone.utc).timestamp()
 
 
-def evaluate(data_dir: Path, test_days: list[dt.date], excluded: set[dt.date], label: str = "all",
+def evaluate(data_dir: Path, test_days: list[dt.date], excluded: set[dt.date], label: str = "ran",
              out_dir: Path | None = None) -> None:
     t = time.time()
     out_dir = out_dir or data_dir
@@ -487,7 +487,7 @@ def _table(P: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows).round(3)
 
 
-def write_report(path: Path, P: pd.DataFrame, groups: pd.DataFrame, test_days, excluded, label: str = "all") -> None:
+def write_report(path: Path, P: pd.DataFrame, groups: pd.DataFrame, test_days, excluded, label: str = "ran") -> None:
     u = groups[groups["usable"]]
     lines = [
         f"# Group ETA edge-free baselines — {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%MZ}",
@@ -535,7 +535,7 @@ def main(argv=None) -> None:
     v.add_argument("--data-dir", required=True, type=Path)
     v.add_argument("--test-days", required=True)
     v.add_argument("--exclude", default="", help="extra excluded days, same syntax as --test-days")
-    v.add_argument("--label", choices=LABEL_MODES, default="all",
+    v.add_argument("--label", choices=LABEL_MODES, default="ran",
                    help="'ran': blocked (never-ran, deadline-exceeded) tasks don't set the group end")
     v.add_argument("--out-dir", type=Path, help="report/predictions dir (default: --data-dir)")
     a = ap.parse_args(argv)

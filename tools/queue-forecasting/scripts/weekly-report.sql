@@ -150,6 +150,7 @@ SELECT pg_size_pretty(pg_total_relation_size('queue_forecast_tasks')) AS tasks_t
 \echo
 \echo '## 6. Shadow task-group ETA (group-eta-plan.md P2), groups predicted since' :since
 \echo 'label = completion of the original graph (tasks created <= t_pred) - t0; only fully-resolved groups older than 1 day.'
+\echo 'blocked tasks (never ran, resolved deadline-exceeded, e.g. dependents of a failed task) do not set the end (label ran, since 2026-11-27).'
 \echo 'internal bars (try): cov90 in [0.85, 0.93], w2x >= 0.70.'
 WITH pg AS (
   SELECT DISTINCT task_group_id, t0, t_pred
@@ -158,7 +159,7 @@ WITH pg AS (
     AND left(estimator, 4) <> 'B2*+'
 ), lab AS (
   SELECT pg.task_group_id,
-         extract(epoch FROM max(r.resolved_at) - pg.t0) AS span,
+         extract(epoch FROM max(r.resolved_at) FILTER (WHERE (r.run_id = 0 AND r.started_at IS NULL AND r.reason_resolved = 'deadline-exceeded' AND r.pending_at = r.resolved_at) IS NOT TRUE) - pg.t0) AS span,
          bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS incomplete
   FROM pg
   JOIN queue_forecast_tasks t
@@ -195,7 +196,7 @@ WITH b AS (
   SELECT DISTINCT task_group_id, t0, t_pred FROM b
 ), lab AS (
   SELECT pg.task_group_id,
-         extract(epoch FROM max(r.resolved_at) - pg.t0) AS span,
+         extract(epoch FROM max(r.resolved_at) FILTER (WHERE (r.run_id = 0 AND r.started_at IS NULL AND r.reason_resolved = 'deadline-exceeded' AND r.pending_at = r.resolved_at) IS NOT TRUE) - pg.t0) AS span,
          bool_or(r.task_id IS NULL OR r.resolved_at IS NULL) AS incomplete
   FROM pg
   JOIN queue_forecast_tasks t
